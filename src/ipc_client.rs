@@ -319,6 +319,18 @@ fn render_timers(reply: &Value) -> Result<String, Failure> {
             last,
             took,
         ]);
+        // What the timer is waiting for, which is what it is set to the first of.
+        for item in timer["pending"].as_array().into_iter().flatten() {
+            let due = match item["due_in_ms"].as_u64().ok_or_else(bad_reply)? {
+                0 => "now".to_string(),
+                ms => format!("in {}", span(ms)),
+            };
+            let what = item["what"].as_str().ok_or_else(bad_reply)?;
+            let who = item["who"].as_str().ok_or_else(bad_reply)?;
+            let mut row = vec![format!("  {what:<11} {who}"), String::new(), due];
+            row.resize(6, String::new());
+            rows.push(row);
+        }
     }
     Ok(table(&rows))
 }
@@ -558,7 +570,8 @@ fn table(rows: &[Vec<String>]) -> String {
             .enumerate()
             .map(|(c, cell)| if c == last { cell.clone() } else { format!("{cell:<w$}", w = widths[c]) })
             .collect();
-        out.push_str(&cells.join("  "));
+        // Rows may leave their last cells empty.
+        out.push_str(cells.join("  ").trim_end());
         out.push('\n');
     }
     out
@@ -1012,6 +1025,32 @@ mod tests {
         let (path, daemon) = streaming_daemon("watch-closed", vec![ACK.into(), added]);
         assert_eq!(watch(&watch_options(&path, false), "IoT", &mut Closed), Ok(()));
         daemon.join().unwrap();
+    }
+
+    #[test]
+    fn timers_list_what_they_wait_for_under_each_timer() {
+        let reply: Value = serde_json::from_str(
+            r#"{"ok":true,"timers":[
+                {"id":1,"name":"upkeep br0/V4","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210,
+                 "pending":[{"what":"re-announce","who":"router.local","due_in_ms":93000},
+                            {"what":"expire","who":"10.0.0.10","due_in_ms":182000},
+                            {"what":"refresh","who":"OZAL-Speakers.local","due_in_ms":0}]},
+                {"id":2,"name":"upkeep wifi/V4","running":false,"due_in_ms":null,"runs":1,"last_run_ago_ms":8000,"last_took_us":96,"pending":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_timers(&reply).unwrap(),
+            "NAME                               STATE    DUE        RUNS  LAST RUN  TOOK\n\
+             upkeep br0/V4                      waiting  in 1m 33s  4     3.5s ago  210us\n\
+             \x20 re-announce router.local                  in 1m 33s\n\
+             \x20 expire      10.0.0.10                     in 3m 02s\n\
+             \x20 refresh     OZAL-Speakers.local           now\n\
+             upkeep wifi/V4                     idle     never      1     8.0s ago  96us\n"
+        );
+        // A daemon that does not say what it waits for is still listed.
+        let old: Value = serde_json::from_str(r#"{"ok":true,"timers":[{"id":1,"name":"x","running":false,"due_in_ms":5,"runs":0,"last_run_ago_ms":null,"last_took_us":null}]}"#).unwrap();
+        assert!(render_timers(&old).is_ok());
+        assert!(render_timers(&serde_json::json!({"ok":true,"timers":[{"id":1,"name":"x","running":false,"due_in_ms":5,"runs":0,"pending":[{"what":"expire"}]}]})).is_err());
     }
 
     #[test]

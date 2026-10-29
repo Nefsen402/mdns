@@ -56,6 +56,16 @@ pub const DEFAULT_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 /// were heard from, which is no use to anyone.
 const MIN_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 
+/// How long the address records of the advertised name are cached by others.
+/// Two minutes is the usual for host names (Avahi used it for `router.local`).
+pub const DEFAULT_ADVERTISE_TTL: Duration = Duration::from_secs(120);
+
+/// It is re-announced at 80% of its TTL, so a shorter one would be a flood.
+const MIN_ADVERTISE_TTL: Duration = Duration::from_secs(10);
+
+/// A longer one is a typo, and the name would outlive the host for a day.
+const MAX_ADVERTISE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// A longer floor than this is a typo: it would keep devices that are long
 /// gone, and a silly one (`99999999999999s`) would overflow the clock.
 const MAX_MIN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
@@ -76,6 +86,9 @@ pub struct Config {
     /// A `.local` name to announce and answer for with this host's own
     /// addresses on every interface.
     pub advertise: Option<String>,
+    /// The TTL of the advertised name's address records, which it is
+    /// re-announced at 80% of.
+    pub advertise_ttl: Duration,
     /// How often to probe every interface for devices; `None` (the default)
     /// probes only at startup and on request.
     pub probe_interval: Option<Duration>,
@@ -95,6 +108,7 @@ impl Default for Config {
             ipv6: true,
             socket: PathBuf::from(DEFAULT_SOCKET),
             advertise: None,
+            advertise_ttl: DEFAULT_ADVERTISE_TTL,
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
             min_lifetime: crate::socket::DEFAULT_MIN_LIFETIME,
@@ -171,6 +185,9 @@ impl Config {
                     }
                     ("advertise", "hostname") => {
                         config.advertise = Some(local_name(&value, lineno)?);
+                    }
+                    ("advertise", "ttl") => {
+                        config.advertise_ttl = parse_advertise_ttl(&value, lineno)?;
                     }
                     ("ipc", "socket") => {
                         if value.is_empty() {
@@ -315,6 +332,19 @@ fn parse_lifetime(value: &str, lineno: usize) -> Result<Duration> {
     Ok(span)
 }
 
+/// The TTL of the advertised name: a time span between the limits.
+fn parse_advertise_ttl(value: &str, lineno: usize) -> Result<Duration> {
+    let span = timespan(value, lineno, "TTL")?;
+    if span < MIN_ADVERTISE_TTL || span > MAX_ADVERTISE_TTL {
+        bail!(
+            "line {lineno}: TTL= must be between {} seconds and {} hours",
+            MIN_ADVERTISE_TTL.as_secs(),
+            MAX_ADVERTISE_TTL.as_secs() / 3600
+        );
+    }
+    Ok(span)
+}
+
 /// A time span setting called `key`, with `0`, `off` or `infinity` meaning
 /// never, and at least `min`.
 fn parse_span(value: &str, lineno: usize, key: &str, min: Duration) -> Result<Option<Duration>> {
@@ -401,13 +431,27 @@ interfaces=br0,wifi
         assert!(with(&format!("{}.local", "x".repeat(63))).is_ok());
     }
 
+    #[test]
+    fn advertise_ttl_defaults_to_two_minutes_and_is_bounded() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().advertise_ttl, Duration::from_secs(120));
+
+        let with = |value: &str| Config::parse(&format!("[Advertise]\nTTL={value}\n{EXAMPLE}"));
+        assert_eq!(with("2min").unwrap().advertise_ttl, Duration::from_secs(120));
+        assert_eq!(with("1h").unwrap().advertise_ttl, Duration::from_secs(3600));
+        assert_eq!(with("10").unwrap().advertise_ttl, Duration::from_secs(10));
+        assert_eq!(with("24h").unwrap().advertise_ttl, Duration::from_secs(86400));
+        for bad in ["9s", "0", "", "off", "infinity", "25h", "soon", "99999999999999s"] {
+            assert!(with(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
     /// The man page must document every key and a config that really parses.
     #[test]
     fn man_page_documents_every_key_and_its_example_parses() {
         let man = include_str!("../man/mdnsd.conf.5");
         for key in [
-            "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "Interval=", "RefreshBefore=", "Hostname=", "Name=",
-            "Interfaces=",
+            "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "Interval=", "RefreshBefore=", "Hostname=", "TTL=",
+            "Name=", "Interfaces=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }

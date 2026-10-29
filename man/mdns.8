@@ -99,7 +99,11 @@ On each interface it publishes the address of this host on that interface (an
 A record with the primary IPv4 address, an AAAA record with the link-local
 IPv6 address), read once at startup.
 The name is handled exactly like a reflected device that has no services: it
-is announced, re-announced periodically, answers queries, and is withdrawn
+is announced, re-announced at 80% of its TTL (see
+.B TTL=
+in
+.BR mdnsd.conf (5)),
+answers queries, and is withdrawn
 with goodbye packets on
 .BR SIGTERM .
 No conflict detection is done: the name is assumed to be yours alone.

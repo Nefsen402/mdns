@@ -5,6 +5,7 @@
 //! `ss` as `224.0.0.251%wifi:5353` and only ever sees that link's traffic.
 
 use std::ffi::CString;
+use std::fmt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::os::fd::AsRawFd;
@@ -35,7 +36,9 @@ const HOST_TTL: u32 = 120;
 const OTHER_TTL: u32 = 4500;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises.
-const REANNOUNCE: Duration = Duration::from_secs(HOST_TTL as u64 * 4 / 5);
+fn reannounce_after(host_ttl: u32) -> Duration {
+    Duration::from_secs(u64::from(host_ttl) * 4 / 5)
+}
 /// How long to wait before trying again after a re-announcement failed to send.
 const ANNOUNCE_RETRY: Duration = Duration::from_secs(10);
 
@@ -252,6 +255,16 @@ pub enum Event {
     Removed(Device),
 }
 
+/// Something a segment's timer is waiting to do: see [`Segment::pending`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    /// `expire`, `refresh` or `re-announce`.
+    pub what: &'static str,
+    /// The device it is about: its hostname, or the address it was heard from.
+    pub who: String,
+    pub at: Instant,
+}
+
 /// How a discovered device is told apart: by hostname once it has one,
 /// otherwise by the address it was heard from.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -334,6 +347,17 @@ struct Manual {
     last_sent: Instant,
     /// Not before this, after a re-announcement failed to send.
     retry: Option<Instant>,
+    /// The TTLs it is announced with: of its address records, and of the rest.
+    host_ttl: u32,
+    other_ttl: u32,
+}
+
+impl Manual {
+    /// When it is next due for re-announcing.
+    fn reannounce_at(&self) -> Instant {
+        let at = self.announced.checked_add(reannounce_after(self.host_ttl)).unwrap_or(self.announced);
+        self.retry.map_or(at, |retry| at.max(retry))
+    }
 }
 
 /// The entry that wakes the segment's upkeep: expiry, refreshing and
@@ -381,11 +405,22 @@ impl State {
     /// in the past means it is due now. Every time returned is one at which
     /// one of them acts, so that running them moves it on.
     fn next_due(&self, now: Instant) -> Option<Instant> {
-        let before = self.wake.as_ref().and_then(|w| w.before);
         let mut next: Option<Instant> = None;
-        let mut soon = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
-        for e in self.discovered.values() {
-            soon(e.expires);
+        self.for_each_deadline(now, &mut |_, _, at| next = Some(next.map_or(at, |n| n.min(at))));
+        next
+    }
+
+    /// Every time something is due, as what is to be done (`expire`,
+    /// `refresh` or `re-announce`), to whom, and when. What
+    /// [`State::next_due`] and [`Segment::pending`] are made of.
+    fn for_each_deadline(&self, now: Instant, f: &mut dyn FnMut(&'static str, &dyn fmt::Display, Instant)) {
+        let before = self.wake.as_ref().and_then(|w| w.before);
+        for (key, e) in &self.discovered {
+            let who: &dyn fmt::Display = match (&e.hostname, key) {
+                (Some(host), _) | (None, Key::Host(host)) => host,
+                (None, Key::Source(addr)) => addr,
+            };
+            f("expire", who, e.expires);
             let Some(before) = before.filter(|_| self.outbound.is_some() && e.askable()) else {
                 continue;
             };
@@ -399,14 +434,12 @@ impl State {
             }
             // A device that runs out first is dropped, not asked.
             if at < e.expires {
-                soon(at);
+                f("refresh", who, at);
             }
         }
-        for m in self.manual.values() {
-            let at = m.announced.checked_add(REANNOUNCE).unwrap_or(m.announced);
-            soon(m.retry.map_or(at, |r| at.max(r)));
+        for (name, m) in &self.manual {
+            f("re-announce", name, m.reannounce_at());
         }
-        next
     }
 
     /// How much longer the daemon keeps `device` if it is not heard from, to
@@ -555,6 +588,25 @@ impl Segment {
         rx
     }
 
+    /// Everything this segment's timer is waiting for, soonest first: devices
+    /// to expire, to ask again, and to re-announce. The timer's own time is the
+    /// first of these.
+    pub fn pending(&self) -> Vec<Pending> {
+        let state = self.state.lock().unwrap();
+        let mut all = Vec::new();
+        state.for_each_deadline(Instant::now(), &mut |what, who, at| {
+            all.push(Pending { what, who: who.to_string(), at });
+        });
+        all.sort_by_key(|p| p.at);
+        all
+    }
+
+    /// The id of this segment's entry in the timer ([`timer::Entry::id`]), if
+    /// it has been scheduled.
+    pub fn timer_id(&self) -> Option<u64> {
+        self.state.lock().unwrap().wake.as_ref().map(|w| w.entry.id())
+    }
+
     /// How much longer the daemon keeps `device`, a device of this segment, if
     /// it is not heard from again, to the second; zero if it is not (or no
     /// longer) known.
@@ -574,6 +626,17 @@ impl Segment {
     /// present. Replacing a device also sends goodbyes for services and
     /// addresses it no longer has. If sending fails nothing is recorded.
     pub fn add_manual(&self, device: Device) -> Result<bool> {
+        self.add_manual_ttl(device, Duration::from_secs(HOST_TTL.into()))
+    }
+
+    /// Like [`add_manual`](Segment::add_manual), with the address records
+    /// announced for `host_ttl` (whole seconds, at least one) instead of the
+    /// usual two minutes, and re-announced at 80% of it.
+    pub fn add_manual_ttl(&self, device: Device, host_ttl: Duration) -> Result<bool> {
+        let host_ttl = u32::try_from(host_ttl.as_secs()).unwrap_or(u32::MAX);
+        if host_ttl == 0 {
+            bail!("a TTL of zero would withdraw the device");
+        }
         let Some(key) = device.key() else {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
         };
@@ -592,7 +655,7 @@ impl Segment {
             return Ok(false);
         }
 
-        let mut records = announcement(&device, HOST_TTL, OTHER_TTL);
+        let mut records = announcement(&device, host_ttl, OTHER_TTL);
         if let Some(old) = old {
             let kept: BTreeSet<_> = device.services.iter().map(|s| &s.instance).collect();
             for svc in old.services.iter().filter(|s| !kept.contains(&s.instance)) {
@@ -605,7 +668,8 @@ impl Segment {
         }
         send(&state.outbound, &records)?;
         let now = Instant::now();
-        state.manual.insert(key, Manual { device, announced: now, last_sent: now, retry: None });
+        let manual = Manual { device, announced: now, last_sent: now, retry: None, host_ttl, other_ttl: OTHER_TTL };
+        state.manual.insert(key, manual);
         drop(guard);
         self.rearm();
         Ok(true)
@@ -631,7 +695,7 @@ impl Segment {
     }
 
     /// Re-announce reflected devices that have not had a full announcement
-    /// for [`REANNOUNCE`]. A failed send is retried after [`ANNOUNCE_RETRY`]; the
+    /// for 80% of their TTL. A failed send is retried after [`ANNOUNCE_RETRY`]; the
     /// first error is returned after every device was tried. Run by
     /// [`Segment::schedule`] when due.
     pub fn reannounce(&self, now: Instant) -> Result<()> {
@@ -639,10 +703,10 @@ impl Segment {
         let State { manual, outbound, .. } = &mut *guard;
         let mut first_err = None;
         for m in manual.values_mut() {
-            if now.saturating_duration_since(m.announced) < REANNOUNCE || m.retry.is_some_and(|r| now < r) {
+            if now < m.reannounce_at() {
                 continue;
             }
-            match send(outbound, &announcement(&m.device, HOST_TTL, OTHER_TTL)) {
+            match send(outbound, &announcement(&m.device, m.host_ttl, m.other_ttl)) {
                 Ok(()) => {
                     m.announced = now;
                     m.last_sent = now;
@@ -677,7 +741,7 @@ impl Segment {
         let mut additionals: Vec<Record> = Vec::new();
         let mut used = Vec::new();
         for (key, m) in &state.manual {
-            let (a, x) = answers_for(query, &m.device);
+            let (a, x) = answers_for(query, &m.device, m.host_ttl, m.other_ttl);
             if a.is_empty() {
                 continue;
             }
@@ -1247,8 +1311,8 @@ fn record(name: String, cache_flush: bool, ttl: u32, data: RData) -> Record {
 /// Records that match `query` for one device, with known-answer suppression
 /// applied, plus the additional records a client will want next (RFC 6763
 /// section 12): a PTR brings its SRV and TXT, and an SRV brings its address.
-fn answers_for(query: &Message, device: &Device) -> (Vec<Record>, Vec<Record>) {
-    let all = announcement(device, HOST_TTL, OTHER_TTL);
+fn answers_for(query: &Message, device: &Device, host_ttl: u32, other_ttl: u32) -> (Vec<Record>, Vec<Record>) {
+    let all = announcement(device, host_ttl, other_ttl);
 
     let mut answers: Vec<Record> = Vec::new();
     for q in &query.questions {
@@ -1726,7 +1790,7 @@ mod tests {
         seg.reannounce(Instant::now()).unwrap();
         assert!(recv(&rx).is_none());
 
-        let later = Instant::now() + REANNOUNCE + Duration::from_secs(1);
+        let later = Instant::now() + reannounce_after(HOST_TTL) + Duration::from_secs(1);
         seg.reannounce(later).unwrap();
         let again = recv(&rx).expect("re-announcement");
         assert_eq!(again.answers.len(), first.answers.len());
@@ -1882,7 +1946,7 @@ mod tests {
         assert_eq!(recv(&rx).unwrap().answers[0].data, RData::A("10.0.1.1".parse().unwrap()));
 
         // ...is re-announced, and says goodbye when removed.
-        seg.reannounce(Instant::now() + REANNOUNCE + Duration::from_secs(1)).unwrap();
+        seg.reannounce(Instant::now() + reannounce_after(HOST_TTL) + Duration::from_secs(1)).unwrap();
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL));
         seg.remove_manual("router.local").unwrap();
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
@@ -2445,9 +2509,67 @@ mod tests {
         // A reflected device is due for re-announcement, and a failed one not before its retry.
         seg.add_manual(tv("10.0.9.9", &["TV"])).unwrap();
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + REANNOUNCE)));
+        assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + reannounce_after(HOST_TTL))));
         seg.state.lock().unwrap().manual.get_mut("tv.local").unwrap().retry = Some(announced + Duration::from_secs(500));
         assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn pending_lists_everything_the_timer_waits_for_soonest_first() {
+        let timer = Timer::new().unwrap();
+        let (seg, _rx) = wired();
+        seg.schedule(&timer, Some(Duration::from_secs(60)));
+        assert!(seg.pending().is_empty());
+        assert!(seg.timer_id().is_some());
+
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        seg.observe(ip("10.0.1.99")); // heard, but never named
+        seg.add_manual(tv("10.0.9.9", &["TV"])).unwrap();
+
+        let expires = expiry_of(&seg, "printer.local");
+        let pending = seg.pending();
+        let rows: Vec<(&str, &str)> = pending.iter().map(|p| (p.what, p.who.as_str())).collect();
+        // The unnamed one is by address and only expires: there is nothing to ask it.
+        assert_eq!(rows.iter().filter(|(_, who)| *who == "10.0.1.99").collect::<Vec<_>>(), [&("expire", "10.0.1.99")]);
+        assert!(rows.contains(&("expire", "printer.local")) && rows.contains(&("refresh", "printer.local")));
+        assert!(rows.contains(&("re-announce", "tv.local")));
+        assert_eq!(rows.len(), 4);
+        assert!(pending.windows(2).all(|w| w[0].at <= w[1].at), "soonest first");
+        // The timer is set for the first of them.
+        assert_eq!(next_due(&seg), Some(pending[0].at));
+        let refresh = pending.iter().find(|p| p.what == "refresh").unwrap();
+        assert_eq!(refresh.at, expires - Duration::from_secs(60));
+        // Without a refresh margin nothing is asked.
+        seg.schedule(&timer, None);
+        assert!(seg.pending().iter().all(|p| p.what != "refresh"));
+    }
+
+    #[test]
+    fn a_name_can_be_announced_with_its_own_ttl_and_is_kept_up_at_80_percent_of_it() {
+        let (seg, rx) = wired();
+        seg.add_manual_ttl(tv("10.0.1.1", &[]), Duration::from_secs(1000)).unwrap();
+        let first = recv(&rx).unwrap();
+        assert!(first.answers.iter().all(|r| r.ttl == 1000));
+        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(800));
+
+        // Queries are answered with it too.
+        age(&seg, 2);
+        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::A, vec![])).unwrap();
+        assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 1000));
+
+        // Not yet at 799 s; again at 800, with the same TTL.
+        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        seg.reannounce(announced + Duration::from_secs(799)).unwrap();
+        assert!(recv(&rx).is_none());
+        seg.reannounce(announced + Duration::from_secs(800)).unwrap();
+        assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 1000));
+
+        // The usual way is unchanged, and a TTL of zero (a goodbye) is refused.
+        let (usual, rx) = wired();
+        usual.add_manual(tv("10.0.1.1", &[])).unwrap();
+        assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL || r.ttl == OTHER_TTL));
+        assert!(usual.add_manual_ttl(tv("10.0.1.2", &[]), Duration::from_millis(900)).is_err());
     }
 
     #[test]

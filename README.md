@@ -115,9 +115,11 @@ MinimumLifetime=5min
 RefreshBefore=30s
 
 # Answer mDNS queries for this name with the router's own address on each
-# interface, so `router.local` resolves from every network listed below.
+# interface, so `router.local` resolves from every network listed below. Others
+# keep the address for TTL, and it is announced again at 80% of that.
 [Advertise]
 Hostname=router.local
+TTL=2min
 
 [Segment]
 Name=media_stuff
@@ -238,6 +240,7 @@ are.
 | Key        | Meaning                                                              |
 |------------|----------------------------------------------------------------------|
 | `Hostname` | A name under `.local` to announce and answer for, e.g. `router.local`. A bare label such as `router` means `router.local`. |
+| `TTL`      | How long others keep the name's address, and so how often it is announced again: at 80% of it (default `2min`, so every 96 seconds). Between 10 seconds and 24 hours. A longer one means less chatter, but a stale address lingers that long after the router's changes. |
 
 The daemon answers queries for this name with **its own address on each
 interface**, so every network is told the address at which it can reach the
@@ -459,10 +462,19 @@ earliest of those that is due.
 
 ```
 $ mdnsctl timers
-NAME            STATE    DUE        RUNS  LAST RUN   TOOK
-upkeep br0/V4   waiting  in 1m 33s  4     3.5s ago   210us
-upkeep wifi/V4  waiting  in 4m 51s  1     8.2s ago   96us
+NAME                               STATE    DUE        RUNS  LAST RUN  TOOK
+upkeep br0/V4                      waiting  in 1m 33s  4     3.5s ago  210us
+  re-announce router.local                  in 1m 33s
+  expire      10.0.0.10                     in 3m 02s
+  refresh     OZAL-Speakers.local           now
+upkeep wifi/V4                     idle     never      1     8.0s ago  96us
 ```
+
+Under each timer is everything it is waiting for, soonest first, which is what
+it is set to the first of: `expire` a device that has not been heard from,
+`refresh` it (ask it to answer again, shortly before that), and `re-announce` a
+name this daemon announces. A device that has no name yet is listed by the
+address it was heard from.
 
 `STATE` is `running` while its callback runs, `waiting` until `DUE`, and `idle`
 when nothing is due (for example, no devices known yet). `DUE` says `now` for

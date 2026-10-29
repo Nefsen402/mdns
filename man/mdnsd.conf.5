@@ -185,6 +185,15 @@ The name is announced and kept alive like a reflected device, answers queries
 (a reflected device without services), and is withdrawn with a goodbye on
 shutdown.
 No conflict detection is done: the name is assumed to be yours alone.
+.TP
+.B TTL=
+How long other devices keep the address of the name, as a time span such as
+.B 2min
+(the default, as Avahi used for host names).
+It is announced again at 80% of this, so by default every 96 seconds; a longer
+TTL means less traffic, but a stale address lingers that long when this host's
+address changes.
+At least 10 seconds and at most 24 hours.
 .SS [Segment]
 One or more are required.
 .TP
@@ -250,6 +259,7 @@ RefreshBefore=30s
 
 [Advertise]
 Hostname=router.local
+TTL=2min
 
 [Segment]
 Name=media_stuff

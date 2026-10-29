@@ -18,7 +18,8 @@
 //!   {"event":"removed","segment":"IoT","ttl":0,"device":{...}}
 //! timers
 //!   {"ok":true,"timers":[{"id":1,"name":"upkeep wifi/V4","running":false,
-//!    "due_in_ms":93000,"runs":4,"last_run_ago_ms":3000,"last_took_us":210}]}
+//!    "due_in_ms":93000,"runs":4,"last_run_ago_ms":3000,"last_took_us":210,
+//!    "pending":[{"what":"re-announce","who":"router.local","due_in_ms":93000}]}]}
 //! ```
 //!
 //! Errors are `{"ok":false,"error":"..."}`. `devices` lists what was
@@ -39,11 +40,17 @@
 //! `timers` lists what the daemon's timer has scheduled, soonest first, for
 //! debugging. `due_in_ms` is 0 for one that is overdue (its callback is queued
 //! behind another) and `null` for one that is running now or never due;
-//! `last_run_ago_ms` and `last_took_us` are `null` until it has run.
+//! `last_run_ago_ms` and `last_took_us` are `null` until it has run. A link's
+//! `upkeep` timer is set for the first of its `pending` list: everything it is
+//! waiting to do, soonest first, as `what` (`expire`, `refresh` or
+//! `re-announce`), to `who` (a hostname, or the address of a device that has
+//! none), and `due_in_ms` from now (0 if it is due).
+//! 
 //!
 //! A device has up to two addresses, of the entry's family: `routable` (IPv4,
 //! or global/ULA IPv6) and `link_local`; either is `null` when unknown.
 
+use std::collections::HashMap;
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -245,7 +252,7 @@ pub fn handle(groups: &[Group], timers: &Watcher, request: &str) -> String {
         "segments" => segments(groups),
         "devices" => devices(groups, arg),
         "probe" => probe(groups, arg),
-        "timers" => timer_list(timers),
+        "timers" => timer_list(groups, timers),
         "watch" => error("watch streams events: it needs a connection of its own"),
         "" => error("empty request"),
         other => error(&format!("unknown command {other:?}; try: segments, devices <name>, probe [name], watch <name>, timers")),
@@ -343,12 +350,32 @@ fn probe(groups: &[Group], name: &str) -> Value {
     json!({ "ok": true, "probed": results })
 }
 
-fn timer_list(timers: &Watcher) -> Value {
+fn timer_list(groups: &[Group], timers: &Watcher) -> Value {
     let Some(all) = timers.snapshot() else {
         return error("the timer is not running");
     };
     let now = Instant::now();
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+
+    // What each link's timer is waiting for, by the id of its entry. A link
+    // that is in several segments is asked once.
+    let mut links: Vec<&Segment> = Vec::new();
+    for seg in groups.iter().flat_map(|g| g.reflector.segments()) {
+        if !links.iter().any(|l| l.interface() == seg.interface() && l.family() == seg.family()) {
+            links.push(seg);
+        }
+    }
+    let mut pending: HashMap<u64, Vec<Value>> = links
+        .into_iter()
+        .filter_map(|seg| {
+            let waiting = seg
+                .pending()
+                .into_iter()
+                .map(|p| json!({ "what": p.what, "who": p.who, "due_in_ms": ms(p.at.saturating_duration_since(now)) }))
+                .collect();
+            Some((seg.timer_id()?, waiting))
+        })
+        .collect();
     let list: Vec<Value> = all
         .iter()
         .map(|t| {
@@ -360,6 +387,7 @@ fn timer_list(timers: &Watcher) -> Value {
                 "runs": t.runs,
                 "last_run_ago_ms": t.last_run.map(|at| ms(now.saturating_duration_since(at))),
                 "last_took_us": t.last_took.map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+                "pending": pending.remove(&t.id).unwrap_or_default(),
             })
         })
         .collect();
@@ -470,6 +498,27 @@ mod tests {
         assert!(list[0]["last_run_ago_ms"].is_null() && list[0]["last_took_us"].is_null());
         assert!(list[2]["due_in_ms"].is_null());
         assert!(list[0]["id"].is_u64());
+    }
+
+    #[test]
+    fn timers_say_what_each_one_is_waiting_for() {
+        let timer = crate::timer::Timer::new().unwrap();
+        let (g, segs) = group("IoT", Family::V4, &["wifi"]);
+        let (g2, _) = group("other", Family::V4, &["eth"]);
+        segs[0].schedule(&timer, Some(Duration::from_secs(30)));
+        segs[0].observe(ip("10.0.1.7"));
+
+        let reply: Value = serde_json::from_str(&handle(&[g, g2], &timer.watcher(), "timers")).unwrap();
+        let list = reply["timers"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "only wifi was scheduled");
+        assert_eq!(list[0]["name"], "upkeep wifi/V4");
+        let pending = list[0]["pending"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "an unnamed device is only expired");
+        assert_eq!((pending[0]["what"].as_str(), pending[0]["who"].as_str()), (Some("expire"), Some("10.0.1.7")));
+        let due = pending[0]["due_in_ms"].as_u64().unwrap();
+        assert!((299_000..=300_000).contains(&due), "{due}");
+        // The timer is set for it.
+        assert!(list[0]["due_in_ms"].as_u64().unwrap().abs_diff(due) < 1000);
     }
 
     #[test]

@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             let link = start_link(
                 interface,
                 family,
-                config.advertise.as_deref(),
+                config.advertise.as_deref().map(|name| (name, config.advertise_ttl)),
                 config.refresh_before,
                 config.min_lifetime,
                 &timer,
@@ -187,11 +187,12 @@ fn release(mut segments: Arc<Vec<Group>>) {
 ///
 /// With `advertise`, the link also announces that name (say `router.local`)
 /// with this host's address on the interface, as a reflected device with a
-/// hostname and an address but no services. The address is read once, here.
+/// hostname and an address but no services, with its records valid for `ttl`.
+/// The address is read once, here.
 fn start_link(
     interface: &str,
     family: Family,
-    advertise: Option<&str>,
+    advertise: Option<(&str, Duration)>,
     refresh_before: Option<Duration>,
     min_lifetime: Duration,
     timer: &Timer,
@@ -205,17 +206,17 @@ fn start_link(
     let (tx, dest) = sock.sender()?;
     link.attach(tx, dest);
 
-    if let Some(name) = advertise {
+    if let Some((name, ttl)) = advertise {
         // On its own link, the router's link-local address is as good as any,
         // and for IPv6 it is the one the kernel picks.
         let router = sock.local_addr().and_then(|addr| {
             let (link_local, routable) =
                 if socket::is_link_local(&addr) { (Some(addr), None) } else { (None, Some(addr)) };
-            link.add_manual(Device { hostname: Some(name.to_string()), link_local, routable, services: Vec::new() })
-                .map(|_| addr)
+            let device = Device { hostname: Some(name.to_string()), link_local, routable, services: Vec::new() };
+            link.add_manual_ttl(device, ttl).map(|_| addr)
         });
         match router {
-            Ok(addr) => eprintln!("{interface}/{family:?}: advertising {name} as {addr}"),
+            Ok(addr) => eprintln!("{interface}/{family:?}: advertising {name} as {addr} (TTL {}s)", ttl.as_secs()),
             // An interface without an address of this family has nothing to
             // advertise; that is not a reason to refuse to start.
             Err(e) => eprintln!("{interface}/{family:?}: not advertising {name}: {e:#}"),
