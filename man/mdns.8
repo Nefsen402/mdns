@@ -1,0 +1,135 @@
+.TH MDNS 8 "October 2026" "mdns 0.1.0" "System Administration"
+.SH NAME
+mdns \- mDNS discovery and reflection daemon
+.SH SYNOPSIS
+.B mdns
+[\fIconfig-file\fR]
+.SH DESCRIPTION
+.B mdns
+tracks the devices announcing themselves with multicast DNS (Bonjour, Avahi)
+on a set of network interfaces, and reflects them between the interfaces you
+choose, and only those.
+Given
+.B br0 <-> media
+and
+.BR "br0 <-> wifi" ,
+the
+.B media
+and
+.B wifi
+networks never learn about each other's devices, even though both talk to
+.BR br0 .
+.PP
+For each interface and each address family (IPv4 and IPv6, which are kept
+completely separate) the daemon opens one socket, bound to that interface and
+to the mDNS multicast group address.
+It never listens on the wildcard address.
+.PP
+What may be reflected where is described by the
+.B [Segment]
+sections of the configuration file; see
+.BR mdnsd.conf (5).
+.SS Tracking
+A device is known by its source address.
+Its hostname and its DNS-SD services are taken from the records it announces.
+A device expires after it has been silent for at least five minutes, or for the
+TTL of its records if that is longer.
+A goodbye packet (TTL 0) removes it immediately.
+.SS Reflection
+Within a segment, every interface announces the devices discovered on every
+other interface of that segment.
+Only devices that announced a hostname and at least one service are reflected;
+chatty clients such as phones are tracked but not reflected.
+Reflection is never transitive: a device reflected onto an interface is not
+reflected again.
+.PP
+Reflected devices are announced with their original address, so the firewall
+must allow the actual connections between the networks; mDNS only makes the
+device discoverable.
+.PP
+The daemon answers queries for reflected devices, including known-answer
+suppression, keeps them alive with periodic re-announcements, and withdraws
+them with goodbye packets when the source device disappears.
+If two devices would clash on hostname or address on a target interface, the
+one from the interface listed first in the segment wins.
+.SS Control socket
+The daemon serves a local control socket, described under
+.B [Ipc]
+in
+.BR mdnsd.conf (5),
+which
+.BR mdnsctl (1)
+uses to list segments and devices.
+.SH OPTIONS
+.TP
+.I config-file
+Read the configuration from this file instead of
+.IR /etc/mdnsd.conf .
+The configuration is read once at startup; restart the daemon to apply changes.
+.SH SIGNALS
+.TP
+.BR SIGTERM ", " SIGINT
+Send goodbye packets for every reflected device, remove the control socket and
+exit with status 0, so that clients drop the reflected devices immediately.
+.PP
+If the daemon is killed with
+.B SIGKILL
+or crashes, no goodbyes are sent, and clients keep the reflected devices until
+their records expire, up to 75 minutes.
+.SH EXIT STATUS
+.TP
+.B 0
+Stopped by
+.B SIGTERM
+or
+.BR SIGINT .
+.TP
+.B 1
+Startup failed: the configuration is invalid, an interface cannot be opened, or
+the control socket cannot be created.
+The reason is printed on standard error.
+.SH FILES
+.TP
+.I /etc/mdnsd.conf
+Default configuration file.
+.TP
+.I /run/mdnsd/mdnsd.sock
+Default control socket.
+.TP
+.I /usr/lib/systemd/system/mdnsd.service
+systemd unit.
+It runs the daemon as the unprivileged
+.B mdnsd
+user, starts it only once
+.I /etc/mdnsd.conf
+exists, and restarts it every five seconds if it exits, which covers interfaces
+that appear after boot.
+.SH NOTES
+Binding a socket to a single interface needs no privilege on Linux 5.7 and
+newer.
+.PP
+The daemon binds with
+.BR SO_REUSEPORT ,
+so it can run next to Avahi while migrating, but do not run two reflectors
+(this one and Avahi's) over the same interfaces.
+.SH EXAMPLES
+Run in the foreground with a configuration file of your own:
+.PP
+.RS
+.nf
+$ mdns ./mdnsd.conf
+.fi
+.RE
+.PP
+Run as a service:
+.PP
+.RS
+.nf
+# cp /usr/share/doc/mdns/examples/mdnsd.conf /etc/mdnsd.conf
+# $EDITOR /etc/mdnsd.conf
+# systemctl enable \-\-now mdnsd.service
+.fi
+.RE
+.SH SEE ALSO
+.BR mdnsd.conf (5),
+.BR mdnsctl (1)

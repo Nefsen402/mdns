@@ -1,0 +1,18 @@
+[package]
+name = "mdns"
+version = "0.1.0"
+edition = "2024"
+description = "mDNS discovery and per-segment reflection daemon, with the mdnsctl client"
+license = "GPL-3.0-only"
+
+default-run = "mdns"
+
+[[bin]]
+name = "mdnsctl"
+path = "src/ipc_client.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+libc = "0.2.191"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+socket2 = { version = "0.6.5", features = ["all"] }

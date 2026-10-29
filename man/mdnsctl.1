@@ -1,0 +1,156 @@
+.TH MDNSCTL 1 "October 2026" "mdns 0.1.0" "User Commands"
+.SH NAME
+mdnsctl \- query the mdns daemon
+.SH SYNOPSIS
+.B mdnsctl
+[\fB\-s\fR \fIPATH\fR]
+[\fB\-\-json\fR]
+.I command
+[\fIargument\fR ...]
+.br
+.B mdnsctl
+.B \-\-help
+.SH DESCRIPTION
+.B mdnsctl
+asks a running
+.BR mdns (8)
+daemon what it knows, over the daemon's control socket.
+Each command of the control protocol has a subcommand here.
+Options must come before the command; everything after the command name
+belongs to the command.
+.SH COMMANDS
+.TP
+.B segments
+List the configured segments, one line each, with the interfaces in the segment
+and the address families (v4, v6) it covers.
+.TP
+\fBdevices\fR \fIname\fR
+List the devices discovered on the interfaces of the segment called
+.IR name ,
+in both address families.
+For each device the interface, family, address and hostname are shown
+(a hostname of
+.B \-
+means the device has been heard but has not announced a name), followed by its
+services: instance, type, port, target and TXT records.
+.IP
+Only devices discovered on the segment's own interfaces are listed.
+Devices that the daemon reflected onto those interfaces from other segments are
+not.
+.IP
+The name needs no quoting, even if it contains spaces:
+.B mdnsctl devices IoT to br0
+works.
+.SH OPTIONS
+.TP
+\fB\-s\fR, \fB\-\-socket\fR \fIPATH\fR
+Use the control socket at
+.I PATH
+instead of the default,
+.IR /run/mdnsd/mdnsd.sock .
+.B \-\-socket=\fIPATH\fR
+is also accepted.
+.TP
+.B \-\-json
+Print the daemon's reply unchanged: one line of JSON, suitable for
+.BR jq (1).
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Show usage and exit.
+.SH OUTPUT
+Without
+.BR \-\-json ,
+.B segments
+prints a table:
+.PP
+.nf
+.RS
+NAME         INTERFACES  FAMILIES
+media_stuff  br0, media  v4, v6
+IoT          wifi        v4, v6
+IoT to br0   br0, wifi   v4, v6
+.RE
+.fi
+.PP
+and
+.B devices
+prints an indented listing:
+.PP
+.nf
+.RS
+IoT to br0: 2 devices
+  br0   v4  10.0.0.10  printer.local
+      Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]
+  wifi  v4  10.0.1.7   \-
+.RE
+.fi
+.PP
+With
+.BR \-\-json ,
+every reply is an object with an
+.B ok
+field.
+Successful replies carry
+.B segments
+or
+.B name
+and
+.BR devices ;
+failures are
+.BR {"ok":false,"error":"..."} .
+.B hostname
+and
+.B target
+are
+.B null
+when unknown.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The daemon answered with an error, for example an unknown segment name.
+.TP
+.B 2
+Bad command line, or the daemon could not be reached.
+.SH FILES
+.TP
+.I /run/mdnsd/mdnsd.sock
+Default control socket.
+It is readable only by the owner and group of the daemon, so to use
+.B mdnsctl
+without privileges join the
+.B mdnsd
+group.
+.SH EXAMPLES
+List the segments, then the devices of one:
+.PP
+.RS
+.nf
+$ mdnsctl segments
+$ mdnsctl devices IoT
+.fi
+.RE
+.PP
+Print every segment name, and every device address with its hostname:
+.PP
+.RS
+.nf
+$ mdnsctl \-\-json segments | jq \-r '.segments[].name'
+$ mdnsctl \-\-json devices media_stuff \e
+    | jq \-r '.devices[] | "\e(.addr) \e(.hostname)"'
+.fi
+.RE
+.PP
+Talk to the socket directly: one request per line, one line of JSON back, any
+number of requests per connection:
+.PP
+.RS
+.nf
+$ printf 'segments\endevices IoT\en' | ncat \-U /run/mdnsd/mdnsd.sock
+.fi
+.RE
+.SH SEE ALSO
+.BR mdns (8),
+.BR mdnsd.conf (5)

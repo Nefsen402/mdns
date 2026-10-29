@@ -1,0 +1,7 @@
+/target
+
+# makepkg scratch (packaging/arch builds in place)
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar*
+/packaging/arch/*.log

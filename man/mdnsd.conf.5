@@ -1,0 +1,157 @@
+.TH MDNSD.CONF 5 "October 2026" "mdns 0.1.0" "File Formats"
+.SH NAME
+mdnsd.conf \- configuration file of the mdns daemon
+.SH SYNOPSIS
+.I /etc/mdnsd.conf
+.SH DESCRIPTION
+.BR mdns (8)
+reads its configuration from
+.IR /etc/mdnsd.conf ,
+or from the file named on its command line.
+The file is read once, at startup.
+.PP
+The syntax is systemd-style INI:
+.IP \(bu 2
+Settings are
+.I Key=Value
+lines in
+.I [Section]
+blocks.
+Section and key names are case-insensitive.
+.IP \(bu 2
+Lines beginning with
+.B #
+or
+.B ;
+are comments; blank lines are ignored.
+.IP \(bu 2
+A value may be wrapped in single or double quotes:
+.BR "Name=\(dqIoT to br0\(dq" .
+.IP \(bu 2
+Repeating a key appends to a list value such as
+.BR Interfaces= ;
+an empty assignment resets the list.
+.IP \(bu 2
+Booleans accept
+.BR yes / no ,
+.BR true / false ,
+.BR on / off
+and
+.BR 1 / 0 .
+.PP
+Unknown sections and keys are errors, so that typos fail loudly.
+.SH SECTIONS
+.SS [Listen]
+Optional.
+.TP
+.B IPv4=
+Listen and announce on IPv4 (224.0.0.251).
+Default
+.BR yes .
+.TP
+.B IPv6=
+Listen and announce on IPv6 (ff02::fb).
+Default
+.BR yes .
+.PP
+At least one of the two must be enabled.
+The families are independent of each other: each has its own sockets, device
+lists and reflectors, and a device reachable over both appears once per family.
+.SS [Ipc]
+Optional.
+.TP
+.B Socket=
+Path of the control socket used by
+.BR mdnsctl (1).
+Default
+.IR /run/mdnsd/mdnsd.sock .
+.IP
+The directory must exist and be writable by the daemon; the systemd service
+creates
+.I /run/mdnsd
+for it.
+Unix socket paths are limited to about 108 bytes.
+The socket is created with mode 0660 (owner and group only).
+A stale socket left by a crashed run is replaced; a live instance, or a file
+that is not a socket, is never overwritten.
+.SS [Segment]
+One or more are required.
+.TP
+.B Name=
+Required.
+A name that is unique within the file, used by
+.BR mdnsctl (1)
+to refer to the segment.
+Quote it if it contains spaces.
+.TP
+.B Interfaces=
+Required.
+The interfaces of the segment, separated by commas and/or whitespace.
+Every interface must exist when the daemon starts.
+.PP
+A segment is a group of interfaces whose devices are reflected between
+.I every pair
+of them: read it as "these networks may see each other".
+.IP \(bu 2
+A segment with a single interface only tracks: its devices are listed by
+.BR mdnsctl (1)
+but nothing is reflected.
+.IP \(bu 2
+An interface may appear in several segments.
+This is how one network can see two others that must not see each other.
+Reflection is never transitive, because a device reflected onto an interface is
+not reflected again.
+.IP \(bu 2
+Two segments may not share two or more interfaces, since both would reflect
+between that pair; sharing one interface is fine.
+.IP \(bu 2
+An interface may be listed only once per segment.
+.SH EXAMPLE
+Three networks: a trusted LAN
+.RB ( br0 ),
+a media VLAN and an IoT Wi-Fi VLAN.
+.B br0
+and
+.B media
+see each other's devices, and so do
+.B br0
+and
+.BR wifi ;
+.B media
+and
+.B wifi
+never see each other.
+.PP
+.RS
+.nf
+[Listen]
+IPv4=yes
+IPv6=yes
+
+[Ipc]
+Socket=/run/mdnsd/mdnsd.sock
+
+[Segment]
+Name=media_stuff
+Interfaces=br0,media
+
+# One interface only: tracked, nothing reflected.
+[Segment]
+Name="IoT"
+Interfaces=wifi
+
+[Segment]
+Name="IoT to br0"
+Interfaces=br0,wifi
+.fi
+.RE
+.SH FILES
+.TP
+.I /etc/mdnsd.conf
+Default location.
+.TP
+.I /usr/share/doc/mdns/examples/mdnsd.conf
+Example configuration, installed with the package.
+.SH SEE ALSO
+.BR mdns (8),
+.BR mdnsctl (1)

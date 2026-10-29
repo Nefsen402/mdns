@@ -1,0 +1,285 @@
+# mdns
+
+An mDNS (Bonjour/Avahi-style) discovery and reflection daemon for routers, with
+per-pair control over which networks can see each other's devices.
+
+- **Tracks** the devices announcing on each interface (name, address, services).
+- **Reflects** devices between the interfaces you choose, and only those. With
+  `br0 <-> media` and `br0 <-> wifi`, `media` and `wifi` never learn about each
+  other, even though both talk to `br0`.
+- **Answers** mDNS queries for reflected devices and withdraws them (with proper
+  goodbye packets) when the source device disappears or the daemon stops.
+- **Exposes** what it knows over a local control socket, queried with `mdnsctl`.
+
+It never listens on the wildcard interface: every socket is bound to one
+interface and the mDNS multicast group address.
+
+## Building and running
+
+```sh
+cargo build --release
+# produces target/release/mdns (the daemon) and target/release/mdnsctl (the client)
+
+mdns                     # reads /etc/mdnsd.conf
+mdns /path/to/other.conf # or a config file you name
+```
+
+To run it as a service, see [Installing (Arch Linux)](#installing-arch-linux).
+
+The configuration is read once at startup; restart the daemon to apply changes.
+Startup fails, naming the problem, if the config is invalid or an interface
+cannot be opened. The daemon stops cleanly on `SIGTERM` or `SIGINT` (see
+[Shutdown](#shutdown)).
+
+## Installing (Arch Linux)
+
+The `PKGBUILD` in `packaging/arch/` builds a package from the working tree:
+
+```sh
+cd packaging/arch
+makepkg -f          # builds, runs the test suite, and creates mdns-*.pkg.tar.zst
+sudo pacman -U mdns-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+It installs `/usr/bin/mdns`, `/usr/bin/mdnsctl`, the `mdnsd.service` unit, a
+sysusers entry that creates the unprivileged `mdnsd` user, the man pages
+(`mdns(8)`, `mdnsd.conf(5)`, `mdnsctl(1)`), and this README and the example
+config under `/usr/share/doc/mdns/`, and the license under
+`/usr/share/licenses/mdns/`. No `/etc/mdnsd.conf` is
+installed, because the example names interfaces that probably do not exist on
+your machine. Create one, then start the service:
+
+```sh
+sudo cp /usr/share/doc/mdns/examples/mdnsd.conf /etc/mdnsd.conf
+sudoedit /etc/mdnsd.conf
+sudo systemctl enable --now mdnsd.service
+journalctl -u mdnsd.service -f
+```
+
+Notes on the service:
+
+- It runs as `mdnsd`, not root, with a locked-down sandbox (no capabilities,
+  read-only filesystem, a syscall allow-list). Binding a socket to one
+  interface needs no privilege on **Linux 5.7 or newer**.
+- It does not start until `/etc/mdnsd.conf` exists, and it is restarted every
+  5 seconds if it exits, which covers VLAN or Wi-Fi interfaces that appear
+  after boot. Configuration is read at start, so apply changes with
+  `systemctl restart mdnsd`.
+- `systemctl stop` sends `SIGTERM`, so reflected devices are withdrawn cleanly.
+- The control socket lives in `/run/mdnsd/`, readable only by the `mdnsd`
+  group. To use `mdnsctl` without `sudo`:
+  `sudo usermod -aG mdnsd $USER` (then log in again).
+
+To run it by hand instead, point `Socket=` at a directory you can write to:
+`mdns /path/to/mdnsd.conf` as root, or as a normal user with a config whose
+`[Ipc] Socket=` is somewhere under your home or `/tmp`.
+
+## Configuration
+
+The file uses systemd-style INI syntax. The default location is
+`/etc/mdnsd.conf`; [`examples/mdnsd.conf`](examples/mdnsd.conf) is a complete
+example.
+
+```ini
+# /etc/mdnsd.conf
+#
+# Three networks: the trusted LAN (br0), a media VLAN and an IoT Wi-Fi VLAN.
+#   br0   <-> media : each sees the other's devices
+#   br0   <-> wifi  : each sees the other's devices
+#   media  x  wifi  : never see each other
+
+[Listen]
+IPv4=yes
+IPv6=yes
+
+[Ipc]
+Socket=/run/mdnsd/mdnsd.sock
+
+[Segment]
+Name=media_stuff
+Interfaces=br0,media
+
+# One interface only: devices are tracked (and show up in `mdnsctl devices IoT`)
+# but nothing is reflected.
+[Segment]
+Name="IoT"
+Interfaces=wifi
+
+[Segment]
+Name="IoT to br0"
+Interfaces=br0,wifi
+```
+
+### Syntax
+
+- `[Section]` headers and `Key=Value` lines. Section and key names are
+  **case-insensitive**.
+- Lines starting with `#` or `;` are comments. Blank lines are ignored.
+- Values may be wrapped in single or double quotes: `Name="IoT to br0"`.
+- Repeating a key **appends** to list values (`Interfaces=`); an empty
+  assignment (`Interfaces=`) **resets** the list.
+- Booleans accept `yes`/`no`, `true`/`false`, `on`/`off`, `1`/`0`.
+- Unknown sections or keys are an error, so typos fail loudly.
+
+### `[Listen]` (optional)
+
+| Key    | Default | Meaning                                        |
+|--------|---------|------------------------------------------------|
+| `IPv4` | `yes`   | Listen and announce on IPv4 (`224.0.0.251`).   |
+| `IPv6` | `yes`   | Listen and announce on IPv6 (`ff02::fb`).      |
+
+At least one must be enabled. The two families are completely independent: each
+has its own sockets, device lists and reflectors, and a device reachable over
+both appears once per family.
+
+### `[Ipc]` (optional)
+
+| Key      | Default                  | Meaning                                    |
+|----------|--------------------------|--------------------------------------------|
+| `Socket` | `/run/mdnsd/mdnsd.sock`  | Path of the control socket `mdnsctl` uses. |
+
+The directory must already exist and be writable by the daemon (the systemd
+service creates `/run/mdnsd` for it). Unix socket paths are limited to about
+108 bytes. The socket is created with mode `0660` (owner and group only). A stale socket file from a crashed run is
+replaced; a live instance or a file that is not a socket is never overwritten.
+
+### `[Segment]` (one or more, required)
+
+| Key          | Meaning                                                              |
+|--------------|----------------------------------------------------------------------|
+| `Name`       | Required. Unique name, used by `mdnsctl`. Quote it if it has spaces. |
+| `Interfaces` | Required. Interfaces in the segment, separated by commas and/or spaces. |
+
+A segment is a group of interfaces **whose devices are reflected between every
+pair of them**. Think of each segment as "these networks may see each other".
+
+- A segment with **one** interface only tracks: its devices are listed by
+  `mdnsctl`, but nothing is reflected.
+- An interface may appear in **several** segments. That is how `br0` can see
+  both `media` and `wifi` while those two stay isolated: reflection is never
+  transitive, because a device reflected onto `br0` is not reflected again.
+- Two segments may not share **two or more** interfaces (they would both
+  reflect between the same pair and fight over it). Sharing one is fine.
+- Names must be unique, an interface may be listed only once per segment, and
+  every interface must exist when the daemon starts.
+
+### What gets reflected
+
+- Only devices that announced **a hostname and at least one service** are
+  reflected. Chatty clients that merely send queries (phones, laptops) are
+  tracked but not reflected.
+- A reflected device is announced on the other interface with its **original
+  address**. Your firewall must allow the actual connections between the
+  networks; mDNS only makes the device discoverable.
+- If two devices would clash on hostname or address on a target interface, the
+  one from the interface listed **first** in the segment wins; the other takes
+  over automatically if the winner goes away.
+- Reflected devices are kept alive with periodic re-announcements, answer
+  queries (including known-answer suppression), and are withdrawn with goodbye
+  packets when their source disappears.
+- A discovered device expires after it has been silent for at least 5 minutes,
+  or for the TTL of its records if that is longer. A goodbye packet removes it
+  immediately.
+
+The daemon binds with `SO_REUSEPORT`, so it can run next to Avahi while you
+migrate, but don't run two reflectors (this and Avahi's) over the same
+interfaces.
+
+## `mdnsctl`
+
+Queries a running daemon over its control socket.
+
+```
+usage: mdnsctl [-s PATH] [--json] <command>
+
+commands:
+  segments          list the configured segments
+  devices <name>    list the devices discovered in a segment
+
+options:
+  -s, --socket PATH  control socket (default /run/mdnsd/mdnsd.sock)
+      --json         print the daemon's reply unchanged
+  -h, --help         show this help
+```
+
+Options must come before the command. Segment names need no quoting:
+`mdnsctl devices IoT to br0` works.
+
+### `mdnsctl segments`
+
+Lists every configured segment once, with its interfaces and the address
+families it covers.
+
+```
+$ mdnsctl segments
+NAME         INTERFACES  FAMILIES
+media_stuff  br0, media  v4, v6
+IoT          wifi        v4, v6
+IoT to br0   br0, wifi   v4, v6
+```
+
+### `mdnsctl devices <name>`
+
+Lists the devices **discovered on the segment's own interfaces** (both
+families): interface, family, address and hostname, with each device's
+services underneath (instance, type, port, target and TXT records). Reflected
+copies from other segments are not included.
+
+```
+$ mdnsctl devices IoT to br0
+IoT to br0: 2 devices
+  br0   v4  10.0.0.10  printer.local
+      Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]
+  wifi  v4  10.0.1.7   -
+
+$ mdnsctl devices IoT
+IoT: no devices
+```
+
+A hostname of `-` means the device has been heard but has not announced a
+name yet.
+
+### Exit status
+
+| Code | Meaning                                                              |
+|------|----------------------------------------------------------------------|
+| `0`  | Success.                                                             |
+| `1`  | The daemon answered with an error (for example an unknown segment).  |
+| `2`  | Bad command line, or the daemon could not be reached.                |
+
+### Scripting
+
+`--json` prints the daemon's reply as a single line of JSON, ready for `jq`:
+
+```sh
+mdnsctl --json segments | jq -r '.segments[].name'
+mdnsctl --json devices media_stuff | jq -r '.devices[] | "\(.addr) \(.hostname)"'
+```
+
+The protocol behind it is one request per line over the Unix socket, one
+line of JSON back, any number of requests per connection:
+
+```sh
+printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
+```
+
+| Request           | Reply                                                                  |
+|-------------------|------------------------------------------------------------------------|
+| `segments`        | `{"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}` |
+| `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4","addr":"10.0.1.7","hostname":"tv.local","services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
+| anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
+
+`hostname` and `target` are `null` when unknown. Requests over 4 KiB are
+refused, and idle connections are closed after 60 seconds.
+
+## Shutdown
+
+On `SIGTERM` or `SIGINT` the daemon sends goodbye packets for every device it
+reflected, removes the control socket and exits with status 0, so clients drop
+the reflected devices immediately. If the daemon is killed with `SIGKILL` or
+crashes, no goodbyes are sent and clients keep the reflected devices until
+their records expire (up to 75 minutes).
+
+## License
+
+GPL-3.0-only. See [`LICENSE`](LICENSE).
