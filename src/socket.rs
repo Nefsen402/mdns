@@ -409,6 +409,20 @@ impl State {
         next
     }
 
+    /// How much longer the daemon keeps `device` if it is not heard from, to
+    /// the second.
+    fn lifetime_left(&self, device: &Device) -> Duration {
+        let key = match (&device.hostname, device.routable.or(device.link_local)) {
+            (Some(host), _) => host_key(host),
+            (None, Some(addr)) => Key::Source(addr),
+            (None, None) => return Duration::ZERO,
+        };
+        self.discovered.get(&key).map_or(Duration::ZERO, |entry| {
+            let left = entry.expires.saturating_duration_since(Instant::now());
+            Duration::from_secs(left.as_secs_f64().round() as u64)
+        })
+    }
+
     /// Drop a discovered device and the addresses that pointed at it.
     fn forget(&mut self, key: &Key) -> Option<Entry> {
         self.by_addr.retain(|_, k| k != key);
@@ -539,6 +553,13 @@ impl Segment {
         let (tx, rx) = mpsc::channel();
         self.state.lock().unwrap().subscribers.push(tx);
         rx
+    }
+
+    /// How much longer the daemon keeps `device`, a device of this segment, if
+    /// it is not heard from again, to the second; zero if it is not (or no
+    /// longer) known.
+    pub fn lifetime_left(&self, device: &Device) -> Duration {
+        self.state.lock().unwrap().lifetime_left(device)
     }
 
     // 3. Reflected devices, invisible to 1 and 2.
@@ -2510,6 +2531,20 @@ mod tests {
         let state = Arc::downgrade(&seg.state);
         drop(seg);
         assert!(state.upgrade().is_none());
+    }
+
+    #[test]
+    fn lifetime_left_is_what_the_daemon_will_keep_a_device() {
+        let (seg, _rx) = wired();
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        let device = seg.devices().remove(0);
+        // Its records say 120 seconds, but it is kept for at least the floor.
+        assert_eq!(seg.lifetime_left(&device), DEFAULT_MIN_LIFETIME);
+
+        // One that is gone has no time left, and neither has a stranger.
+        seg.expire(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(seg.lifetime_left(&device), Duration::ZERO);
+        assert_eq!(seg.lifetime_left(&unnamed("10.9.9.9")), Duration::ZERO);
     }
 
     #[test]

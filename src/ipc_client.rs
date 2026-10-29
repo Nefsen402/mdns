@@ -1,7 +1,8 @@
 //! `mdnsctl`: command line client for the daemon's control socket (see
 //! `ipc.rs` for the protocol). Every IPC command has a subcommand here.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashSet;
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -22,6 +23,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("segments", "", "list the configured segments"),
     ("devices", "<name>", "list the devices discovered in a segment"),
     ("probe", "[<name>]", "actively query for devices (all segments, or one)"),
+    ("watch", "<name>", "print the devices of a segment as they appear and go"),
     ("timers", "", "list the timers the daemon has scheduled"),
 ];
 
@@ -30,6 +32,7 @@ enum Command {
     Segments,
     Devices(String),
     Probe(Option<String>),
+    Watch(String),
     Timers,
 }
 
@@ -122,6 +125,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
             }
             Command::Probe((!segment.trim().is_empty()).then_some(segment))
         }
+        "watch" => {
+            let segment = rest.join(" ");
+            if segment.trim().is_empty() {
+                return Err(Failure::Usage("watch needs a segment name".into()));
+            }
+            if segment.contains(['\n', '\r']) {
+                return Err(Failure::Usage("segment name contains a line break".into()));
+            }
+            Command::Watch(segment)
+        }
         "timers" if rest.is_empty() => Command::Timers,
         "timers" => return Err(Failure::Usage("timers takes no arguments".into())),
         other => return Err(Failure::Usage(format!("unknown command {other:?}"))),
@@ -129,25 +142,77 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
     Ok(Parsed::Run(Options { socket, json, verbose, command }))
 }
 
+fn connect_err(socket: &Path, e: io::Error) -> Failure {
+    Failure::Connect(format!(
+        "cannot talk to {}: {e} (is the daemon running, and can you access the socket?)",
+        socket.display()
+    ))
+}
+
+/// Connect and send one request line, waiting up to `timeout` for replies.
+fn send(socket: &Path, line: &str, timeout: Duration) -> Result<UnixStream, Failure> {
+    let err = |e| connect_err(socket, e);
+    let mut stream = UnixStream::connect(socket).map_err(err)?;
+    stream.set_read_timeout(Some(timeout)).map_err(err)?;
+    stream.set_write_timeout(Some(TIMEOUT)).map_err(err)?;
+    writeln!(stream, "{line}").map_err(err)?;
+    Ok(stream)
+}
+
 /// Send one request line and return the one-line reply.
 fn request(socket: &Path, line: &str, timeout: Duration) -> Result<String, Failure> {
-    let connect_err = |e: std::io::Error| {
-        Failure::Connect(format!(
-            "cannot talk to {}: {e} (is the daemon running, and can you access the socket?)",
-            socket.display()
-        ))
-    };
-    let mut stream = UnixStream::connect(socket).map_err(connect_err)?;
-    stream.set_read_timeout(Some(timeout)).map_err(connect_err)?;
-    stream.set_write_timeout(Some(TIMEOUT)).map_err(connect_err)?;
-    writeln!(stream, "{line}").map_err(connect_err)?;
-
+    let stream = send(socket, line, timeout)?;
     let mut reply = String::new();
-    let n = BufReader::new(stream).read_line(&mut reply).map_err(connect_err)?;
+    let n = BufReader::new(stream).read_line(&mut reply).map_err(|e| connect_err(socket, e))?;
     if n == 0 {
         return Err(Failure::Connect("the daemon closed the connection without replying".into()));
     }
     Ok(reply.trim_end().to_string())
+}
+
+/// The error a reply carries, if it is one.
+fn server_error(reply: &Value) -> Option<Failure> {
+    (reply["ok"] == Value::Bool(false))
+        .then(|| Failure::Server(reply["error"].as_str().unwrap_or("request failed").to_string()))
+}
+
+/// Follow a segment: print each change the daemon reports until it stops (an
+/// error) or `out` is closed (success: `mdnsctl watch | head` is fine).
+fn watch(opts: &Options, name: &str, out: &mut impl Write) -> Result<(), Failure> {
+    let socket = &opts.socket;
+    let mut reader = BufReader::new(send(socket, &format!("watch {name}"), TIMEOUT)?);
+    let mut line = String::new();
+    let mut seen = HashSet::new();
+    let mut acknowledged = false;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).map_err(|e| connect_err(socket, e))?;
+        if n == 0 {
+            return Err(Failure::Connect("the daemon closed the connection".into()));
+        }
+        let text = line.trim_end();
+        let reply: Value =
+            serde_json::from_str(text).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
+        if let Some(failure) = server_error(&reply) {
+            return Err(failure);
+        }
+        if !acknowledged {
+            // Now it waits for changes, however long that takes.
+            reader.get_ref().set_read_timeout(None).map_err(|e| connect_err(socket, e))?;
+            acknowledged = true;
+            continue;
+        }
+        let shown = if opts.json {
+            Some(format!("{text}\n"))
+        } else {
+            render_event(&reply, opts.verbose, &mut seen)?
+        };
+        if let Some(shown) = shown {
+            if out.write_all(shown.as_bytes()).and_then(|()| out.flush()).is_err() {
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Run a command and return the text to print.
@@ -158,14 +223,14 @@ fn execute(opts: &Options) -> Result<String, Failure> {
         Command::Probe(None) => ("probe".to_string(), PROBE_TIMEOUT),
         Command::Probe(Some(name)) => (format!("probe {name}"), PROBE_TIMEOUT),
         Command::Timers => ("timers".to_string(), TIMEOUT),
+        Command::Watch(_) => unreachable!("watch streams: see watch()"),
     };
     let raw = request(&opts.socket, &line, timeout)?;
     let reply: Value =
         serde_json::from_str(&raw).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
 
     if reply["ok"] != Value::Bool(true) {
-        let message = reply["error"].as_str().unwrap_or("request failed");
-        return Err(Failure::Server(message.to_string()));
+        return Err(server_error(&reply).unwrap_or_else(|| Failure::Server("request failed".into())));
     }
     if opts.json {
         return Ok(format!("{raw}\n"));
@@ -176,6 +241,7 @@ fn execute(opts: &Options) -> Result<String, Failure> {
         Command::Devices(_) => render_devices_brief(&reply),
         Command::Probe(_) => render_probe(&reply),
         Command::Timers => render_timers(&reply),
+        Command::Watch(_) => unreachable!("watch streams: see watch()"),
     }
 }
 
@@ -381,17 +447,7 @@ fn render_devices(reply: &Value) -> Result<String, Failure> {
         return Ok(format!("{name}: no devices\n"));
     }
 
-    let rows = devices
-        .iter()
-        .map(|d| {
-            Ok(vec![
-                d["interface"].as_str().ok_or_else(bad_reply)?.to_string(),
-                d["family"].as_str().ok_or_else(bad_reply)?.to_string(),
-                device_addrs(d),
-                d["hostname"].as_str().unwrap_or("-").to_string(),
-            ])
-        })
-        .collect::<Result<Vec<_>, Failure>>()?;
+    let rows = devices.iter().map(device_row).collect::<Result<Vec<_>, Failure>>()?;
     let widths: Vec<usize> = (0..3).map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0)).collect();
 
     let plural = if devices.len() == 1 { "" } else { "s" };
@@ -407,22 +463,85 @@ fn render_devices(reply: &Value) -> Result<String, Failure> {
             w1 = widths[1],
             w2 = widths[2]
         ));
-        for svc in device["services"].as_array().into_iter().flatten() {
-            let kind = svc["type"].as_str().unwrap_or("");
-            let instance = svc["instance"].as_str().unwrap_or("");
-            let label = instance.strip_suffix(&format!(".{kind}")).unwrap_or(instance);
-            out.push_str(&format!("      {label}  {kind}  :{}", svc["port"]));
-            if let Some(target) = svc["target"].as_str() {
-                out.push_str(&format!(" -> {target}"));
-            }
-            let txt = strings(&svc["txt"]);
-            if !txt.is_empty() {
-                out.push_str(&format!("  [{}]", txt.join(", ")));
-            }
-            out.push('\n');
-        }
+        out.push_str(&service_lines(device));
     }
     Ok(out)
+}
+
+/// The columns of a device in the verbose listing: interface, family,
+/// addresses, hostname.
+fn device_row(device: &Value) -> Result<[String; 4], Failure> {
+    Ok([
+        device["interface"].as_str().ok_or_else(bad_reply)?.to_string(),
+        device["family"].as_str().ok_or_else(bad_reply)?.to_string(),
+        device_addrs(device),
+        device["hostname"].as_str().unwrap_or("-").to_string(),
+    ])
+}
+
+/// One indented line for each service of a device in the verbose listing.
+fn service_lines(device: &Value) -> String {
+    let mut out = String::new();
+    for svc in device["services"].as_array().into_iter().flatten() {
+        let kind = svc["type"].as_str().unwrap_or("");
+        let instance = svc["instance"].as_str().unwrap_or("");
+        let label = instance.strip_suffix(&format!(".{kind}")).unwrap_or(instance);
+        out.push_str(&format!("      {label}  {kind}  :{}", svc["port"]));
+        if let Some(target) = svc["target"].as_str() {
+            out.push_str(&format!(" -> {target}"));
+        }
+        let txt = strings(&svc["txt"]);
+        if !txt.is_empty() {
+            out.push_str(&format!("  [{}]", txt.join(", ")));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// One change of a `watch`, as a line (or, verbose, a device and its
+/// services), starting with what happened and how long the daemon keeps the
+/// device; the rest is as `devices` shows it. `seen` is what has been shown:
+/// the first time a device is named is `added` whatever the daemon called it,
+/// then `updated`, and `removed` (ttl 0) when it goes. Devices that have not
+/// announced a name are skipped unless verbose.
+fn render_event(
+    event: &Value,
+    verbose: bool,
+    seen: &mut HashSet<(String, String)>,
+) -> Result<Option<String>, Failure> {
+    let device = &event["device"];
+    let ttl = event["ttl"].as_u64().ok_or_else(bad_reply)?;
+    let kind = event["event"].as_str().ok_or_else(bad_reply)?;
+    let row = device_row(device)?;
+
+    let key = device["hostname"].as_str().map(|h| (h.to_ascii_lowercase(), row[1].clone()));
+    let label = match (kind, &key) {
+        ("removed", Some(key)) => {
+            seen.remove(key);
+            "removed"
+        }
+        ("removed", None) => "removed",
+        ("added" | "updated", Some(key)) if seen.insert(key.clone()) => "added",
+        ("added" | "updated", Some(_)) => "updated",
+        // Nothing to track it by: say what the daemon said.
+        ("added", None) => "added",
+        ("updated", None) => "updated",
+        _ => return Err(bad_reply()),
+    };
+    let ttl = format!("{:<9}", format!("ttl={ttl}"));
+
+    if verbose {
+        let mut out = format!("{label:<7}  {ttl}  {}  {}  {}  {}\n", row[0], row[1], row[2], row[3]);
+        out.push_str(&service_lines(device));
+        return Ok(Some(out));
+    }
+    let Some(host) = device["hostname"].as_str() else {
+        return Ok(None);
+    };
+    let pretty = pretty_names(device);
+    let pretty = if pretty.is_empty() { "-".to_string() } else { pretty.join(", ") };
+    Ok(Some(format!("{label:<7}  {ttl}  {host}  {pretty}  {}\n", row[2])))
 }
 
 /// Left-aligned columns; the last column is not padded.
@@ -459,11 +578,12 @@ fn main() -> ExitCode {
         Err(_) => unreachable!("parse_args only reports usage errors"),
     };
 
-    match execute(&opts) {
-        Ok(text) => {
-            print!("{text}");
-            ExitCode::SUCCESS
-        }
+    let result = match &opts.command {
+        Command::Watch(name) => watch(&opts, name, &mut io::stdout().lock()),
+        _ => execute(&opts).map(|text| print!("{text}")),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Server(message)) => {
             eprintln!("mdnsctl: {message}");
             ExitCode::from(1)
@@ -518,6 +638,7 @@ mod tests {
         assert_eq!(opts(&["probe", "  "]).command, Command::Probe(None));
         assert_eq!(opts(&["probe", "IoT", "to", "br0"]).command, Command::Probe(Some("IoT to br0".into())));
         assert_eq!(opts(&["timers"]).command, Command::Timers);
+        assert_eq!(opts(&["watch", "IoT", "to", "br0"]).command, Command::Watch("IoT to br0".into()));
         assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
         assert_eq!(parse(&["segments", "-h"]), Err(Failure::Usage("segments takes no arguments".into())));
     }
@@ -531,6 +652,9 @@ mod tests {
             &["devices", "  "],
             &["segments", "extra"],
             &["timers", "extra"],
+            &["watch"],
+            &["watch", "  "],
+            &["watch", "a\nsegments"],
             &["--bogus", "segments"],
             &["-s"],
             &["devices", "a\nsegments"],
@@ -739,6 +863,155 @@ mod tests {
              parked          idle     never      1     1h 15m ago  25ms\n"
         );
         assert!(render_timers(&serde_json::json!({"ok":true})).is_err());
+    }
+
+    fn event(kind: &str, ttl: u64, host: Option<&str>, family: &str, addr: &str, services: &str) -> Value {
+        serde_json::from_str(&format!(
+            r#"{{"event":"{kind}","segment":"IoT","ttl":{ttl},"device":{{"interface":"wifi","family":"{family}","hostname":{},"routable":"{addr}","link_local":null,"services":{services}}}}}"#,
+            host.map_or("null".to_string(), |h| format!("\"{h}\""))
+        ))
+        .unwrap()
+    }
+
+    const PLUG: &str = r#"[{"instance":"Plug S._shelly._tcp.local","type":"_shelly._tcp.local","port":80,"target":"plug.local","txt":["gen=2"]}]"#;
+
+    #[test]
+    fn watch_lines_say_what_happened_and_for_how_long() {
+        let mut seen = HashSet::new();
+        let mut show = |e: Value, verbose| render_event(&e, verbose, &mut seen).unwrap();
+
+        // Heard by address first: nothing to show until it has a name.
+        assert_eq!(show(event("added", 300, None, "v4", "10.0.1.9", "[]"), false), None);
+        // The first named sighting is "added", whatever the daemon called it.
+        assert_eq!(
+            show(event("updated", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG), false).as_deref(),
+            Some("added    ttl=4500   plug.local  Plug S  10.0.1.9\n")
+        );
+        assert_eq!(
+            show(event("updated", 4400, Some("plug.local"), "v4", "10.0.1.9", PLUG), false).as_deref(),
+            Some("updated  ttl=4400   plug.local  Plug S  10.0.1.9\n")
+        );
+        // Its IPv6 side is a device of its own.
+        assert!(show(event("added", 300, Some("plug.local"), "v6", "fd00::9", "[]"), false).unwrap().starts_with("added  "));
+        // Gone: ttl 0, and a later return is "added" again.
+        assert_eq!(
+            show(event("removed", 0, Some("plug.local"), "v4", "10.0.1.9", PLUG), false).as_deref(),
+            Some("removed  ttl=0      plug.local  Plug S  10.0.1.9\n")
+        );
+        assert!(show(event("added", 300, Some("plug.local"), "v4", "10.0.1.9", PLUG), false).unwrap().starts_with("added  "));
+    }
+
+    #[test]
+    fn verbose_watch_lines_are_a_device_with_its_services() {
+        let mut seen = HashSet::new();
+        let shown = render_event(&event("added", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG), true, &mut seen)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shown,
+            "added    ttl=4500   wifi  v4  10.0.1.9  plug.local\n      Plug S  _shelly._tcp.local  :80 -> plug.local  [gen=2]\n"
+        );
+        // Verbose shows devices that have no name too.
+        let unnamed = render_event(&event("added", 300, None, "v4", "10.0.1.9", "[]"), true, &mut seen).unwrap().unwrap();
+        assert_eq!(unnamed, "added    ttl=300    wifi  v4  10.0.1.9  -\n");
+    }
+
+    #[test]
+    fn a_malformed_event_is_an_error() {
+        let mut seen = HashSet::new();
+        assert!(render_event(&serde_json::json!({"event":"added"}), false, &mut seen).is_err());
+        let mut odd = event("exploded", 1, Some("x.local"), "v4", "10.0.0.1", "[]");
+        assert!(render_event(&odd, false, &mut seen).is_err());
+        odd["event"] = "added".into();
+        assert!(render_event(&odd, false, &mut seen).is_ok());
+    }
+
+    /// A fake daemon that acknowledges a watch, sends `lines`, and hangs up.
+    fn streaming_daemon(tag: &str, lines: Vec<String>) -> (PathBuf, JoinHandle<String>) {
+        std::fs::create_dir_all("target").unwrap();
+        let path = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let socket_file = path.clone();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = std::fs::remove_file(&socket_file);
+            let mut asked = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut asked).unwrap();
+            for line in lines {
+                writeln!(stream, "{line}").unwrap();
+            }
+            asked
+        });
+        (path, handle)
+    }
+
+    const ACK: &str = r#"{"ok":true,"name":"IoT","watching":true}"#;
+
+    fn watch_options(path: &Path, json: bool) -> Options {
+        Options { socket: path.into(), json, verbose: false, command: Command::Watch("IoT".into()) }
+    }
+
+    #[test]
+    fn watch_prints_changes_until_the_daemon_stops() {
+        let added = event("added", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG).to_string();
+        let removed = event("removed", 0, Some("plug.local"), "v4", "10.0.1.9", PLUG).to_string();
+        let (path, daemon) = streaming_daemon("watch", vec![ACK.into(), added.clone(), removed.clone()]);
+
+        let mut out = Vec::new();
+        let result = watch(&watch_options(&path, false), "IoT", &mut out);
+        assert_eq!(daemon.join().unwrap(), "watch IoT\n");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "added    ttl=4500   plug.local  Plug S  10.0.1.9\nremoved  ttl=0      plug.local  Plug S  10.0.1.9\n"
+        );
+        // The daemon went away: that is a failure, not a clean end.
+        assert!(matches!(result, Err(Failure::Connect(m)) if m.contains("closed")));
+    }
+
+    #[test]
+    fn watch_json_prints_each_event_unchanged_and_not_the_acknowledgement() {
+        let added = event("added", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG).to_string();
+        let (path, daemon) = streaming_daemon("watch-json", vec![ACK.into(), added.clone()]);
+        let mut out = Vec::new();
+        let _ = watch(&watch_options(&path, true), "IoT", &mut out);
+        daemon.join().unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{added}\n"));
+    }
+
+    #[test]
+    fn watch_reports_refusals_and_failures_mid_stream() {
+        let (path, daemon) = streaming_daemon("watch-refused", vec![r#"{"ok":false,"error":"no such segment: IoT"}"#.into()]);
+        assert_eq!(
+            watch(&watch_options(&path, false), "IoT", &mut Vec::new()),
+            Err(Failure::Server("no such segment: IoT".into()))
+        );
+        daemon.join().unwrap();
+
+        let (path, daemon) = streaming_daemon("watch-stopped", vec![ACK.into(), r#"{"ok":false,"error":"shutting down"}"#.into()]);
+        assert_eq!(
+            watch(&watch_options(&path, false), "IoT", &mut Vec::new()),
+            Err(Failure::Server("shutting down".into()))
+        );
+        daemon.join().unwrap();
+    }
+
+    /// `mdnsctl watch | head` must not be an error when the reader leaves.
+    #[test]
+    fn watch_ends_quietly_when_the_output_is_closed() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let added = event("added", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG).to_string();
+        let (path, daemon) = streaming_daemon("watch-closed", vec![ACK.into(), added]);
+        assert_eq!(watch(&watch_options(&path, false), "IoT", &mut Closed), Ok(()));
+        daemon.join().unwrap();
     }
 
     #[test]

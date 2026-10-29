@@ -12,6 +12,10 @@
 //!    "services":[{"instance":...}]}]}
 //! probe [<segment name>]
 //!   {"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":14,"error":null}]}
+//! watch <segment name>
+//!   {"ok":true,"name":"IoT","watching":true}
+//!   {"event":"added","segment":"IoT","ttl":4500,"device":{...as in devices...}}
+//!   {"event":"removed","segment":"IoT","ttl":0,"device":{...}}
 //! timers
 //!   {"ok":true,"timers":[{"id":1,"name":"upkeep wifi/V4","running":false,
 //!    "due_in_ms":93000,"runs":4,"last_run_ago_ms":3000,"last_took_us":210}]}
@@ -24,6 +28,14 @@
 //! seconds, once the answers have been processed; list what was found with
 //! `devices`.
 //!
+//! `watch` takes over the connection: after the first reply, a line follows
+//! for every device that appears (`added`), changes (`updated`) or goes
+//! (`removed`) on the segment's own interfaces, until the client hangs up. It
+//! has the device as `devices` lists it, and `ttl`: for how many more seconds
+//! the daemon keeps the device without hearing from it, or 0 if it is gone (it
+//! said goodbye or ran out). Nothing is replayed: only changes from then on. A
+//! failure after the first line is a final `{"ok":false,"error":"..."}`.
+//!
 //! `timers` lists what the daemon's timer has scheduled, soonest first, for
 //! debugging. `due_in_ms` is 0 for one that is overdue (its callback is queued
 //! behind another) and `null` for one that is running now or never due;
@@ -34,9 +46,11 @@
 
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -44,7 +58,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::socket::{Device, Family, Segment};
+use crate::reflector::Notice;
+use crate::socket::{Device, Event, Family, Segment};
 use crate::timer::Watcher;
 use crate::Group;
 
@@ -53,6 +68,11 @@ const MAX_LINE: u64 = 4096;
 
 /// Idle connections are closed after this long, so clients can't pile up threads.
 const IDLE: Duration = Duration::from_secs(60);
+
+/// How often a watch checks that its client is still there, and how
+/// long it lets a write to a client that is not reading take.
+const STREAM_CHECK: Duration = Duration::from_secs(1);
+const STREAM_WRITE: Duration = Duration::from_secs(10);
 
 /// Bind the socket and serve it on background threads. Binding happens
 /// before this returns so a bad path or a second instance is reported at
@@ -120,12 +140,99 @@ fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watc
             writeln!(writer, "{}", error("request too long"))?;
             return Ok(());
         }
+        let request = line.trim();
+        if let Some(name) = watch_arg(request) {
+            // Hold the segments only long enough to register: a stream that
+            // lasts must not keep the daemon from releasing them at shutdown.
+            let registered = match groups.upgrade() {
+                Some(groups) => follow(&groups, name),
+                None => Err(error("shutting down")),
+            };
+            return match registered {
+                Ok((name, events)) => stream_events(&mut writer, &name, &events),
+                Err(reply) => writeln!(writer, "{reply}"),
+            };
+        }
         let reply = match groups.upgrade() {
-            Some(groups) => handle(&groups, timers, line.trim()),
+            Some(groups) => handle(&groups, timers, request),
             None => error("shutting down").to_string(),
         };
         writeln!(writer, "{reply}")?;
     }
+}
+
+/// The segment name of a `watch` request, if it is one.
+fn watch_arg(request: &str) -> Option<&str> {
+    let (command, arg) = request.split_once(char::is_whitespace).unwrap_or((request, ""));
+    command.eq_ignore_ascii_case("watch").then(|| arg.trim())
+}
+
+/// Start following the devices of the named segment, on every interface and
+/// family of it. The receiver ends when the segments are dropped.
+fn follow(groups: &[Group], name: &str) -> Result<(String, Receiver<Notice>), Value> {
+    let name = segment_arg(name);
+    if name.is_empty() {
+        return Err(error("usage: watch <segment name>"));
+    }
+    let members: Vec<&Group> = groups.iter().filter(|g| g.name == name).collect();
+    if members.is_empty() {
+        return Err(error(&format!("no such segment: {name}")));
+    }
+    let (tx, rx) = mpsc::channel();
+    for group in members {
+        group.reflector.watch(tx.clone());
+    }
+    Ok((name.to_string(), rx))
+}
+
+/// Send what happens to the segment's devices, a line each, until the client
+/// goes away or the daemon stops.
+fn stream_events(writer: &mut UnixStream, name: &str, events: &Receiver<Notice>) -> io::Result<()> {
+    writer.set_write_timeout(Some(STREAM_WRITE))?;
+    writeln!(writer, "{}", json!({ "ok": true, "name": name, "watching": true }))?;
+    loop {
+        match events.recv_timeout(STREAM_CHECK) {
+            Ok(notice) => writeln!(writer, "{}", notice_json(name, &notice))?,
+            Err(RecvTimeoutError::Timeout) => {
+                if client_gone(writer)? {
+                    return Ok(());
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return writeln!(writer, "{}", error("shutting down")),
+        }
+    }
+}
+
+/// Has the client hung up (or sent something, which a watch does not
+/// expect)? Looks without consuming or waiting.
+fn client_gone(stream: &UnixStream) -> io::Result<bool> {
+    let mut byte = 0u8;
+    // SAFETY: the descriptor is open for the life of `stream`, and `byte` is
+    // one writable byte.
+    let n = unsafe {
+        libc::recv(stream.as_raw_fd(), (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+    };
+    if n >= 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error() {
+        e if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        e => Err(e),
+    }
+}
+
+fn notice_json(segment: &str, notice: &Notice) -> Value {
+    let (event, device) = match &notice.event {
+        Event::Added(d) => ("added", d),
+        Event::Updated(d) => ("updated", d),
+        Event::Removed(d) => ("removed", d),
+    };
+    json!({
+        "event": event,
+        "segment": segment,
+        "ttl": notice.ttl.as_secs(),
+        "device": device_json(&notice.interface, notice.family, device),
+    })
 }
 
 /// Answer one request line with one line of JSON.
@@ -139,8 +246,9 @@ pub fn handle(groups: &[Group], timers: &Watcher, request: &str) -> String {
         "devices" => devices(groups, arg),
         "probe" => probe(groups, arg),
         "timers" => timer_list(timers),
+        "watch" => error("watch streams events: it needs a connection of its own"),
         "" => error("empty request"),
-        other => error(&format!("unknown command {other:?}; try: segments, devices <name>, probe [name], timers")),
+        other => error(&format!("unknown command {other:?}; try: segments, devices <name>, probe [name], watch <name>, timers")),
     }
     .to_string()
 }
@@ -259,6 +367,10 @@ fn timer_list(timers: &Watcher) -> Value {
 }
 
 fn device(seg: &Segment, d: &Device) -> Value {
+    device_json(seg.interface(), seg.family(), d)
+}
+
+fn device_json(interface: &str, family: Family, d: &Device) -> Value {
     let services: Vec<Value> = d
         .services
         .iter()
@@ -273,8 +385,8 @@ fn device(seg: &Segment, d: &Device) -> Value {
         })
         .collect();
     json!({
-        "interface": seg.interface(),
-        "family": family_name(seg.family()),
+        "interface": interface,
+        "family": family_name(family),
         "hostname": d.hostname,
         "routable": d.routable.map(|a| a.to_string()),
         "link_local": d.link_local.map(|a| a.to_string()),
@@ -530,6 +642,54 @@ mod tests {
         drop(groups);
         assert!(ask(&mut stream, &mut reader, "segments").contains("shutting down"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn watch_streams_changes_without_holding_the_segments() {
+        let (g, segs) = group("IoT", Family::V4, &["wifi"]);
+        let path = temp_socket("watch");
+        let groups = Arc::new(vec![g]);
+        serve(&path, &groups, Watcher::default()).unwrap();
+
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        assert_eq!(ask(&mut stream, &mut reader, "WATCH IoT"), r#"{"ok":true,"name":"IoT","watching":true}"#);
+        // The stream does not keep the daemon from letting go of the segments.
+        assert_eq!(Arc::strong_count(&groups), 1);
+
+        let mut next = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        segs[0].observe(ip("10.0.1.7"));
+        let added = next();
+        assert_eq!((added["event"].as_str(), added["segment"].as_str()), (Some("added"), Some("IoT")));
+        assert_eq!(added["ttl"], 300);
+        assert_eq!(added["device"]["interface"], "wifi");
+        assert_eq!(added["device"]["routable"], "10.0.1.7");
+
+        segs[0].expire(Instant::now() + Duration::from_secs(3600));
+        let removed = next();
+        assert_eq!(removed["event"], "removed");
+        assert_eq!(removed["ttl"], 0);
+        assert_eq!(removed["device"]["routable"], "10.0.1.7");
+
+        // Failures are ordinary replies, and the connection can go on.
+        let mut other = UnixStream::connect(&path).unwrap();
+        let mut other_reader = BufReader::new(other.try_clone().unwrap());
+        assert!(ask(&mut other, &mut other_reader, "watch nope").contains("no such segment: nope"));
+        let mut other = UnixStream::connect(&path).unwrap();
+        let mut other_reader = BufReader::new(other.try_clone().unwrap());
+        assert!(ask(&mut other, &mut other_reader, "watch").contains("usage: watch"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn watch_is_refused_where_it_cannot_stream() {
+        let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), "watch IoT")).unwrap();
+        assert_eq!(reply["ok"], false);
     }
 
     #[test]

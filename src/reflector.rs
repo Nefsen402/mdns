@@ -12,20 +12,33 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use crate::socket::{Device, Event, Segment};
+use crate::socket::{Device, Event, Family, Segment};
 
 /// How often a worker checks for shutdown while waiting for events.
 const TICK: Duration = Duration::from_millis(250);
 
 /// How often a worker reconciles even without events, to retry failed sends.
 const RETRY: Duration = Duration::from_secs(5);
+
+/// A change to a device discovered on one of a reflector's segments, as
+/// [`Reflector::watch`] delivers it.
+#[derive(Clone, Debug)]
+pub struct Notice {
+    /// The segment the device was discovered on.
+    pub interface: String,
+    pub family: Family,
+    pub event: Event,
+    /// How much longer the daemon keeps the device if it is not heard from
+    /// again, to the second; zero if it was removed.
+    pub ttl: Duration,
+}
 
 pub struct Reflector {
     inner: Arc<Inner>,
@@ -36,6 +49,7 @@ struct Inner {
     segments: Vec<Segment>,
     book: Mutex<Book>,
     stop: AtomicBool,
+    subscribers: Mutex<Vec<Sender<Notice>>>,
 }
 
 #[derive(Default)]
@@ -75,6 +89,7 @@ impl Reflector {
             segments,
             book: Mutex::default(),
             stop: AtomicBool::new(false),
+            subscribers: Mutex::default(),
         });
 
         // Subscribe before taking the snapshot so no change is missed. A
@@ -106,6 +121,13 @@ impl Reflector {
     /// The segments this reflector spans, in the order they were given.
     pub fn segments(&self) -> &[Segment] {
         &self.inner.segments
+    }
+
+    /// Send a [`Notice`] to `tx` for every device that appears, changes or goes
+    /// on the segments this reflector spans, from now on. Stops when the
+    /// receiver is dropped.
+    pub fn watch(&self, tx: Sender<Notice>) {
+        self.inner.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
     }
 }
 
@@ -145,7 +167,23 @@ impl Inner {
         }
     }
 
+    /// Tell the subscribers, before the reflecting, which can take a while.
+    fn notify(&self, src: usize, event: &Event) {
+        let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        if subscribers.is_empty() {
+            return;
+        }
+        let seg = &self.segments[src];
+        let ttl = match event {
+            Event::Removed(_) => Duration::ZERO,
+            Event::Added(device) | Event::Updated(device) => seg.lifetime_left(device),
+        };
+        let notice = Notice { interface: seg.interface().to_string(), family: seg.family(), event: event.clone(), ttl };
+        subscribers.retain(|tx| tx.send(notice.clone()).is_ok());
+    }
+
     fn apply(&self, src: usize, event: Event) {
+        self.notify(src, &event);
         let mut book = self.book();
         match event {
             Event::Added(device) | Event::Updated(device) => track(&mut book, src, device),
@@ -260,6 +298,50 @@ mod tests {
         let seg = Segment::new(name, Family::V6);
         seg.attach(tx, rx.local_addr().unwrap());
         (seg, rx)
+    }
+
+    #[test]
+    fn watching_a_reflector_follows_every_segment_it_spans() {
+        let (a, _ra) = wired("a");
+        let (b, _rb) = wired("b");
+        let reflector = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let (tx, notices) = std::sync::mpsc::channel();
+        reflector.watch(tx);
+        let next = || notices.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        a.observe("10.0.1.1".parse().unwrap());
+        let first = next();
+        assert_eq!((first.interface.as_str(), first.family), ("a", Family::V4));
+        assert!(matches!(first.event, Event::Added(_)));
+        // Kept for at least the floor, whatever its records said.
+        assert_eq!(first.ttl, crate::socket::DEFAULT_MIN_LIFETIME);
+
+        b.observe("10.0.2.2".parse().unwrap());
+        assert_eq!(next().interface, "b");
+
+        // Gone is ttl 0.
+        a.expire(Instant::now() + Duration::from_secs(3600));
+        let gone = next();
+        assert!(matches!(gone.event, Event::Removed(_)));
+        assert_eq!((gone.interface.as_str(), gone.ttl), ("a", Duration::ZERO));
+    }
+
+    #[test]
+    fn a_watcher_that_is_dropped_is_forgotten_and_reflecting_goes_on() {
+        let (a, _ra) = wired("a");
+        let (b, rb) = wired("b");
+        let reflector = Reflector::new(vec![a.clone(), b]).unwrap();
+        let (tx, notices) = std::sync::mpsc::channel();
+        reflector.watch(tx);
+        drop(notices);
+        // The first event finds the receiver gone; reflecting is unaffected.
+        a.observe("10.0.1.1".parse().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !reflector.inner.subscribers.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reflector.inner.subscribers.lock().unwrap().is_empty());
+        let _ = rb;
     }
 
     fn drain(rx: &UdpSocket) -> Vec<Message> {

@@ -331,6 +331,7 @@ commands:
   segments          list the configured segments
   devices <name>    list the devices discovered in a segment
   probe [<name>]    actively query for devices (all segments, or one)
+  watch <name>      print the devices of a segment as they appear and go
   timers            list the timers the daemon has scheduled
 
 options:
@@ -411,6 +412,43 @@ The daemon already probes every interface at startup, and again every
 [`Interval`](#probe-optional) if you set one; run this to probe right now, for
 example to pick up a device you have just switched on.
 
+### `mdnsctl watch <name>`
+
+Follows a segment and prints each device as it appears, changes and goes, until
+you interrupt it. It prints only what happens from then on; `devices` shows what
+is there already.
+
+```
+$ mdnsctl watch IoT
+added    ttl=4500   plug.local  Plug S  10.0.1.9
+updated  ttl=4499   plug.local  Plug S  10.0.1.9
+removed  ttl=0      plug.local  Plug S  10.0.1.9
+```
+
+A line is what happened, the device's `ttl` (the seconds the daemon keeps it if
+it is not heard from again, or `0` once it is gone because it said goodbye or ran
+out), then the same columns as `devices`. The first time a device is shown with a
+name it is `added`, whatever the daemon first called it, and `updated` after
+that; devices that have not announced a name are not shown. `-v` prints each
+change as `devices -v` would list the device, services included, and shows
+unnamed ones too. It exits with status 2 if the daemon stops, and quietly with 0
+if its output is closed (`mdnsctl watch IoT | head`).
+
+With `--json` each change is one line of JSON as the daemon sent it, which is
+what to build on: react to a device the moment it announces itself, instead of
+polling. For example, configure each Shelly plug once as it appears:
+
+```sh
+mdnsctl --json watch IoT | jq -r --unbuffered '
+    select(.event != "removed" and .ttl > 0)
+    | select(any(.device.services[]?; .type == "_shelly._tcp.local"))
+    | .device.routable // empty' |
+while read -r ip; do configure-plug "$ip"; done
+```
+
+A device usually produces several `updated` events as its records arrive, so a
+script like that should be idempotent, or remember the addresses it has done.
+
 ### `mdnsctl timers`
 
 Lists what the daemon's timer has scheduled, soonest first, for finding out why
@@ -460,6 +498,7 @@ printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
 | `segments`        | `{"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}` |
 | `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4","hostname":"tv.local","routable":"10.0.1.7","link_local":null,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
 | `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":9,"error":null}]}` (replies after about 4 seconds) |
+| `watch <name>`    | `{"ok":true,"name":"IoT","watching":true}`, then until the client hangs up one line per change: `{"event":"added","segment":"IoT","ttl":4500,"device":{…as in devices…}}` (`added`, `updated` or `removed`; `ttl` is 0 when removed) |
 | `timers`          | `{"ok":true,"timers":[{"id":1,"name":"upkeep wifi/V4","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210}]}` |
 | anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
 
