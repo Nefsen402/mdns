@@ -330,6 +330,11 @@ impl Timer {
         self.shared.snapshot()
     }
 
+    /// A handle that can take snapshots but does not keep the timer alive.
+    pub fn watcher(&self) -> Watcher {
+        Watcher { shared: Arc::downgrade(&self.shared) }
+    }
+
     fn register(&self, name: String, at: Option<Instant>, callback: Callback) -> Entry {
         Entry {
             shared: Arc::downgrade(&self.shared),
@@ -364,6 +369,20 @@ impl Drop for Timer {
                 let _ = worker.join();
             }
         }
+    }
+}
+
+/// A way to look at a timer's entries without owning it, or keeping it alive.
+/// The default one watches nothing.
+#[derive(Clone, Default)]
+pub struct Watcher {
+    shared: Weak<Shared>,
+}
+
+impl Watcher {
+    /// [`Timer::snapshot`], or `None` if the timer has been dropped.
+    pub fn snapshot(&self) -> Option<Vec<Info>> {
+        self.shared.upgrade().map(|shared| shared.snapshot())
     }
 }
 
@@ -772,6 +791,19 @@ mod tests {
         assert_eq!((info.name.as_str(), info.runs, info.running, info.due), ("worker", 2, false, None));
         assert!(info.last_run.is_some() && info.last_took.is_some());
         assert_eq!(info.id, entry.id());
+    }
+
+    #[test]
+    fn a_watcher_sees_the_timer_until_it_is_dropped() {
+        let timer = Timer::new().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let _entry = timer.schedule("watched", Duration::from_secs(60), notify(&tx, 1));
+        let watcher = timer.watcher();
+        assert_eq!(watcher.snapshot().unwrap()[0].name, "watched");
+        assert!(Watcher::default().snapshot().is_none());
+
+        drop(timer);
+        assert!(watcher.snapshot().is_none());
     }
 
     #[test]

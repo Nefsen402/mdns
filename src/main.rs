@@ -142,7 +142,7 @@ fn main() -> Result<()> {
     }
 
     let segments = Arc::new(segments);
-    ipc::serve(&config.socket, &segments)?;
+    ipc::serve(&config.socket, &segments, timer.watcher())?;
 
     let signal = signal::wait().context("waiting for shutdown signal")?;
     eprintln!("received {signal}: withdrawing reflected devices");

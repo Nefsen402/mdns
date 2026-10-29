@@ -12,6 +12,9 @@
 //!    "services":[{"instance":...}]}]}
 //! probe [<segment name>]
 //!   {"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":14,"error":null}]}
+//! timers
+//!   {"ok":true,"timers":[{"id":1,"name":"upkeep wifi/V4","running":false,
+//!    "due_in_ms":93000,"runs":4,"last_run_ago_ms":3000,"last_took_us":210}]}
 //! ```
 //!
 //! Errors are `{"ok":false,"error":"..."}`. `devices` lists what was
@@ -20,6 +23,11 @@
 //! (of all segments if no name is given) and replies after about four
 //! seconds, once the answers have been processed; list what was found with
 //! `devices`.
+//!
+//! `timers` lists what the daemon's timer has scheduled, soonest first, for
+//! debugging. `due_in_ms` is 0 for one that is overdue (its callback is queued
+//! behind another) and `null` for one that is running now or never due;
+//! `last_run_ago_ms` and `last_took_us` are `null` until it has run.
 //!
 //! A device has up to two addresses, of the entry's family: `routable` (IPv4,
 //! or global/ULA IPv6) and `link_local`; either is `null` when unknown.
@@ -31,12 +39,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::socket::{Device, Family, Segment};
+use crate::timer::Watcher;
 use crate::Group;
 
 /// Longest request line accepted.
@@ -51,7 +60,7 @@ const IDLE: Duration = Duration::from_secs(60);
 ///
 /// The server only holds a weak reference, so it never keeps the segments
 /// alive: once the owner drops them, requests are answered "shutting down".
-pub fn serve(path: &Path, groups: &Arc<Vec<Group>>) -> Result<JoinHandle<()>> {
+pub fn serve(path: &Path, groups: &Arc<Vec<Group>>, timers: Watcher) -> Result<JoinHandle<()>> {
     let listener = bind(path)?;
     let groups = Arc::downgrade(groups);
     eprintln!("ipc: listening on {}", path.display());
@@ -60,7 +69,8 @@ pub fn serve(path: &Path, groups: &Arc<Vec<Group>>) -> Result<JoinHandle<()>> {
             match conn {
                 Ok(stream) => {
                     let groups = Weak::clone(&groups);
-                    thread::spawn(move || match serve_connection(stream, &groups) {
+                    let timers = timers.clone();
+                    thread::spawn(move || match serve_connection(stream, &groups, &timers) {
                         Err(e) if !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                             eprintln!("ipc: connection ended: {e}");
                         }
@@ -95,7 +105,7 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>) -> io::Result<()> {
+fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watcher) -> io::Result<()> {
     stream.set_read_timeout(Some(IDLE))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -111,7 +121,7 @@ fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>) -> io::Result
             return Ok(());
         }
         let reply = match groups.upgrade() {
-            Some(groups) => handle(&groups, line.trim()),
+            Some(groups) => handle(&groups, timers, line.trim()),
             None => error("shutting down").to_string(),
         };
         writeln!(writer, "{reply}")?;
@@ -119,7 +129,7 @@ fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>) -> io::Result
 }
 
 /// Answer one request line with one line of JSON.
-pub fn handle(groups: &[Group], request: &str) -> String {
+pub fn handle(groups: &[Group], timers: &Watcher, request: &str) -> String {
     let (command, arg) = match request.split_once(char::is_whitespace) {
         Some((command, arg)) => (command, arg.trim()),
         None => (request, ""),
@@ -128,8 +138,9 @@ pub fn handle(groups: &[Group], request: &str) -> String {
         "segments" => segments(groups),
         "devices" => devices(groups, arg),
         "probe" => probe(groups, arg),
+        "timers" => timer_list(timers),
         "" => error("empty request"),
-        other => error(&format!("unknown command {other:?}; try: segments, devices <name>, probe [name]")),
+        other => error(&format!("unknown command {other:?}; try: segments, devices <name>, probe [name], timers")),
     }
     .to_string()
 }
@@ -224,6 +235,29 @@ fn probe(groups: &[Group], name: &str) -> Value {
     json!({ "ok": true, "probed": results })
 }
 
+fn timer_list(timers: &Watcher) -> Value {
+    let Some(all) = timers.snapshot() else {
+        return error("the timer is not running");
+    };
+    let now = Instant::now();
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let list: Vec<Value> = all
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "name": t.name,
+                "running": t.running,
+                "due_in_ms": t.due.map(|at| ms(at.saturating_duration_since(now))),
+                "runs": t.runs,
+                "last_run_ago_ms": t.last_run.map(|at| ms(now.saturating_duration_since(at))),
+                "last_took_us": t.last_took.map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+            })
+        })
+        .collect();
+    json!({ "ok": true, "timers": list })
+}
+
 fn device(seg: &Segment, d: &Device) -> Value {
     let services: Vec<Value> = d
         .services
@@ -305,13 +339,42 @@ mod tests {
     }
 
     #[test]
+    fn lists_the_timers_soonest_first() {
+        let timer = crate::timer::Timer::new().unwrap();
+        let _later = timer.schedule("later", Duration::from_secs(600), || crate::timer::Next::Stop);
+        let _sooner = timer.schedule("sooner", Duration::from_secs(60), || crate::timer::Next::Stop);
+        let _never = timer.schedule("never", Duration::MAX, || crate::timer::Next::Stop);
+
+        let reply: Value = serde_json::from_str(&handle(&[], &timer.watcher(), "timers")).unwrap();
+        assert_eq!(reply["ok"], true);
+        let list = reply["timers"].as_array().unwrap();
+        let names: Vec<&str> = list.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["sooner", "later", "never"]);
+
+        let due = list[0]["due_in_ms"].as_u64().unwrap();
+        assert!((59_000..=60_000).contains(&due), "{due}");
+        assert_eq!(list[0]["running"], false);
+        assert_eq!(list[0]["runs"], 0);
+        assert!(list[0]["last_run_ago_ms"].is_null() && list[0]["last_took_us"].is_null());
+        assert!(list[2]["due_in_ms"].is_null());
+        assert!(list[0]["id"].is_u64());
+    }
+
+    #[test]
+    fn timers_reports_a_timer_that_is_gone() {
+        let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), "timers")).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("timer"));
+    }
+
+    #[test]
     fn lists_segments_merging_families() {
         let (m4, _) = group("media", Family::V4, &["a", "b"]);
         let (m6, _) = group("media", Family::V6, &["a", "b"]);
         let (iot, _) = group("iot", Family::V4, &["c"]);
         let groups = [m4, m6, iot];
         assert_eq!(
-            handle(&groups, "segments"),
+            handle(&groups, &Watcher::default(), "segments"),
             r#"{"ok":true,"segments":[{"name":"media","interfaces":["a","b"],"families":["v4","v6"]},{"name":"iot","interfaces":["c"],"families":["v4"]}]}"#
         );
     }
@@ -321,7 +384,7 @@ mod tests {
         let (iot, segs) = group("IoT to br0", Family::V4, &["c"]);
         segs[0].observe(ip("10.0.3.9"));
         assert_eq!(
-            handle(&[iot], r#"devices "IoT to br0""#),
+            handle(&[iot], &Watcher::default(), r#"devices "IoT to br0""#),
             r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","family":"v4","hostname":null,"routable":"10.0.3.9","link_local":null,"services":[]}]}"#
         );
     }
@@ -331,7 +394,7 @@ mod tests {
         let (g, segs) = group("media", Family::V4, &["a", "b"]);
         announce(&segs[0], "10.0.1.5", "tv.local", r#"My "TV""#);
         segs[1].observe(ip("10.0.2.1"));
-        let out = handle(&[g], "DEVICES media");
+        let out = handle(&[g], &Watcher::default(), "DEVICES media");
         assert!(
             out.contains(r#""interface":"a","family":"v4","hostname":"tv.local","routable":"10.0.1.5","link_local":null"#),
             "{out}"
@@ -351,7 +414,7 @@ mod tests {
         announce(&segs[0], "10.0.1.5", "tv.local", "TV");
         std::thread::sleep(Duration::from_millis(150));
         assert!(!segs[1].manual_devices().is_empty(), "precondition: reflected onto b");
-        let out = handle(&[g], "devices media");
+        let out = handle(&[g], &Watcher::default(), "devices media");
         assert_eq!(out.matches("\"routable\"").count(), 1, "{out}");
     }
 
@@ -367,7 +430,7 @@ mod tests {
             Group { name: "y".into(), family: Family::V4, reflector: Reflector::new(vec![a, c]).unwrap() },
         ];
         let interfaces = |request: &str| -> Vec<String> {
-            let reply: Value = serde_json::from_str(&handle(&groups, request)).unwrap();
+            let reply: Value = serde_json::from_str(&handle(&groups, &Watcher::default(), request)).unwrap();
             assert_eq!(reply["ok"], true, "{reply}");
             reply["probed"]
                 .as_array()
@@ -386,7 +449,7 @@ mod tests {
         let (g, _segs) = group("media", Family::V4, &["a"]);
         // No sender is attached in tests, so nothing is sent.
         assert_eq!(
-            handle(&[g], "probe media"),
+            handle(&[g], &Watcher::default(), "probe media"),
             r#"{"ok":true,"probed":[{"interface":"a","family":"v4","queries":0,"error":null}]}"#
         );
     }
@@ -402,7 +465,7 @@ mod tests {
             ("", "empty request"),
             ("frobnicate", "unknown command"),
         ] {
-            let out = handle(&groups, request);
+            let out = handle(&groups, &Watcher::default(), request);
             assert!(out.starts_with(r#"{"ok":false,"error":""#) && out.contains(expect), "{request}: {out}");
         }
     }
@@ -413,7 +476,7 @@ mod tests {
     fn replies_stay_on_one_line_whatever_the_names_contain() {
         let (g, segs) = group("media", Family::V4, &["a", "b"]);
         announce(&segs[0], "10.0.1.5", "tv.local", "My\nTV\"\\");
-        let out = handle(&[g], "devices media");
+        let out = handle(&[g], &Watcher::default(), "devices media");
         assert!(!out.contains('\n'), "{out}");
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
@@ -444,7 +507,7 @@ mod tests {
         segs[0].observe(ip("10.0.1.7"));
         let path = temp_socket("serve");
         let groups = Arc::new(vec![g]);
-        serve(&path, &groups).unwrap();
+        serve(&path, &groups, Watcher::default()).unwrap();
 
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o660);
 

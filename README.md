@@ -331,6 +331,7 @@ commands:
   segments          list the configured segments
   devices <name>    list the devices discovered in a segment
   probe [<name>]    actively query for devices (all segments, or one)
+  timers            list the timers the daemon has scheduled
 
 options:
   -s, --socket PATH  control socket (default /run/mdnsd/mdnsd.sock)
@@ -410,6 +411,26 @@ The daemon already probes every interface at startup, and again every
 [`Interval`](#probe-optional) if you set one; run this to probe right now, for
 example to pick up a device you have just switched on.
 
+### `mdnsctl timers`
+
+Lists what the daemon's timer has scheduled, soonest first, for finding out why
+something did or did not happen when you expected: each link has one `upkeep`
+timer, which expires devices, asks the ones about to expire to answer again, and
+re-announces reflected devices (`router.local` included), and it is set to the
+earliest of those that is due.
+
+```
+$ mdnsctl timers
+NAME            STATE    DUE        RUNS  LAST RUN   TOOK
+upkeep br0/V4   waiting  in 1m 33s  4     3.5s ago   210us
+upkeep wifi/V4  waiting  in 4m 51s  1     8.2s ago   96us
+```
+
+`STATE` is `running` while its callback runs, `waiting` until `DUE`, and `idle`
+when nothing is due (for example, no devices known yet). `DUE` says `now` for
+one that is overdue because another callback is still running. `TOOK` is how
+long the last run took.
+
 ### Exit status
 
 | Code | Meaning                                                              |
@@ -439,9 +460,12 @@ printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
 | `segments`        | `{"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}` |
 | `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4","hostname":"tv.local","routable":"10.0.1.7","link_local":null,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
 | `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":9,"error":null}]}` (replies after about 4 seconds) |
+| `timers`          | `{"ok":true,"timers":[{"id":1,"name":"upkeep wifi/V4","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210}]}` |
 | anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
 
-`hostname`, `target`, `routable` and `link_local` are `null` when unknown. Requests over 4 KiB are
+`hostname`, `target`, `routable` and `link_local` are `null` when unknown. In
+`timers`, `due_in_ms` is `null` for a timer that is running or has nothing due,
+and `last_run_ago_ms` and `last_took_us` are `null` until it has run. Requests over 4 KiB are
 refused, and idle connections are closed after 60 seconds.
 
 ## Shutdown

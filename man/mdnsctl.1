@@ -75,6 +75,24 @@ in
 .BR mdnsd.conf (5)).
 Run it to probe right now, for example to pick up a device you have just
 switched on.
+.TP
+.B timers
+List the timers the daemon has scheduled, soonest first, with their state,
+when each is due, how often it has run, when it last ran and how long that
+took.
+Each interface and address family has one
+.B upkeep
+timer, which drops devices as they expire, asks the ones about to expire to
+answer again, and re-announces reflected devices; it is set for the earliest of
+those that is due, so this shows when the daemon will next do any of them.
+A state of
+.B running
+means its callback is running now,
+.B waiting
+that it is due at the time shown (\fBnow\fR if it is overdue behind another
+callback), and
+.B idle
+that nothing is due.
 .SH OPTIONS
 .TP
 \fB\-s\fR, \fB\-\-socket\fR \fIPATH\fR
@@ -150,6 +168,17 @@ wifi       v4      9 queries sent
 .RE
 .fi
 .PP
+and
+.B timers
+prints one line per timer:
+.PP
+.nf
+.RS
+NAME            STATE    DUE        RUNS  LAST RUN   TOOK
+upkeep br0/V4   waiting  in 1m 33s  4     3.5s ago   210us
+.RE
+.fi
+.PP
 With
 .BR \-\-json ,
 every reply is an object with an
@@ -160,8 +189,9 @@ Successful replies carry
 .B name
 and
 .BR devices ,
+.BR probed ,
 or
-.BR probed ;
+.BR timers ;
 failures are
 .BR {"ok":false,"error":"..."} .
 .BR hostname ,

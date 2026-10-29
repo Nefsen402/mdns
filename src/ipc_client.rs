@@ -22,6 +22,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("segments", "", "list the configured segments"),
     ("devices", "<name>", "list the devices discovered in a segment"),
     ("probe", "[<name>]", "actively query for devices (all segments, or one)"),
+    ("timers", "", "list the timers the daemon has scheduled"),
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +30,7 @@ enum Command {
     Segments,
     Devices(String),
     Probe(Option<String>),
+    Timers,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -120,6 +122,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
             }
             Command::Probe((!segment.trim().is_empty()).then_some(segment))
         }
+        "timers" if rest.is_empty() => Command::Timers,
+        "timers" => return Err(Failure::Usage("timers takes no arguments".into())),
         other => return Err(Failure::Usage(format!("unknown command {other:?}"))),
     };
     Ok(Parsed::Run(Options { socket, json, verbose, command }))
@@ -153,6 +157,7 @@ fn execute(opts: &Options) -> Result<String, Failure> {
         Command::Devices(name) => (format!("devices {name}"), TIMEOUT),
         Command::Probe(None) => ("probe".to_string(), PROBE_TIMEOUT),
         Command::Probe(Some(name)) => (format!("probe {name}"), PROBE_TIMEOUT),
+        Command::Timers => ("timers".to_string(), TIMEOUT),
     };
     let raw = request(&opts.socket, &line, timeout)?;
     let reply: Value =
@@ -170,6 +175,7 @@ fn execute(opts: &Options) -> Result<String, Failure> {
         Command::Devices(_) if opts.verbose => render_devices(&reply),
         Command::Devices(_) => render_devices_brief(&reply),
         Command::Probe(_) => render_probe(&reply),
+        Command::Timers => render_timers(&reply),
     }
 }
 
@@ -211,6 +217,44 @@ fn render_probe(reply: &Value) -> Result<String, Failure> {
     let mut out = table(&rows);
     out.push_str("\nList what answered with: mdnsctl devices <name>\n");
     Ok(out)
+}
+
+/// A duration given in milliseconds, in the largest units that read well.
+fn span(ms: u64) -> String {
+    match ms {
+        0..1000 => format!("{ms}ms"),
+        1000..60_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        60_000..3_600_000 => format!("{}m {:02}s", ms / 60_000, ms / 1000 % 60),
+        _ => format!("{}h {:02}m", ms / 3_600_000, ms / 60_000 % 60),
+    }
+}
+
+fn render_timers(reply: &Value) -> Result<String, Failure> {
+    let list = reply["timers"].as_array().ok_or_else(bad_reply)?;
+    let mut rows = vec![vec!["NAME", "STATE", "DUE", "RUNS", "LAST RUN", "TOOK"].into_iter().map(String::from).collect::<Vec<_>>()];
+    for timer in list {
+        let (state, due) = match (timer["running"].as_bool(), timer["due_in_ms"].as_u64()) {
+            (Some(true), _) => ("running", "-".to_string()),
+            (Some(false), Some(0)) => ("waiting", "now".to_string()),
+            (Some(false), Some(ms)) => ("waiting", format!("in {}", span(ms))),
+            (Some(false), None) => ("idle", "never".to_string()),
+            _ => return Err(bad_reply()),
+        };
+        let last = timer["last_run_ago_ms"].as_u64().map_or("-".to_string(), |ms| format!("{} ago", span(ms)));
+        let took = timer["last_took_us"].as_u64().map_or("-".to_string(), |us| match us {
+            0..1000 => format!("{us}us"),
+            _ => span(us / 1000),
+        });
+        rows.push(vec![
+            timer["name"].as_str().ok_or_else(bad_reply)?.to_string(),
+            state.to_string(),
+            due,
+            timer["runs"].as_u64().ok_or_else(bad_reply)?.to_string(),
+            last,
+            took,
+        ]);
+    }
+    Ok(table(&rows))
 }
 
 /// One line per named device: its DNS name, its pretty name (the service
@@ -473,6 +517,7 @@ mod tests {
         assert_eq!(opts(&["probe"]).command, Command::Probe(None));
         assert_eq!(opts(&["probe", "  "]).command, Command::Probe(None));
         assert_eq!(opts(&["probe", "IoT", "to", "br0"]).command, Command::Probe(Some("IoT to br0".into())));
+        assert_eq!(opts(&["timers"]).command, Command::Timers);
         assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
         assert_eq!(parse(&["segments", "-h"]), Err(Failure::Usage("segments takes no arguments".into())));
     }
@@ -485,6 +530,7 @@ mod tests {
             &["devices"],
             &["devices", "  "],
             &["segments", "extra"],
+            &["timers", "extra"],
             &["--bogus", "segments"],
             &["-s"],
             &["devices", "a\nsegments"],
@@ -672,6 +718,46 @@ mod tests {
             render_probe(&reply).unwrap(),
             "INTERFACE  FAMILY  RESULT\nbr0        v4      14 queries sent\nwifi       v6      error: sending to ff02::fb: Network is unreachable\n\nList what answered with: mdnsctl devices <name>\n"
         );
+    }
+
+    #[test]
+    fn renders_timers() {
+        let reply: Value = serde_json::from_str(
+            r#"{"ok":true,"timers":[
+                {"id":1,"name":"upkeep br0/V4","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210},
+                {"id":2,"name":"upkeep wifi/V4","running":false,"due_in_ms":0,"runs":0,"last_run_ago_ms":null,"last_took_us":null},
+                {"id":3,"name":"busy","running":true,"due_in_ms":null,"runs":9,"last_run_ago_ms":90,"last_took_us":null},
+                {"id":4,"name":"parked","running":false,"due_in_ms":null,"runs":1,"last_run_ago_ms":4500000,"last_took_us":25000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_timers(&reply).unwrap(),
+            "NAME            STATE    DUE        RUNS  LAST RUN    TOOK\n\
+             upkeep br0/V4   waiting  in 1m 33s  4     3.5s ago    210us\n\
+             upkeep wifi/V4  waiting  now        0     -           -\n\
+             busy            running  -          9     90ms ago    -\n\
+             parked          idle     never      1     1h 15m ago  25ms\n"
+        );
+        assert!(render_timers(&serde_json::json!({"ok":true})).is_err());
+    }
+
+    #[test]
+    fn spans_read_naturally() {
+        let shown: Vec<String> = [0, 999, 1000, 59_999, 60_000, 3_599_999, 3_600_000, 90_000_000].map(span).into();
+        assert_eq!(shown, ["0ms", "999ms", "1.0s", "60.0s", "1m 00s", "59m 59s", "1h 00m", "25h 00m"]);
+    }
+
+    #[test]
+    fn timers_asks_the_daemon() {
+        const REPLY: &str = r#"{"ok":true,"timers":[{"id":1,"name":"upkeep br0/V4","running":false,"due_in_ms":5000,"runs":0,"last_run_ago_ms":null,"last_took_us":null}]}"#;
+        let (path, daemon) = fake_daemon("timers", REPLY);
+        let out = run(&path, false, Command::Timers).unwrap();
+        assert_eq!(daemon.join().unwrap(), "timers\n");
+        assert!(out.contains("upkeep br0/V4") && out.contains("in 5.0s"), "{out}");
+
+        let (path, daemon) = fake_daemon("timers-json", REPLY);
+        assert_eq!(run(&path, true, Command::Timers).unwrap(), format!("{REPLY}\n"));
+        daemon.join().unwrap();
     }
 
     /// A one-shot fake daemon: replies to one request, returns what it was asked.
