@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 
 use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
+use crate::timer::{self, Next, Timer};
 
 pub const MDNS_PORT: u16 = 5353;
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
@@ -35,6 +36,8 @@ const OTHER_TTL: u32 = 4500;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises.
 const REANNOUNCE: Duration = Duration::from_secs(HOST_TTL as u64 * 4 / 5);
+/// How long to wait before trying again after a re-announcement failed to send.
+const ANNOUNCE_RETRY: Duration = Duration::from_secs(10);
 
 /// DNS-SD service type enumeration (RFC 6763 section 9).
 const META_QUERY: &str = "_services._dns-sd._udp.local";
@@ -279,6 +282,11 @@ impl Entry {
         }
     }
 
+    /// Whether there is anything to ask it about: a name or a service.
+    fn askable(&self) -> bool {
+        self.hostname.is_some() || !self.services.is_empty()
+    }
+
     fn device(&self) -> Device {
         Device {
             hostname: self.hostname.clone(),
@@ -324,6 +332,23 @@ struct Manual {
     announced: Instant,
     /// When any of its records was last multicast; drives the rate limit.
     last_sent: Instant,
+    /// Not before this, after a re-announcement failed to send.
+    retry: Option<Instant>,
+}
+
+/// The entry that wakes the segment's upkeep: expiry, refreshing and
+/// re-announcing.
+struct Wake {
+    entry: timer::Entry,
+    /// How long before expiry devices are asked to answer again, if at all.
+    before: Option<Duration>,
+    /// When the entry was last set to wake up; `None` if it is parked.
+    at: Option<Instant>,
+}
+
+/// How long to wait before asking a device again that has not answered.
+fn refresh_gap(before: Duration) -> Duration {
+    (before / 4).max(Duration::from_secs(5))
 }
 
 #[derive(Default)]
@@ -342,12 +367,46 @@ struct State {
     types: BTreeSet<String>,
     /// The least a device is kept after it was last heard from.
     min_lifetime: Duration,
+    wake: Option<Wake>,
 }
 
 impl State {
     fn notify(&mut self, event: Event) {
         // A dropped receiver is an unsubscribe.
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+
+    /// The next time [`Segment::expire`], [`Segment::refresh`] or
+    /// [`Segment::reannounce`] has something to do, or `None` if never. A time
+    /// in the past means it is due now. Every time returned is one at which
+    /// one of them acts, so that running them moves it on.
+    fn next_due(&self, now: Instant) -> Option<Instant> {
+        let before = self.wake.as_ref().and_then(|w| w.before);
+        let mut next: Option<Instant> = None;
+        let mut soon = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        for e in self.discovered.values() {
+            soon(e.expires);
+            let Some(before) = before.filter(|_| self.outbound.is_some() && e.askable()) else {
+                continue;
+            };
+            // Due `before` ahead of expiry, and not again until the gap has
+            // passed since it was last asked.
+            let mut at = e.expires.checked_sub(before).unwrap_or(now);
+            match e.refreshed.map(|t| t.checked_add(refresh_gap(before))) {
+                Some(Some(again)) => at = at.max(again),
+                Some(None) => continue, // never again
+                None => {}
+            }
+            // A device that runs out first is dropped, not asked.
+            if at < e.expires {
+                soon(at);
+            }
+        }
+        for m in self.manual.values() {
+            let at = m.announced.checked_add(REANNOUNCE).unwrap_or(m.announced);
+            soon(m.retry.map_or(at, |r| at.max(r)));
+        }
+        next
     }
 
     /// Drop a discovered device and the addresses that pointed at it.
@@ -387,6 +446,67 @@ impl Segment {
     /// Applies to what is heard from now on.
     pub fn set_min_lifetime(&self, min_lifetime: Duration) {
         self.state.lock().unwrap().min_lifetime = min_lifetime;
+    }
+
+    /// Have `timer` run this segment's upkeep from now on: drop devices when
+    /// they expire, ask devices to answer again `refresh_before` ahead of that
+    /// (if given), and re-announce reflected devices. Each happens when it is
+    /// due, not on a tick, and the wake-up follows whatever is heard or added.
+    /// Replaces an earlier call. Stops with the timer or the last clone of
+    /// the segment.
+    pub fn schedule(&self, timer: &Timer, refresh_before: Option<Duration>) {
+        let state = Arc::downgrade(&self.state);
+        let (interface, family) = (self.interface.clone(), self.family);
+        // Parked until `rearm` finds something due. The timer holds only a
+        // weak reference, so it does not keep the segment alive.
+        let entry = timer.schedule(format!("upkeep {}/{:?}", self.interface, self.family), Duration::MAX, move || match state.upgrade() {
+            Some(state) => Segment { interface: interface.clone(), family, state }.run_timers(),
+            None => Next::Stop,
+        });
+        self.state.lock().unwrap().wake = Some(Wake { entry, before: refresh_before, at: None });
+        self.rearm();
+    }
+
+    /// Point the wake-up at whatever is due next. Call after anything that
+    /// can make something due sooner: a device heard or added.
+    fn rearm(&self) {
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        let at = state.next_due(Instant::now());
+        let Some(wake) = state.wake.as_mut().filter(|w| w.at != at) else {
+            return;
+        };
+        wake.at = at;
+        match at {
+            Some(at) => wake.entry.reschedule_at(at),
+            None => wake.entry.reschedule(Duration::MAX),
+        };
+    }
+
+    /// The timer's callback: do what is due, and say when to run next.
+    fn run_timers(&self) -> Next {
+        let before = self.state.lock().unwrap().wake.as_ref().and_then(|w| w.before);
+        let now = Instant::now();
+        // Drop what has run out first, so that nothing is asked that is being
+        // dropped, then ask the devices about to expire to answer again.
+        // Routine refreshes are not worth a journal line each.
+        self.expire(now);
+        if let Some(before) = before {
+            if let Err(e) = self.refresh(now, before) {
+                eprintln!("{}/{:?}: refresh failed: {e:#}", self.interface, self.family);
+            }
+        }
+        if let Err(e) = self.reannounce(now) {
+            eprintln!("{}/{:?}: re-announce failed: {e:#}", self.interface, self.family);
+        }
+
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        let at = state.next_due(Instant::now());
+        if let Some(wake) = &mut state.wake {
+            wake.at = at;
+        }
+        at.map_or(Next::After(Duration::MAX), Next::At)
     }
 
     pub fn interface(&self) -> &str {
@@ -464,7 +584,9 @@ impl Segment {
         }
         send(&state.outbound, &records)?;
         let now = Instant::now();
-        state.manual.insert(key, Manual { device, announced: now, last_sent: now });
+        state.manual.insert(key, Manual { device, announced: now, last_sent: now, retry: None });
+        drop(guard);
+        self.rearm();
         Ok(true)
     }
 
@@ -488,22 +610,25 @@ impl Segment {
     }
 
     /// Re-announce reflected devices that have not had a full announcement
-    /// for [`REANNOUNCE`]. Call periodically. A failed send is retried on the
-    /// next call; the first error is returned after every device was tried.
+    /// for [`REANNOUNCE`]. A failed send is retried after [`ANNOUNCE_RETRY`]; the
+    /// first error is returned after every device was tried. Run by
+    /// [`Segment::schedule`] when due.
     pub fn reannounce(&self, now: Instant) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
         let State { manual, outbound, .. } = &mut *guard;
         let mut first_err = None;
         for m in manual.values_mut() {
-            if now.saturating_duration_since(m.announced) < REANNOUNCE {
+            if now.saturating_duration_since(m.announced) < REANNOUNCE || m.retry.is_some_and(|r| now < r) {
                 continue;
             }
             match send(outbound, &announcement(&m.device, HOST_TTL, OTHER_TTL)) {
                 Ok(()) => {
                     m.announced = now;
                     m.last_sent = now;
+                    m.retry = None;
                 }
                 Err(e) => {
+                    m.retry = Some(now + ANNOUNCE_RETRY);
                     first_err.get_or_insert(e);
                 }
             }
@@ -591,7 +716,7 @@ impl Segment {
         Ok(())
     }
 
-    // Fed by the receive loops and a periodic reaper.
+    // Fed by the receive loops and the timer.
 
     /// Handle a received datagram: record the sender (still counted as alive
     /// if the packet does not parse) and answer it if it is a query we can
@@ -600,6 +725,7 @@ impl Segment {
         match Message::parse(packet) {
             Ok(msg) => {
                 self.apply(from.ip(), Instant::now(), Some(&msg));
+                self.rearm();
                 self.respond(from, &msg)
             }
             Err(_) => {
@@ -612,6 +738,7 @@ impl Segment {
     /// Record that `addr` was heard on this segment, without any record data.
     pub fn observe(&self, addr: IpAddr) {
         self.apply(addr, Instant::now(), None);
+        self.rearm();
     }
 
     fn apply(&self, src: IpAddr, now: Instant, msg: Option<&Message>) {
@@ -814,24 +941,25 @@ impl Segment {
     /// answers. A device that does not answer is asked again after a quarter of
     /// `before` (at least five seconds) until it expires. Devices known only by
     /// the address they were heard from have nothing to ask for and are left
-    /// alone, and so is one whose time has already run out. Call periodically,
-    /// after [`Segment::expire`]; returns how many questions were sent.
+    /// alone, and so is one whose time has already run out. Run by
+    /// [`Segment::schedule`] when due, after [`Segment::expire`]; returns how
+    /// many questions were sent.
     pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
         let mut guard = self.state.lock().unwrap();
         let State { discovered, outbound, .. } = &mut *guard;
         if outbound.is_none() {
             return Ok(0);
         }
-        let gap = (before / 4).max(Duration::from_secs(5));
+        let gap = refresh_gap(before);
         let address_type = if self.family == Family::V4 { rtype::A } else { rtype::AAAA };
 
         let mut qs = Questions::default();
         for entry in discovered.values_mut() {
-            let askable = entry.hostname.is_some() || !entry.services.is_empty();
-            // Not one that has already run out: it is about to be dropped.
-            let due = entry.expires > now && entry.expires <= now + before;
+            // Not one that has already run out: it is about to be dropped. A
+            // margin too long to add to a time reaches past every expiry.
+            let due = entry.expires > now && now.checked_add(before).is_none_or(|limit| entry.expires <= limit);
             let recent = entry.refreshed.is_some_and(|t| now.saturating_duration_since(t) < gap);
-            if !askable || !due || recent {
+            if !entry.askable() || !due || recent {
                 continue;
             }
             entry.refreshed = Some(now);
@@ -2250,6 +2378,138 @@ mod tests {
         assert!(recv(&rx).is_none());
         assert_eq!(seg.refresh(t0 + Duration::from_secs(72), before).unwrap(), 3, "within 30 s of it");
         assert!(recv(&rx).is_some());
+    }
+
+    // The timer-driven upkeep.
+
+    fn expiry_of(seg: &Segment, host: &str) -> Instant {
+        seg.state.lock().unwrap().discovered[&host_key(host)].expires
+    }
+
+    fn next_due(seg: &Segment) -> Option<Instant> {
+        seg.state.lock().unwrap().next_due(Instant::now())
+    }
+
+    /// Wait for the next event of this kind, as long as it takes up to `within`.
+    fn wait_for_removed(events: &Receiver<Event>, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match events.recv_timeout(left) {
+                Ok(Event::Removed(_)) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn the_next_deadline_is_the_earliest_of_expiry_refresh_and_reannounce() {
+        let timer = Timer::new().unwrap();
+        let (seg, _rx) = wired();
+        assert_eq!(next_due(&seg), None, "nothing known, nothing due");
+
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        let expires = expiry_of(&seg, "printer.local");
+        assert_eq!(next_due(&seg), Some(expires));
+
+        // Asking ahead of expiry makes it earlier...
+        seg.schedule(&timer, Some(Duration::from_secs(60)));
+        assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(60)));
+
+        // ...until it was asked: then the gap (a quarter of the margin) has to pass.
+        seg.refresh(expires - Duration::from_secs(60), Duration::from_secs(60)).unwrap();
+        assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)));
+
+        // A reflected device is due for re-announcement, and a failed one not before its retry.
+        seg.add_manual(tv("10.0.9.9", &["TV"])).unwrap();
+        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + REANNOUNCE)));
+        seg.state.lock().unwrap().manual.get_mut("tv.local").unwrap().retry = Some(announced + Duration::from_secs(500));
+        assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn a_segment_that_cannot_send_has_nothing_to_refresh() {
+        let timer = Timer::new().unwrap();
+        let seg = Segment::new("test", Family::V4);
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        seg.schedule(&timer, Some(Duration::from_secs(60)));
+        // Only the expiry: refresh would return at once without asking, and
+        // being due, it would spin.
+        assert_eq!(next_due(&seg), Some(expiry_of(&seg, "printer.local")));
+    }
+
+    #[test]
+    fn a_margin_too_big_for_the_clock_neither_panics_nor_spins() {
+        let timer = Timer::new().unwrap();
+        let (seg, rx) = wired();
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        seg.schedule(&timer, Some(Duration::MAX));
+        // Everything is within that margin of its expiry, so it is asked...
+        assert!(next_due(&seg).unwrap() <= Instant::now() + Duration::from_millis(50));
+        assert!(seg.refresh(Instant::now(), Duration::MAX).unwrap() > 0);
+        assert!(recv(&rx).is_some());
+        // ...once, and then not again until it has expired.
+        assert_eq!(next_due(&seg), Some(expiry_of(&seg, "printer.local")));
+    }
+
+    #[test]
+    fn a_device_is_dropped_the_moment_it_expires() {
+        let timer = Timer::new().unwrap();
+        let (seg, _rx) = wired();
+        seg.schedule(&timer, None);
+        let events = seg.subscribe();
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+
+        // Not on a tick: 150 ms from now, even though the wake-up was parked
+        // for five minutes when it was heard.
+        set_expiry(&seg, "printer.local", Instant::now() + Duration::from_millis(150));
+        seg.rearm();
+        assert!(wait_for_removed(&events, Duration::from_secs(2)));
+        assert!(seg.devices().is_empty());
+    }
+
+    #[test]
+    fn a_device_heard_after_the_wakeup_was_set_can_be_due_sooner() {
+        let timer = Timer::new().unwrap();
+        let (seg, _rx) = wired();
+        seg.set_min_lifetime(Duration::ZERO);
+        seg.schedule(&timer, None); // nothing known: parked
+        let events = seg.subscribe();
+        hear_a_device_with_ttl(&seg, 1);
+        assert!(wait_for_removed(&events, Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn a_device_is_asked_the_margin_before_it_expires() {
+        let timer = Timer::new().unwrap();
+        let (seg, rx) = wired();
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        seg.schedule(&timer, Some(Duration::from_millis(300)));
+        let events = seg.subscribe();
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+
+        let start = Instant::now();
+        set_expiry(&seg, "printer.local", start + Duration::from_millis(500));
+        seg.rearm();
+        let query = recv(&rx).expect("never asked");
+        let waited = start.elapsed();
+        assert!(asked(&query).contains(&q("printer.local", rtype::A)));
+        assert!(waited >= Duration::from_millis(150), "asked too early: {waited:?}");
+        assert!(waited < Duration::from_millis(450), "asked too late: {waited:?}");
+        // It does not answer, so it goes.
+        assert!(wait_for_removed(&events, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn the_timer_does_not_keep_a_dropped_segment_alive() {
+        let timer = Timer::new().unwrap();
+        let seg = Segment::new("test", Family::V4);
+        seg.schedule(&timer, None);
+        let state = Arc::downgrade(&seg.state);
+        drop(seg);
+        assert!(state.upgrade().is_none());
     }
 
     #[test]

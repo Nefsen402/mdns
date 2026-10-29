@@ -4,6 +4,7 @@ mod parser;
 mod reflector;
 mod signal;
 mod socket;
+mod timer;
 
 use std::collections::HashMap;
 use std::net::UdpSocket;
@@ -17,6 +18,7 @@ use anyhow::{Context, Result};
 use config::Config;
 use reflector::Reflector;
 use socket::{Device, Family, MdnsSocket, Segment};
+use timer::Timer;
 
 /// One configured segment for one address family.
 pub struct Group {
@@ -34,6 +36,7 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
     let config = Config::load(&path)?;
+    let timer = Timer::new().context("starting the timer")?;
 
     let families: Vec<Family> = [(config.ipv4, Family::V4), (config.ipv6, Family::V6)]
         .into_iter()
@@ -52,6 +55,7 @@ fn main() -> Result<()> {
                 config.advertise.as_deref(),
                 config.refresh_before,
                 config.min_lifetime,
+                &timer,
             )?;
             links.insert((interface, family), link);
         }
@@ -142,6 +146,8 @@ fn main() -> Result<()> {
 
     let signal = signal::wait().context("waiting for shutdown signal")?;
     eprintln!("received {signal}: withdrawing reflected devices");
+    // No more upkeep while the goodbyes go out.
+    drop(timer);
     release(segments);
     // With the reflectors gone, what is left in the manual lists is the
     // advertised name: say goodbye to it too.
@@ -176,8 +182,8 @@ fn release(mut segments: Arc<Vec<Group>>) {
 }
 
 /// Open the socket for one interface and family and start its threads:
-/// receive/respond, expiry/re-announcement, and an event logger. They run
-/// until the process exits.
+/// receive/respond and an event logger, which run until the process exits.
+/// Expiry, refreshing and re-announcement run on `timer`.
 ///
 /// With `advertise`, the link also announces that name (say `router.local`)
 /// with this host's address on the interface, as a reflected device with a
@@ -188,6 +194,7 @@ fn start_link(
     advertise: Option<&str>,
     refresh_before: Option<Duration>,
     min_lifetime: Duration,
+    timer: &Timer,
 ) -> Result<Segment> {
     let sock = socket::open(interface, family)
         .with_context(|| format!("opening {family:?} socket on {interface}"))?;
@@ -227,23 +234,7 @@ fn start_link(
         }
     });
 
-    let reaper = link.clone();
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(10));
-        let now = Instant::now();
-        // Drop what has run out first, so that nothing is asked that is being
-        // dropped, then ask the devices about to expire to answer again.
-        // Routine refreshes are not worth a journal line each.
-        reaper.expire(now);
-        if let Some(before) = refresh_before {
-            if let Err(e) = reaper.refresh(now, before) {
-                eprintln!("{name}: refresh failed: {e:#}");
-            }
-        }
-        if let Err(e) = reaper.reannounce(now) {
-            eprintln!("{name}: re-announce failed: {e:#}");
-        }
-    });
+    link.schedule(timer, refresh_before);
 
     let receiver = link.clone();
     thread::spawn(move || recv_loop(sock, receiver));

@@ -210,7 +210,7 @@ minutes; a device with short records just before its minimum lifetime is up.
 Devices that are heard
 from regularly are never asked, and a device known only by the address it was
 heard from (a phone that merely sends queries) has nothing to ask and is left
-alone. The minimum is 30 seconds, because devices are checked every 10 seconds.
+alone. The minimum is 30 seconds.
 
 *Short TTLs.* The minimum lifetime is why a TTL shorter than the margin (10
 seconds, say) is not a problem: the device is not due the moment it is heard, it

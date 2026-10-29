@@ -52,8 +52,8 @@ const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long before a device would expire it is asked to answer again.
 pub const DEFAULT_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 
-/// Devices are checked for being due every 10 seconds (the reaper tick), so a
-/// smaller margin could fall between two checks and never fire.
+/// A smaller margin would have devices asked about almost as soon as they
+/// were heard from, which is no use to anyone.
 const MIN_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 
 /// A longer floor than this is a typo: it would keep devices that are long
