@@ -61,7 +61,9 @@ const MIN_MULTICAST_GAP: Duration = Duration::from_secs(1);
 /// TTL cap for replies to legacy unicast resolvers (RFC 6762 section 6.7).
 const LEGACY_TTL_CAP: u32 = 10;
 
-pub const DEVICE_TIMEOUT: Duration = Duration::from_secs(300);
+/// The default for how long a device is kept at least after it was last heard
+/// from, whatever TTLs it announced. See [`Segment::set_min_lifetime`].
+pub const DEFAULT_MIN_LIFETIME: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -338,6 +340,8 @@ struct State {
     /// Service types devices on this segment have said they offer, learned
     /// from answers to the type enumeration query.
     types: BTreeSet<String>,
+    /// The least a device is kept after it was last heard from.
+    min_lifetime: Duration,
 }
 
 impl State {
@@ -369,8 +373,20 @@ impl Segment {
         Segment {
             interface: interface.into(),
             family,
-            state: Arc::default(),
+            state: Arc::new(Mutex::new(State {
+                min_lifetime: DEFAULT_MIN_LIFETIME,
+                ..State::default()
+            })),
         }
+    }
+
+    /// How long a device is kept, at least, after it was last heard from. A
+    /// device lives for the longest TTL it announced, but never for less than
+    /// this, so that a device that announces tiny TTLs is not dropped between
+    /// two of the daemon's checks. The default is [`DEFAULT_MIN_LIFETIME`].
+    /// Applies to what is heard from now on.
+    pub fn set_min_lifetime(&self, min_lifetime: Duration) {
+        self.state.lock().unwrap().min_lifetime = min_lifetime;
     }
 
     pub fn interface(&self) -> &str {
@@ -604,6 +620,7 @@ impl Segment {
         let msg = msg.filter(|m| m.header.response);
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
+        let floor = state.min_lifetime;
         let mut touched = Touched::default();
 
         // A response saying one of the sender's addresses is gone (TTL 0) is a
@@ -675,7 +692,7 @@ impl Segment {
                 entry.absorb(earlier);
             }
             let ttl = Duration::from_secs(g.max_ttl as u64);
-            entry.expires = entry.expires.max(now + ttl.max(DEVICE_TIMEOUT));
+            entry.expires = entry.expires.max(now + ttl.max(floor));
             entry.hostname = Some(g.host.clone());
             entry.set_addrs(&addrs, src);
             merge_records(entry, g.records.iter().copied());
@@ -704,7 +721,7 @@ impl Segment {
             let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now));
             let ttl = rest.iter().map(|r| r.ttl).max().unwrap_or(0);
             let ttl = Duration::from_secs(ttl as u64);
-            entry.expires = entry.expires.max(now + ttl.max(DEVICE_TIMEOUT));
+            entry.expires = entry.expires.max(now + ttl.max(floor));
             entry.set_addrs(&[src], src);
             merge_records(entry, rest.iter().copied());
             state.by_addr.insert(src, key);
@@ -790,7 +807,8 @@ impl Segment {
     /// it would be dropped, instead of being found again later.
     ///
     /// A device is due once it would expire within `before` of `now`: its
-    /// lifetime is the longest TTL it announced, at least [`DEVICE_TIMEOUT`].
+    /// lifetime is the longest TTL it announced, at least the minimum lifetime
+    /// ([`Segment::set_min_lifetime`]).
     /// It is asked for what it announced (its address, and the service and text
     /// records of each instance) and not for whole service types, so only it
     /// answers. A device that does not answer is asked again after a quarter of
@@ -1304,7 +1322,7 @@ mod tests {
         let rx = seg.subscribe();
         seg.expire(Instant::now());
         assert_eq!(seg.devices().len(), 1);
-        seg.expire(Instant::now() + DEVICE_TIMEOUT + Duration::from_secs(1));
+        seg.expire(Instant::now() + DEFAULT_MIN_LIFETIME + Duration::from_secs(1));
         assert!(seg.devices().is_empty());
         assert_eq!(rx.try_recv(), Ok(Event::Removed(unnamed("10.0.1.5"))));
     }
@@ -2123,13 +2141,13 @@ mod tests {
         assert!(recv(&rx).is_none());
 
         // 30 s before the 5 minute floor ends, it is asked.
-        assert_eq!(seg.refresh(t0 + DEVICE_TIMEOUT - before + Duration::from_secs(1), before).unwrap(), 3);
+        assert_eq!(seg.refresh(t0 + DEFAULT_MIN_LIFETIME - before + Duration::from_secs(1), before).unwrap(), 3);
         assert!(recv(&rx).is_some());
 
         // And without an answer it is dropped when the floor ends, not before.
         seg.expire(t0 + Duration::from_secs(250));
         assert_eq!(seg.devices().len(), 1);
-        seg.expire(t0 + DEVICE_TIMEOUT + Duration::from_secs(1));
+        seg.expire(t0 + DEFAULT_MIN_LIFETIME + Duration::from_secs(1));
         assert!(seg.devices().is_empty());
     }
 
@@ -2160,10 +2178,78 @@ mod tests {
 
         // Still alive just before the end: asked. Past the end, but not yet
         // dropped (the next expiry pass has not run): not asked.
-        assert_eq!(seg.refresh(t0 + DEVICE_TIMEOUT - Duration::from_secs(5), before).unwrap(), 3);
+        assert_eq!(seg.refresh(t0 + DEFAULT_MIN_LIFETIME - Duration::from_secs(5), before).unwrap(), 3);
         recv(&rx).unwrap();
-        assert_eq!(seg.refresh(t0 + DEVICE_TIMEOUT + Duration::from_secs(10), before).unwrap(), 0);
+        assert_eq!(seg.refresh(t0 + DEFAULT_MIN_LIFETIME + Duration::from_secs(10), before).unwrap(), 0);
         assert!(recv(&rx).is_none());
+    }
+
+    /// A device whose records all have this TTL, heard on `seg`.
+    fn hear_a_device_with_ttl(seg: &Segment, ttl: u32) {
+        hear(seg, "10.0.1.30", vec![
+            record("d.local".into(), true, ttl, RData::A("10.0.1.30".parse().unwrap())),
+            record("D._x._tcp.local".into(), true, ttl, RData::Srv { priority: 0, weight: 0, port: 1, target: "d.local".into() }),
+            record("_x._tcp.local".into(), false, ttl, RData::Ptr("D._x._tcp.local".into())),
+        ]);
+    }
+
+    /// Is the device still known `secs` after it was heard, once expired as of then?
+    fn alive_after(seg: &Segment, secs: u64) -> bool {
+        seg.expire(Instant::now() + Duration::from_secs(secs));
+        !seg.devices().is_empty()
+    }
+
+    #[test]
+    fn the_minimum_lifetime_is_a_floor_under_a_devices_ttl_and_can_be_changed() {
+        // Default: the 5 minute floor holds a 10 second TTL up to 300 s.
+        let seg = Segment::new("test", Family::V4);
+        hear_a_device_with_ttl(&seg, 10);
+        assert!(alive_after(&seg, 290));
+        assert!(!alive_after(&seg, 301));
+
+        // A shorter floor lets that device go sooner...
+        let seg = Segment::new("test", Family::V4);
+        seg.set_min_lifetime(Duration::from_secs(60));
+        hear_a_device_with_ttl(&seg, 10);
+        assert!(alive_after(&seg, 50));
+        assert!(!alive_after(&seg, 61));
+
+        // ...a longer one keeps it longer...
+        let seg = Segment::new("test", Family::V4);
+        seg.set_min_lifetime(Duration::from_secs(900));
+        hear_a_device_with_ttl(&seg, 10);
+        assert!(alive_after(&seg, 890));
+        assert!(!alive_after(&seg, 901));
+
+        // ...and zero means no floor: it lives for exactly its TTL.
+        let seg = Segment::new("test", Family::V4);
+        seg.set_min_lifetime(Duration::ZERO);
+        hear_a_device_with_ttl(&seg, 10);
+        assert!(alive_after(&seg, 8));
+        assert!(!alive_after(&seg, 11));
+    }
+
+    #[test]
+    fn a_ttl_longer_than_the_floor_still_wins() {
+        let seg = Segment::new("test", Family::V4);
+        seg.set_min_lifetime(Duration::from_secs(60));
+        hear_a_device_with_ttl(&seg, 4500);
+        assert!(alive_after(&seg, 4490));
+        assert!(!alive_after(&seg, 4501));
+    }
+
+    #[test]
+    fn refresh_follows_the_configured_floor() {
+        let (seg, rx) = wired();
+        seg.set_min_lifetime(Duration::from_secs(100));
+        hear_a_device_with_ttl(&seg, 10); // lives 100 s
+        let t0 = Instant::now();
+        let before = Duration::from_secs(30);
+
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(60), before).unwrap(), 0, "not yet within 30 s of 100 s");
+        assert!(recv(&rx).is_none());
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(72), before).unwrap(), 3, "within 30 s of it");
+        assert!(recv(&rx).is_some());
     }
 
     #[test]
@@ -2235,7 +2321,7 @@ mod tests {
     fn long_ttl_extends_lifetime() {
         let seg = Segment::new("test", Family::V4);
         seg.handle(sa("10.0.1.7"), &announcement(4500)).unwrap();
-        seg.expire(Instant::now() + DEVICE_TIMEOUT + Duration::from_secs(1));
+        seg.expire(Instant::now() + DEFAULT_MIN_LIFETIME + Duration::from_secs(1));
         assert_eq!(seg.devices().len(), 1);
         seg.expire(Instant::now() + Duration::from_secs(4501));
         assert!(seg.devices().is_empty());

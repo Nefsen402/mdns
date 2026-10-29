@@ -100,6 +100,12 @@ IPv6=yes
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
 
+# A device is kept at least this long after it was last heard from, whatever
+# TTLs it announced (a device lives for its longest TTL, but not for less than
+# this). `0` keeps it for exactly its TTL.
+[Devices]
+MinimumLifetime=5min
+
 # Most devices (speakers especially) only answer when asked, and one that is
 # not heard from expires and is withdrawn from the other networks. So a device
 # is asked to answer again this long before it would expire (`0` or `off` turns
@@ -163,6 +169,23 @@ service creates `/run/mdnsd` for it). Unix socket paths are limited to about
 108 bytes. The socket is created with mode `0660` (owner and group only). A stale socket file from a crashed run is
 replaced; a live instance or a file that is not a socket is never overwritten.
 
+### `[Devices]` (optional)
+
+| Key               | Default | Meaning                                                     |
+|-------------------|---------|-------------------------------------------------------------|
+| `MinimumLifetime` | `5min`  | The least a device is kept after it was last heard from.    |
+
+A systemd time span (`5min`, `90s`, `1h`), at most 1 day. A device lives for the
+longest TTL it announced, but never for less than this, so a device that
+announces tiny TTLs is not dropped between two of the daemon's checks. `0` removes
+the minimum: each device then lives for exactly its longest TTL.
+
+It is also the price of a device that vanishes without saying goodbye: it stays
+listed, and announced to the other networks, for up to this long. A lower value
+drops it sooner; a higher one keeps devices through longer silences. Keep
+[`RefreshBefore`](#probe-optional) shorter than it (the daemon warns at startup
+if it is not), because that margin is counted back from the end of this lifetime.
+
 ### `[Probe]` (optional)
 
 | Key             | Default | Meaning                                                                               |
@@ -178,30 +201,33 @@ start; they only answer when asked. A device that nobody has heard from expires,
 and is then withdrawn from the other networks until something asks it again.
 
 **`RefreshBefore`** renews each device just in time. A device lives for as long
-as the longest TTL it announced, **and at least 5 minutes**. `RefreshBefore`
+as the longest TTL it announced, **and at least
+[`MinimumLifetime`](#devices-optional)** (5 minutes by default). `RefreshBefore`
 before that runs out, the daemon asks that device, and only it, for the records
 it announced, and asks again about every quarter of the margin until it answers
 or expires. A speaker whose records live 75 minutes is asked at about 74
-minutes; a device with short records just before its 5. Devices that are heard
+minutes; a device with short records just before its minimum lifetime is up.
+Devices that are heard
 from regularly are never asked, and a device known only by the address it was
 heard from (a phone that merely sends queries) has nothing to ask and is left
 alone. The minimum is 30 seconds, because devices are checked every 10 seconds.
 
-*Short TTLs.* The 5 minute floor is why a TTL shorter than the margin (10
+*Short TTLs.* The minimum lifetime is why a TTL shorter than the margin (10
 seconds, say) is not a problem: the device is not due the moment it is heard, it
-lives 5 minutes after it was last heard and is asked 30 seconds before that. The
-price is that a device that really vanishes is still listed, and still announced
-to the other networks, for up to 5 minutes. A margin longer than the lifetime
-(more than 5 minutes for such a device) makes every device due all the time; it
-is then asked once per quarter of the margin, not continuously.
+lives `MinimumLifetime` after it was last heard (5 minutes by default) and is
+asked 30 seconds before that. The price is that a device that really vanishes is
+still listed, and still announced to the other networks, for up to that long. A
+margin longer than the lifetime (with `MinimumLifetime=0` and short TTLs, say)
+makes every device due all the time; it is then asked once per quarter of the
+margin, not continuously.
 
 **`Interval`** is not set by default. It probes every interface (browsing for
 service types and instances) on a timer, which is the way to find a **new**
 quiet device that never announces itself. Without it, new devices are found at
 startup, when they announce themselves (most do when they join a network), and by
 `mdnsctl probe`. The minimum is 10 seconds. With `RefreshBefore` off, an
-`Interval` has to stay under 5 minutes to keep devices listed, and the daemon
-warns at startup if it does not.
+`Interval` has to stay under `MinimumLifetime` to keep devices listed, and the
+daemon warns at startup if it does not.
 
 A probe is a handful of multicast queries per interface and takes about four
 seconds; a refresh is a few questions. Routine ones are not logged; failures
@@ -283,8 +309,9 @@ be reflected, so without probing they would stay invisible.
 - Reflected devices are kept alive with periodic re-announcements, answer
   queries (including known-answer suppression), and are withdrawn with goodbye
   packets when their source disappears.
-- A discovered device expires after it has been silent for at least 5 minutes,
-  or for the TTL of its records if that is longer. A goodbye packet removes it
+- A discovered device expires after it has been silent for at least
+  [`MinimumLifetime`](#devices-optional) (5 minutes by default), or for the TTL
+  of its records if that is longer. A goodbye packet removes it
   immediately. A device that is about to expire is asked to answer again
   ([`RefreshBefore`](#probe-optional)), which is what keeps quiet ones from
   expiring.

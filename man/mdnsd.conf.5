@@ -78,6 +78,31 @@ Unix socket paths are limited to about 108 bytes.
 The socket is created with mode 0660 (owner and group only).
 A stale socket left by a crashed run is replaced; a live instance, or a file
 that is not a socket, is never overwritten.
+.SS [Devices]
+Optional.
+.TP
+.B MinimumLifetime=
+The least a device is kept after it was last heard from, as a systemd time span
+such as
+.BR 5min ,
+.B 90s
+or
+.BR 1h ,
+at most one day.
+Default
+.BR 5min .
+A device lives for the longest TTL it announced, but never for less than this, so
+a device that announces tiny TTLs is not dropped between two of the daemon's
+checks.
+.B 0
+removes the minimum: each device then lives for exactly its longest TTL.
+.IP
+It is also the price of a device that vanishes without saying goodbye: it stays
+listed, and announced to the other networks, for up to this long.
+Keep
+.B RefreshBefore=
+shorter than it, because that margin is counted back from the end of this
+lifetime; the daemon warns at startup if it is not.
 .SS [Probe]
 Optional.
 Both settings are systemd time spans, such as
@@ -95,22 +120,24 @@ Default
 or
 .B off
 turns it off.
-A device lives for as long as the longest TTL it announced, and at least five
-minutes.
+A device lives for as long as the longest TTL it announced, and at least
+.B MinimumLifetime=
+(five minutes by default).
 This long before that runs out, the daemon asks that device, and only it, for
 the records it announced, and asks again about every quarter of this margin
 until it answers or expires.
 A speaker whose records live seventy-five minutes is asked at about seventy-four
-minutes; a device with short records just before its five.
+minutes; a device with short records just before its minimum lifetime is up.
 Devices that are heard from regularly are never asked, and a device known only by
 the address it was heard from has nothing to ask and is left alone.
 It must be at least 30 seconds, because devices are checked every 10 seconds.
 .IP
-Because of the five minute floor, a TTL shorter than this margin is not a problem:
-such a device is not due as soon as it is heard, it lives five minutes after it
-was last heard and is asked 30 seconds before that.
+Because of the minimum lifetime, a TTL shorter than this margin is not a problem:
+such a device is not due as soon as it is heard, it lives
+.B MinimumLifetime=
+after it was last heard and is asked 30 seconds before that.
 The cost is that a device that really vanishes stays listed, and announced to the
-other networks, for up to five minutes.
+other networks, for up to that long.
 A margin longer than the lifetime makes every device due all the time; it is then
 asked once per quarter of the margin, not continuously.
 .TP
@@ -127,8 +154,9 @@ With
 .B RefreshBefore=
 off, an
 .B Interval=
-has to stay under five minutes to keep devices listed, and the daemon warns about
-it at startup.
+has to stay under
+.B MinimumLifetime=
+to keep devices listed, and the daemon warns about it at startup.
 .SS [Advertise]
 Optional.
 .TP
@@ -213,6 +241,9 @@ IPv6=yes
 
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
+
+[Devices]
+MinimumLifetime=5min
 
 [Probe]
 RefreshBefore=30s

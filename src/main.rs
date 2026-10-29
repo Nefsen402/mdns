@@ -46,7 +46,13 @@ fn main() -> Result<()> {
     let mut links: HashMap<(&str, Family), Segment> = HashMap::new();
     for interface in config.interfaces() {
         for &family in &families {
-            let link = start_link(interface, family, config.advertise.as_deref(), config.refresh_before)?;
+            let link = start_link(
+                interface,
+                family,
+                config.advertise.as_deref(),
+                config.refresh_before,
+                config.min_lifetime,
+            )?;
             links.insert((interface, family), link);
         }
     }
@@ -77,8 +83,19 @@ fn main() -> Result<()> {
     // answer when asked, so without this a quiet one expires and is withdrawn
     // from the other networks. The probes run on their own threads, so startup
     // is not held up; `mdnsctl probe` does the same on demand.
+    eprintln!("keeping a device for at least {}s after it was last heard from", config.min_lifetime.as_secs());
     match config.refresh_before {
-        Some(before) => eprintln!("asking devices to answer again {}s before they would expire", before.as_secs()),
+        Some(before) => {
+            eprintln!("asking devices to answer again {}s before they would expire", before.as_secs());
+            if before >= config.min_lifetime {
+                eprintln!(
+                    "warning: that is not shorter than the {}s a device is kept at least, so a device whose records \
+                     expire sooner is always due and is asked about every {}s while it answers",
+                    config.min_lifetime.as_secs(),
+                    (before.as_secs() / 4).max(5)
+                );
+            }
+        }
         None => eprintln!("refreshing devices before they expire is off"),
     }
     match config.probe_interval {
@@ -86,11 +103,11 @@ fn main() -> Result<()> {
             eprintln!("probing every {}s", interval.as_secs());
             // With refreshing on, each device is asked just before it would
             // expire, so a long interval only delays finding new devices.
-            if config.refresh_before.is_none() && interval > socket::DEVICE_TIMEOUT {
+            if config.refresh_before.is_none() && interval > config.min_lifetime {
                 eprintln!(
                     "warning: that is longer than the {}s a device is kept without being heard from, \
                      so devices whose records all expire sooner will come and go between probes",
-                    socket::DEVICE_TIMEOUT.as_secs()
+                    config.min_lifetime.as_secs()
                 );
             }
         }
@@ -170,12 +187,14 @@ fn start_link(
     family: Family,
     advertise: Option<&str>,
     refresh_before: Option<Duration>,
+    min_lifetime: Duration,
 ) -> Result<Segment> {
     let sock = socket::open(interface, family)
         .with_context(|| format!("opening {family:?} socket on {interface}"))?;
     eprintln!("listening on {interface} ({family:?})");
 
     let link = Segment::new(interface, family);
+    link.set_min_lifetime(min_lifetime);
     let (tx, dest) = sock.sender()?;
     link.attach(tx, dest);
 

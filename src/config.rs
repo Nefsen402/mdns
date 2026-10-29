@@ -8,6 +8,9 @@
 //! [Ipc]               ; optional
 //! Socket=/run/mdnsd/mdnsd.sock
 //!
+//! [Devices]           ; optional
+//! MinimumLifetime=5min
+//!
 //! [Probe]             ; optional
 //! RefreshBefore=30s
 //! Interval=4min       ; off unless set
@@ -53,6 +56,10 @@ pub const DEFAULT_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 /// smaller margin could fall between two checks and never fire.
 const MIN_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 
+/// A longer floor than this is a typo: it would keep devices that are long
+/// gone, and a silly one (`99999999999999s`) would overflow the clock.
+const MAX_MIN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
     pub name: String,
@@ -75,6 +82,9 @@ pub struct Config {
     /// How long before a device would expire to ask it to answer again;
     /// `None` leaves that to the periodic probe.
     pub refresh_before: Option<Duration>,
+    /// The least a device is kept after it was last heard from, whatever TTLs
+    /// it announced. Zero keeps it for exactly its longest TTL.
+    pub min_lifetime: Duration,
 }
 
 impl Default for Config {
@@ -87,6 +97,7 @@ impl Default for Config {
             advertise: None,
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
+            min_lifetime: crate::socket::DEFAULT_MIN_LIFETIME,
         }
     }
 }
@@ -151,6 +162,9 @@ impl Config {
                     ("listen", "ipv6") => config.ipv6 = parse_bool(&entry, lineno)?,
                     ("probe", "interval") => {
                         config.probe_interval = parse_span(&value, lineno, "Interval", MIN_PROBE_INTERVAL)?;
+                    }
+                    ("devices", "minimumlifetime") => {
+                        config.min_lifetime = parse_lifetime(&value, lineno)?;
                     }
                     ("probe", "refreshbefore") => {
                         config.refresh_before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
@@ -281,18 +295,36 @@ fn failing_line(text: &str) -> Option<usize> {
     None
 }
 
-/// A time span setting called `key`: a systemd time span such as `4min` or
-/// `1h 30min`, with `0`, `off` or `infinity` meaning never, and at least `min`.
+/// A systemd time span such as `4min` or `1h 30min`; one that adds up to zero
+/// (`0`, `0s`) is `Duration::ZERO`.
+fn timespan(value: &str, lineno: usize, key: &str) -> Result<Duration> {
+    match parse_timespan(value) {
+        Ok(span) => Ok(span),
+        // The crate reports a span that adds up to zero ("0", "0s") as empty.
+        Err(TimespanParseError::Empty) if !value.trim().is_empty() => Ok(Duration::ZERO),
+        Err(e) => bail!("line {lineno}: invalid {key} {value:?}: {e}"),
+    }
+}
+
+/// The minimum lifetime of a device: a time span, where zero means no minimum.
+fn parse_lifetime(value: &str, lineno: usize) -> Result<Duration> {
+    let span = timespan(value, lineno, "MinimumLifetime")?;
+    if span > MAX_MIN_LIFETIME {
+        bail!("line {lineno}: MinimumLifetime= must be at most {} hours", MAX_MIN_LIFETIME.as_secs() / 3600);
+    }
+    Ok(span)
+}
+
+/// A time span setting called `key`, with `0`, `off` or `infinity` meaning
+/// never, and at least `min`.
 fn parse_span(value: &str, lineno: usize, key: &str, min: Duration) -> Result<Option<Duration>> {
     if matches!(value.to_ascii_lowercase().as_str(), "off" | "infinity") {
         return Ok(None);
     }
-    let span = match parse_timespan(value) {
-        Ok(span) => span,
-        // The crate reports a span that adds up to zero ("0", "0s") as empty.
-        Err(TimespanParseError::Empty) if !value.trim().is_empty() => return Ok(None),
-        Err(e) => bail!("line {lineno}: invalid {key} {value:?}: {e}"),
-    };
+    let span = timespan(value, lineno, key)?;
+    if span.is_zero() {
+        return Ok(None);
+    }
     if span < min {
         bail!("line {lineno}: {key}= must be at least {} seconds", min.as_secs());
     }
@@ -348,6 +380,7 @@ interfaces=br0,wifi
         assert_eq!(c.probe_interval, None, "the example does not set an Interval");
         assert_eq!(c.refresh_before, Some(Duration::from_secs(30)));
         assert_eq!(c.refresh_before, Some(DEFAULT_REFRESH_BEFORE), "the example shows the default");
+        assert_eq!(c.min_lifetime, crate::socket::DEFAULT_MIN_LIFETIME, "the example shows the default");
         assert!(c.ipv4 && c.ipv6);
     }
 
@@ -372,7 +405,10 @@ interfaces=br0,wifi
     #[test]
     fn man_page_documents_every_key_and_its_example_parses() {
         let man = include_str!("../man/mdnsd.conf.5");
-        for key in ["IPv4=", "IPv6=", "Socket=", "Interval=", "RefreshBefore=", "Hostname=", "Name=", "Interfaces="] {
+        for key in [
+            "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "Interval=", "RefreshBefore=", "Hostname=", "Name=",
+            "Interfaces=",
+        ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
         assert!(man.contains(DEFAULT_SOCKET));
@@ -521,6 +557,32 @@ interfaces=br0,wifi
         let err = |v: &str| error_of(&format!("[Probe]\nRefreshBefore={v}\n{EXAMPLE}"));
         assert!(err("20s").contains("RefreshBefore= must be at least 30 seconds"), "{}", err("20s"));
         assert!(err("soon").contains("line 2") && err("soon").contains("invalid RefreshBefore"));
+    }
+
+    #[test]
+    fn the_minimum_lifetime_defaults_to_five_minutes_and_takes_systemd_time_spans() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().min_lifetime, Duration::from_secs(300));
+
+        let with = |v: &str| Config::parse(&format!("[Devices]\nMinimumLifetime={v}\n{EXAMPLE}"));
+        let secs = |v: &str| with(v).unwrap().min_lifetime.as_secs();
+        assert_eq!(secs("5min"), 300);
+        assert_eq!(secs("90s"), 90);
+        assert_eq!(secs("1h"), 3600);
+        assert_eq!(secs("1d"), 86400, "the longest allowed");
+        assert_eq!(secs("0"), 0, "zero means no minimum: a device lives for exactly its TTL");
+        assert_eq!(secs("0s"), 0);
+
+        let err = |v: &str| error_of(&format!("[Devices]\nMinimumLifetime={v}\n{EXAMPLE}"));
+        assert!(err("2d").contains("at most 24 hours") && err("2d").contains("line 2"));
+        // A value that parses but would overflow the clock when added to "now".
+        assert!(err("99999999999999s").contains("at most 24 hours"), "{}", err("99999999999999s"));
+        assert!(err("18446744073709551615s").contains("at most 24 hours"));
+        assert!(err("99999999999y").contains("invalid MinimumLifetime"), "an unknown unit is just invalid");
+        assert!(err("soon").contains("invalid MinimumLifetime"));
+        assert!(err("").contains("line 2"), "an empty value is not a time span");
+        // Unlike the probe settings, `off` and `infinity` are not "never": a device must be able to expire.
+        assert!(err("off").contains("invalid MinimumLifetime"));
+        assert!(err("infinity").contains("invalid MinimumLifetime"));
     }
 
     #[test]

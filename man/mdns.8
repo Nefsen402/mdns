@@ -43,8 +43,12 @@ points at, together with the PTR and TXT records of that instance.
 The address a packet came from is credited to a host only if that host
 announced it, or announced no address at all and is the only host described;
 a reflector announcing other devices is not mistaken for any of them.
-A device expires after it has been silent for at least five minutes, or for the
-TTL of its records if that is longer.
+A device expires after it has been silent for at least the minimum lifetime
+(five minutes by default, see
+.B MinimumLifetime=
+in
+.BR mdnsd.conf (5)),
+or for the TTL of its records if that is longer.
 A goodbye packet (TTL 0) removes it immediately.
 .SS Probing
 Devices announce themselves rarely, and some only answer when asked, so waiting
@@ -73,7 +77,7 @@ if one is set (it is not by default).
 Most devices only answer when asked, and one that is not heard from expires, so
 a device that is about to expire is asked to answer again, on its own: this long
 before the end of its lifetime, which is the longest TTL it announced and at
-least five minutes, the daemon asks that device, and only it, for the records it
+least the minimum lifetime, the daemon asks that device, and only it, for the records it
 announced, and asks again until it answers or expires.
 This is the
 .B RefreshBefore=
