@@ -9,11 +9,16 @@
 //! devices <segment name>
 //!   {"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4",
 //!    "addr":"10.0.1.7","hostname":"tv.local","services":[{"instance":...}]}]}
+//! probe [<segment name>]
+//!   {"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":14,"error":null}]}
 //! ```
 //!
 //! Errors are `{"ok":false,"error":"..."}`. `devices` lists what was
 //! discovered on the segment's own interfaces, not reflected copies from
-//! other segments.
+//! other segments. `probe` actively queries the interfaces of the segment
+//! (of all segments if no name is given) and replies after about four
+//! seconds, once the answers have been processed; list what was found with
+//! `devices`.
 
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -118,8 +123,9 @@ pub fn handle(groups: &[Group], request: &str) -> String {
     match command.to_ascii_lowercase().as_str() {
         "segments" => segments(groups),
         "devices" => devices(groups, arg),
+        "probe" => probe(groups, arg),
         "" => error("empty request"),
-        other => error(&format!("unknown command {other:?}; try: segments, devices <name>")),
+        other => error(&format!("unknown command {other:?}; try: segments, devices <name>, probe [name]")),
     }
     .to_string()
 }
@@ -145,11 +151,13 @@ fn segments(groups: &[Group]) -> Value {
     json!({ "ok": true, "segments": list })
 }
 
+/// A segment name argument, with optional surrounding quotes removed.
+fn segment_arg(arg: &str) -> &str {
+    arg.strip_prefix('"').and_then(|n| n.strip_suffix('"')).unwrap_or(arg)
+}
+
 fn devices(groups: &[Group], name: &str) -> Value {
-    let name = name
-        .strip_prefix('"')
-        .and_then(|n| n.strip_suffix('"'))
-        .unwrap_or(name);
+    let name = segment_arg(name);
     if name.is_empty() {
         return error("usage: devices <segment name>");
     }
@@ -167,6 +175,49 @@ fn devices(groups: &[Group], name: &str) -> Value {
         }
     }
     json!({ "ok": true, "name": name, "devices": list })
+}
+
+/// Probe every interface of the named segment, or of all segments. An
+/// interface shared by several segments is probed once.
+fn probe(groups: &[Group], name: &str) -> Value {
+    let name = segment_arg(name);
+    let members: Vec<&Group> = groups.iter().filter(|g| name.is_empty() || g.name == name).collect();
+    if members.is_empty() {
+        return error(&format!("no such segment: {name}"));
+    }
+
+    let mut links: Vec<&Segment> = Vec::new();
+    for seg in members.iter().flat_map(|g| g.reflector.segments()) {
+        if !links.iter().any(|l| l.interface() == seg.interface() && l.family() == seg.family()) {
+            links.push(seg);
+        }
+    }
+
+    // The links are independent, so probe them together: the reply takes one
+    // probe's time, not one per interface.
+    let results: Vec<Value> = thread::scope(|scope| {
+        let running: Vec<_> = links
+            .iter()
+            .map(|&seg| scope.spawn(move || (seg, seg.probe())))
+            .collect();
+        running
+            .into_iter()
+            .map(|handle| {
+                let (seg, result) = handle.join().expect("probe thread panicked");
+                let (queries, err) = match result {
+                    Ok(n) => (Some(n), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+                json!({
+                    "interface": seg.interface(),
+                    "family": family_name(seg.family()),
+                    "queries": queries,
+                    "error": err,
+                })
+            })
+            .collect()
+    });
+    json!({ "ok": true, "probed": results })
 }
 
 fn device(seg: &Segment, d: &Device) -> Value {
@@ -297,11 +348,48 @@ mod tests {
     }
 
     #[test]
+    fn probes_each_interface_once_even_when_segments_share_it() {
+        let (a, b, c) = (
+            Segment::new("a", Family::V4),
+            Segment::new("b", Family::V4),
+            Segment::new("c", Family::V4),
+        );
+        let groups = [
+            Group { name: "x".into(), family: Family::V4, reflector: Reflector::new(vec![a.clone(), b.clone()]).unwrap() },
+            Group { name: "y".into(), family: Family::V4, reflector: Reflector::new(vec![a, c]).unwrap() },
+        ];
+        let interfaces = |request: &str| -> Vec<String> {
+            let reply: Value = serde_json::from_str(&handle(&groups, request)).unwrap();
+            assert_eq!(reply["ok"], true, "{reply}");
+            reply["probed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["interface"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(interfaces("probe"), ["a", "b", "c"]);
+        assert_eq!(interfaces("probe x"), ["a", "b"]);
+        assert_eq!(interfaces(r#"probe "y""#), ["a", "c"]);
+    }
+
+    #[test]
+    fn probe_reports_what_was_sent_per_interface() {
+        let (g, _segs) = group("media", Family::V4, &["a"]);
+        // No sender is attached in tests, so nothing is sent.
+        assert_eq!(
+            handle(&[g], "probe media"),
+            r#"{"ok":true,"probed":[{"interface":"a","family":"v4","queries":0,"error":null}]}"#
+        );
+    }
+
+    #[test]
     fn reports_errors() {
         let (g, _) = group("media", Family::V4, &["a", "b"]);
         let groups = [g];
         for (request, expect) in [
             ("devices nope", "no such segment: nope"),
+            ("probe nope", "no such segment: nope"),
             ("devices", "usage"),
             ("", "empty request"),
             ("frobnicate", "unknown command"),

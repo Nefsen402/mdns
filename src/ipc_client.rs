@@ -14,16 +14,21 @@ const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A probe takes the daemon about four seconds to run before it replies.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// (command, arguments, description): the whole IPC surface.
 const COMMANDS: &[(&str, &str, &str)] = &[
     ("segments", "", "list the configured segments"),
     ("devices", "<name>", "list the devices discovered in a segment"),
+    ("probe", "[<name>]", "actively query for devices (all segments, or one)"),
 ];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Segments,
     Devices(String),
+    Probe(Option<String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -105,13 +110,20 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
             }
             Command::Devices(segment)
         }
+        "probe" => {
+            let segment = rest.join(" ");
+            if segment.contains(['\n', '\r']) {
+                return Err(Failure::Usage("segment name contains a line break".into()));
+            }
+            Command::Probe((!segment.trim().is_empty()).then_some(segment))
+        }
         other => return Err(Failure::Usage(format!("unknown command {other:?}"))),
     };
     Ok(Parsed::Run(Options { socket, json, command }))
 }
 
 /// Send one request line and return the one-line reply.
-fn request(socket: &Path, line: &str) -> Result<String, Failure> {
+fn request(socket: &Path, line: &str, timeout: Duration) -> Result<String, Failure> {
     let connect_err = |e: std::io::Error| {
         Failure::Connect(format!(
             "cannot talk to {}: {e} (is the daemon running, and can you access the socket?)",
@@ -119,7 +131,7 @@ fn request(socket: &Path, line: &str) -> Result<String, Failure> {
         ))
     };
     let mut stream = UnixStream::connect(socket).map_err(connect_err)?;
-    stream.set_read_timeout(Some(TIMEOUT)).map_err(connect_err)?;
+    stream.set_read_timeout(Some(timeout)).map_err(connect_err)?;
     stream.set_write_timeout(Some(TIMEOUT)).map_err(connect_err)?;
     writeln!(stream, "{line}").map_err(connect_err)?;
 
@@ -133,11 +145,13 @@ fn request(socket: &Path, line: &str) -> Result<String, Failure> {
 
 /// Run a command and return the text to print.
 fn execute(opts: &Options) -> Result<String, Failure> {
-    let line = match &opts.command {
-        Command::Segments => "segments".to_string(),
-        Command::Devices(name) => format!("devices {name}"),
+    let (line, timeout) = match &opts.command {
+        Command::Segments => ("segments".to_string(), TIMEOUT),
+        Command::Devices(name) => (format!("devices {name}"), TIMEOUT),
+        Command::Probe(None) => ("probe".to_string(), PROBE_TIMEOUT),
+        Command::Probe(Some(name)) => (format!("probe {name}"), PROBE_TIMEOUT),
     };
-    let raw = request(&opts.socket, &line)?;
+    let raw = request(&opts.socket, &line, timeout)?;
     let reply: Value =
         serde_json::from_str(&raw).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
 
@@ -151,6 +165,7 @@ fn execute(opts: &Options) -> Result<String, Failure> {
     match opts.command {
         Command::Segments => render_segments(&reply),
         Command::Devices(_) => render_devices(&reply),
+        Command::Probe(_) => render_probe(&reply),
     }
 }
 
@@ -173,6 +188,25 @@ fn render_segments(reply: &Value) -> Result<String, Failure> {
         ]);
     }
     Ok(table(&rows))
+}
+
+fn render_probe(reply: &Value) -> Result<String, Failure> {
+    let list = reply["probed"].as_array().ok_or_else(bad_reply)?;
+    let mut rows = vec![vec!["INTERFACE".to_string(), "FAMILY".into(), "RESULT".into()]];
+    for link in list {
+        let result = match link["error"].as_str() {
+            Some(error) => format!("error: {error}"),
+            None => format!("{} queries sent", link["queries"]),
+        };
+        rows.push(vec![
+            link["interface"].as_str().ok_or_else(bad_reply)?.to_string(),
+            link["family"].as_str().ok_or_else(bad_reply)?.to_string(),
+            result,
+        ]);
+    }
+    let mut out = table(&rows);
+    out.push_str("\nList what answered with: mdnsctl devices <name>\n");
+    Ok(out)
 }
 
 fn render_devices(reply: &Value) -> Result<String, Failure> {
@@ -307,6 +341,9 @@ mod tests {
         assert_eq!(opts(&["--socket=/y.sock", "segments"]).socket, PathBuf::from("/y.sock"));
         // Options after the command belong to the command.
         assert_eq!(opts(&["devices", "--json"]).command, Command::Devices("--json".into()));
+        assert_eq!(opts(&["probe"]).command, Command::Probe(None));
+        assert_eq!(opts(&["probe", "  "]).command, Command::Probe(None));
+        assert_eq!(opts(&["probe", "IoT", "to", "br0"]).command, Command::Probe(Some("IoT to br0".into())));
         assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
         assert_eq!(parse(&["segments", "-h"]), Err(Failure::Usage("segments takes no arguments".into())));
     }
@@ -322,6 +359,7 @@ mod tests {
             &["--bogus", "segments"],
             &["-s"],
             &["devices", "a\nsegments"],
+            &["probe", "a\nsegments"],
         ] {
             assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
         }
@@ -371,6 +409,18 @@ mod tests {
         assert_eq!(render_devices(&empty).unwrap(), "IoT: no devices\n");
     }
 
+    #[test]
+    fn renders_probe_results() {
+        let reply: Value = serde_json::from_str(
+            r#"{"ok":true,"probed":[{"interface":"br0","family":"v4","queries":14,"error":null},{"interface":"wifi","family":"v6","queries":null,"error":"sending to ff02::fb: Network is unreachable"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_probe(&reply).unwrap(),
+            "INTERFACE  FAMILY  RESULT\nbr0        v4      14 queries sent\nwifi       v6      error: sending to ff02::fb: Network is unreachable\n\nList what answered with: mdnsctl devices <name>\n"
+        );
+    }
+
     /// A one-shot fake daemon: replies to one request, returns what it was asked.
     fn fake_daemon(tag: &str, reply: &'static str) -> (PathBuf, JoinHandle<String>) {
         // Unix socket paths are limited to ~108 bytes, so stay relative to
@@ -407,6 +457,19 @@ mod tests {
         assert_eq!(daemon.join().unwrap(), "devices IoT to br0\n");
         assert!(out.starts_with("IoT to br0: 2 devices"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn probe_asks_for_all_segments_or_one() {
+        const REPLY: &str = r#"{"ok":true,"probed":[{"interface":"br0","family":"v4","queries":3,"error":null}]}"#;
+        let (path, daemon) = fake_daemon("probe-all", REPLY);
+        let out = run(&path, false, Command::Probe(None)).unwrap();
+        assert_eq!(daemon.join().unwrap(), "probe\n");
+        assert!(out.contains("br0        v4      3 queries sent"), "{out}");
+
+        let (path, daemon) = fake_daemon("probe-one", REPLY);
+        run(&path, false, Command::Probe(Some("IoT to br0".into()))).unwrap();
+        assert_eq!(daemon.join().unwrap(), "probe IoT to br0\n");
     }
 
     #[test]

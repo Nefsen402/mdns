@@ -72,6 +72,20 @@ fn main() -> Result<()> {
         }
     }
 
+    // Look for devices right away instead of waiting for them to announce
+    // themselves. The probes run on their own threads, so startup is not held
+    // up; `mdnsctl probe` does the same on demand.
+    for link in links.values() {
+        let link = link.clone();
+        thread::spawn(move || {
+            let name = format!("{}/{:?}", link.interface(), link.family());
+            match link.probe() {
+                Ok(queries) => eprintln!("{name}: startup probe sent {queries} queries"),
+                Err(e) => eprintln!("{name}: startup probe failed: {e:#}"),
+            }
+        });
+    }
+
     let segments = Arc::new(segments);
     ipc::serve(&config.socket, &segments)?;
 

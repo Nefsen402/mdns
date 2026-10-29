@@ -41,6 +41,23 @@ not.
 The name needs no quoting, even if it contains spaces:
 .B mdnsctl devices IoT to br0
 works.
+.TP
+\fBprobe\fR [\fIname\fR]
+Actively look for devices instead of waiting for them to announce themselves:
+ask the interfaces of the segment called
+.I name
+(of every segment if no name is given) which service types exist, browse each
+type for instances, and resolve every instance that has not yet said where it
+is.
+This takes three rounds of queries over about four seconds, and the command
+returns once the answers have been processed.
+It prints how many queries were sent on each interface; use
+.B devices
+to see what answered.
+.IP
+The daemon already does this once at startup.
+Run it again to pick up devices that were switched on later or that rarely
+announce.
 .SH OPTIONS
 .TP
 \fB\-s\fR, \fB\-\-socket\fR \fIPATH\fR
@@ -85,17 +102,30 @@ IoT to br0: 2 devices
 .RE
 .fi
 .PP
+and
+.B probe
+prints what it sent where:
+.PP
+.nf
+.RS
+INTERFACE  FAMILY  RESULT
+br0        v4      14 queries sent
+wifi       v4      9 queries sent
+.RE
+.fi
+.PP
 With
 .BR \-\-json ,
 every reply is an object with an
 .B ok
 field.
 Successful replies carry
-.B segments
-or
+.BR segments ,
 .B name
 and
-.BR devices ;
+.BR devices ,
+or
+.BR probed ;
 failures are
 .BR {"ok":false,"error":"..."} .
 .B hostname
@@ -129,6 +159,15 @@ List the segments, then the devices of one:
 .RS
 .nf
 $ mdnsctl segments
+$ mdnsctl devices IoT
+.fi
+.RE
+.PP
+Look for devices on the IoT segment, then list what was found:
+.PP
+.RS
+.nf
+$ mdnsctl probe IoT
 $ mdnsctl devices IoT
 .fi
 .RE

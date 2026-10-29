@@ -10,12 +10,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::os::fd::AsRawFd;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 
-use crate::parser::{self, rtype, Header, Message, RData, Record};
+use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
 
 pub const MDNS_PORT: u16 = 5353;
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
@@ -34,6 +35,25 @@ const OTHER_TTL: u32 = 4500;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises.
 const REANNOUNCE: Duration = Duration::from_secs(HOST_TTL as u64 * 4 / 5);
+
+/// DNS-SD service type enumeration (RFC 6763 section 9).
+const META_QUERY: &str = "_services._dns-sd._udp.local";
+
+/// Pause after each round of a probe. A probe is three rounds, because the
+/// answers to one round (service types, then instances) decide what the next
+/// one asks; the last pause lets the final answers arrive before returning.
+const PROBE_GAPS: [Duration; 3] = if cfg!(test) {
+    [Duration::from_millis(5); 3]
+} else {
+    [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(1)]
+};
+
+/// Questions per query packet, to stay well inside one Ethernet frame.
+const QUESTIONS_PER_PACKET: usize = 16;
+
+/// Service types remembered per segment, so a hostile device cannot grow it
+/// without bound by announcing endless made-up types.
+const MAX_TYPES: usize = 256;
 
 /// A record may not be multicast more than once a second (RFC 6762 section 6).
 const MIN_MULTICAST_GAP: Duration = Duration::from_secs(1);
@@ -222,6 +242,9 @@ struct State {
     manual: HashMap<IpAddr, Manual>,
     subscribers: Vec<Sender<Event>>,
     outbound: Option<Outbound>,
+    /// Service types devices on this segment have said they offer, learned
+    /// from answers to the type enumeration query.
+    types: BTreeSet<String>,
 }
 
 impl State {
@@ -487,6 +510,18 @@ impl Segment {
             }
         }
 
+        for rec in msg.into_iter().flat_map(|m| m.records()) {
+            if let RData::Ptr(kind) = &rec.data {
+                if rec.ttl > 0
+                    && rec.name.eq_ignore_ascii_case(META_QUERY)
+                    && is_service_type(kind)
+                    && state.types.len() < MAX_TYPES
+                {
+                    state.types.insert(kind.clone());
+                }
+            }
+        }
+
         let before = state.discovered.get(&src).map(|e| e.device(src));
         let entry = state.discovered.entry(src).or_insert_with(|| Entry {
             expires: now,
@@ -512,6 +547,67 @@ impl Segment {
             Some(before) if before != after => state.notify(Event::Updated(after)),
             Some(_) => {}
         }
+    }
+
+    /// Actively look for devices: ask what service types exist, browse each
+    /// type for instances, and resolve every instance that has not yet said
+    /// where it is (target and port). Three rounds, a few seconds in all,
+    /// because each round's answers decide the next one's questions. Blocks
+    /// until done and returns how many questions were sent; answers are
+    /// processed by the receive loop as they arrive.
+    pub fn probe(&self) -> Result<usize> {
+        self.probe_with(&PROBE_GAPS)
+    }
+
+    fn probe_with(&self, gaps: &[Duration]) -> Result<usize> {
+        let mut sent = 0;
+        for gap in gaps {
+            sent += self.probe_round()?;
+            thread::sleep(*gap);
+        }
+        Ok(sent)
+    }
+
+    /// One round of queries, built from what is known right now. A no-op
+    /// when the segment has no sender attached.
+    fn probe_round(&self) -> Result<usize> {
+        let state = self.state.lock().unwrap();
+        if state.outbound.is_none() {
+            return Ok(0);
+        }
+
+        let mut questions: Vec<Question> = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut ask = |name: &str, qtype: u16| {
+            if !seen.insert((name.to_ascii_lowercase(), qtype)) {
+                return;
+            }
+            let q = Question { name: name.into(), qtype, class: 1, unicast_response: false };
+            // Names come off the network; one that cannot be re-encoded
+            // (lossy UTF-8 can stretch a label past 63 bytes) is skipped
+            // rather than failing the whole round.
+            if query(std::slice::from_ref(&q)).encode().is_ok() {
+                questions.push(q);
+            }
+        };
+
+        ask(META_QUERY, rtype::PTR);
+
+        let mut kinds: BTreeSet<&str> = state.types.iter().map(String::as_str).collect();
+        let services = || state.discovered.values().flat_map(|e| e.services.values());
+        kinds.extend(services().map(|s| s.kind.as_str()).filter(|k| !k.is_empty()));
+        for kind in kinds {
+            ask(kind, rtype::PTR);
+        }
+        for svc in services().filter(|s| s.target.is_none()) {
+            ask(&svc.instance, rtype::SRV);
+            ask(&svc.instance, rtype::TXT);
+        }
+
+        for chunk in questions.chunks(QUESTIONS_PER_PACKET) {
+            transmit(&state.outbound, &query(chunk), None)?;
+        }
+        Ok(questions.len())
     }
 
     /// Drop devices whose lifetime has run out as of `now`.
@@ -723,6 +819,29 @@ fn answers_for(query: &Message, device: &Device) -> (Vec<Record>, Vec<Record>) {
         }
     }
     (answers, extra)
+}
+
+/// A multicast query for `questions` (no known answers, so every device
+/// that has a match replies).
+fn query(questions: &[Question]) -> Message {
+    Message {
+        header: Header {
+            id: 0,
+            response: false,
+            opcode: 0,
+            authoritative: false,
+            truncated: false,
+            rcode: 0,
+        },
+        questions: questions.to_vec(),
+        answers: Vec::new(),
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+    }
+}
+
+fn is_service_type(name: &str) -> bool {
+    name.ends_with("._tcp.local") || name.ends_with("._udp.local")
 }
 
 fn send(outbound: &Option<Outbound>, records: &[Record]) -> Result<()> {
@@ -1091,6 +1210,127 @@ mod tests {
 
         seg.reannounce(later).unwrap();
         assert!(recv(&rx).is_none());
+    }
+
+    /// Make `seg` hear a response carrying `records` from `from`.
+    fn hear(seg: &Segment, from: &str, records: Vec<Record>) {
+        let msg = Message {
+            header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+            questions: vec![],
+            answers: records,
+            authorities: vec![],
+            additionals: vec![],
+        };
+        seg.handle(sa(from), &msg.encode().unwrap()).unwrap();
+    }
+
+    /// What the questions of one received query ask, as (name, type).
+    fn asked(m: &Message) -> BTreeSet<(String, u16)> {
+        assert!(!m.header.response);
+        assert!(m.questions.iter().all(|q| q.class == 1 && !q.unicast_response));
+        m.questions.iter().map(|q| (q.name.clone(), q.qtype)).collect()
+    }
+
+    fn q(name: &str, qtype: u16) -> (String, u16) {
+        (name.to_string(), qtype)
+    }
+
+    #[test]
+    fn probe_browses_then_resolves() {
+        let (seg, rx) = wired();
+
+        // Nothing known yet: just ask what types exist.
+        assert_eq!(seg.probe_round().unwrap(), 1);
+        assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([q(META_QUERY, rtype::PTR)]));
+
+        // A device names a type, and an instance of it with no location yet.
+        hear(&seg, "10.0.2.73", vec![
+            record(META_QUERY.into(), false, 4500, RData::Ptr("_airplay._tcp.local".into())),
+            record("_airplay._tcp.local".into(), false, 4500, RData::Ptr("Speaker._airplay._tcp.local".into())),
+        ]);
+        seg.probe_round().unwrap();
+        assert_eq!(
+            asked(&recv(&rx).unwrap()),
+            BTreeSet::from([
+                q(META_QUERY, rtype::PTR),
+                q("_airplay._tcp.local", rtype::PTR),
+                q("Speaker._airplay._tcp.local", rtype::SRV),
+                q("Speaker._airplay._tcp.local", rtype::TXT),
+            ])
+        );
+
+        // Once the instance says where it is, it is no longer asked about.
+        hear(&seg, "10.0.2.73", vec![record(
+            "Speaker._airplay._tcp.local".into(),
+            true,
+            120,
+            RData::Srv { priority: 0, weight: 0, port: 7000, target: "speaker.local".into() },
+        )]);
+        seg.probe_round().unwrap();
+        assert_eq!(
+            asked(&recv(&rx).unwrap()),
+            BTreeSet::from([q(META_QUERY, rtype::PTR), q("_airplay._tcp.local", rtype::PTR)])
+        );
+        // ...and that is what makes it reflectable.
+        assert_eq!(seg.devices()[0].hostname.as_deref(), Some("speaker.local"));
+    }
+
+    #[test]
+    fn probe_runs_every_round_and_counts_questions() {
+        let (seg, rx) = wired();
+        assert_eq!(seg.probe().unwrap(), 3);
+        assert_eq!(drain_queries(&rx), 3);
+    }
+
+    fn drain_queries(rx: &UdpSocket) -> usize {
+        std::iter::from_fn(|| recv(rx)).count()
+    }
+
+    #[test]
+    fn probe_splits_big_rounds_into_several_packets() {
+        let (seg, rx) = wired();
+        let ptrs = (0..40)
+            .map(|i| record(META_QUERY.into(), false, 4500, RData::Ptr(format!("_t{i}._tcp.local"))))
+            .collect();
+        hear(&seg, "10.0.2.73", ptrs);
+        assert_eq!(seg.probe_round().unwrap(), 41);
+        let packets: Vec<_> = std::iter::from_fn(|| recv(&rx)).collect();
+        assert_eq!(packets.len(), 3);
+        assert!(packets.iter().all(|p| p.questions.len() <= QUESTIONS_PER_PACKET));
+    }
+
+    #[test]
+    fn probe_skips_names_it_cannot_encode() {
+        let (seg, rx) = wired();
+        // An instance whose label is 60 invalid UTF-8 bytes: decoding turns
+        // each into U+FFFD, so the name no longer fits in a 63-byte label.
+        let mut p = response(1);
+        let mut instance = vec![60];
+        instance.extend([0xff; 60]);
+        instance.extend(labels(&["_x", "_tcp", "local"]));
+        rr(&mut p, &["_x", "_tcp", "local"], 12, 4500, &instance);
+        seg.handle(sa("10.0.2.73"), &p).unwrap();
+
+        assert!(seg.probe_round().is_ok());
+        let asked = asked(&recv(&rx).unwrap());
+        assert!(asked.contains(&q("_x._tcp.local", rtype::PTR)));
+        assert_eq!(asked.len(), 2, "the unencodable instance is skipped: {asked:?}");
+    }
+
+    #[test]
+    fn probe_without_a_sender_does_nothing() {
+        let seg = Segment::new("test", Family::V4);
+        assert_eq!(seg.probe().unwrap(), 0);
+    }
+
+    #[test]
+    fn learned_types_are_capped() {
+        let seg = Segment::new("test", Family::V4);
+        let ptrs = (0..MAX_TYPES + 50)
+            .map(|i| record(META_QUERY.into(), false, 4500, RData::Ptr(format!("_t{i}._tcp.local"))))
+            .collect();
+        hear(&seg, "10.0.2.73", ptrs);
+        assert_eq!(seg.state.lock().unwrap().types.len(), MAX_TYPES);
     }
 
     #[test]

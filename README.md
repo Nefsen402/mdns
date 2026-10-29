@@ -7,6 +7,8 @@ per-pair control over which networks can see each other's devices.
 - **Reflects** devices between the interfaces you choose, and only those. With
   `br0 <-> media` and `br0 <-> wifi`, `media` and `wifi` never learn about each
   other, even though both talk to `br0`.
+- **Probes** for devices actively (at startup and on demand) instead of only
+  waiting for them to announce themselves.
 - **Answers** mDNS queries for reflected devices and withdraws them (with proper
   goodbye packets) when the source device disappears or the daemon stops.
 - **Exposes** what it knows over a local control socket, queried with `mdnsctl`.
@@ -165,6 +167,12 @@ pair of them**. Think of each segment as "these networks may see each other".
 
 ### What gets reflected
 
+Devices are found by listening, and by probing: at startup, and whenever you
+run `mdnsctl probe`, the daemon browses every interface for service types and
+instances and resolves each instance's hostname and port. Many devices answer
+only when asked, and a device needs a hostname to be reflected, so without
+probing they would stay invisible.
+
 - Only devices that announced **a hostname and at least one service** are
   reflected. Chatty clients that merely send queries (phones, laptops) are
   tracked but not reflected.
@@ -195,6 +203,7 @@ usage: mdnsctl [-s PATH] [--json] <command>
 commands:
   segments          list the configured segments
   devices <name>    list the devices discovered in a segment
+  probe [<name>]    actively query for devices (all segments, or one)
 
 options:
   -s, --socket PATH  control socket (default /run/mdnsd/mdnsd.sock)
@@ -239,6 +248,27 @@ IoT: no devices
 A hostname of `-` means the device has been heard but has not announced a
 name yet.
 
+### `mdnsctl probe [<name>]`
+
+Actively looks for devices on the interfaces of the named segment, or of every
+segment if no name is given. It asks which service types exist, browses each
+type for instances, and resolves instances that have not yet said where they
+are, in three rounds over about four seconds. It replies once the answers have
+been processed, with the number of queries sent on each interface:
+
+```
+$ mdnsctl probe IoT
+INTERFACE  FAMILY  RESULT
+wifi       v4      9 queries sent
+wifi       v6      9 queries sent
+
+List what answered with: mdnsctl devices <name>
+```
+
+The daemon already probes every interface once at startup; run this again to
+pick up devices that were switched on later or that rarely announce. Probes are
+not repeated on a timer.
+
 ### Exit status
 
 | Code | Meaning                                                              |
@@ -267,6 +297,7 @@ printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
 |-------------------|------------------------------------------------------------------------|
 | `segments`        | `{"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}` |
 | `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4","addr":"10.0.1.7","hostname":"tv.local","services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
+| `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":9,"error":null}]}` (replies after about 4 seconds) |
 | anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
 
 `hostname` and `target` are `null` when unknown. Requests over 4 KiB are

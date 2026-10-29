@@ -35,6 +35,21 @@ Its hostname and its DNS-SD services are taken from the records it announces.
 A device expires after it has been silent for at least five minutes, or for the
 TTL of its records if that is longer.
 A goodbye packet (TTL 0) removes it immediately.
+.SS Probing
+Devices announce themselves rarely, and some only answer when asked, so waiting
+is not enough.
+The daemon therefore also asks.
+A probe is three rounds of multicast queries, a few seconds in all: the first
+asks which service types exist; the next browses every type learned so far for
+instances; and instances that have not yet said where they are (their target
+and port) are resolved by asking for their service and text records.
+A device needs a hostname and a service to be reflected, and the resolve step is
+what supplies the hostname for devices that only answer browse queries.
+.PP
+A probe runs on every interface once at startup, and again whenever
+.B mdnsctl probe
+is run.
+Probes are not repeated on a timer.
 .SS Reflection
 Within a segment, every interface announces the devices discovered on every
 other interface of that segment.
