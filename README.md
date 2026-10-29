@@ -257,16 +257,17 @@ IoT to br0   br0, wifi   v4, v6
 ### `mdnsctl devices <name>`
 
 Lists the devices **discovered on the segment's own interfaces** (both
-families). By default each device is one line: its DNS name and its pretty name
-(the name of its services, such as `OZAL Speakers`). The IPv4 and IPv6 entries
-of one device are merged, and devices that have not announced a name yet have no
-DNS name to show, so they are only counted. Reflected copies from other segments
-are not included.
+families). By default each device is one line: its DNS name, its pretty name
+(the name of its services, such as `OZAL Speakers`) and, last, all of its
+addresses, IPv4 first. The IPv4 and IPv6 entries of one device are merged into
+one line, and devices that have not announced a name yet have no DNS name to
+show, so they are only counted. Reflected copies from other segments are not
+included.
 
 ```
 $ mdnsctl devices IoT to br0
 IoT to br0: 1 device
-  printer.local  Printer
+  printer.local  Printer  10.0.0.10
 
 (1 device without a name not shown; use -v to list everything)
 ```

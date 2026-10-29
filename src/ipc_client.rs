@@ -213,47 +213,73 @@ fn render_probe(reply: &Value) -> Result<String, Failure> {
     Ok(out)
 }
 
-/// One line per named device: its DNS name and its pretty name (the service
-/// instance name, such as "OZAL Speakers"). The IPv4 and IPv6 entries of a
-/// device are merged. Devices that have not announced a hostname have no DNS
-/// name to show, so they are only counted.
+/// One line per named device: its DNS name, its pretty name (the service
+/// instance name, such as "OZAL Speakers") and, last, all of its addresses,
+/// IPv4 before IPv6. The IPv4 and IPv6 entries of a device are merged. Devices
+/// that have not announced a hostname have no DNS name to show, so they are
+/// only counted.
 fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
+    struct Named {
+        host: String,
+        pretty: Vec<String>,
+        /// (is IPv6, address): sorting on this puts IPv4 first.
+        addrs: Vec<(bool, String)>,
+    }
+
     let name = reply["name"].as_str().ok_or_else(bad_reply)?;
     let devices = reply["devices"].as_array().ok_or_else(bad_reply)?;
     if devices.is_empty() {
         return Ok(format!("{name}: no devices\n"));
     }
 
-    let mut named: Vec<(String, Vec<String>)> = Vec::new();
+    let mut named: Vec<Named> = Vec::new();
     let mut unnamed = 0;
     for device in devices {
         let Some(host) = device["hostname"].as_str() else {
             unnamed += 1;
             continue;
         };
-        let pretty = pretty_names(device);
-        match named.iter_mut().find(|(h, _)| h.eq_ignore_ascii_case(host)) {
-            Some((_, names)) => {
-                for p in pretty {
-                    if !names.contains(&p) {
-                        names.push(p);
-                    }
-                }
+        let entry = match named.iter().position(|n| n.host.eq_ignore_ascii_case(host)) {
+            Some(i) => &mut named[i],
+            None => {
+                named.push(Named { host: host.to_string(), pretty: vec![], addrs: vec![] });
+                named.last_mut().unwrap()
             }
-            None => named.push((host.to_string(), pretty)),
+        };
+        let addr = (
+            device["family"].as_str() == Some("v6"),
+            device["addr"].as_str().ok_or_else(bad_reply)?.to_string(),
+        );
+        if !entry.addrs.contains(&addr) {
+            entry.addrs.push(addr);
+        }
+        for p in pretty_names(device) {
+            if !entry.pretty.contains(&p) {
+                entry.pretty.push(p);
+            }
         }
     }
-    named.sort_by_key(|(host, _)| host.to_ascii_lowercase());
+    named.sort_by_key(|n| n.host.to_ascii_lowercase());
 
-    let mut out = match named.len() {
+    let rows: Vec<[String; 3]> = named
+        .iter_mut()
+        .map(|n| {
+            n.addrs.sort_by_key(|(v6, _)| *v6);
+            let pretty = if n.pretty.is_empty() { "-".to_string() } else { n.pretty.join(", ") };
+            let addrs: Vec<&str> = n.addrs.iter().map(|(_, a)| a.as_str()).collect();
+            [n.host.clone(), pretty, addrs.join(", ")]
+        })
+        .collect();
+
+    let mut out = match rows.len() {
         0 => format!("{name}: no named devices\n"),
         1 => format!("{name}: 1 device\n"),
         n => format!("{name}: {n} devices\n"),
     };
-    let width = named.iter().map(|(host, _)| host.len()).max().unwrap_or(0);
-    for (host, names) in &named {
-        let pretty = if names.is_empty() { "-".to_string() } else { names.join(", ") };
-        out.push_str(&format!("  {host:<width$}  {pretty}\n"));
+    let width = |col: usize| rows.iter().map(|r| r[col].len()).max().unwrap_or(0);
+    let (w0, w1) = (width(0), width(1));
+    for [host, pretty, addrs] in &rows {
+        out.push_str(&format!("  {host:<w0$}  {pretty:<w1$}  {addrs}\n"));
     }
     if unnamed > 0 {
         let s = if unnamed == 1 { "" } else { "s" };
@@ -513,7 +539,7 @@ mod tests {
         let reply: Value = serde_json::from_str(DEVICES).unwrap();
         assert_eq!(
             render_devices_brief(&reply).unwrap(),
-            "IoT to br0: 1 device\n  printer.local  Printer\n\n(1 device without a name not shown; use -v to list everything)\n"
+            "IoT to br0: 1 device\n  printer.local  Printer  10.0.0.10\n\n(1 device without a name not shown; use -v to list everything)\n"
         );
     }
 
@@ -541,7 +567,26 @@ mod tests {
         );
         assert_eq!(
             brief(&json),
-            "media: 2 devices\n  OZAL-Speakers.local  OZAL Speakers\n  tv.local             Living Room. TV\n"
+            "media: 2 devices\n  OZAL-Speakers.local  OZAL Speakers    10.0.2.73, fe80::1\n  tv.local             Living Room. TV  10.0.2.9\n"
+        );
+    }
+
+    #[test]
+    fn brief_listing_shows_every_address_ipv4_first_without_duplicates() {
+        let entry = |host: &str, family: &str, addr: &str| {
+            format!(r#"{{"interface":"a","family":"{family}","addr":"{addr}","hostname":"{host}","services":[]}}"#)
+        };
+        let json = format!(
+            r#"{{"ok":true,"name":"x","devices":[{},{},{},{},{}]}}"#,
+            entry("dual.local", "v6", "fe80::1"),
+            entry("dual.local", "v4", "10.0.0.5"),
+            entry("dual.local", "v4", "10.0.1.5"),
+            entry("v6only.local", "v6", "fe80::2"),
+            entry("v6only.local", "v6", "fe80::2"),
+        );
+        assert_eq!(
+            brief(&json),
+            "x: 2 devices\n  dual.local    -  10.0.0.5, 10.0.1.5, fe80::1\n  v6only.local  -  fe80::2\n"
         );
     }
 
@@ -553,7 +598,10 @@ mod tests {
                 {"instance":"Kitchen._a._tcp.local","type":"_a._tcp.local","port":1,"target":null,"txt":[]},
                 {"instance":"Hall._b._tcp.local","type":"_b._tcp.local","port":2,"target":null,"txt":[]}]},
             {"interface":"a","family":"v4","addr":"1.1.1.2","hostname":"A.local","services":[]}]}"#;
-        assert_eq!(brief(json), "x: 2 devices\n  A.local  -\n  b.local  Kitchen, Hall\n");
+        assert_eq!(
+            brief(json),
+            "x: 2 devices\n  A.local  -              1.1.1.2\n  b.local  Kitchen, Hall  1.1.1.1\n"
+        );
 
         // Only unnamed devices, none at all.
         let only_unnamed = r#"{"ok":true,"name":"x","devices":[
