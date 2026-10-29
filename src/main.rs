@@ -89,11 +89,14 @@ fn main() -> Result<()> {
     // from the other networks. The probes run on their own threads, so startup
     // is not held up; `mdnsctl probe` does the same on demand.
     eprintln!("keeping a device for at least {}s after it was last heard from", config.min_lifetime.as_secs());
-    eprintln!(
-        "announcing reflected devices with a TTL of {}s, again every {}s",
-        config.reflect_ttl.as_secs(),
-        config.reflect_ttl.as_secs() * 4 / 5
-    );
+    match config.reflect_ttl {
+        Some(ttl) => eprintln!(
+            "announcing reflected devices with a TTL of {}s, again every {}s",
+            ttl.as_secs(),
+            ttl.as_secs() * 4 / 5
+        ),
+        None => eprintln!("announcing reflected devices with the TTL they announced themselves with"),
+    }
     match config.refresh_before {
         Some(before) => {
             eprintln!("asking devices to answer again {}s before they would expire", before.as_secs());
@@ -201,7 +204,7 @@ fn start_link(
     advertise: Option<(&str, Duration)>,
     refresh_before: Option<Duration>,
     min_lifetime: Duration,
-    reflect_ttl: Duration,
+    reflect_ttl: Option<Duration>,
     timer: &Timer,
 ) -> Result<Segment> {
     let sock = socket::open(interface, family)
@@ -220,7 +223,7 @@ fn start_link(
         let router = sock.local_addr().and_then(|addr| {
             let (link_local, routable) =
                 if socket::is_link_local(&addr) { (Some(addr), None) } else { (None, Some(addr)) };
-            let device = Device { hostname: Some(name.to_string()), link_local, routable, services: Vec::new() };
+            let device = Device { hostname: Some(name.to_string()), link_local, routable, ..Device::default() };
             link.add_manual_ttl(device, ttl).map(|_| addr)
         });
         match router {

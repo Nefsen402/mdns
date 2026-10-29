@@ -35,10 +35,10 @@ const IPV6_MULTICAST_ALL: libc::c_int = 29;
 const HOST_TTL: u32 = 120;
 const OTHER_TTL: u32 = 4500;
 
-/// How long the address records of a reflected device are valid, unless
-/// [`Segment::set_reflect_ttl`] says otherwise. Two minutes is the usual for
-/// host names.
-pub const DEFAULT_REFLECT_TTL: Duration = Duration::from_secs(HOST_TTL as u64);
+/// A reflected device is never announced for less than this, however short a
+/// TTL it announced itself with: it is announced again at 80% of its TTL, and
+/// a few seconds would be a flood.
+const MIN_REFLECT_TTL: u32 = 10;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises.
 fn reannounce_after(host_ttl: u32) -> Duration {
@@ -213,6 +213,9 @@ pub struct Service {
     pub target: Option<String>,
     /// TXT strings, usually `key=value`.
     pub txt: Vec<String>,
+    /// The TTL its records were last announced with, in seconds: that of the
+    /// SRV record, or else of the PTR or TXT; 0 if not known.
+    pub ttl: u32,
 }
 
 /// A device on a segment. Once it has announced a hostname it is known by
@@ -221,12 +224,15 @@ pub struct Service {
 /// It has up to two addresses, of the segment's family: a link-local one,
 /// which only means something on the link it was heard on, and a routable one
 /// that other networks can reach it at (IPv4, or global/ULA IPv6).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Device {
     pub hostname: Option<String>,
     pub link_local: Option<IpAddr>,
     pub routable: Option<IpAddr>,
     pub services: Vec<Service>,
+    /// The TTL its address records were last announced with, in seconds;
+    /// `None` if it has not announced any (it was only heard from).
+    pub ttl: Option<u32>,
 }
 
 impl Device {
@@ -282,6 +288,8 @@ struct Entry {
     expires: Instant,
     /// When it was last asked to answer again because it was about to expire.
     refreshed: Option<Instant>,
+    /// The TTL its address records were last announced with.
+    addr_ttl: Option<u32>,
     hostname: Option<String>,
     link_local: Option<IpAddr>,
     routable: Option<IpAddr>,
@@ -293,6 +301,7 @@ impl Entry {
         Entry {
             expires: now,
             refreshed: None,
+            addr_ttl: None,
             hostname: None,
             link_local: None,
             routable: None,
@@ -311,6 +320,7 @@ impl Entry {
             link_local: self.link_local,
             routable: self.routable,
             services: self.services.values().cloned().collect(),
+            ttl: self.addr_ttl,
         }
     }
 
@@ -358,9 +368,16 @@ struct Manual {
 }
 
 impl Manual {
+    /// The shortest TTL anything of it is announced with: it has to be
+    /// announced again before that runs out.
+    fn shortest_ttl(&self) -> u32 {
+        let services = self.device.services.iter().map(|svc| service_ttl(svc, self.other_ttl));
+        services.chain([self.host_ttl]).min().unwrap_or(self.host_ttl)
+    }
+
     /// When it is next due for re-announcing.
     fn reannounce_at(&self) -> Instant {
-        let at = self.announced.checked_add(reannounce_after(self.host_ttl)).unwrap_or(self.announced);
+        let at = self.announced.checked_add(reannounce_after(self.shortest_ttl())).unwrap_or(self.announced);
         self.retry.map_or(at, |retry| at.max(retry))
     }
 }
@@ -396,9 +413,9 @@ struct State {
     types: BTreeSet<String>,
     /// The least a device is kept after it was last heard from.
     min_lifetime: Duration,
-    /// The TTL of the address records of the devices [`Segment::add_manual`]
-    /// announces, in seconds.
-    reflect_ttl: u32,
+    /// The TTL, in seconds, of the address records of the devices
+    /// [`Segment::add_manual`] announces; `None` follows each device's own.
+    reflect_ttl: Option<u32>,
     wake: Option<Wake>,
 }
 
@@ -489,7 +506,6 @@ impl Segment {
             family,
             state: Arc::new(Mutex::new(State {
                 min_lifetime: DEFAULT_MIN_LIFETIME,
-                reflect_ttl: HOST_TTL,
                 ..State::default()
             })),
         }
@@ -504,13 +520,15 @@ impl Segment {
         self.state.lock().unwrap().min_lifetime = min_lifetime;
     }
 
-    /// The TTL, to the second (at least one), of the address records of the
-    /// devices [`add_manual`](Segment::add_manual) announces from now on: how
-    /// long others keep them, and so, at 80% of it, how often they are
-    /// announced again. The default is [`DEFAULT_REFLECT_TTL`]. The records of
-    /// their services keep their own, longer TTL.
-    pub fn set_reflect_ttl(&self, ttl: Duration) {
-        let secs = u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX).max(1);
+    /// The TTL, to the second, of the address records of the devices
+    /// [`add_manual`](Segment::add_manual) announces from now on: how long
+    /// others keep them, and so, at 80% of it, how often they are announced
+    /// again. `None`, the default, announces each device with the TTL it
+    /// announced itself with (at least ten seconds, and two minutes if it did
+    /// not say). The records of a device's services keep their own TTL either
+    /// way.
+    pub fn set_reflect_ttl(&self, ttl: Option<Duration>) {
+        let secs = ttl.map(|t| u32::try_from(t.as_secs()).unwrap_or(u32::MAX).max(MIN_REFLECT_TTL));
         self.state.lock().unwrap().reflect_ttl = secs;
     }
 
@@ -645,14 +663,17 @@ impl Segment {
     /// present. Replacing a device also sends goodbyes for services and
     /// addresses it no longer has. If sending fails nothing is recorded.
     pub fn add_manual(&self, device: Device) -> Result<bool> {
-        let ttl = self.state.lock().unwrap().reflect_ttl;
+        let ttl = {
+            let state = self.state.lock().unwrap();
+            state.reflect_ttl.or(device.ttl.map(|t| t.max(MIN_REFLECT_TTL))).unwrap_or(HOST_TTL)
+        };
         self.add_manual_ttl(device, Duration::from_secs(ttl.into()))
     }
 
     /// Like [`add_manual`](Segment::add_manual), with the address records
-    /// announced for `host_ttl` (whole seconds, at least one) instead of the
-    /// segment's [reflect TTL](Segment::set_reflect_ttl), and re-announced at
-    /// 80% of it.
+    /// announced for `host_ttl` (whole seconds, at least one) whatever the
+    /// device or the segment's [reflect TTL](Segment::set_reflect_ttl) say,
+    /// and re-announced at 80% of it.
     pub fn add_manual_ttl(&self, device: Device, host_ttl: Duration) -> Result<bool> {
         let host_ttl = u32::try_from(host_ttl.as_secs()).unwrap_or(u32::MAX);
         if host_ttl == 0 {
@@ -928,6 +949,7 @@ impl Segment {
             entry.expires = entry.expires.max(now + ttl.max(floor));
             entry.hostname = Some(g.host.clone());
             entry.set_addrs(&addrs, src);
+            entry.addr_ttl = g.addr_ttl.or(entry.addr_ttl);
             merge_records(entry, g.records.iter().copied());
 
             for addr in addrs {
@@ -1116,13 +1138,15 @@ struct Group<'a> {
     addrs: Vec<IpAddr>,
     records: Vec<&'a Record>,
     max_ttl: u32,
+    /// The TTL its address records announced, if it has any of this family.
+    addr_ttl: Option<u32>,
 }
 
 fn group_index(groups: &mut Vec<Group<'_>>, host: &str) -> usize {
     if let Some(i) = groups.iter().position(|g| g.host.eq_ignore_ascii_case(host)) {
         return i;
     }
-    groups.push(Group { host: host.to_string(), addrs: Vec::new(), records: Vec::new(), max_ttl: 0 });
+    groups.push(Group { host: host.to_string(), addrs: Vec::new(), records: Vec::new(), max_ttl: 0, addr_ttl: None });
     groups.len() - 1
 }
 
@@ -1170,6 +1194,12 @@ fn partition<'a>(msg: &'a Message, family: Family) -> (Vec<Group<'a>>, Vec<&'a R
 
     for g in &mut groups {
         g.addrs = announced_addrs(msg, &g.host, family);
+        g.addr_ttl = msg
+            .records()
+            .filter(|r| r.name.eq_ignore_ascii_case(&g.host))
+            .filter(|r| addr_of(&r.data).is_some_and(|a| g.addrs.contains(&a)))
+            .map(|r| r.ttl)
+            .max();
     }
     (groups, rest)
 }
@@ -1233,7 +1263,12 @@ fn merge_records<'a>(entry: &mut Entry, records: impl Iterator<Item = &'a Record
                 if rec.ttl == 0 {
                     entry.services.remove(instance);
                 } else {
-                    service(entry, instance).kind = rec.name.clone();
+                    let svc = service(entry, instance);
+                    svc.kind = rec.name.clone();
+                    // The SRV record's TTL is the one that counts, if known.
+                    if svc.ttl == 0 {
+                        svc.ttl = rec.ttl;
+                    }
                 }
             }
             RData::Srv { port, target, .. } => {
@@ -1243,15 +1278,20 @@ fn merge_records<'a>(entry: &mut Entry, records: impl Iterator<Item = &'a Record
                     let svc = service(entry, &rec.name);
                     svc.port = *port;
                     svc.target = Some(target.clone());
+                    svc.ttl = rec.ttl;
                 }
             }
             RData::Txt(strings) => {
                 if rec.ttl != 0 {
-                    service(entry, &rec.name).txt = strings
+                    let svc = service(entry, &rec.name);
+                    svc.txt = strings
                         .iter()
                         .filter(|s| !s.is_empty())
                         .map(|s| String::from_utf8_lossy(s).into_owned())
                         .collect();
+                    if svc.ttl == 0 {
+                        svc.ttl = rec.ttl;
+                    }
                 }
             }
             _ => {}
@@ -1284,7 +1324,7 @@ fn announcement(device: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
         .collect();
 
     for svc in &device.services {
-        records.extend(service_records(device, svc, other_ttl));
+        records.extend(service_records(device, svc, service_ttl(svc, other_ttl)));
     }
     // DNS-SD service type enumeration, once per distinct type.
     let kinds: BTreeSet<_> = device.services.iter().map(|s| &s.kind).collect();
@@ -1297,6 +1337,17 @@ fn announcement(device: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
         ));
     }
     records
+}
+
+/// The TTL to announce `svc` with: the one it announced itself with (at least
+/// [`MIN_REFLECT_TTL`]) or, if that is not known, `other_ttl`. Zero stays zero:
+/// that is a goodbye.
+fn service_ttl(svc: &Service, other_ttl: u32) -> u32 {
+    match (other_ttl, svc.ttl) {
+        (0, _) => 0,
+        (_, 0) => other_ttl,
+        (_, ttl) => ttl.max(MIN_REFLECT_TTL),
+    }
 }
 
 fn service_records(device: &Device, svc: &Service, ttl: u32) -> Vec<Record> {
@@ -1535,7 +1586,7 @@ mod tests {
     fn unnamed(addr: &str) -> Device {
         let a = ip(addr);
         let (link_local, routable) = if is_link_local(&a) { (Some(a), None) } else { (None, Some(a)) };
-        Device { hostname: None, link_local, routable, services: vec![] }
+        Device { hostname: None, link_local, routable, ..Device::default() }
     }
 
     #[test]
@@ -1590,8 +1641,10 @@ mod tests {
                     port: 8080,
                     target: None,
                     txt: vec!["a=b".into()],
+                    ttl: 0,
                 })
                 .collect(),
+            ttl: None,
         }
     }
 
@@ -1951,7 +2004,7 @@ mod tests {
             hostname: Some("router.local".into()),
             link_local: None,
             routable: Some(ip("10.0.1.1")),
-            services: vec![],
+            ..Device::default()
         };
         seg.add_manual(router).unwrap();
 
@@ -2127,7 +2180,7 @@ mod tests {
             hostname: Some("router.local".into()),
             link_local: Some(ip("fe80::1")),
             routable: None,
-            services: vec![],
+            ..Device::default()
         };
         seg.add_manual(router).unwrap();
         let m = recv(&rx).unwrap();
@@ -2593,28 +2646,97 @@ mod tests {
         assert!(usual.add_manual_ttl(tv("10.0.1.2", &[]), Duration::from_millis(900)).is_err());
     }
 
-    #[test]
-    fn reflected_devices_use_the_segments_reflect_ttl_and_the_services_keep_theirs() {
-        let (seg, rx) = wired();
-        seg.set_reflect_ttl(Duration::from_secs(600));
-        seg.add_manual(tv("10.0.1.1", &["TV"])).unwrap();
-        let sent = recv(&rx).unwrap();
-        let ttls: Vec<(bool, u32)> =
-            sent.answers.iter().map(|r| (matches!(r.data, RData::A(_)), r.ttl)).collect();
-        assert!(ttls.contains(&(true, 600)), "the address record: {ttls:?}");
-        assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == OTHER_TTL), "{ttls:?}");
+    /// `tv.local` as it announced itself: an address with `addr` seconds, and a
+    /// service with `svc` (0: not known).
+    fn tv_with_ttls(addr: Option<u32>, svc: u32) -> Device {
+        let mut device = tv("10.0.1.1", &["TV"]);
+        device.ttl = addr;
+        device.services[0].ttl = svc;
+        device
+    }
 
-        // It is kept up at 80% of it.
+    /// (is an address record, ttl) of what was announced, without the type
+    /// enumeration, which is the daemon's.
+    fn announced_ttls(rx: &UdpSocket) -> Vec<(bool, u32)> {
+        let sent = recv(rx).unwrap();
+        sent.answers
+            .iter()
+            .filter(|r| !r.name.starts_with("_services."))
+            .map(|r| (matches!(r.data, RData::A(_)), r.ttl))
+            .collect()
+    }
+
+    #[test]
+    fn a_device_is_announced_with_the_ttls_it_announced_itself_with() {
+        let (seg, rx) = wired();
+        seg.add_manual(tv_with_ttls(Some(300), 600)).unwrap();
+        let ttls = announced_ttls(&rx);
+        assert!(ttls.contains(&(true, 300)), "{ttls:?}");
+        assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
+
+        // It is announced again before the shortest of them runs out: 80% of 300.
+        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(240));
+    }
+
+    #[test]
+    fn a_short_service_ttl_brings_the_reannouncement_forward() {
+        let (seg, rx) = wired();
+        seg.add_manual(tv_with_ttls(Some(300), 50)).unwrap();
+        assert!(announced_ttls(&rx).contains(&(false, 50)));
+        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(40));
+    }
+
+    #[test]
+    fn what_a_device_did_not_say_gets_the_usual_ttl_and_tiny_ones_are_raised() {
+        let (seg, rx) = wired();
+        seg.add_manual(tv_with_ttls(None, 0)).unwrap();
+        let ttls = announced_ttls(&rx);
+        assert!(ttls.contains(&(true, HOST_TTL)) && ttls.contains(&(false, OTHER_TTL)), "{ttls:?}");
+
+        let (seg, rx) = wired();
+        seg.add_manual(tv_with_ttls(Some(2), 3)).unwrap();
+        let ttls = announced_ttls(&rx);
+        assert!(ttls.iter().all(|(_, ttl)| *ttl == MIN_REFLECT_TTL), "{ttls:?}");
+    }
+
+    #[test]
+    fn a_configured_reflect_ttl_wins_for_the_address_only() {
+        let (seg, rx) = wired();
+        seg.set_reflect_ttl(Some(Duration::from_secs(900)));
+        seg.add_manual(tv_with_ttls(Some(300), 600)).unwrap();
+        let ttls = announced_ttls(&rx);
+        assert!(ttls.contains(&(true, 900)), "{ttls:?}");
+        assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
+        // The services run out first, and it is announced again before that.
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
         assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(480));
 
-        // The default is what it always was, and zero cannot be asked for.
-        assert_eq!(DEFAULT_REFLECT_TTL, Duration::from_secs(120));
-        let (usual, rx) = wired();
-        usual.add_manual(tv("10.0.1.1", &[])).unwrap();
-        assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 120));
-        usual.set_reflect_ttl(Duration::ZERO);
-        assert_eq!(usual.state.lock().unwrap().reflect_ttl, 1);
+        // Even a tiny setting is kept to the floor.
+        seg.set_reflect_ttl(Some(Duration::from_secs(1)));
+        assert_eq!(seg.state.lock().unwrap().reflect_ttl, Some(MIN_REFLECT_TTL));
+        seg.set_reflect_ttl(None);
+        assert_eq!(seg.state.lock().unwrap().reflect_ttl, None);
+    }
+
+    #[test]
+    fn the_ttls_a_device_announces_are_kept_and_the_address_ones_do_not_get_the_services() {
+        let (seg, _rx) = wired();
+        hear(&seg, "10.0.1.30", vec![
+            record("d.local".into(), true, 120, RData::A("10.0.1.30".parse().unwrap())),
+            record("D._x._tcp.local".into(), true, 4500, RData::Srv { priority: 0, weight: 0, port: 1, target: "d.local".into() }),
+            record("_x._tcp.local".into(), false, 100, RData::Ptr("D._x._tcp.local".into())),
+        ]);
+        let device = seg.devices().remove(0);
+        assert_eq!(device.ttl, Some(120));
+        // The SRV record's TTL counts, not the PTR's.
+        assert_eq!(device.services[0].ttl, 4500);
+
+        // A device known only by address has announced nothing.
+        seg.observe(ip("10.0.1.99"));
+        let bare = seg.devices().into_iter().find(|d| d.hostname.is_none()).unwrap();
+        assert_eq!((bare.ttl, bare.services.len()), (None, 0));
     }
 
     #[test]

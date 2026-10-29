@@ -483,15 +483,22 @@ fn render_devices(reply: &Value) -> Result<String, Failure> {
 /// The columns of a device in the verbose listing: interface, family,
 /// addresses, hostname.
 fn device_row(device: &Value) -> Result<[String; 4], Failure> {
+    // The hostname is the last column, so the TTL of its address records can
+    // follow it.
+    let mut hostname = device["hostname"].as_str().unwrap_or("-").to_string();
+    if let Some(ttl) = device["address_ttl"].as_u64() {
+        hostname.push_str(&format!("  addr-ttl={ttl}"));
+    }
     Ok([
         device["interface"].as_str().ok_or_else(bad_reply)?.to_string(),
         device["family"].as_str().ok_or_else(bad_reply)?.to_string(),
         device_addrs(device),
-        device["hostname"].as_str().unwrap_or("-").to_string(),
+        hostname,
     ])
 }
 
-/// One indented line for each service of a device in the verbose listing.
+/// One indented line for each service of a device in the verbose listing, with
+/// the TTL its records were announced with.
 fn service_lines(device: &Value) -> String {
     let mut out = String::new();
     for svc in device["services"].as_array().into_iter().flatten() {
@@ -501,6 +508,9 @@ fn service_lines(device: &Value) -> String {
         out.push_str(&format!("      {label}  {kind}  :{}", svc["port"]));
         if let Some(target) = svc["target"].as_str() {
             out.push_str(&format!(" -> {target}"));
+        }
+        if let Some(ttl) = svc["ttl"].as_u64() {
+            out.push_str(&format!("  ttl={ttl}"));
         }
         let txt = strings(&svc["txt"]);
         if !txt.is_empty() {
@@ -1051,6 +1061,23 @@ mod tests {
         let old: Value = serde_json::from_str(r#"{"ok":true,"timers":[{"id":1,"name":"x","running":false,"due_in_ms":5,"runs":0,"last_run_ago_ms":null,"last_took_us":null}]}"#).unwrap();
         assert!(render_timers(&old).is_ok());
         assert!(render_timers(&serde_json::json!({"ok":true,"timers":[{"id":1,"name":"x","running":false,"due_in_ms":5,"runs":0,"pending":[{"what":"expire"}]}]})).is_err());
+    }
+
+    #[test]
+    fn verbose_listings_show_the_ttls_the_device_announced() {
+        let device = r#"{"interface":"wifi","family":"v4","hostname":"plug.local","routable":"10.0.1.9","link_local":null,"address_ttl":120,"services":[{"instance":"Plug S._shelly._tcp.local","type":"_shelly._tcp.local","port":80,"target":"plug.local","txt":["gen=2"],"ttl":4500},{"instance":"Plug S._http._tcp.local","type":"_http._tcp.local","port":80,"target":"plug.local","txt":[],"ttl":null}]}"#;
+        let reply: Value = serde_json::from_str(&format!(r#"{{"ok":true,"name":"IoT","devices":[{device}]}}"#)).unwrap();
+        assert_eq!(
+            render_devices(&reply).unwrap(),
+            "IoT: 1 device\n  wifi  v4  10.0.1.9  plug.local  addr-ttl=120\n      Plug S  _shelly._tcp.local  :80 -> plug.local  ttl=4500  [gen=2]\n      Plug S  _http._tcp.local  :80 -> plug.local\n"
+        );
+        // A watch shows them too, after its own ttl: how long the daemon keeps the device.
+        let event: Value = serde_json::from_str(&format!(r#"{{"event":"added","segment":"IoT","ttl":300,"device":{device}}}"#)).unwrap();
+        let shown = render_event(&event, true, &mut HashSet::new()).unwrap().unwrap();
+        assert!(shown.starts_with("added    ttl=300    wifi  v4  10.0.1.9  plug.local  addr-ttl=120\n"), "{shown}");
+        // The brief views stay as they were.
+        let brief = render_event(&event, false, &mut HashSet::new()).unwrap().unwrap();
+        assert_eq!(brief, "added    ttl=300    plug.local  Plug S  10.0.1.9\n");
     }
 
     #[test]

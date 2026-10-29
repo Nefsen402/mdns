@@ -104,11 +104,12 @@ Socket=/run/mdnsd/mdnsd.sock
 # TTLs it announced (a device lives for its longest TTL, but not for less than
 # this). `0` keeps it for exactly its TTL.
 #
-# Reflected devices are announced on the other networks with this TTL for their
-# address, and announced again at 80% of it (every 96 seconds by default).
+# Reflected devices are announced on the other networks with the TTL they
+# announced themselves with (`auto`), and again at 80% of it. Set a time to
+# announce their address for that long instead, for less chatter.
 [Devices]
 MinimumLifetime=5min
-ReflectTTL=2min
+ReflectTTL=auto
 
 # Most devices (speakers especially) only answer when asked, and one that is
 # not heard from expires and is withdrawn from the other networks. So a device
@@ -180,7 +181,7 @@ replaced; a live instance or a file that is not a socket is never overwritten.
 | Key               | Default | Meaning                                                     |
 |-------------------|---------|-------------------------------------------------------------|
 | `MinimumLifetime` | `5min`  | The least a device is kept after it was last heard from.    |
-| `ReflectTTL`      | `2min`  | The TTL of the address of devices reflected to other networks. |
+| `ReflectTTL`      | `auto`  | The TTL of the address of devices reflected to other networks. |
 
 A systemd time span (`5min`, `90s`, `1h`), at most 1 day. A device lives for the
 longest TTL it announced, but never for less than this, so a device that
@@ -195,10 +196,18 @@ if it is not), because that margin is counted back from the end of this lifetime
 
 **`ReflectTTL`** is how long the other networks keep the address of a device
 this daemon reflects onto them, and so how often it is announced again: at 80%
-of it, every 96 seconds by default (the usual two minutes for host names). The
-records of its services keep their own, longer TTL. A longer value means less
-chatter, but a stale address lingers that long if a device moves or goes
-without a goodbye. It is between 10 seconds and 24 hours, and independent of the
+of it. The default, `auto`, passes on the TTLs the device announced itself with
+(`mdnsctl devices -v` lists them): hosts conventionally say two minutes, so
+their address is announced again every 96 seconds, and services conventionally
+75 minutes. A time span overrides the TTL of the *address* only, between 10
+seconds and 24 hours: longer means less chatter, but a stale address lingers
+that long if a device moves or goes without a goodbye. The records of a
+device's services always keep their own TTL, and a device is announced again
+before the shortest of them runs out. Anything below 10 seconds is raised to
+10, and a device that did not say gets two minutes for its address and 75
+minutes for its services. The TTL is the one last heard, not counted down: a
+copy of a device that went silent is withdrawn when the device expires, up to
+`MinimumLifetime` after it was last heard. `ReflectTTL` is independent of the
 [`TTL`](#advertise-optional) of the advertised name.
 
 ### `[Probe]` (optional)
@@ -392,19 +401,24 @@ IoT to br0: 1 device
 ```
 
 `-v` (`--verbose`) lists everything: interface, family, addresses (routable
-first, then link-local) and hostname for every entry, with each device's services underneath (instance, type, port,
-target and TXT records), including the devices without a name.
+first, then link-local) and hostname for every entry, then `addr-ttl=`, the TTL
+its address records were announced with. Each device's services are underneath
+(instance, type, port, target, the `ttl=` their records were announced with, and
+TXT records), including the devices without a name.
 
 ```
 $ mdnsctl -v devices IoT to br0
 IoT to br0: 2 devices
-  br0   v4  10.0.0.10  printer.local
-      Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]
+  br0   v4  10.0.0.10  printer.local  addr-ttl=120
+      Printer  _http._tcp.local  :631 -> printer.local  ttl=4500  [rp=ipp, ty=hp]
   wifi  v4  10.0.1.7   -
 ```
 
 A hostname of `-` means the device has been heard but has not announced a name
-yet. `--json` always prints the full reply, regardless of `-v`.
+yet. The TTLs are what a reflected copy is announced with (see
+[`ReflectTTL`](#devices-optional)); they are not shown for a device that has not
+announced any. `--json` always prints the full reply, regardless of `-v`, with
+them as `address_ttl` and, for each service, `ttl` (`null` when not known).
 
 ### `mdnsctl probe [<name>]`
 
@@ -446,8 +460,8 @@ it is not heard from again, or `0` once it is gone because it said goodbye or ra
 out), then the same columns as `devices`. The first time a device is shown with a
 name it is `added`, whatever the daemon first called it, and `updated` after
 that; devices that have not announced a name are not shown. `-v` prints each
-change as `devices -v` would list the device, services included, and shows
-unnamed ones too. It exits with status 2 if the daemon stops, and quietly with 0
+change as `devices -v` would list the device, services and their TTLs included,
+and shows unnamed ones too. It exits with status 2 if the daemon stops, and quietly with 0
 if its output is closed (`mdnsctl watch IoT | head`).
 
 With `--json` each change is one line of JSON as the daemon sent it, which is

@@ -43,8 +43,17 @@ every device is listed with its interface, family, addresses (routable first,
 then link-local) and hostname (a
 hostname of
 .B \-
-means the device has been heard but has not announced a name), followed by its
-services: instance, type, port, target and TXT records.
+means the device has been heard but has not announced a name), and
+.B addr-ttl=
+after it: the TTL, in seconds, its address records were announced with, if it
+announced any, followed by its
+services: instance, type, port, target, the
+.B ttl=
+its records were announced with, and TXT records.
+These are the TTLs a reflected copy is announced with (see
+.B ReflectTTL=
+in
+.BR mdnsd.conf (5)).
 .IP
 Only devices discovered on the segment's own interfaces are listed.
 Devices that the daemon reflected onto those interfaces from other segments are
@@ -148,8 +157,8 @@ is also accepted.
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 List devices with everything the daemon knows: interface, address family,
-address, and every service with its port, target and TXT records, including
-devices that have not announced a name.
+address, the TTLs they were announced with, and every service with its port,
+target and TXT records, including devices that have not announced a name.
 Only
 .B devices
 and
@@ -195,8 +204,8 @@ it lists everything, including addresses and service details:
 .nf
 .RS
 IoT to br0: 2 devices
-  br0   v4  10.0.0.10  printer.local
-      Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]
+  br0   v4  10.0.0.10  printer.local  addr-ttl=120
+      Printer  _http._tcp.local  :631 -> printer.local  ttl=4500  [rp=ipp, ty=hp]
   wifi  v4  10.0.1.7   \-
 .RE
 .fi

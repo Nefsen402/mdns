@@ -106,14 +106,24 @@ lifetime; the daemon warns at startup if it is not.
 .TP
 .B ReflectTTL=
 How long other networks keep the address of a device this daemon reflects onto
-them, as a time span, and so how often it is announced again: at 80% of it.
+them, and so how often it is announced again: at 80% of it.
 Default
-.B 2min
-(every 96 seconds), the usual TTL for host names.
-The records of the device's services keep their own, longer TTL.
-A longer value means less traffic, but a stale address lingers that long when a
-device moves or vanishes without a goodbye.
-At least 10 seconds and at most 24 hours; independent of
+.BR auto :
+each device is announced with the TTLs it announced itself with (see
+.BR "mdnsctl devices \-v" ).
+Hosts conventionally say two minutes, so their address is announced again every
+96 seconds.
+A time span, from 10 seconds to 24 hours, replaces the TTL of the
+.I address
+only: a longer one means less traffic, but a stale address lingers that long
+when a device moves or vanishes without a goodbye.
+The records of a device's services always keep their own TTL, and a device is
+announced again before the shortest of them runs out.
+A TTL below 10 seconds is raised to 10; a device that did not say gets two
+minutes for its address and 75 minutes for its services.
+The TTL is the one last heard, not counted down: a copy of a device that went
+silent is withdrawn when the device expires.
+Independent of
 .B TTL=
 of
 .BR [Advertise] .
@@ -267,7 +277,7 @@ Socket=/run/mdnsd/mdnsd.sock
 
 [Devices]
 MinimumLifetime=5min
-ReflectTTL=2min
+ReflectTTL=auto
 
 [Probe]
 RefreshBefore=30s

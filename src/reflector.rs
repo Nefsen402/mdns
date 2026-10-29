@@ -364,18 +364,28 @@ mod tests {
     }
 
     fn rec(name: &str, data: RData) -> Record {
-        Record { name: name.into(), class: 1, cache_flush: false, ttl: 120, data }
+        rec_ttl(name, data, 120)
+    }
+
+    fn rec_ttl(name: &str, data: RData, ttl: u32) -> Record {
+        Record { name: name.into(), class: 1, cache_flush: false, ttl, data }
     }
 
     /// Make `seg` hear `host` at `from` announcing one service per instance.
     fn announce(seg: &Segment, from: &str, host: &str, instances: &[&str]) {
+        announce_ttl(seg, from, host, instances, 120, 120);
+    }
+
+    /// Like [`announce`], with the TTLs of the address and of the services.
+    fn announce_ttl(seg: &Segment, from: &str, host: &str, instances: &[&str], addr_ttl: u32, svc_ttl: u32) {
         let addr: Ipv4Addr = from.parse().unwrap();
-        let mut answers = vec![rec(host, RData::A(addr))];
+        let mut answers = vec![rec_ttl(host, RData::A(addr), addr_ttl)];
         for i in instances {
-            answers.push(rec("_http._tcp.local", RData::Ptr(format!("{i}._http._tcp.local"))));
-            answers.push(rec(
+            answers.push(rec_ttl("_http._tcp.local", RData::Ptr(format!("{i}._http._tcp.local")), svc_ttl));
+            answers.push(rec_ttl(
                 &format!("{i}._http._tcp.local"),
                 RData::Srv { priority: 0, weight: 0, port: 80, target: host.into() },
+                svc_ttl,
             ));
         }
         let msg = Message {
@@ -520,27 +530,45 @@ mod tests {
         });
     }
 
+    /// The TTLs of the address and of the other records a reflected device is
+    /// announced with, as `(address, others)`.
+    fn announced_ttls(rx: &UdpSocket) -> (Vec<u32>, Vec<u32>) {
+        let records: Vec<Record> = drain(rx).into_iter().flat_map(|m| m.answers).collect();
+        let (addrs, others): (Vec<_>, Vec<_>) = records.iter().partition(|r| matches!(r.data, RData::A(_)));
+        // The type enumeration is the daemon's own, not the device's.
+        let others = others.iter().filter(|r| !r.name.starts_with("_services.")).map(|r| r.ttl).collect();
+        (addrs.iter().map(|r| r.ttl).collect(), others)
+    }
+
+    #[test]
+    fn reflected_devices_are_announced_with_the_ttls_they_announced_themselves_with() {
+        let (a, _arx) = wired("a");
+        let (b, brx) = wired("b");
+        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+
+        announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
+        wait_for(|| b.manual_devices().len() == 1);
+        assert_eq!(announced_ttls(&brx), (vec![300], vec![600, 600, 600]));
+        // What the device said is on record, too.
+        assert_eq!(a.devices()[0].ttl, Some(300));
+        assert_eq!(a.devices()[0].services[0].ttl, 600);
+    }
+
+    #[test]
+    fn a_configured_reflect_ttl_wins_for_the_address_and_leaves_the_services_alone() {
+        let (a, _arx) = wired("a");
+        let (b, brx) = wired("b");
+        b.set_reflect_ttl(Some(Duration::from_secs(900)));
+        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+
+        announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
+        wait_for(|| b.manual_devices().len() == 1);
+        assert_eq!(announced_ttls(&brx), (vec![900], vec![600, 600, 600]));
+    }
+
     /// One device with two hostnames on one address (an LG TV announces
     /// `LGwebOSTV.local` and `LGwebOSTV-nsAs-1.local`, each with its own
     /// services). That is not a clash: both names are reflected.
-    #[test]
-    fn reflected_addresses_are_announced_with_the_targets_reflect_ttl() {
-        let (a, _arx) = wired("a");
-        let (b, brx) = wired("b");
-        b.set_reflect_ttl(Duration::from_secs(900));
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
-
-        announce(&a, "10.0.1.5", "tv.local", &["TV"]);
-        wait_for(|| b.manual_devices().len() == 1);
-        let ttls: Vec<u32> = drain(&brx)
-            .iter()
-            .flat_map(|m| &m.answers)
-            .filter(|r| matches!(r.data, RData::A(_)))
-            .map(|r| r.ttl)
-            .collect();
-        assert_eq!(ttls, [900]);
-    }
-
     #[test]
     fn a_device_with_two_hostnames_on_one_address_has_both_reflected() {
         let (a, _arx) = wired("a");

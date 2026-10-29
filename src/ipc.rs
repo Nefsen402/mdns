@@ -49,6 +49,11 @@
 //!
 //! A device has up to two addresses, of the entry's family: `routable` (IPv4,
 //! or global/ULA IPv6) and `link_local`; either is `null` when unknown.
+//!
+//! The TTLs a device announced itself with are kept: `address_ttl` for its
+//! address records and `ttl` for each service (the SRV record's, else the PTR's
+//! or TXT's), in seconds, `null` when not known. A reflected copy is announced
+//! with them, unless the configuration says otherwise.
 
 use std::collections::HashMap;
 use std::fs::{self, Permissions};
@@ -409,6 +414,7 @@ fn device_json(interface: &str, family: Family, d: &Device) -> Value {
                 "port": s.port,
                 "target": s.target,
                 "txt": s.txt,
+                "ttl": (s.ttl != 0).then_some(s.ttl),
             })
         })
         .collect();
@@ -418,6 +424,7 @@ fn device_json(interface: &str, family: Family, d: &Device) -> Value {
         "hostname": d.hostname,
         "routable": d.routable.map(|a| a.to_string()),
         "link_local": d.link_local.map(|a| a.to_string()),
+        "address_ttl": d.ttl,
         "services": services,
     })
 }
@@ -546,7 +553,7 @@ mod tests {
         segs[0].observe(ip("10.0.3.9"));
         assert_eq!(
             handle(&[iot], &Watcher::default(), r#"devices "IoT to br0""#),
-            r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","family":"v4","hostname":null,"routable":"10.0.3.9","link_local":null,"services":[]}]}"#
+            r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","family":"v4","hostname":null,"routable":"10.0.3.9","link_local":null,"address_ttl":null,"services":[]}]}"#
         );
     }
 
@@ -557,11 +564,11 @@ mod tests {
         segs[1].observe(ip("10.0.2.1"));
         let out = handle(&[g], &Watcher::default(), "DEVICES media");
         assert!(
-            out.contains(r#""interface":"a","family":"v4","hostname":"tv.local","routable":"10.0.1.5","link_local":null"#),
+            out.contains(r#""interface":"a","family":"v4","hostname":"tv.local","routable":"10.0.1.5","link_local":null,"address_ttl":120"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"{"instance":"My \"TV\"._http._tcp.local","type":"_http._tcp.local","port":80,"target":"tv.local","txt":["k=v"]}"#),
+            out.contains(r#"{"instance":"My \"TV\"._http._tcp.local","type":"_http._tcp.local","port":80,"target":"tv.local","txt":["k=v"],"ttl":120}"#),
             "{out}"
         );
         assert!(out.contains(r#""interface":"b","family":"v4","hostname":null,"routable":"10.0.2.1""#), "{out}");
