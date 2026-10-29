@@ -10,7 +10,7 @@
 //! interfaces share a reflector is the caller's policy. A reflector with a
 //! single segment only tracks and reflects nothing.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -160,18 +160,18 @@ impl Inner {
     }
 
     /// What `target` should be announcing: every reflectable device from the
-    /// other segments, by hostname. If two devices clash on hostname or
-    /// address (the cache-flush bit would make them overwrite each other), the
-    /// one from the lowest-numbered segment wins; the other takes over when it
-    /// goes.
+    /// other segments, by hostname. If two devices announce the same hostname
+    /// (the cache-flush bit would make them overwrite each other), the one from
+    /// the lowest-numbered segment wins; the other takes over when it goes.
+    /// Different hostnames never clash, even on one address: a device may have
+    /// several names, each with services of its own.
     ///
     /// A device's link-local address is dropped: it only means something on
     /// the link the device is on, and on any other it names nobody.
     fn desired(&self, book: &Book, target: usize) -> HashMap<String, Device> {
         let mut out: HashMap<String, Device> = HashMap::new();
-        let mut addrs = HashSet::new();
         for ((src, key), device) in &book.sources {
-            if *src == target || out.contains_key(key) || !addrs.insert(device.routable) {
+            if *src == target || out.contains_key(key) {
                 continue;
             }
             out.insert(key.clone(), Device { link_local: None, ..device.clone() });
@@ -436,6 +436,26 @@ mod tests {
             let d = c.manual_devices();
             d.len() == 1 && d[0].routable == Some(ip("10.0.2.5"))
         });
+    }
+
+    /// One device with two hostnames on one address (an LG TV announces
+    /// `LGwebOSTV.local` and `LGwebOSTV-nsAs-1.local`, each with its own
+    /// services). That is not a clash: both names are reflected.
+    #[test]
+    fn a_device_with_two_hostnames_on_one_address_has_both_reflected() {
+        let (a, _arx) = wired("a");
+        let (b, _brx) = wired("b");
+        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+
+        announce(&a, "10.0.1.5", "tv.local", &["Airplay"]);
+        announce(&a, "10.0.1.5", "tv-nsas-1.local", &["Display"]);
+        wait_for(|| a.devices().len() == 2);
+        thread::sleep(Duration::from_millis(100));
+
+        let mut names: Vec<_> = b.manual_devices().iter().map(|d| d.hostname.clone().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["tv-nsas-1.local", "tv.local"]);
+        assert!(b.manual_devices().iter().all(|d| d.routable == Some(ip("10.0.1.5"))));
     }
 
     /// The configured topology: a<->b and b<->c, but never a<->c, even

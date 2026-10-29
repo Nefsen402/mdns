@@ -102,8 +102,10 @@ device discoverable.
 The daemon answers queries for reflected devices, including known-answer
 suppression, keeps them alive with periodic re-announcements, and withdraws
 them with goodbye packets when the source device disappears.
-If two devices would clash on hostname or address on a target interface, the
-one from the interface listed first in the segment wins.
+If devices on different interfaces announce the same hostname, the one from the
+interface listed first in the segment wins.
+Different hostnames never clash, even on one address: a device with several
+names has each of them reflected.
 .SS Control socket
 The daemon serves a local control socket, described under
 .B [Ipc]

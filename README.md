@@ -220,9 +220,11 @@ be reflected, so without probing they would stay invisible.
 - A reflected device is announced on the other interface with that **routable
   address**. Your firewall must allow the actual connections between the
   networks; mDNS only makes the device discoverable.
-- If two devices would clash on hostname or address on a target interface, the
-  one from the interface listed **first** in the segment wins; the other takes
-  over automatically if the winner goes away.
+- If devices on different interfaces announce the **same hostname**, the one
+  from the interface listed **first** in the segment wins; the other takes over
+  automatically if the winner goes away. Different hostnames never clash, even
+  on one address: a device with several names (a TV often has two) has each of
+  them reflected.
 - Reflected devices are kept alive with periodic re-announcements, answer
   queries (including known-answer suppression), and are withdrawn with goodbye
   packets when their source disappears.
