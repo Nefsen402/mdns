@@ -257,6 +257,8 @@ enum Key {
 
 struct Entry {
     expires: Instant,
+    /// When it was last asked to answer again because it was about to expire.
+    refreshed: Option<Instant>,
     hostname: Option<String>,
     link_local: Option<IpAddr>,
     routable: Option<IpAddr>,
@@ -267,6 +269,7 @@ impl Entry {
     fn new(now: Instant) -> Entry {
         Entry {
             expires: now,
+            refreshed: None,
             hostname: None,
             link_local: None,
             routable: None,
@@ -759,44 +762,70 @@ impl Segment {
             return Ok(0);
         }
 
-        let mut questions: Vec<Question> = Vec::new();
-        let mut seen = BTreeSet::new();
-        let mut ask = |name: &str, qtype: u16| {
-            if !seen.insert((name.to_ascii_lowercase(), qtype)) {
-                return;
-            }
-            let q = Question { name: name.into(), qtype, class: 1, unicast_response: false };
-            // Names come off the network; one that cannot be re-encoded
-            // (lossy UTF-8 can stretch a label past 63 bytes) is skipped
-            // rather than failing the whole round.
-            if query(std::slice::from_ref(&q)).encode().is_ok() {
-                questions.push(q);
-            }
-        };
-
-        ask(META_QUERY, rtype::PTR);
+        let mut qs = Questions::default();
+        qs.ask(META_QUERY, rtype::PTR);
 
         let mut kinds: BTreeSet<&str> = state.types.iter().map(String::as_str).collect();
         let services = || state.discovered.values().flat_map(|e| e.services.values());
         kinds.extend(services().map(|s| s.kind.as_str()).filter(|k| !k.is_empty()));
         for kind in kinds {
-            ask(kind, rtype::PTR);
+            qs.ask(kind, rtype::PTR);
         }
         for svc in services().filter(|s| s.target.is_none()) {
-            ask(&svc.instance, rtype::SRV);
-            ask(&svc.instance, rtype::TXT);
+            qs.ask(&svc.instance, rtype::SRV);
+            qs.ask(&svc.instance, rtype::TXT);
         }
         // A device known by name but without a routable address (it only ever
         // showed a link-local one) is asked for all of its addresses.
         let address_type = if self.family == Family::V4 { rtype::A } else { rtype::AAAA };
         for host in state.discovered.values().filter(|e| e.routable.is_none()).filter_map(|e| e.hostname.as_deref()) {
-            ask(host, address_type);
+            qs.ask(host, address_type);
         }
 
-        for chunk in questions.chunks(QUESTIONS_PER_PACKET) {
-            transmit(&state.outbound, &query(chunk), None)?;
+        qs.send(&state.outbound)
+    }
+
+    /// Ask the devices that are about to expire to answer again, so that a
+    /// quiet one (most speakers only answer when asked) is renewed just before
+    /// it would be dropped, instead of being found again later.
+    ///
+    /// A device is due once it would expire within `before` of `now`: its
+    /// lifetime is the longest TTL it announced, at least [`DEVICE_TIMEOUT`].
+    /// It is asked for what it announced (its address, and the service and text
+    /// records of each instance) and not for whole service types, so only it
+    /// answers. A device that does not answer is asked again after a quarter of
+    /// `before` (at least five seconds) until it expires. Devices known only by
+    /// the address they were heard from have nothing to ask for and are left
+    /// alone, and so is one whose time has already run out. Call periodically,
+    /// after [`Segment::expire`]; returns how many questions were sent.
+    pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
+        let mut guard = self.state.lock().unwrap();
+        let State { discovered, outbound, .. } = &mut *guard;
+        if outbound.is_none() {
+            return Ok(0);
         }
-        Ok(questions.len())
+        let gap = (before / 4).max(Duration::from_secs(5));
+        let address_type = if self.family == Family::V4 { rtype::A } else { rtype::AAAA };
+
+        let mut qs = Questions::default();
+        for entry in discovered.values_mut() {
+            let askable = entry.hostname.is_some() || !entry.services.is_empty();
+            // Not one that has already run out: it is about to be dropped.
+            let due = entry.expires > now && entry.expires <= now + before;
+            let recent = entry.refreshed.is_some_and(|t| now.saturating_duration_since(t) < gap);
+            if !askable || !due || recent {
+                continue;
+            }
+            entry.refreshed = Some(now);
+            if let Some(host) = &entry.hostname {
+                qs.ask(host, address_type);
+            }
+            for svc in entry.services.values() {
+                qs.ask(&svc.instance, rtype::SRV);
+                qs.ask(&svc.instance, rtype::TXT);
+            }
+        }
+        qs.send(outbound)
     }
 
     /// Drop devices whose lifetime has run out as of `now`.
@@ -1109,6 +1138,36 @@ fn answers_for(query: &Message, device: &Device) -> (Vec<Record>, Vec<Record>) {
         }
     }
     (answers, extra)
+}
+
+/// Questions for one query, each asked once however many devices want it.
+#[derive(Default)]
+struct Questions {
+    list: Vec<Question>,
+    seen: BTreeSet<(String, u16)>,
+}
+
+impl Questions {
+    fn ask(&mut self, name: &str, qtype: u16) {
+        if !self.seen.insert((name.to_ascii_lowercase(), qtype)) {
+            return;
+        }
+        let q = Question { name: name.into(), qtype, class: 1, unicast_response: false };
+        // Names come off the network; one that cannot be re-encoded (lossy
+        // UTF-8 can stretch a label past 63 bytes) is skipped rather than
+        // failing the whole query.
+        if query(std::slice::from_ref(&q)).encode().is_ok() {
+            self.list.push(q);
+        }
+    }
+
+    /// Multicast the questions, a few to a packet. Returns how many there were.
+    fn send(&self, outbound: &Option<Outbound>) -> Result<usize> {
+        for chunk in self.list.chunks(QUESTIONS_PER_PACKET) {
+            transmit(outbound, &query(chunk), None)?;
+        }
+        Ok(self.list.len())
+    }
 }
 
 /// A multicast query for `questions` (no known answers, so every device
@@ -1943,6 +2002,168 @@ mod tests {
         assert_eq!(seg.devices()[0].routable, Some(ip("fd00::9")));
         seg.probe_round().unwrap();
         assert!(!asked(&recv(&rx).unwrap()).contains(&q("t.local", rtype::AAAA)));
+    }
+
+    /// Pretend the device called `host` was heard from so that it now expires at `at`.
+    fn set_expiry(seg: &Segment, host: &str, at: Instant) {
+        let mut state = seg.state.lock().unwrap();
+        state.discovered.get_mut(&host_key(host)).expect("no such device").expires = at;
+    }
+
+    /// printer.local lives only for the 5 minute floor (all its TTLs are 120);
+    /// other.local announces a 4500 second PTR, so it lives 75 minutes.
+    fn hear_a_short_and_a_long_lived_device(seg: &Segment) {
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        hear(seg, "10.0.1.8", vec![
+            a_record("other.local", "10.0.1.8"),
+            ptr("_x._tcp.local", "O._x._tcp.local"),
+            srv("O._x._tcp.local", 1, "other.local"),
+        ]);
+    }
+
+    #[test]
+    fn refresh_asks_only_the_devices_about_to_expire_and_only_about_what_they_announced() {
+        let (seg, rx) = wired();
+        hear_a_short_and_a_long_lived_device(&seg);
+        let t0 = Instant::now();
+        let before = Duration::from_secs(60);
+
+        // 100 s in, nothing is near its expiry.
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(100), before).unwrap(), 0);
+        assert!(recv(&rx).is_none());
+
+        // 250 s in, printer.local (expires after 300 s) is within 60 s of it; other.local is not.
+        let sent = seg.refresh(t0 + Duration::from_secs(250), before).unwrap();
+        assert_eq!(sent, 3);
+        assert_eq!(
+            asked(&recv(&rx).unwrap()),
+            BTreeSet::from([
+                q("printer.local", rtype::A),
+                q("Printer._http._tcp.local", rtype::SRV),
+                q("Printer._http._tcp.local", rtype::TXT),
+            ])
+        );
+        assert!(recv(&rx).is_none());
+    }
+
+    #[test]
+    fn refresh_retries_after_a_gap_and_stops_once_the_device_has_answered() {
+        let (seg, rx) = wired();
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        let t = Instant::now() + Duration::from_secs(250);
+        let before = Duration::from_secs(60); // so the retry gap is 15 s
+
+        assert_eq!(seg.refresh(t, before).unwrap(), 3);
+        recv(&rx).unwrap();
+        // Too soon to ask again.
+        assert_eq!(seg.refresh(t + Duration::from_secs(5), before).unwrap(), 0);
+        assert!(recv(&rx).is_none());
+        // No answer after the gap: ask again.
+        assert_eq!(seg.refresh(t + Duration::from_secs(15), before).unwrap(), 3);
+        recv(&rx).unwrap();
+
+        // It answers, which moves its expiry out: no more questions.
+        set_expiry(&seg, "printer.local", t + Duration::from_secs(4500));
+        assert_eq!(seg.refresh(t + Duration::from_secs(40), before).unwrap(), 0);
+        assert!(recv(&rx).is_none());
+    }
+
+    #[test]
+    fn refresh_leaves_devices_known_only_by_address_alone() {
+        let (seg, rx) = wired();
+        // A phone that only sends queries: no hostname, no services, nothing to ask it.
+        seg.handle(sa("10.0.1.9"), &query("x.local", rtype::A, vec![])).unwrap();
+        assert_eq!(seg.devices().len(), 1);
+        let far = Instant::now() + Duration::from_secs(280);
+        assert_eq!(seg.refresh(far, Duration::from_secs(60)).unwrap(), 0);
+        assert!(recv(&rx).is_none());
+    }
+
+    #[test]
+    fn refresh_asks_an_ipv6_device_for_its_aaaa_record() {
+        let (seg, rx) = wired_family(Family::V6);
+        hear(&seg, "fe80::9", vec![srv("T._x._tcp.local", 1, "t.local"), aaaa("t.local", "fe80::9")]);
+        assert_eq!(seg.refresh(Instant::now() + Duration::from_secs(250), Duration::from_secs(60)).unwrap(), 3);
+        let asked = asked(&recv(&rx).unwrap());
+        assert!(asked.contains(&q("t.local", rtype::AAAA)) && !asked.contains(&q("t.local", rtype::A)), "{asked:?}");
+    }
+
+    #[test]
+    fn refresh_without_a_sender_does_nothing_and_remembers_nothing() {
+        let seg = Segment::new("test", Family::V4);
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        assert_eq!(seg.refresh(Instant::now() + Duration::from_secs(250), Duration::from_secs(60)).unwrap(), 0);
+        // Once there is a sender it still asks, because the earlier call asked nobody.
+        let (wired_seg, rx) = wired();
+        wired_seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        assert_eq!(wired_seg.refresh(Instant::now() + Duration::from_secs(250), Duration::from_secs(60)).unwrap(), 3);
+        assert!(recv(&rx).is_some());
+    }
+
+    /// A device whose records all have a TTL shorter than the margin. Its
+    /// lifetime is never less than the 5 minute floor, so it is not "due" the
+    /// moment it is heard: it is asked 30 s before that floor runs out.
+    #[test]
+    fn a_ttl_shorter_than_the_margin_does_not_make_a_device_due_early() {
+        let (seg, rx) = wired();
+        // Every record has a 10 second TTL: shorter than the 30 s margin.
+        hear(&seg, "10.0.1.20", vec![
+            record("short.local".into(), true, 10, RData::A("10.0.1.20".parse().unwrap())),
+            record("S._x._tcp.local".into(), true, 10, RData::Srv { priority: 0, weight: 0, port: 1, target: "short.local".into() }),
+            record("_x._tcp.local".into(), false, 10, RData::Ptr("S._x._tcp.local".into())),
+        ]);
+        let t0 = Instant::now();
+        let before = Duration::from_secs(30);
+
+        // Heard just now, a 10 s TTL would already be "inside" the margin if the
+        // TTL were used as the lifetime. It is not: the floor applies.
+        assert_eq!(seg.refresh(t0, before).unwrap(), 0);
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(10), before).unwrap(), 0);
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(200), before).unwrap(), 0);
+        assert!(recv(&rx).is_none());
+
+        // 30 s before the 5 minute floor ends, it is asked.
+        assert_eq!(seg.refresh(t0 + DEVICE_TIMEOUT - before + Duration::from_secs(1), before).unwrap(), 3);
+        assert!(recv(&rx).is_some());
+
+        // And without an answer it is dropped when the floor ends, not before.
+        seg.expire(t0 + Duration::from_secs(250));
+        assert_eq!(seg.devices().len(), 1);
+        seg.expire(t0 + DEVICE_TIMEOUT + Duration::from_secs(1));
+        assert!(seg.devices().is_empty());
+    }
+
+    /// The other extreme: a margin longer than any lifetime makes every device
+    /// due all the time. It must not turn into a flood.
+    #[test]
+    fn a_margin_longer_than_the_lifetime_asks_at_a_steady_rate_not_constantly() {
+        let (seg, rx) = wired();
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        let t0 = Instant::now();
+        let before = Duration::from_secs(600); // longer than the 300 s floor; the retry gap is 150 s
+
+        assert_eq!(seg.refresh(t0, before).unwrap(), 3, "due from the start");
+        recv(&rx).unwrap();
+        for secs in [1, 10, 100, 149] {
+            assert_eq!(seg.refresh(t0 + Duration::from_secs(secs), before).unwrap(), 0, "{secs}s");
+        }
+        assert!(recv(&rx).is_none());
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(150), before).unwrap(), 3, "then once per gap");
+    }
+
+    #[test]
+    fn refresh_does_not_ask_a_device_whose_time_has_already_run_out() {
+        let (seg, rx) = wired();
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        let t0 = Instant::now();
+        let before = Duration::from_secs(30);
+
+        // Still alive just before the end: asked. Past the end, but not yet
+        // dropped (the next expiry pass has not run): not asked.
+        assert_eq!(seg.refresh(t0 + DEVICE_TIMEOUT - Duration::from_secs(5), before).unwrap(), 3);
+        recv(&rx).unwrap();
+        assert_eq!(seg.refresh(t0 + DEVICE_TIMEOUT + Duration::from_secs(10), before).unwrap(), 0);
+        assert!(recv(&rx).is_none());
     }
 
     #[test]

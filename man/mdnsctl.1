@@ -67,9 +67,14 @@ It prints how many queries were sent on each interface; use
 .B devices
 to see what answered.
 .IP
-The daemon already does this once at startup.
-Run it again to pick up devices that were switched on later or that rarely
-announce.
+The daemon already does this at startup, and again every
+.B Interval=
+if one is set (see
+.B [Probe]
+in
+.BR mdnsd.conf (5)).
+Run it to probe right now, for example to pick up a device you have just
+switched on.
 .SH OPTIONS
 .TP
 \fB\-s\fR, \fB\-\-socket\fR \fIPATH\fR

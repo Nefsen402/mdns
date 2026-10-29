@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     let mut links: HashMap<(&str, Family), Segment> = HashMap::new();
     for interface in config.interfaces() {
         for &family in &families {
-            let link = start_link(interface, family, config.advertise.as_deref())?;
+            let link = start_link(interface, family, config.advertise.as_deref(), config.refresh_before)?;
             links.insert((interface, family), link);
         }
     }
@@ -73,15 +73,49 @@ fn main() -> Result<()> {
     }
 
     // Look for devices right away instead of waiting for them to announce
-    // themselves. The probes run on their own threads, so startup is not held
-    // up; `mdnsctl probe` does the same on demand.
+    // themselves, and then again every `probe_interval`: most devices only
+    // answer when asked, so without this a quiet one expires and is withdrawn
+    // from the other networks. The probes run on their own threads, so startup
+    // is not held up; `mdnsctl probe` does the same on demand.
+    match config.refresh_before {
+        Some(before) => eprintln!("asking devices to answer again {}s before they would expire", before.as_secs()),
+        None => eprintln!("refreshing devices before they expire is off"),
+    }
+    match config.probe_interval {
+        Some(interval) => {
+            eprintln!("probing every {}s", interval.as_secs());
+            // With refreshing on, each device is asked just before it would
+            // expire, so a long interval only delays finding new devices.
+            if config.refresh_before.is_none() && interval > socket::DEVICE_TIMEOUT {
+                eprintln!(
+                    "warning: that is longer than the {}s a device is kept without being heard from, \
+                     so devices whose records all expire sooner will come and go between probes",
+                    socket::DEVICE_TIMEOUT.as_secs()
+                );
+            }
+        }
+        None => eprintln!("not probing periodically (Interval= is not set): only at startup and on request"),
+    }
     for link in links.values() {
         let link = link.clone();
+        let interval = config.probe_interval;
         thread::spawn(move || {
             let name = format!("{}/{:?}", link.interface(), link.family());
-            match link.probe() {
-                Ok(queries) => eprintln!("{name}: startup probe sent {queries} queries"),
-                Err(e) => eprintln!("{name}: startup probe failed: {e:#}"),
+            let mut first = true;
+            loop {
+                let started = Instant::now();
+                match link.probe() {
+                    Ok(queries) if first => eprintln!("{name}: startup probe sent {queries} queries"),
+                    // Routine probes are not worth a journal line each.
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{name}: {} probe failed: {e:#}", if first { "startup" } else { "periodic" }),
+                }
+                first = false;
+                // The interval is between starts, and a probe itself takes a few seconds.
+                match interval {
+                    Some(i) => thread::sleep(i.saturating_sub(started.elapsed())),
+                    None => return,
+                }
             }
         });
     }
@@ -131,7 +165,12 @@ fn release(mut segments: Arc<Vec<Group>>) {
 /// With `advertise`, the link also announces that name (say `router.local`)
 /// with this host's address on the interface, as a reflected device with a
 /// hostname and an address but no services. The address is read once, here.
-fn start_link(interface: &str, family: Family, advertise: Option<&str>) -> Result<Segment> {
+fn start_link(
+    interface: &str,
+    family: Family,
+    advertise: Option<&str>,
+    refresh_before: Option<Duration>,
+) -> Result<Segment> {
     let sock = socket::open(interface, family)
         .with_context(|| format!("opening {family:?} socket on {interface}"))?;
     eprintln!("listening on {interface} ({family:?})");
@@ -173,7 +212,15 @@ fn start_link(interface: &str, family: Family, advertise: Option<&str>) -> Resul
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(10));
         let now = Instant::now();
+        // Drop what has run out first, so that nothing is asked that is being
+        // dropped, then ask the devices about to expire to answer again.
+        // Routine refreshes are not worth a journal line each.
         reaper.expire(now);
+        if let Some(before) = refresh_before {
+            if let Err(e) = reaper.refresh(now, before) {
+                eprintln!("{name}: refresh failed: {e:#}");
+            }
+        }
         if let Err(e) = reaper.reannounce(now) {
             eprintln!("{name}: re-announce failed: {e:#}");
         }

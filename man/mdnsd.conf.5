@@ -78,6 +78,57 @@ Unix socket paths are limited to about 108 bytes.
 The socket is created with mode 0660 (owner and group only).
 A stale socket left by a crashed run is replaced; a live instance, or a file
 that is not a socket, is never overwritten.
+.SS [Probe]
+Optional.
+Both settings are systemd time spans, such as
+.BR 30s ,
+.B 4min
+or
+.BR "1h 30min" ,
+or a bare number of seconds.
+.TP
+.B RefreshBefore=
+Ask a device to answer again this long before it would expire.
+Default
+.BR 30s ;
+.B 0
+or
+.B off
+turns it off.
+A device lives for as long as the longest TTL it announced, and at least five
+minutes.
+This long before that runs out, the daemon asks that device, and only it, for
+the records it announced, and asks again about every quarter of this margin
+until it answers or expires.
+A speaker whose records live seventy-five minutes is asked at about seventy-four
+minutes; a device with short records just before its five.
+Devices that are heard from regularly are never asked, and a device known only by
+the address it was heard from has nothing to ask and is left alone.
+It must be at least 30 seconds, because devices are checked every 10 seconds.
+.IP
+Because of the five minute floor, a TTL shorter than this margin is not a problem:
+such a device is not due as soon as it is heard, it lives five minutes after it
+was last heard and is asked 30 seconds before that.
+The cost is that a device that really vanishes stays listed, and announced to the
+other networks, for up to five minutes.
+A margin longer than the lifetime makes every device due all the time; it is then
+asked once per quarter of the margin, not continuously.
+.TP
+.B Interval=
+Also probe every interface for devices this often: browse for service types and
+instances.
+Not set by default.
+It must be at least 10 seconds.
+This is how a new quiet device that never announces itself is found; without it,
+new devices are found at startup, when they announce themselves (most do when
+they join a network) and by
+.BR "mdnsctl probe" .
+With
+.B RefreshBefore=
+off, an
+.B Interval=
+has to stay under five minutes to keep devices listed, and the daemon warns about
+it at startup.
 .SS [Advertise]
 Optional.
 .TP
@@ -162,6 +213,9 @@ IPv6=yes
 
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
+
+[Probe]
+RefreshBefore=30s
 
 [Advertise]
 Hostname=router.local

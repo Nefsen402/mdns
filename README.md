@@ -7,8 +7,9 @@ per-pair control over which networks can see each other's devices.
 - **Reflects** devices between the interfaces you choose, and only those. With
   `br0 <-> media` and `br0 <-> wifi`, `media` and `wifi` never learn about each
   other, even though both talk to `br0`.
-- **Probes** for devices actively (at startup and on demand) instead of only
-  waiting for them to announce themselves.
+- **Probes** for devices actively (at startup and on demand) and asks each
+  device to answer again just before it would expire, instead of only waiting
+  for devices to announce themselves.
 - **Advertises** the router's own name (`router.local`) on every network, as
   Avahi does, if you configure one.
 - **Answers** mDNS queries for reflected devices and withdraws them (with proper
@@ -99,6 +100,14 @@ IPv6=yes
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
 
+# Most devices (speakers especially) only answer when asked, and one that is
+# not heard from expires and is withdrawn from the other networks. So a device
+# is asked to answer again this long before it would expire (`0` or `off` turns
+# this off). `Interval=` would also probe every network that often, to find new
+# quiet devices; it is not set by default.
+[Probe]
+RefreshBefore=30s
+
 # Answer mDNS queries for this name with the router's own address on each
 # interface, so `router.local` resolves from every network listed below.
 [Advertise]
@@ -154,6 +163,50 @@ service creates `/run/mdnsd` for it). Unix socket paths are limited to about
 108 bytes. The socket is created with mode `0660` (owner and group only). A stale socket file from a crashed run is
 replaced; a live instance or a file that is not a socket is never overwritten.
 
+### `[Probe]` (optional)
+
+| Key             | Default | Meaning                                                                               |
+|-----------------|---------|---------------------------------------------------------------------------------------|
+| `RefreshBefore` | `30s`   | Ask a device to answer again this long before it would expire. `0`/`off` disables it. |
+| `Interval`      | off     | Also probe every interface for devices this often.                                    |
+
+Both are systemd time spans: `30s`, `4min`, `1h 30min`, or a bare number of
+seconds.
+
+Most devices (speakers especially) never announce themselves again after they
+start; they only answer when asked. A device that nobody has heard from expires,
+and is then withdrawn from the other networks until something asks it again.
+
+**`RefreshBefore`** renews each device just in time. A device lives for as long
+as the longest TTL it announced, **and at least 5 minutes**. `RefreshBefore`
+before that runs out, the daemon asks that device, and only it, for the records
+it announced, and asks again about every quarter of the margin until it answers
+or expires. A speaker whose records live 75 minutes is asked at about 74
+minutes; a device with short records just before its 5. Devices that are heard
+from regularly are never asked, and a device known only by the address it was
+heard from (a phone that merely sends queries) has nothing to ask and is left
+alone. The minimum is 30 seconds, because devices are checked every 10 seconds.
+
+*Short TTLs.* The 5 minute floor is why a TTL shorter than the margin (10
+seconds, say) is not a problem: the device is not due the moment it is heard, it
+lives 5 minutes after it was last heard and is asked 30 seconds before that. The
+price is that a device that really vanishes is still listed, and still announced
+to the other networks, for up to 5 minutes. A margin longer than the lifetime
+(more than 5 minutes for such a device) makes every device due all the time; it
+is then asked once per quarter of the margin, not continuously.
+
+**`Interval`** is not set by default. It probes every interface (browsing for
+service types and instances) on a timer, which is the way to find a **new**
+quiet device that never announces itself. Without it, new devices are found at
+startup, when they announce themselves (most do when they join a network), and by
+`mdnsctl probe`. The minimum is 10 seconds. With `RefreshBefore` off, an
+`Interval` has to stay under 5 minutes to keep devices listed, and the daemon
+warns at startup if it does not.
+
+A probe is a handful of multicast queries per interface and takes about four
+seconds; a refresh is a few questions. Routine ones are not logged; failures
+are.
+
 ### `[Advertise]` (optional)
 
 | Key        | Meaning                                                              |
@@ -196,7 +249,7 @@ pair of them**. Think of each segment as "these networks may see each other".
 ### What gets reflected
 
 Devices are found by listening, and by probing: at startup, and whenever you
-run `mdnsctl probe`, the daemon browses every interface for service types and
+run `mdnsctl probe` (or every [`Interval`](#probe-optional), if set), the daemon browses every interface for service types and
 instances, resolves each instance's hostname and port, and asks for the
 addresses of devices that have a name but no routable address yet. Many devices
 answer only when asked, and a device needs a hostname and a routable address to
@@ -232,7 +285,9 @@ be reflected, so without probing they would stay invisible.
   packets when their source disappears.
 - A discovered device expires after it has been silent for at least 5 minutes,
   or for the TTL of its records if that is longer. A goodbye packet removes it
-  immediately.
+  immediately. A device that is about to expire is asked to answer again
+  ([`RefreshBefore`](#probe-optional)), which is what keeps quiet ones from
+  expiring.
 
 The daemon binds with `SO_REUSEPORT`, so it can run next to Avahi while you
 migrate, but don't run two reflectors (this and Avahi's) over the same
@@ -324,9 +379,9 @@ wifi       v6      9 queries sent
 List what answered with: mdnsctl devices <name>
 ```
 
-The daemon already probes every interface once at startup; run this again to
-pick up devices that were switched on later or that rarely announce. Probes are
-not repeated on a timer.
+The daemon already probes every interface at startup, and again every
+[`Interval`](#probe-optional) if you set one; run this to probe right now, for
+example to pick up a device you have just switched on.
 
 ### Exit status
 

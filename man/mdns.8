@@ -60,10 +60,27 @@ A device needs a hostname, a routable address and a service to be reflected, and
 the resolve steps are what supply the hostname and the address for devices that
 only answer browse queries.
 .PP
-A probe runs on every interface once at startup, and again whenever
+A probe runs on every interface at startup, and again whenever
 .B mdnsctl probe
-is run.
-Probes are not repeated on a timer.
+is run, or every
+.B Interval=
+of the
+.B [Probe]
+section of
+.BR mdnsd.conf (5)
+if one is set (it is not by default).
+.PP
+Most devices only answer when asked, and one that is not heard from expires, so
+a device that is about to expire is asked to answer again, on its own: this long
+before the end of its lifetime, which is the longest TTL it announced and at
+least five minutes, the daemon asks that device, and only it, for the records it
+announced, and asks again until it answers or expires.
+This is the
+.B RefreshBefore=
+setting of the
+.B [Probe]
+section (30 seconds by default); see
+.BR mdnsd.conf (5).
 .SS Advertising
 With
 .B Hostname=

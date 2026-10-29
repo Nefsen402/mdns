@@ -8,6 +8,10 @@
 //! [Ipc]               ; optional
 //! Socket=/run/mdnsd/mdnsd.sock
 //!
+//! [Probe]             ; optional
+//! RefreshBefore=30s
+//! Interval=4min       ; off unless set
+//!
 //! [Advertise]         ; optional
 //! Hostname=router.local
 //!
@@ -31,12 +35,23 @@
 //! whitespace.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use systemd_unit_edit::{Entry, Parse, SystemdUnit};
+use systemd_unit_edit::{parse_timespan, Entry, Parse, SystemdUnit, TimespanParseError};
 
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
+
+/// Probing more often than this would be a flood, not a probe.
+const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long before a device would expire it is asked to answer again.
+pub const DEFAULT_REFRESH_BEFORE: Duration = Duration::from_secs(30);
+
+/// Devices are checked for being due every 10 seconds (the reaper tick), so a
+/// smaller margin could fall between two checks and never fire.
+const MIN_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
@@ -54,6 +69,12 @@ pub struct Config {
     /// A `.local` name to announce and answer for with this host's own
     /// addresses on every interface.
     pub advertise: Option<String>,
+    /// How often to probe every interface for devices; `None` (the default)
+    /// probes only at startup and on request.
+    pub probe_interval: Option<Duration>,
+    /// How long before a device would expire to ask it to answer again;
+    /// `None` leaves that to the periodic probe.
+    pub refresh_before: Option<Duration>,
 }
 
 impl Default for Config {
@@ -64,6 +85,8 @@ impl Default for Config {
             ipv6: true,
             socket: PathBuf::from(DEFAULT_SOCKET),
             advertise: None,
+            probe_interval: None,
+            refresh_before: Some(DEFAULT_REFRESH_BEFORE),
         }
     }
 }
@@ -126,6 +149,12 @@ impl Config {
                     }
                     ("listen", "ipv4") => config.ipv4 = parse_bool(&entry, lineno)?,
                     ("listen", "ipv6") => config.ipv6 = parse_bool(&entry, lineno)?,
+                    ("probe", "interval") => {
+                        config.probe_interval = parse_span(&value, lineno, "Interval", MIN_PROBE_INTERVAL)?;
+                    }
+                    ("probe", "refreshbefore") => {
+                        config.refresh_before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
+                    }
                     ("advertise", "hostname") => {
                         config.advertise = Some(local_name(&value, lineno)?);
                     }
@@ -252,6 +281,24 @@ fn failing_line(text: &str) -> Option<usize> {
     None
 }
 
+/// A time span setting called `key`: a systemd time span such as `4min` or
+/// `1h 30min`, with `0`, `off` or `infinity` meaning never, and at least `min`.
+fn parse_span(value: &str, lineno: usize, key: &str, min: Duration) -> Result<Option<Duration>> {
+    if matches!(value.to_ascii_lowercase().as_str(), "off" | "infinity") {
+        return Ok(None);
+    }
+    let span = match parse_timespan(value) {
+        Ok(span) => span,
+        // The crate reports a span that adds up to zero ("0", "0s") as empty.
+        Err(TimespanParseError::Empty) if !value.trim().is_empty() => return Ok(None),
+        Err(e) => bail!("line {lineno}: invalid {key} {value:?}: {e}"),
+    };
+    if span < min {
+        bail!("line {lineno}: {key}= must be at least {} seconds", min.as_secs());
+    }
+    Ok(Some(span))
+}
+
 /// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
 fn parse_bool(entry: &Entry, lineno: usize) -> Result<bool> {
     entry
@@ -298,6 +345,9 @@ interfaces=br0,wifi
         );
         assert_eq!(c.socket, PathBuf::from("/run/mdnsd/mdnsd.sock"));
         assert_eq!(c.advertise.as_deref(), Some("router.local"));
+        assert_eq!(c.probe_interval, None, "the example does not set an Interval");
+        assert_eq!(c.refresh_before, Some(Duration::from_secs(30)));
+        assert_eq!(c.refresh_before, Some(DEFAULT_REFRESH_BEFORE), "the example shows the default");
         assert!(c.ipv4 && c.ipv6);
     }
 
@@ -322,7 +372,7 @@ interfaces=br0,wifi
     #[test]
     fn man_page_documents_every_key_and_its_example_parses() {
         let man = include_str!("../man/mdnsd.conf.5");
-        for key in ["IPv4=", "IPv6=", "Socket=", "Hostname=", "Name=", "Interfaces="] {
+        for key in ["IPv4=", "IPv6=", "Socket=", "Interval=", "RefreshBefore=", "Hostname=", "Name=", "Interfaces="] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
         assert!(man.contains(DEFAULT_SOCKET));
@@ -423,6 +473,54 @@ interfaces=br0,wifi
         // A value may contain an equals sign.
         let c = Config::parse("[Segment]\nName=a=b\nInterfaces=x\n").unwrap();
         assert_eq!(c.segments[0].name, "a=b");
+    }
+
+    #[test]
+    fn the_probe_interval_is_off_by_default_and_takes_systemd_time_spans() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().probe_interval, None);
+
+        let with = |v: &str| Config::parse(&format!("[Probe]\nInterval={v}\n{EXAMPLE}"));
+        let secs = |v: &str| with(v).unwrap().probe_interval.map(|d| d.as_secs());
+        assert_eq!(secs("4min"), Some(240));
+        assert_eq!(secs("30s"), Some(30));
+        assert_eq!(secs("1h"), Some(3600));
+        assert_eq!(secs("1h 30min"), Some(5400));
+        assert_eq!(secs("90"), Some(90), "a bare number is seconds");
+        assert_eq!(secs("\"10min\""), Some(600));
+        for never in ["0", "0s", "0min", "off", "OFF", "infinity"] {
+            assert_eq!(secs(never), None, "{never}");
+        }
+    }
+
+    #[test]
+    fn bad_probe_intervals_are_rejected_with_their_line() {
+        let with = |v: &str| error_of(&format!("[Probe]\nInterval={v}\n{EXAMPLE}"));
+        assert!(with("soon").contains("line 2") && with("soon").contains("invalid Interval"));
+        assert!(with("5s").contains("at least 10 seconds"));
+        assert!(with("").contains("line 2"), "an empty value is not a time span");
+        assert!(with("3 fortnights").contains("invalid"));
+    }
+
+    #[test]
+    fn refreshing_before_expiry_defaults_on_and_takes_systemd_time_spans() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().refresh_before, Some(DEFAULT_REFRESH_BEFORE));
+
+        let with = |v: &str| Config::parse(&format!("[Probe]\nRefreshBefore={v}\n{EXAMPLE}"));
+        let secs = |v: &str| with(v).unwrap().refresh_before.map(|d| d.as_secs());
+        assert_eq!(secs("1min"), Some(60));
+        assert_eq!(secs("30s"), Some(30), "the minimum is allowed");
+        assert_eq!(secs("45s"), Some(45));
+        assert_eq!(secs("10min"), Some(600), "longer than the idle floor is allowed");
+        for never in ["0", "off", "infinity"] {
+            assert_eq!(secs(never), None, "{never}");
+        }
+        // It is independent of the periodic probe, in both directions.
+        let both = Config::parse(&format!("[Probe]\nInterval=off\nRefreshBefore=2min\n{EXAMPLE}")).unwrap();
+        assert_eq!((both.probe_interval, both.refresh_before), (None, Some(Duration::from_secs(120))));
+
+        let err = |v: &str| error_of(&format!("[Probe]\nRefreshBefore={v}\n{EXAMPLE}"));
+        assert!(err("20s").contains("RefreshBefore= must be at least 30 seconds"), "{}", err("20s"));
+        assert!(err("soon").contains("line 2") && err("soon").contains("invalid RefreshBefore"));
     }
 
     #[test]
