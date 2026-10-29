@@ -9,6 +9,8 @@ per-pair control over which networks can see each other's devices.
   other, even though both talk to `br0`.
 - **Probes** for devices actively (at startup and on demand) instead of only
   waiting for them to announce themselves.
+- **Advertises** the router's own name (`router.local`) on every network, as
+  Avahi does, if you configure one.
 - **Answers** mDNS queries for reflected devices and withdraws them (with proper
   goodbye packets) when the source device disappears or the daemon stops.
 - **Exposes** what it knows over a local control socket, queried with `mdnsctl`.
@@ -97,6 +99,11 @@ IPv6=yes
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
 
+# Answer mDNS queries for this name with the router's own address on each
+# interface, so `router.local` resolves from every network listed below.
+[Advertise]
+Hostname=router.local
+
 [Segment]
 Name=media_stuff
 Interfaces=br0,media
@@ -144,6 +151,25 @@ The directory must already exist and be writable by the daemon (the systemd
 service creates `/run/mdnsd` for it). Unix socket paths are limited to about
 108 bytes. The socket is created with mode `0660` (owner and group only). A stale socket file from a crashed run is
 replaced; a live instance or a file that is not a socket is never overwritten.
+
+### `[Advertise]` (optional)
+
+| Key        | Meaning                                                              |
+|------------|----------------------------------------------------------------------|
+| `Hostname` | A name under `.local` to announce and answer for, e.g. `router.local`. A bare label such as `router` means `router.local`. |
+
+The daemon answers queries for this name with **its own address on each
+interface**, so every network is told the address at which it can reach the
+router. The IPv4 socket publishes an A record with the interface's primary
+IPv4 address and the IPv6 socket an AAAA record with its link-local IPv6
+address (the source address the kernel uses towards the mDNS group there). An
+interface with no address of a family is skipped, with a message in the log.
+Addresses are read once, at startup; restart the daemon after changing them.
+
+Internally the name is just a reflected device that has a hostname and an
+address but no services, so it is announced, kept alive, answered for and
+withdrawn with a goodbye on shutdown like any other. There is no conflict
+detection; the name is assumed to be yours alone.
 
 ### `[Segment]` (one or more, required)
 

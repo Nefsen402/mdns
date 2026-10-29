@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 
 use config::Config;
 use reflector::Reflector;
-use socket::{Family, MdnsSocket, Segment};
+use socket::{Device, Family, MdnsSocket, Segment};
 
 /// One configured segment for one address family.
 pub struct Group {
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     let mut links: HashMap<(&str, Family), Segment> = HashMap::new();
     for interface in config.interfaces() {
         for &family in &families {
-            let link = start_link(interface, family)?;
+            let link = start_link(interface, family, config.advertise.as_deref())?;
             links.insert((interface, family), link);
         }
     }
@@ -92,6 +92,15 @@ fn main() -> Result<()> {
     let signal = signal::wait().context("waiting for shutdown signal")?;
     eprintln!("received {signal}: withdrawing reflected devices");
     release(segments);
+    // With the reflectors gone, what is left in the manual lists is the
+    // advertised name: say goodbye to it too.
+    for link in links.values() {
+        for device in link.manual_devices() {
+            if let Err(e) = link.remove_manual(device.addr) {
+                eprintln!("{}/{:?}: withdrawing {} failed: {e:#}", link.interface(), link.family(), device.addr);
+            }
+        }
+    }
     let _ = std::fs::remove_file(&config.socket);
     Ok(())
 }
@@ -118,7 +127,11 @@ fn release(mut segments: Arc<Vec<Group>>) {
 /// Open the socket for one interface and family and start its threads:
 /// receive/respond, expiry/re-announcement, and an event logger. They run
 /// until the process exits.
-fn start_link(interface: &str, family: Family) -> Result<Segment> {
+///
+/// With `advertise`, the link also announces that name (say `router.local`)
+/// with this host's address on the interface, as a reflected device with a
+/// hostname and an address but no services. The address is read once, here.
+fn start_link(interface: &str, family: Family, advertise: Option<&str>) -> Result<Segment> {
     let sock = socket::open(interface, family)
         .with_context(|| format!("opening {family:?} socket on {interface}"))?;
     eprintln!("listening on {interface} ({family:?})");
@@ -126,6 +139,19 @@ fn start_link(interface: &str, family: Family) -> Result<Segment> {
     let link = Segment::new(interface, family);
     let (tx, dest) = sock.sender()?;
     link.attach(tx, dest);
+
+    if let Some(name) = advertise {
+        let router = sock.local_addr().and_then(|addr| {
+            link.add_manual(Device { addr, hostname: Some(name.to_string()), services: Vec::new() })
+                .map(|_| addr)
+        });
+        match router {
+            Ok(addr) => eprintln!("{interface}/{family:?}: advertising {name} as {addr}"),
+            // An interface without an address of this family has nothing to
+            // advertise; that is not a reason to refuse to start.
+            Err(e) => eprintln!("{interface}/{family:?}: not advertising {name}: {e:#}"),
+        }
+    }
 
     // Placeholder consumer: log changes to the discovered list.
     let events = link.subscribe();

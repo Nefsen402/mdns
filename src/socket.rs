@@ -87,6 +87,31 @@ impl MdnsSocket {
         };
         Ok((self.socket.try_clone()?.into(), dest))
     }
+
+    /// The address this host uses on this interface: the source address the
+    /// kernel picks for traffic to the mDNS group there, which is the primary
+    /// IPv4 address and, for IPv6, the link-local address. Nothing is sent.
+    pub fn local_addr(&self) -> Result<IpAddr> {
+        let (domain, group) = match self.family {
+            Family::V4 => (Domain::IPV4, SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT))),
+            Family::V6 => (
+                Domain::IPV6,
+                SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, self.index)),
+            ),
+        };
+        // A throwaway socket: connecting UDP only makes the kernel choose a
+        // source address, which `local_addr` then reveals.
+        let probe = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        probe.bind_device(Some(self.interface.as_bytes()))?;
+        probe
+            .connect(&group.into())
+            .with_context(|| format!("finding the address used on {}", self.interface))?;
+        probe
+            .local_addr()?
+            .as_socket()
+            .map(|a| a.ip())
+            .ok_or_else(|| anyhow!("no local address on {}", self.interface))
+    }
 }
 
 pub fn ifindex(name: &str) -> Result<u32> {
@@ -1331,6 +1356,46 @@ mod tests {
             .collect();
         hear(&seg, "10.0.2.73", ptrs);
         assert_eq!(seg.state.lock().unwrap().types.len(), MAX_TYPES);
+    }
+
+    /// `router.local` is advertised as a reflected device that has a hostname
+    /// and an address but no services.
+    #[test]
+    fn a_device_without_services_can_be_advertised() {
+        let (seg, rx) = wired();
+        let router = Device { addr: ip("10.0.1.1"), hostname: Some("router.local".into()), services: vec![] };
+        seg.add_manual(router).unwrap();
+
+        let m = recv(&rx).expect("announcement");
+        assert_eq!(m.answers.len(), 1, "just the address record: {:?}", m.answers);
+        assert_eq!(m.answers[0].name, "router.local");
+        assert_eq!(m.answers[0].data, RData::A("10.0.1.1".parse().unwrap()));
+        assert!(m.answers[0].cache_flush);
+
+        // It answers for its name like any reflected device...
+        age(&seg, 2);
+        seg.handle(sa("10.0.1.50"), &query("Router.LOCAL", rtype::A, vec![])).unwrap();
+        assert_eq!(recv(&rx).unwrap().answers[0].data, RData::A("10.0.1.1".parse().unwrap()));
+
+        // ...is re-announced, and says goodbye when removed.
+        seg.reannounce(Instant::now() + REANNOUNCE + Duration::from_secs(1)).unwrap();
+        assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL));
+        seg.remove_manual(ip("10.0.1.1")).unwrap();
+        assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
+    }
+
+    /// Manual check against a real interface: `MDNS_TEST_IFACE=br cargo test
+    /// live_local_addr -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_local_addr() {
+        let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
+        for family in [Family::V4, Family::V6] {
+            let addr = open(&iface, family).unwrap().local_addr().unwrap();
+            println!("{iface} {family:?}: {addr}");
+            assert!(!addr.is_loopback() && !addr.is_unspecified());
+            assert_eq!(addr.is_ipv4(), family == Family::V4);
+        }
     }
 
     #[test]

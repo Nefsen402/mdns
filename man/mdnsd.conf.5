@@ -74,6 +74,34 @@ Unix socket paths are limited to about 108 bytes.
 The socket is created with mode 0660 (owner and group only).
 A stale socket left by a crashed run is replaced; a live instance, or a file
 that is not a socket, is never overwritten.
+.SS [Advertise]
+Optional.
+.TP
+.B Hostname=
+A name under
+.B .local
+that the daemon announces, and answers queries for, with this host's own
+addresses on each interface it listens on, for example
+.BR router.local .
+A bare label such as
+.B router
+means
+.BR router.local .
+.IP
+Each interface is told the address at which this host can be reached on it:
+the IPv4 socket publishes an A record with the interface's primary IPv4
+address, and the IPv6 socket an AAAA record with its link-local IPv6 address,
+which is what the kernel uses as the source address towards the mDNS group
+there.
+An interface that has no address of a family is skipped, with a message in
+the log.
+The addresses are read once, at startup: restart the daemon after changing
+them.
+.IP
+The name is announced and kept alive like a reflected device, answers queries
+(a reflected device without services), and is withdrawn with a goodbye on
+shutdown.
+No conflict detection is done: the name is assumed to be yours alone.
 .SS [Segment]
 One or more are required.
 .TP
@@ -130,6 +158,9 @@ IPv6=yes
 
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
+
+[Advertise]
+Hostname=router.local
 
 [Segment]
 Name=media_stuff

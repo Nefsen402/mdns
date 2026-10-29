@@ -50,6 +50,24 @@ A probe runs on every interface once at startup, and again whenever
 .B mdnsctl probe
 is run.
 Probes are not repeated on a timer.
+.SS Advertising
+With
+.B Hostname=
+in the
+.B [Advertise]
+section of
+.BR mdnsd.conf (5),
+the daemon also announces and answers for its own name, for example
+.BR router.local ,
+the way Avahi does for the host it runs on.
+On each interface it publishes the address of this host on that interface (an
+A record with the primary IPv4 address, an AAAA record with the link-local
+IPv6 address), read once at startup.
+The name is handled exactly like a reflected device that has no services: it
+is announced, re-announced periodically, answers queries, and is withdrawn
+with goodbye packets on
+.BR SIGTERM .
+No conflict detection is done: the name is assumed to be yours alone.
 .SS Reflection
 Within a segment, every interface announces the devices discovered on every
 other interface of that segment.

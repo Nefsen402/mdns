@@ -8,6 +8,9 @@
 //! [Ipc]               ; optional
 //! Socket=/run/mdnsd/mdnsd.sock
 //!
+//! [Advertise]         ; optional
+//! Hostname=router.local
+//!
 //! [Segment]
 //! Name=media_stuff
 //! Interfaces=br0,media
@@ -47,6 +50,9 @@ pub struct Config {
     pub ipv6: bool,
     /// Where the IPC server listens.
     pub socket: PathBuf,
+    /// A `.local` name to announce and answer for with this host's own
+    /// addresses on every interface.
+    pub advertise: Option<String>,
 }
 
 impl Default for Config {
@@ -56,6 +62,7 @@ impl Default for Config {
             ipv4: true,
             ipv6: true,
             socket: PathBuf::from(DEFAULT_SOCKET),
+            advertise: None,
         }
     }
 }
@@ -123,6 +130,9 @@ impl Config {
                 }
                 ("listen", "ipv4") => config.ipv4 = parse_bool(value, lineno)?,
                 ("listen", "ipv6") => config.ipv6 = parse_bool(value, lineno)?,
+                ("advertise", "hostname") => {
+                    config.advertise = Some(local_name(&unquote(value), lineno)?);
+                }
                 ("ipc", "socket") => {
                     let path = unquote(value);
                     if path.is_empty() {
@@ -190,6 +200,29 @@ impl Config {
     }
 }
 
+/// A name to advertise: a hostname under `.local`. A bare label such as
+/// `router` means `router.local`.
+fn local_name(value: &str, lineno: usize) -> Result<String> {
+    if value.is_empty() {
+        bail!("line {lineno}: Hostname= needs a name");
+    }
+    let name = if value.contains('.') { value.to_string() } else { format!("{value}.local") };
+    if !name.to_ascii_lowercase().ends_with(".local") {
+        bail!("line {lineno}: {name:?} is not under .local, the only domain mDNS answers for");
+    }
+    for label in name.split('.') {
+        let ok = (1..=63).contains(&label.len())
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !ok {
+            bail!("line {lineno}: {name:?} is not a valid hostname (label {label:?})");
+        }
+    }
+    if name.len() > 253 {
+        bail!("line {lineno}: {name:?} is too long");
+    }
+    Ok(name)
+}
+
 /// Strip one pair of matching surrounding quotes.
 fn unquote(value: &str) -> String {
     let value = value.trim();
@@ -247,14 +280,32 @@ interfaces=br0,wifi
             ]
         );
         assert_eq!(c.socket, PathBuf::from("/run/mdnsd/mdnsd.sock"));
+        assert_eq!(c.advertise.as_deref(), Some("router.local"));
         assert!(c.ipv4 && c.ipv6);
+    }
+
+    #[test]
+    fn advertise_is_optional_and_validated() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().advertise, None);
+
+        let with = |value: &str| Config::parse(&format!("[Advertise]\nHostname={value}\n{EXAMPLE}"));
+        assert_eq!(with("router.local").unwrap().advertise.as_deref(), Some("router.local"));
+        assert_eq!(with("\"My-Router.LOCAL\"").unwrap().advertise.as_deref(), Some("My-Router.LOCAL"));
+        // A bare label means that label under .local.
+        assert_eq!(with("router").unwrap().advertise.as_deref(), Some("router.local"));
+
+        for bad in ["", "router.lan", "router.example.com", "bad name.local", "a..local", ".local", "ro_uter.local"] {
+            assert!(with(bad).is_err(), "should reject {bad:?}");
+        }
+        assert!(with(&format!("{}.local", "x".repeat(64))).is_err());
+        assert!(with(&format!("{}.local", "x".repeat(63))).is_ok());
     }
 
     /// The man page must document every key and a config that really parses.
     #[test]
     fn man_page_documents_every_key_and_its_example_parses() {
         let man = include_str!("../man/mdnsd.conf.5");
-        for key in ["IPv4=", "IPv6=", "Socket=", "Name=", "Interfaces="] {
+        for key in ["IPv4=", "IPv6=", "Socket=", "Hostname=", "Name=", "Interfaces="] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
         assert!(man.contains(DEFAULT_SOCKET));
