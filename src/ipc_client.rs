@@ -35,6 +35,7 @@ enum Command {
 struct Options {
     socket: PathBuf,
     json: bool,
+    verbose: bool,
     command: Command,
 }
 
@@ -55,12 +56,12 @@ enum Failure {
 }
 
 fn usage() -> String {
-    let mut out = String::from("usage: mdnsctl [-s PATH] [--json] <command>\n\ncommands:\n");
+    let mut out = String::from("usage: mdnsctl [-s PATH] [-v] [--json] <command>\n\ncommands:\n");
     for (name, args, about) in COMMANDS {
         out.push_str(&format!("  {:<18}{about}\n", format!("{name} {args}").trim_end()));
     }
     out.push_str(&format!(
-        "\noptions:\n  -s, --socket PATH  control socket (default {DEFAULT_SOCKET})\n      --json         print the daemon's reply unchanged\n  -h, --help         show this help\n"
+        "\noptions:\n  -s, --socket PATH  control socket (default {DEFAULT_SOCKET})\n  -v, --verbose      list devices with all details (addresses, services)\n      --json         print the daemon's reply unchanged\n  -h, --help         show this help\n"
     ));
     out
 }
@@ -69,6 +70,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
     let mut args = args.into_iter();
     let mut socket = PathBuf::from(DEFAULT_SOCKET);
     let mut json = false;
+    let mut verbose = false;
     let mut words: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -80,6 +82,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--json" => json = true,
+            "-v" | "--verbose" => verbose = true,
             "-s" | "--socket" => {
                 let path = args.next().ok_or_else(|| Failure::Usage(format!("{arg} needs a path")))?;
                 socket = PathBuf::from(path);
@@ -119,7 +122,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
         }
         other => return Err(Failure::Usage(format!("unknown command {other:?}"))),
     };
-    Ok(Parsed::Run(Options { socket, json, command }))
+    Ok(Parsed::Run(Options { socket, json, verbose, command }))
 }
 
 /// Send one request line and return the one-line reply.
@@ -164,7 +167,8 @@ fn execute(opts: &Options) -> Result<String, Failure> {
     }
     match opts.command {
         Command::Segments => render_segments(&reply),
-        Command::Devices(_) => render_devices(&reply),
+        Command::Devices(_) if opts.verbose => render_devices(&reply),
+        Command::Devices(_) => render_devices_brief(&reply),
         Command::Probe(_) => render_probe(&reply),
     }
 }
@@ -207,6 +211,89 @@ fn render_probe(reply: &Value) -> Result<String, Failure> {
     let mut out = table(&rows);
     out.push_str("\nList what answered with: mdnsctl devices <name>\n");
     Ok(out)
+}
+
+/// One line per named device: its DNS name and its pretty name (the service
+/// instance name, such as "OZAL Speakers"). The IPv4 and IPv6 entries of a
+/// device are merged. Devices that have not announced a hostname have no DNS
+/// name to show, so they are only counted.
+fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
+    let name = reply["name"].as_str().ok_or_else(bad_reply)?;
+    let devices = reply["devices"].as_array().ok_or_else(bad_reply)?;
+    if devices.is_empty() {
+        return Ok(format!("{name}: no devices\n"));
+    }
+
+    let mut named: Vec<(String, Vec<String>)> = Vec::new();
+    let mut unnamed = 0;
+    for device in devices {
+        let Some(host) = device["hostname"].as_str() else {
+            unnamed += 1;
+            continue;
+        };
+        let pretty = pretty_names(device);
+        match named.iter_mut().find(|(h, _)| h.eq_ignore_ascii_case(host)) {
+            Some((_, names)) => {
+                for p in pretty {
+                    if !names.contains(&p) {
+                        names.push(p);
+                    }
+                }
+            }
+            None => named.push((host.to_string(), pretty)),
+        }
+    }
+    named.sort_by_key(|(host, _)| host.to_ascii_lowercase());
+
+    let mut out = match named.len() {
+        0 => format!("{name}: no named devices\n"),
+        1 => format!("{name}: 1 device\n"),
+        n => format!("{name}: {n} devices\n"),
+    };
+    let width = named.iter().map(|(host, _)| host.len()).max().unwrap_or(0);
+    for (host, names) in &named {
+        let pretty = if names.is_empty() { "-".to_string() } else { names.join(", ") };
+        out.push_str(&format!("  {host:<width$}  {pretty}\n"));
+    }
+    if unnamed > 0 {
+        let s = if unnamed == 1 { "" } else { "s" };
+        out.push_str(&format!("\n({unnamed} device{s} without a name not shown; use -v to list everything)\n"));
+    }
+    Ok(out)
+}
+
+/// The human names of a device's services, from its instance names: the
+/// first label, without the AirPlay `<MAC>@` prefix, each name once.
+fn pretty_names(device: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for svc in device["services"].as_array().into_iter().flatten() {
+        let kind = svc["type"].as_str().unwrap_or("");
+        let instance = svc["instance"].as_str().unwrap_or("");
+        let label = instance.strip_suffix(&format!(".{kind}")).unwrap_or(instance);
+        let label = unescape_label(label);
+        let name = match label.split_once('@') {
+            Some((mac, rest)) if mac.len() == 12 && mac.chars().all(|c| c.is_ascii_hexdigit()) => rest,
+            _ => &label,
+        };
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Undo the daemon's escaping of `.` and `\` inside a name label.
+fn unescape_label(label: &str) -> String {
+    let mut out = String::new();
+    let mut chars = label.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            out.extend(chars.next());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn render_devices(reply: &Value) -> Result<String, Failure> {
@@ -331,7 +418,10 @@ mod tests {
     #[test]
     fn parses_commands_and_options() {
         let o = opts(&["segments"]);
-        assert_eq!(o, Options { socket: DEFAULT_SOCKET.into(), json: false, command: Command::Segments });
+        assert_eq!(
+            o,
+            Options { socket: DEFAULT_SOCKET.into(), json: false, verbose: false, command: Command::Segments }
+        );
 
         let o = opts(&["-s", "/x.sock", "--json", "devices", "IoT", "to", "br0"]);
         assert_eq!(o.socket, PathBuf::from("/x.sock"));
@@ -341,6 +431,11 @@ mod tests {
         assert_eq!(opts(&["--socket=/y.sock", "segments"]).socket, PathBuf::from("/y.sock"));
         // Options after the command belong to the command.
         assert_eq!(opts(&["devices", "--json"]).command, Command::Devices("--json".into()));
+        assert!(!opts(&["devices", "IoT"]).verbose);
+        assert!(opts(&["-v", "devices", "IoT"]).verbose);
+        assert!(opts(&["--verbose", "--json", "devices", "IoT"]).verbose);
+        // After the command, "-v" is part of the segment name, not a flag.
+        assert_eq!(opts(&["devices", "-v"]).command, Command::Devices("-v".into()));
         assert_eq!(opts(&["probe"]).command, Command::Probe(None));
         assert_eq!(opts(&["probe", "  "]).command, Command::Probe(None));
         assert_eq!(opts(&["probe", "IoT", "to", "br0"]).command, Command::Probe(Some("IoT to br0".into())));
@@ -372,7 +467,7 @@ mod tests {
         for (name, _, _) in COMMANDS {
             assert!(man.contains(&format!(".B {name}")) || man.contains(&format!("\\fB{name}\\fR")), "{name}");
         }
-        for option in ["\\-\\-json", "\\-\\-socket", "\\-\\-help"] {
+        for option in ["\\-\\-json", "\\-\\-socket", "\\-\\-help", "\\-\\-verbose"] {
             assert!(man.contains(option), "{option}");
         }
         assert!(man.contains(DEFAULT_SOCKET));
@@ -409,6 +504,68 @@ mod tests {
         assert_eq!(render_devices(&empty).unwrap(), "IoT: no devices\n");
     }
 
+    fn brief(json: &str) -> String {
+        render_devices_brief(&serde_json::from_str(json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn brief_listing_shows_dns_name_and_pretty_name() {
+        let reply: Value = serde_json::from_str(DEVICES).unwrap();
+        assert_eq!(
+            render_devices_brief(&reply).unwrap(),
+            "IoT to br0: 1 device\n  printer.local  Printer\n\n(1 device without a name not shown; use -v to list everything)\n"
+        );
+    }
+
+    #[test]
+    fn brief_listing_merges_families_and_cleans_names() {
+        // A speaker seen over v4 and v6, with an AirPlay-style "<MAC>@Name" instance.
+        let svc = |instance: &str, kind: &str| {
+            format!(r#"{{"instance":"{instance}","type":"{kind}","port":7000,"target":"x.local","txt":[]}}"#)
+        };
+        let device = |family: &str, addr: &str| {
+            format!(
+                r#"{{"interface":"media","family":"{family}","addr":"{addr}","hostname":"OZAL-Speakers.local","services":[{},{}]}}"#,
+                svc("04098643E3F7@OZAL Speakers._raop._tcp.local", "_raop._tcp.local"),
+                svc("OZAL Speakers._airplay._tcp.local", "_airplay._tcp.local"),
+            )
+        };
+        let other = format!(
+            r#"{{"interface":"media","family":"v4","addr":"10.0.2.9","hostname":"tv.local","services":[{}]}}"#,
+            svc(r"Living Room\\. TV._http._tcp.local", "_http._tcp.local")
+        );
+        let json = format!(
+            r#"{{"ok":true,"name":"media","devices":[{},{},{other}]}}"#,
+            device("v4", "10.0.2.73"),
+            device("v6", "fe80::1")
+        );
+        assert_eq!(
+            brief(&json),
+            "media: 2 devices\n  OZAL-Speakers.local  OZAL Speakers\n  tv.local             Living Room. TV\n"
+        );
+    }
+
+    #[test]
+    fn brief_listing_edge_cases() {
+        // Several distinct names are all shown; no services shows a dash.
+        let json = r#"{"ok":true,"name":"x","devices":[
+            {"interface":"a","family":"v4","addr":"1.1.1.1","hostname":"b.local","services":[
+                {"instance":"Kitchen._a._tcp.local","type":"_a._tcp.local","port":1,"target":null,"txt":[]},
+                {"instance":"Hall._b._tcp.local","type":"_b._tcp.local","port":2,"target":null,"txt":[]}]},
+            {"interface":"a","family":"v4","addr":"1.1.1.2","hostname":"A.local","services":[]}]}"#;
+        assert_eq!(brief(json), "x: 2 devices\n  A.local  -\n  b.local  Kitchen, Hall\n");
+
+        // Only unnamed devices, none at all.
+        let only_unnamed = r#"{"ok":true,"name":"x","devices":[
+            {"interface":"a","family":"v4","addr":"1.1.1.1","hostname":null,"services":[]},
+            {"interface":"a","family":"v6","addr":"fe80::1","hostname":null,"services":[]}]}"#;
+        assert_eq!(
+            brief(only_unnamed),
+            "x: no named devices\n\n(2 devices without a name not shown; use -v to list everything)\n"
+        );
+        assert_eq!(brief(r#"{"ok":true,"name":"x","devices":[]}"#), "x: no devices\n");
+    }
+
     #[test]
     fn renders_probe_results() {
         let reply: Value = serde_json::from_str(
@@ -442,7 +599,11 @@ mod tests {
     }
 
     fn run(path: &Path, json: bool, command: Command) -> Result<String, Failure> {
-        execute(&Options { socket: path.into(), json, command })
+        execute(&Options { socket: path.into(), json, verbose: false, command })
+    }
+
+    fn run_verbose(path: &Path, command: Command) -> Result<String, Failure> {
+        execute(&Options { socket: path.into(), json: false, verbose: true, command })
     }
 
     #[test]
@@ -455,7 +616,12 @@ mod tests {
         let (path, daemon) = fake_daemon("devices", DEVICES);
         let out = run(&path, false, Command::Devices("IoT to br0".into())).unwrap();
         assert_eq!(daemon.join().unwrap(), "devices IoT to br0\n");
-        assert!(out.starts_with("IoT to br0: 2 devices"));
+        assert!(out.starts_with("IoT to br0: 1 device\n"), "brief by default: {out}");
+
+        let (path, daemon) = fake_daemon("devices-v", DEVICES);
+        let out = run_verbose(&path, Command::Devices("IoT to br0".into())).unwrap();
+        daemon.join().unwrap();
+        assert!(out.starts_with("IoT to br0: 2 devices\n") && out.contains("10.0.1.7"), "verbose: {out}");
         let _ = std::fs::remove_file(&path);
     }
 

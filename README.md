@@ -224,7 +224,7 @@ interfaces.
 Queries a running daemon over its control socket.
 
 ```
-usage: mdnsctl [-s PATH] [--json] <command>
+usage: mdnsctl [-s PATH] [-v] [--json] <command>
 
 commands:
   segments          list the configured segments
@@ -233,6 +233,7 @@ commands:
 
 options:
   -s, --socket PATH  control socket (default /run/mdnsd/mdnsd.sock)
+  -v, --verbose      list devices with all details (addresses, services)
       --json         print the daemon's reply unchanged
   -h, --help         show this help
 ```
@@ -256,23 +257,34 @@ IoT to br0   br0, wifi   v4, v6
 ### `mdnsctl devices <name>`
 
 Lists the devices **discovered on the segment's own interfaces** (both
-families): interface, family, address and hostname, with each device's
-services underneath (instance, type, port, target and TXT records). Reflected
-copies from other segments are not included.
+families). By default each device is one line: its DNS name and its pretty name
+(the name of its services, such as `OZAL Speakers`). The IPv4 and IPv6 entries
+of one device are merged, and devices that have not announced a name yet have no
+DNS name to show, so they are only counted. Reflected copies from other segments
+are not included.
 
 ```
 $ mdnsctl devices IoT to br0
+IoT to br0: 1 device
+  printer.local  Printer
+
+(1 device without a name not shown; use -v to list everything)
+```
+
+`-v` (`--verbose`) lists everything: interface, family, address and hostname for
+every entry, with each device's services underneath (instance, type, port,
+target and TXT records), including the devices without a name.
+
+```
+$ mdnsctl -v devices IoT to br0
 IoT to br0: 2 devices
   br0   v4  10.0.0.10  printer.local
       Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]
   wifi  v4  10.0.1.7   -
-
-$ mdnsctl devices IoT
-IoT: no devices
 ```
 
-A hostname of `-` means the device has been heard but has not announced a
-name yet.
+A hostname of `-` means the device has been heard but has not announced a name
+yet. `--json` always prints the full reply, regardless of `-v`.
 
 ### `mdnsctl probe [<name>]`
 

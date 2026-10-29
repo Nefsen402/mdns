@@ -4,6 +4,7 @@ mdnsctl \- query the mdns daemon
 .SH SYNOPSIS
 .B mdnsctl
 [\fB\-s\fR \fIPATH\fR]
+[\fB\-v\fR]
 [\fB\-\-json\fR]
 .I command
 [\fIargument\fR ...]
@@ -28,8 +29,17 @@ and the address families (v4, v6) it covers.
 List the devices discovered on the interfaces of the segment called
 .IR name ,
 in both address families.
-For each device the interface, family, address and hostname are shown
-(a hostname of
+By default each device is one line: its DNS name (for example
+.BR OZAL\-Speakers.local )
+and its pretty name, which is the name of its services (for example
+.BR "OZAL Speakers" ).
+The IPv4 and IPv6 entries of one device are merged into one line, and devices
+that have not announced a name yet have no DNS name to show, so they are only
+counted.
+With
+.B \-v
+every device is listed with its interface, family, address and hostname (a
+hostname of
 .B \-
 means the device has been heard but has not announced a name), followed by its
 services: instance, type, port, target and TXT records.
@@ -68,6 +78,14 @@ instead of the default,
 .B \-\-socket=\fIPATH\fR
 is also accepted.
 .TP
+\fB\-v\fR, \fB\-\-verbose\fR
+List devices with everything the daemon knows: interface, address family,
+address, and every service with its port, target and TXT records, including
+devices that have not announced a name.
+Only
+.B devices
+is affected.
+.TP
 .B \-\-json
 Print the daemon's reply unchanged: one line of JSON, suitable for
 .BR jq (1).
@@ -91,7 +109,18 @@ IoT to br0   br0, wifi   v4, v6
 .PP
 and
 .B devices
-prints an indented listing:
+prints one line per named device, its DNS name and its pretty name:
+.PP
+.nf
+.RS
+IoT to br0: 1 device
+  printer.local  Printer
+.RE
+.fi
+.PP
+With
+.BR \-v ,
+it lists everything, including addresses and service details:
 .PP
 .nf
 .RS
