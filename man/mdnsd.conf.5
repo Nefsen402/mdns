@@ -232,6 +232,33 @@ Quote it if it contains spaces.
 Required.
 The interfaces of the segment, separated by commas and/or whitespace.
 Every interface must exist when the daemon starts.
+.TP
+.B Untrusted=
+Optional.
+Interfaces of the segment, in the same form as
+.BR Interfaces= ,
+that are announced nothing: the devices of an untrusted interface are still
+announced to the other interfaces of the segment, but it is not told about
+theirs.
+This is how one network can be seen from another without seeing it back, for
+example
+.B Interfaces=br0,wifi
+with
+.B Untrusted=wifi
+lets
+.B br0
+find the devices on
+.B wifi
+while
+.B wifi
+learns nothing about
+.BR br0 .
+Every one must be in
+.BR Interfaces= ,
+and at least one interface of a segment of two or more must be trusted.
+Several untrusted interfaces do not learn about each other either.
+Devices are still tracked on an untrusted interface, and listed by
+.BR mdnsctl (1).
 .PP
 A segment is a group of interfaces whose devices are reflected between
 .I every pair
@@ -295,9 +322,11 @@ Interfaces=br0,media
 Name="IoT"
 Interfaces=wifi
 
+# br0 sees the devices on wifi, and wifi sees nothing of br0.
 [Segment]
 Name="IoT to br0"
 Interfaces=br0,wifi
+Untrusted=wifi
 .fi
 .RE
 .SH FILES

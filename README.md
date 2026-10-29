@@ -136,9 +136,12 @@ Interfaces=br0,media
 Name="IoT"
 Interfaces=wifi
 
+# wifi is untrusted: br0 learns about its devices, but wifi is not told about
+# br0's (nothing is announced to an untrusted interface).
 [Segment]
 Name="IoT to br0"
 Interfaces=br0,wifi
+Untrusted=wifi
 ```
 
 ### Syntax
@@ -283,9 +286,19 @@ detection; the name is assumed to be yours alone.
 |--------------|----------------------------------------------------------------------|
 | `Name`       | Required. Unique name, used by `mdnsctl`. Quote it if it has spaces. |
 | `Interfaces` | Required. Interfaces in the segment, separated by commas and/or spaces. |
+| `Untrusted`  | Optional. Interfaces of the segment that are announced nothing (see below). |
 
 A segment is a group of interfaces **whose devices are reflected between every
 pair of them**. Think of each segment as "these networks may see each other".
+
+An **untrusted** interface still has its devices announced to the others, but is
+told nothing about theirs: `Interfaces=br0,wifi` with `Untrusted=wifi` lets
+`br0` find the devices on `wifi` while `wifi` learns nothing about `br0`. That
+is the one-way announcement: `Interfaces=media,br0` with `Untrusted=media` has
+`media` announce its devices to `br0` and not the other way around. Several
+untrusted interfaces do not learn about each other either. Each must be in
+`Interfaces`, and at least one interface of a segment has to be trusted. The
+devices on an untrusted interface are still tracked and listed by `mdnsctl`.
 
 - A segment with **one** interface only tracks: its devices are listed by
   `mdnsctl`, but nothing is reflected.
@@ -376,11 +389,13 @@ families it covers.
 
 ```
 $ mdnsctl segments
-NAME         INTERFACES  FAMILIES
-media_stuff  br0, media  v4, v6
-IoT          wifi        v4, v6
-IoT to br0   br0, wifi   v4, v6
+NAME         INTERFACES             FAMILIES
+media_stuff  br0, media             v4, v6
+IoT          wifi                   v4, v6
+IoT to br0   br0, wifi (untrusted)  v4, v6
 ```
+
+An interface marked `(untrusted)` is announced nothing by the segment.
 
 ### `mdnsctl devices <name>`
 

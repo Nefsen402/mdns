@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! segments
-//!   {"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}
+//!   {"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"untrusted":[],"families":["v4","v6"]}]}
 //! devices <segment name>
 //!   {"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v6",
 //!    "hostname":"tv.local","routable":"fd00:0:1::7","link_local":"fe80::7",
@@ -280,7 +280,8 @@ fn segments(groups: &[Group]) -> Value {
             let interfaces: Vec<&str> = members[0].reflector.segments().iter().map(Segment::interface).collect();
             let mut families: Vec<&str> = members.iter().map(|g| family_name(g.family)).collect();
             families.sort_unstable();
-            json!({ "name": name, "interfaces": interfaces, "families": families })
+            let untrusted = members[0].reflector.untrusted();
+            json!({ "name": name, "interfaces": interfaces, "untrusted": untrusted, "families": families })
         })
         .collect();
     json!({ "ok": true, "segments": list })
@@ -543,7 +544,18 @@ mod tests {
         let groups = [m4, m6, iot];
         assert_eq!(
             handle(&groups, &Watcher::default(), "segments"),
-            r#"{"ok":true,"segments":[{"name":"media","interfaces":["a","b"],"families":["v4","v6"]},{"name":"iot","interfaces":["c"],"families":["v4"]}]}"#
+            r#"{"ok":true,"segments":[{"name":"media","interfaces":["a","b"],"untrusted":[],"families":["v4","v6"]},{"name":"iot","interfaces":["c"],"untrusted":[],"families":["v4"]}]}"#
+        );
+    }
+
+    #[test]
+    fn segments_say_which_interfaces_are_untrusted() {
+        let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| Segment::new(i, Family::V4)).collect();
+        let reflector = Reflector::with_untrusted(segs, &["wifi".to_string()]).unwrap();
+        let groups = [Group { name: "IoT to br0".into(), family: Family::V4, reflector }];
+        assert_eq!(
+            handle(&groups, &Watcher::default(), "segments"),
+            r#"{"ok":true,"segments":[{"name":"IoT to br0","interfaces":["br0","wifi"],"untrusted":["wifi"],"families":["v4"]}]}"#
         );
     }
 

@@ -72,9 +72,12 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|iface| links[&(iface.as_str(), family)].clone())
                 .collect();
-            let reflector = Reflector::new(members)
+            let reflector = Reflector::with_untrusted(members, &seg.untrusted)
                 .with_context(|| format!("starting segment {:?} ({family:?})", seg.name))?;
             eprintln!("segment {:?} ({family:?}): {}", seg.name, seg.interfaces.join(", "));
+            if !seg.untrusted.is_empty() {
+                eprintln!("segment {:?} ({family:?}): {} not told about the others", seg.name, seg.untrusted.join(", "));
+            }
             segments.push(Group {
                 name: seg.name.clone(),
                 family,

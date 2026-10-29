@@ -74,6 +74,9 @@ const MAX_MIN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct SegmentConfig {
     pub name: String,
     pub interfaces: Vec<String>,
+    /// Interfaces of the segment that are announced nothing: their devices
+    /// are announced to the others, but not the others' to them.
+    pub untrusted: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -177,6 +180,19 @@ impl Config {
                             );
                         }
                     }
+                    ("segment", "untrusted") => {
+                        let list = &mut config.segments.last_mut().unwrap().untrusted;
+                        if value.is_empty() {
+                            list.clear();
+                        } else {
+                            list.extend(
+                                value
+                                    .split(|c: char| c == ',' || c.is_whitespace())
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from),
+                            );
+                        }
+                    }
                     ("listen", "ipv4") => config.ipv4 = parse_bool(&entry, lineno)?,
                     ("listen", "ipv6") => config.ipv6 = parse_bool(&entry, lineno)?,
                     ("probe", "interval") => {
@@ -236,6 +252,15 @@ impl Config {
                 .find(|(n, iface)| seg.interfaces[..*n].contains(iface))
             {
                 bail!("segment {:?} lists interface {} twice", seg.name, dup.1);
+            }
+            if let Some(stray) = seg.untrusted.iter().find(|u| !seg.interfaces.contains(u)) {
+                bail!("segment {:?} (line {at}) has Untrusted={stray}, which is not in its Interfaces=", seg.name);
+            }
+            if let Some(dup) = seg.untrusted.iter().enumerate().find(|(n, u)| seg.untrusted[..*n].contains(u)) {
+                bail!("segment {:?} lists {} as untrusted twice", seg.name, dup.1);
+            }
+            if seg.interfaces.len() >= 2 && seg.untrusted.len() == seg.interfaces.len() {
+                bail!("segment {:?} (line {at}) has no trusted interface to announce to", seg.name);
             }
             for other in &self.segments[..i] {
                 if other.name == seg.name {
@@ -400,6 +425,7 @@ interfaces=br0,wifi
         SegmentConfig {
             name: name.into(),
             interfaces: interfaces.iter().map(|s| s.to_string()).collect(),
+            ..SegmentConfig::default()
         }
     }
 
@@ -412,7 +438,7 @@ interfaces=br0,wifi
             [
                 seg("media_stuff", &["br0", "media"]),
                 seg("IoT", &["wifi"]),
-                seg("IoT to br0", &["br0", "wifi"]),
+                SegmentConfig { untrusted: vec!["wifi".into()], ..seg("IoT to br0", &["br0", "wifi"]) },
             ]
         );
         assert_eq!(c.socket, PathBuf::from("/run/mdnsd/mdnsd.sock"));
@@ -422,6 +448,26 @@ interfaces=br0,wifi
         assert_eq!(c.refresh_before, Some(DEFAULT_REFRESH_BEFORE), "the example shows the default");
         assert_eq!(c.min_lifetime, crate::socket::DEFAULT_MIN_LIFETIME, "the example shows the default");
         assert!(c.ipv4 && c.ipv6);
+    }
+
+    #[test]
+    fn untrusted_interfaces_are_listed_and_checked() {
+        let parse = |extra: &str| Config::parse(&format!("[Segment]\nName=s\nInterfaces=br0,media,wifi\n{extra}"));
+        assert!(parse("").unwrap().segments[0].untrusted.is_empty());
+        assert_eq!(parse("Untrusted=media").unwrap().segments[0].untrusted, ["media"]);
+        // The same kind of list as Interfaces=, with the key in any case.
+        assert_eq!(parse("untrusted=media, wifi").unwrap().segments[0].untrusted, ["media", "wifi"]);
+        assert_eq!(parse("UNTRUSTED=media\nUntrusted=wifi").unwrap().segments[0].untrusted, ["media", "wifi"]);
+        assert!(parse("Untrusted=media\nUntrusted=").unwrap().segments[0].untrusted.is_empty(), "empty resets");
+
+        // Only interfaces of the segment, each once.
+        assert!(parse("Untrusted=eth9").unwrap_err().to_string().contains("not in its Interfaces"));
+        assert!(parse("Untrusted=media,media").is_err());
+        // Someone has to be told about the others.
+        assert!(parse("Untrusted=br0,media,wifi").unwrap_err().to_string().contains("no trusted interface"));
+        assert!(parse("Untrusted=media,wifi").is_ok());
+        // A segment of one interface reflects nothing anyway.
+        assert!(Config::parse("[Segment]\nName=s\nInterfaces=wifi\nUntrusted=wifi\n").is_ok());
     }
 
     #[test]
@@ -482,7 +528,7 @@ interfaces=br0,wifi
         let man = include_str!("../man/mdnsd.conf.5");
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "Interval=", "RefreshBefore=", "Hostname=", "TTL=",
-            "ReflectTTL=", "Name=", "Interfaces=",
+            "ReflectTTL=", "Name=", "Interfaces=", "Untrusted=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }

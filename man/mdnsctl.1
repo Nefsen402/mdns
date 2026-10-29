@@ -23,7 +23,8 @@ belongs to the command.
 .TP
 .B segments
 List the configured segments, one line each, with the interfaces in the segment
-and the address families (v4, v6) it covers.
+(an untrusted one marked, as it is announced nothing) and the address families
+(v4, v6) it covers.
 .TP
 \fBdevices\fR \fIname\fR
 List the devices discovered on the interfaces of the segment called
@@ -179,10 +180,10 @@ prints a table:
 .PP
 .nf
 .RS
-NAME         INTERFACES  FAMILIES
-media_stuff  br0, media  v4, v6
-IoT          wifi        v4, v6
-IoT to br0   br0, wifi   v4, v6
+NAME         INTERFACES             FAMILIES
+media_stuff  br0, media             v4, v6
+IoT          wifi                   v4, v6
+IoT to br0   br0, wifi (untrusted)  v4, v6
 .RE
 .fi
 .PP

@@ -132,6 +132,10 @@ in
 .BR mdnsd.conf (5)),
 and withdraws
 them with goodbye packets when the source device disappears.
+An interface listed in
+.B Untrusted=
+is announced nothing by its segment, though its own devices are announced to the
+others, so a network can be seen from another without seeing it back.
 If devices on different interfaces announce the same hostname, the one from the
 interface listed first in the segment wins.
 Different hostnames never clash, even on one address: a device with several

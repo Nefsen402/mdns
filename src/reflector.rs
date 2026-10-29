@@ -47,6 +47,8 @@ pub struct Reflector {
 
 struct Inner {
     segments: Vec<Segment>,
+    /// Whether each segment is untrusted: it is not announced anything.
+    untrusted: Vec<bool>,
     book: Mutex<Book>,
     stop: AtomicBool,
     subscribers: Mutex<Vec<Sender<Notice>>>,
@@ -67,6 +69,15 @@ impl Reflector {
     /// address family and on different interfaces. Devices already
     /// discovered are reflected before this returns.
     pub fn new(segments: Vec<Segment>) -> Result<Reflector> {
+        Self::with_untrusted(segments, &[])
+    }
+
+    /// Like [`new`](Reflector::new), but the segments on the interfaces named
+    /// in `untrusted` are announced nothing: their devices are still
+    /// announced to the others, but they do not learn about the devices of the
+    /// others, so a network that is not to see the rest can still be seen
+    /// from it.
+    pub fn with_untrusted(segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
         if segments.is_empty() {
             bail!("a reflector needs at least one segment");
         }
@@ -85,8 +96,14 @@ impl Reflector {
             }
         }
 
+        if let Some(unknown) = untrusted.iter().find(|name| !segments.iter().any(|s| s.interface() == name.as_str())) {
+            bail!("{unknown} is untrusted but not one of the segments");
+        }
+        let untrusted = segments.iter().map(|s| untrusted.iter().any(|name| name == s.interface())).collect();
+
         let inner = Arc::new(Inner {
             segments,
+            untrusted,
             book: Mutex::default(),
             stop: AtomicBool::new(false),
             subscribers: Mutex::default(),
@@ -121,6 +138,12 @@ impl Reflector {
     /// The segments this reflector spans, in the order they were given.
     pub fn segments(&self) -> &[Segment] {
         &self.inner.segments
+    }
+
+    /// The interfaces whose segments are announced nothing.
+    pub fn untrusted(&self) -> Vec<&str> {
+        let segments = &self.inner.segments;
+        (0..segments.len()).filter(|&i| self.inner.untrusted[i]).map(|i| segments[i].interface()).collect()
     }
 
     /// Send a [`Notice`] to `tx` for every device that appears, changes or goes
@@ -198,7 +221,7 @@ impl Inner {
     }
 
     /// What `target` should be announcing: every reflectable device from the
-    /// other segments, by hostname. If two devices announce the same hostname
+    /// other segments (nothing, if it is untrusted), by hostname. If two devices announce the same hostname
     /// (the cache-flush bit would make them overwrite each other), the one from
     /// the lowest-numbered segment wins; the other takes over when it goes.
     /// Different hostnames never clash, even on one address: a device may have
@@ -208,6 +231,9 @@ impl Inner {
     /// the link the device is on, and on any other it names nobody.
     fn desired(&self, book: &Book, target: usize) -> HashMap<String, Device> {
         let mut out: HashMap<String, Device> = HashMap::new();
+        if self.untrusted[target] {
+            return out;
+        }
         for ((src, key), device) in &book.sources {
             if *src == target || out.contains_key(key) {
                 continue;
@@ -528,6 +554,57 @@ mod tests {
             let d = c.manual_devices();
             d.len() == 1 && d[0].routable == Some(ip("10.0.2.5"))
         });
+    }
+
+    /// What each segment announces, by hostname.
+    fn announced_on(seg: &Segment) -> Vec<String> {
+        let mut names: Vec<String> = seg.manual_devices().into_iter().filter_map(|d| d.hostname).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_untrusted_segment_announces_but_is_announced_nothing() {
+        let (br0, br0_rx) = wired("br0");
+        let (media, media_rx) = wired("media");
+        let (wifi, wifi_rx) = wired("wifi");
+        let r = Reflector::with_untrusted(
+            vec![br0.clone(), media.clone(), wifi.clone()],
+            &["media".to_string(), "wifi".to_string()],
+        )
+        .unwrap();
+        assert_eq!(r.untrusted(), ["media", "wifi"]);
+
+        announce(&media, "10.0.2.5", "speaker.local", &["Speaker"]);
+        announce(&wifi, "10.0.3.5", "plug.local", &["Plug"]);
+        announce(&br0, "10.0.0.5", "desktop.local", &["Desktop"]);
+        wait_for(|| announced_on(&br0).len() == 2);
+
+        // br0 hears of both; the untrusted ones hear of nothing, not even of
+        // each other.
+        assert_eq!(announced_on(&br0), ["plug.local", "speaker.local"]);
+        assert!(announced_on(&media).is_empty() && announced_on(&wifi).is_empty());
+        thread::sleep(Duration::from_millis(100));
+        assert!(drain(&media_rx).is_empty() && drain(&wifi_rx).is_empty(), "nothing was sent to them");
+        assert!(!drain(&br0_rx).is_empty());
+
+        // They are still tracked, and withdrawn from br0 when they go.
+        assert_eq!(media.devices().len(), 1);
+        media.expire(Instant::now() + Duration::from_secs(3600));
+        wait_for(|| announced_on(&br0) == ["plug.local"]);
+    }
+
+    #[test]
+    fn untrusted_must_name_a_segment_of_the_reflector_and_trusted_is_the_default() {
+        let (a, _ra) = wired("a");
+        let (b, _rb) = wired("b");
+        assert!(Reflector::with_untrusted(vec![a.clone(), b.clone()], &["c".to_string()]).is_err());
+        let r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        assert!(r.untrusted().is_empty());
+
+        announce(&a, "10.0.1.5", "tv.local", &["TV"]);
+        announce(&b, "10.0.2.5", "nas.local", &["NAS"]);
+        wait_for(|| announced_on(&a).len() == 1 && announced_on(&b).len() == 1);
     }
 
     /// The TTLs of the address and of the other records a reflected device is

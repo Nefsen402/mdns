@@ -257,9 +257,15 @@ fn render_segments(reply: &Value) -> Result<String, Failure> {
     let list = reply["segments"].as_array().ok_or_else(bad_reply)?;
     let mut rows = vec![vec!["NAME".to_string(), "INTERFACES".into(), "FAMILIES".into()]];
     for seg in list {
+        // An untrusted interface is told nothing of the others.
+        let untrusted = strings(&seg["untrusted"]);
+        let interfaces: Vec<String> = strings(&seg["interfaces"])
+            .into_iter()
+            .map(|i| if untrusted.contains(&i) { format!("{i} (untrusted)") } else { i.to_string() })
+            .collect();
         rows.push(vec![
             seg["name"].as_str().ok_or_else(bad_reply)?.to_string(),
-            strings(&seg["interfaces"]).join(", "),
+            interfaces.join(", "),
             strings(&seg["families"]).join(", "),
         ]);
     }
@@ -724,6 +730,18 @@ mod tests {
 
     fn reply(name: &str, entries: &[String]) -> String {
         format!(r#"{{"ok":true,"name":"{name}","devices":[{}]}}"#, entries.join(","))
+    }
+
+    #[test]
+    fn segments_mark_untrusted_interfaces() {
+        let reply: Value = serde_json::from_str(
+            r#"{"ok":true,"segments":[{"name":"IoT to br0","interfaces":["br0","wifi"],"untrusted":["wifi"],"families":["v4","v6"]},{"name":"old","interfaces":["a"],"families":["v4"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_segments(&reply).unwrap(),
+            "NAME        INTERFACES             FAMILIES\nIoT to br0  br0, wifi (untrusted)  v4, v6\nold         a                      v4\n"
+        );
     }
 
     #[test]
