@@ -55,6 +55,7 @@ fn main() -> Result<()> {
                 config.advertise.as_deref().map(|name| (name, config.advertise_ttl)),
                 config.refresh_before,
                 config.min_lifetime,
+                config.reflect_ttl,
                 &timer,
             )?;
             links.insert((interface, family), link);
@@ -88,6 +89,11 @@ fn main() -> Result<()> {
     // from the other networks. The probes run on their own threads, so startup
     // is not held up; `mdnsctl probe` does the same on demand.
     eprintln!("keeping a device for at least {}s after it was last heard from", config.min_lifetime.as_secs());
+    eprintln!(
+        "announcing reflected devices with a TTL of {}s, again every {}s",
+        config.reflect_ttl.as_secs(),
+        config.reflect_ttl.as_secs() * 4 / 5
+    );
     match config.refresh_before {
         Some(before) => {
             eprintln!("asking devices to answer again {}s before they would expire", before.as_secs());
@@ -195,6 +201,7 @@ fn start_link(
     advertise: Option<(&str, Duration)>,
     refresh_before: Option<Duration>,
     min_lifetime: Duration,
+    reflect_ttl: Duration,
     timer: &Timer,
 ) -> Result<Segment> {
     let sock = socket::open(interface, family)
@@ -203,6 +210,7 @@ fn start_link(
 
     let link = Segment::new(interface, family);
     link.set_min_lifetime(min_lifetime);
+    link.set_reflect_ttl(reflect_ttl);
     let (tx, dest) = sock.sender()?;
     link.attach(tx, dest);
 

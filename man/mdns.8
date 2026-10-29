@@ -125,7 +125,11 @@ must allow the actual connections between the networks; mDNS only makes the
 device discoverable.
 .PP
 The daemon answers queries for reflected devices, including known-answer
-suppression, keeps them alive with periodic re-announcements, and withdraws
+suppression, keeps them alive with re-announcements at 80% of their TTL (see
+.B ReflectTTL=
+in
+.BR mdnsd.conf (5)),
+and withdraws
 them with goodbye packets when the source device disappears.
 If devices on different interfaces announce the same hostname, the one from the
 interface listed first in the segment wins.

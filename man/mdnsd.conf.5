@@ -103,6 +103,20 @@ Keep
 .B RefreshBefore=
 shorter than it, because that margin is counted back from the end of this
 lifetime; the daemon warns at startup if it is not.
+.TP
+.B ReflectTTL=
+How long other networks keep the address of a device this daemon reflects onto
+them, as a time span, and so how often it is announced again: at 80% of it.
+Default
+.B 2min
+(every 96 seconds), the usual TTL for host names.
+The records of the device's services keep their own, longer TTL.
+A longer value means less traffic, but a stale address lingers that long when a
+device moves or vanishes without a goodbye.
+At least 10 seconds and at most 24 hours; independent of
+.B TTL=
+of
+.BR [Advertise] .
 .SS [Probe]
 Optional.
 Both settings are systemd time spans, such as
@@ -253,6 +267,7 @@ Socket=/run/mdnsd/mdnsd.sock
 
 [Devices]
 MinimumLifetime=5min
+ReflectTTL=2min
 
 [Probe]
 RefreshBefore=30s

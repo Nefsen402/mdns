@@ -103,8 +103,12 @@ Socket=/run/mdnsd/mdnsd.sock
 # A device is kept at least this long after it was last heard from, whatever
 # TTLs it announced (a device lives for its longest TTL, but not for less than
 # this). `0` keeps it for exactly its TTL.
+#
+# Reflected devices are announced on the other networks with this TTL for their
+# address, and announced again at 80% of it (every 96 seconds by default).
 [Devices]
 MinimumLifetime=5min
+ReflectTTL=2min
 
 # Most devices (speakers especially) only answer when asked, and one that is
 # not heard from expires and is withdrawn from the other networks. So a device
@@ -176,6 +180,7 @@ replaced; a live instance or a file that is not a socket is never overwritten.
 | Key               | Default | Meaning                                                     |
 |-------------------|---------|-------------------------------------------------------------|
 | `MinimumLifetime` | `5min`  | The least a device is kept after it was last heard from.    |
+| `ReflectTTL`      | `2min`  | The TTL of the address of devices reflected to other networks. |
 
 A systemd time span (`5min`, `90s`, `1h`), at most 1 day. A device lives for the
 longest TTL it announced, but never for less than this, so a device that
@@ -187,6 +192,14 @@ listed, and announced to the other networks, for up to this long. A lower value
 drops it sooner; a higher one keeps devices through longer silences. Keep
 [`RefreshBefore`](#probe-optional) shorter than it (the daemon warns at startup
 if it is not), because that margin is counted back from the end of this lifetime.
+
+**`ReflectTTL`** is how long the other networks keep the address of a device
+this daemon reflects onto them, and so how often it is announced again: at 80%
+of it, every 96 seconds by default (the usual two minutes for host names). The
+records of its services keep their own, longer TTL. A longer value means less
+chatter, but a stale address lingers that long if a device moves or goes
+without a goodbye. It is between 10 seconds and 24 hours, and independent of the
+[`TTL`](#advertise-optional) of the advertised name.
 
 ### `[Probe]` (optional)
 

@@ -35,6 +35,11 @@ const IPV6_MULTICAST_ALL: libc::c_int = 29;
 const HOST_TTL: u32 = 120;
 const OTHER_TTL: u32 = 4500;
 
+/// How long the address records of a reflected device are valid, unless
+/// [`Segment::set_reflect_ttl`] says otherwise. Two minutes is the usual for
+/// host names.
+pub const DEFAULT_REFLECT_TTL: Duration = Duration::from_secs(HOST_TTL as u64);
+
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises.
 fn reannounce_after(host_ttl: u32) -> Duration {
     Duration::from_secs(u64::from(host_ttl) * 4 / 5)
@@ -391,6 +396,9 @@ struct State {
     types: BTreeSet<String>,
     /// The least a device is kept after it was last heard from.
     min_lifetime: Duration,
+    /// The TTL of the address records of the devices [`Segment::add_manual`]
+    /// announces, in seconds.
+    reflect_ttl: u32,
     wake: Option<Wake>,
 }
 
@@ -481,6 +489,7 @@ impl Segment {
             family,
             state: Arc::new(Mutex::new(State {
                 min_lifetime: DEFAULT_MIN_LIFETIME,
+                reflect_ttl: HOST_TTL,
                 ..State::default()
             })),
         }
@@ -493,6 +502,16 @@ impl Segment {
     /// Applies to what is heard from now on.
     pub fn set_min_lifetime(&self, min_lifetime: Duration) {
         self.state.lock().unwrap().min_lifetime = min_lifetime;
+    }
+
+    /// The TTL, to the second (at least one), of the address records of the
+    /// devices [`add_manual`](Segment::add_manual) announces from now on: how
+    /// long others keep them, and so, at 80% of it, how often they are
+    /// announced again. The default is [`DEFAULT_REFLECT_TTL`]. The records of
+    /// their services keep their own, longer TTL.
+    pub fn set_reflect_ttl(&self, ttl: Duration) {
+        let secs = u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX).max(1);
+        self.state.lock().unwrap().reflect_ttl = secs;
     }
 
     /// Have `timer` run this segment's upkeep from now on: drop devices when
@@ -626,12 +645,14 @@ impl Segment {
     /// present. Replacing a device also sends goodbyes for services and
     /// addresses it no longer has. If sending fails nothing is recorded.
     pub fn add_manual(&self, device: Device) -> Result<bool> {
-        self.add_manual_ttl(device, Duration::from_secs(HOST_TTL.into()))
+        let ttl = self.state.lock().unwrap().reflect_ttl;
+        self.add_manual_ttl(device, Duration::from_secs(ttl.into()))
     }
 
     /// Like [`add_manual`](Segment::add_manual), with the address records
     /// announced for `host_ttl` (whole seconds, at least one) instead of the
-    /// usual two minutes, and re-announced at 80% of it.
+    /// segment's [reflect TTL](Segment::set_reflect_ttl), and re-announced at
+    /// 80% of it.
     pub fn add_manual_ttl(&self, device: Device, host_ttl: Duration) -> Result<bool> {
         let host_ttl = u32::try_from(host_ttl.as_secs()).unwrap_or(u32::MAX);
         if host_ttl == 0 {
@@ -2570,6 +2591,30 @@ mod tests {
         usual.add_manual(tv("10.0.1.1", &[])).unwrap();
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL || r.ttl == OTHER_TTL));
         assert!(usual.add_manual_ttl(tv("10.0.1.2", &[]), Duration::from_millis(900)).is_err());
+    }
+
+    #[test]
+    fn reflected_devices_use_the_segments_reflect_ttl_and_the_services_keep_theirs() {
+        let (seg, rx) = wired();
+        seg.set_reflect_ttl(Duration::from_secs(600));
+        seg.add_manual(tv("10.0.1.1", &["TV"])).unwrap();
+        let sent = recv(&rx).unwrap();
+        let ttls: Vec<(bool, u32)> =
+            sent.answers.iter().map(|r| (matches!(r.data, RData::A(_)), r.ttl)).collect();
+        assert!(ttls.contains(&(true, 600)), "the address record: {ttls:?}");
+        assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == OTHER_TTL), "{ttls:?}");
+
+        // It is kept up at 80% of it.
+        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(480));
+
+        // The default is what it always was, and zero cannot be asked for.
+        assert_eq!(DEFAULT_REFLECT_TTL, Duration::from_secs(120));
+        let (usual, rx) = wired();
+        usual.add_manual(tv("10.0.1.1", &[])).unwrap();
+        assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 120));
+        usual.set_reflect_ttl(Duration::ZERO);
+        assert_eq!(usual.state.lock().unwrap().reflect_ttl, 1);
     }
 
     #[test]

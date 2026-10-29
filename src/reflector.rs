@@ -524,6 +524,24 @@ mod tests {
     /// `LGwebOSTV.local` and `LGwebOSTV-nsAs-1.local`, each with its own
     /// services). That is not a clash: both names are reflected.
     #[test]
+    fn reflected_addresses_are_announced_with_the_targets_reflect_ttl() {
+        let (a, _arx) = wired("a");
+        let (b, brx) = wired("b");
+        b.set_reflect_ttl(Duration::from_secs(900));
+        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+
+        announce(&a, "10.0.1.5", "tv.local", &["TV"]);
+        wait_for(|| b.manual_devices().len() == 1);
+        let ttls: Vec<u32> = drain(&brx)
+            .iter()
+            .flat_map(|m| &m.answers)
+            .filter(|r| matches!(r.data, RData::A(_)))
+            .map(|r| r.ttl)
+            .collect();
+        assert_eq!(ttls, [900]);
+    }
+
+    #[test]
     fn a_device_with_two_hostnames_on_one_address_has_both_reflected() {
         let (a, _arx) = wired("a");
         let (b, _brx) = wired("b");

@@ -60,11 +60,11 @@ const MIN_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 /// Two minutes is the usual for host names (Avahi used it for `router.local`).
 pub const DEFAULT_ADVERTISE_TTL: Duration = Duration::from_secs(120);
 
-/// It is re-announced at 80% of its TTL, so a shorter one would be a flood.
-const MIN_ADVERTISE_TTL: Duration = Duration::from_secs(10);
+/// Names are re-announced at 80% of their TTL, so a shorter one would be a flood.
+const MIN_HOST_TTL: Duration = Duration::from_secs(10);
 
-/// A longer one is a typo, and the name would outlive the host for a day.
-const MAX_ADVERTISE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A longer one is a typo, and a name would outlive its host for a day.
+const MAX_HOST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A longer floor than this is a typo: it would keep devices that are long
 /// gone, and a silly one (`99999999999999s`) would overflow the clock.
@@ -89,6 +89,9 @@ pub struct Config {
     /// The TTL of the advertised name's address records, which it is
     /// re-announced at 80% of.
     pub advertise_ttl: Duration,
+    /// The TTL of the address records of reflected devices, which they are
+    /// re-announced at 80% of.
+    pub reflect_ttl: Duration,
     /// How often to probe every interface for devices; `None` (the default)
     /// probes only at startup and on request.
     pub probe_interval: Option<Duration>,
@@ -109,6 +112,7 @@ impl Default for Config {
             socket: PathBuf::from(DEFAULT_SOCKET),
             advertise: None,
             advertise_ttl: DEFAULT_ADVERTISE_TTL,
+            reflect_ttl: crate::socket::DEFAULT_REFLECT_TTL,
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
             min_lifetime: crate::socket::DEFAULT_MIN_LIFETIME,
@@ -186,9 +190,8 @@ impl Config {
                     ("advertise", "hostname") => {
                         config.advertise = Some(local_name(&value, lineno)?);
                     }
-                    ("advertise", "ttl") => {
-                        config.advertise_ttl = parse_advertise_ttl(&value, lineno)?;
-                    }
+                    ("advertise", "ttl") => config.advertise_ttl = parse_host_ttl(&value, lineno, "TTL")?,
+                    ("devices", "reflectttl") => config.reflect_ttl = parse_host_ttl(&value, lineno, "ReflectTTL")?,
                     ("ipc", "socket") => {
                         if value.is_empty() {
                             bail!("line {lineno}: Socket= needs a path");
@@ -332,14 +335,15 @@ fn parse_lifetime(value: &str, lineno: usize) -> Result<Duration> {
     Ok(span)
 }
 
-/// The TTL of the advertised name: a time span between the limits.
-fn parse_advertise_ttl(value: &str, lineno: usize) -> Result<Duration> {
-    let span = timespan(value, lineno, "TTL")?;
-    if span < MIN_ADVERTISE_TTL || span > MAX_ADVERTISE_TTL {
+/// The TTL of the address records of a name we announce: a time span between
+/// the limits.
+fn parse_host_ttl(value: &str, lineno: usize, key: &str) -> Result<Duration> {
+    let span = timespan(value, lineno, key)?;
+    if span < MIN_HOST_TTL || span > MAX_HOST_TTL {
         bail!(
-            "line {lineno}: TTL= must be between {} seconds and {} hours",
-            MIN_ADVERTISE_TTL.as_secs(),
-            MAX_ADVERTISE_TTL.as_secs() / 3600
+            "line {lineno}: {key}= must be between {} seconds and {} hours",
+            MIN_HOST_TTL.as_secs(),
+            MAX_HOST_TTL.as_secs() / 3600
         );
     }
     Ok(span)
@@ -445,13 +449,29 @@ interfaces=br0,wifi
         }
     }
 
+    #[test]
+    fn reflect_ttl_defaults_to_two_minutes_and_is_bounded() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().reflect_ttl, Duration::from_secs(120));
+
+        let with = |value: &str| Config::parse(&format!("[Devices]\nReflectTTL={value}\n{EXAMPLE}"));
+        assert_eq!(with("2min").unwrap().reflect_ttl, Duration::from_secs(120));
+        assert_eq!(with("30min").unwrap().reflect_ttl, Duration::from_secs(1800));
+        assert_eq!(with("10").unwrap().reflect_ttl, Duration::from_secs(10));
+        for bad in ["9s", "0", "", "off", "infinity", "25h", "soon", "99999999999999s"] {
+            assert!(with(bad).is_err(), "should reject {bad:?}");
+        }
+        // It is independent of the advertised name's.
+        let both = Config::parse(&format!("[Devices]\nReflectTTL=5min\n[Advertise]\nTTL=1h\n{EXAMPLE}")).unwrap();
+        assert_eq!((both.reflect_ttl, both.advertise_ttl), (Duration::from_secs(300), Duration::from_secs(3600)));
+    }
+
     /// The man page must document every key and a config that really parses.
     #[test]
     fn man_page_documents_every_key_and_its_example_parses() {
         let man = include_str!("../man/mdnsd.conf.5");
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "Interval=", "RefreshBefore=", "Hostname=", "TTL=",
-            "Name=", "Interfaces=",
+            "ReflectTTL=", "Name=", "Interfaces=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
