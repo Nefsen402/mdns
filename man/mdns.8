@@ -30,8 +30,12 @@ What may be reflected where is described by the
 sections of the configuration file; see
 .BR mdnsd.conf (5).
 .SS Tracking
-A device is known by its source address.
-Its hostname and its DNS-SD services are taken from the records it announces.
+A device is known by its hostname once it has announced one, and until then by
+the address it was heard from.
+Its addresses are those of its own address records (and the address it sent
+from, if it announced none of its own); per address family it has up to two, a
+link-local one and a routable one.
+Its DNS-SD services are taken from the records it announces.
 A device expires after it has been silent for at least five minutes, or for the
 TTL of its records if that is longer.
 A goodbye packet (TTL 0) removes it immediately.
@@ -71,12 +75,17 @@ No conflict detection is done: the name is assumed to be yours alone.
 .SS Reflection
 Within a segment, every interface announces the devices discovered on every
 other interface of that segment.
-Only devices that announced a hostname and at least one service are reflected;
-chatty clients such as phones are tracked but not reflected.
+Only devices that announced a hostname, a routable address and at least one
+service are reflected; chatty clients such as phones are tracked but not
+reflected.
+A link-local address is never reflected: it only means something on the link
+the device is on.
+A device is announced with its routable address only, so one that has only a
+link-local IPv6 address is not reflected over IPv6.
 Reflection is never transitive: a device reflected onto an interface is not
 reflected again.
 .PP
-Reflected devices are announced with their original address, so the firewall
+Reflected devices are announced with their routable address, so the firewall
 must allow the actual connections between the networks; mDNS only makes the
 device discoverable.
 .PP

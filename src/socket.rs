@@ -202,22 +202,39 @@ pub struct Service {
     pub txt: Vec<String>,
 }
 
-/// A device on a segment, identified by its address (scope id dropped,
-/// since the segment already pins the link).
+/// A device on a segment. Once it has announced a hostname it is known by
+/// that; until then only by the address it was heard from.
+///
+/// It has up to two addresses, of the segment's family: a link-local one,
+/// which only means something on the link it was heard on, and a routable one
+/// that other networks can reach it at (IPv4, or global/ULA IPv6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
-    pub addr: IpAddr,
     pub hostname: Option<String>,
+    pub link_local: Option<IpAddr>,
+    pub routable: Option<IpAddr>,
     pub services: Vec<Service>,
 }
 
 impl Device {
-    fn bare(addr: IpAddr) -> Device {
-        Device {
-            addr,
-            hostname: None,
-            services: Vec::new(),
-        }
+    /// Its addresses, the routable one first.
+    pub fn addrs(&self) -> impl Iterator<Item = IpAddr> {
+        self.routable.into_iter().chain(self.link_local)
+    }
+
+    /// What identifies it in the manual list and to the reflector: its
+    /// hostname, case-insensitively.
+    pub fn key(&self) -> Option<String> {
+        self.hostname.as_ref().map(|h| h.to_ascii_lowercase())
+    }
+}
+
+/// Link-local: IPv6 `fe80::/10` and IPv4 `169.254.0.0/16`. Valid on one link
+/// only, so never to be handed to another network.
+pub fn is_link_local(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(a) => a.is_link_local(),
+        IpAddr::V6(a) => a.segments()[0] & 0xffc0 == 0xfe80,
     }
 }
 
@@ -230,18 +247,62 @@ pub enum Event {
     Removed(Device),
 }
 
+/// How a discovered device is told apart: by hostname once it has one,
+/// otherwise by the address it was heard from.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Key {
+    Host(String),
+    Source(IpAddr),
+}
+
 struct Entry {
     expires: Instant,
     hostname: Option<String>,
+    link_local: Option<IpAddr>,
+    routable: Option<IpAddr>,
     services: BTreeMap<String, Service>,
 }
 
 impl Entry {
-    fn device(&self, addr: IpAddr) -> Device {
+    fn new(now: Instant) -> Entry {
+        Entry {
+            expires: now,
+            hostname: None,
+            link_local: None,
+            routable: None,
+            services: BTreeMap::new(),
+        }
+    }
+
+    fn device(&self) -> Device {
         Device {
-            addr,
             hostname: self.hostname.clone(),
+            link_local: self.link_local,
+            routable: self.routable,
             services: self.services.values().cloned().collect(),
+        }
+    }
+
+    /// Take over what was learned about this device before its name was known.
+    fn absorb(&mut self, earlier: Entry) {
+        for (instance, svc) in earlier.services {
+            self.services.entry(instance).or_insert(svc);
+        }
+        self.expires = self.expires.max(earlier.expires);
+    }
+
+    /// Record the addresses a packet vouches for. When there are several of a
+    /// kind, the one the packet came from wins, else the lowest.
+    fn set_addrs(&mut self, addrs: &[IpAddr], src: IpAddr) {
+        let pick = |wanted: bool| {
+            let found: Vec<IpAddr> = addrs.iter().copied().filter(|a| is_link_local(a) == wanted).collect();
+            found.contains(&src).then_some(src).or_else(|| found.iter().min().copied())
+        };
+        if let Some(a) = pick(false) {
+            self.routable = Some(a);
+        }
+        if let Some(a) = pick(true) {
+            self.link_local = Some(a);
         }
     }
 }
@@ -262,9 +323,13 @@ struct Manual {
 
 #[derive(Default)]
 struct State {
-    discovered: HashMap<IpAddr, Entry>,
-    /// Devices we announce on this segment on behalf of somewhere else.
-    manual: HashMap<IpAddr, Manual>,
+    discovered: HashMap<Key, Entry>,
+    /// Which discovered device each address belongs to, so a packet that does
+    /// not name its sender can still be attributed.
+    by_addr: HashMap<IpAddr, Key>,
+    /// Devices we announce on this segment on behalf of somewhere else, by
+    /// lowercase hostname.
+    manual: HashMap<String, Manual>,
     subscribers: Vec<Sender<Event>>,
     outbound: Option<Outbound>,
     /// Service types devices on this segment have said they offer, learned
@@ -276,6 +341,12 @@ impl State {
     fn notify(&mut self, event: Event) {
         // A dropped receiver is an unsubscribe.
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+
+    /// Drop a discovered device and the addresses that pointed at it.
+    fn forget(&mut self, key: &Key) -> Option<Entry> {
+        self.by_addr.retain(|_, k| k != key);
+        self.discovered.remove(key)
     }
 }
 
@@ -318,7 +389,7 @@ impl Segment {
     /// Devices currently active on this segment (excludes manual ones).
     pub fn devices(&self) -> Vec<Device> {
         let state = self.state.lock().unwrap();
-        state.discovered.iter().map(|(&a, e)| e.device(a)).collect()
+        state.discovered.values().map(Entry::device).collect()
     }
 
     // 2. Change notifications for the discovered list.
@@ -333,28 +404,30 @@ impl Segment {
 
     // 3. Reflected devices, invisible to 1 and 2.
 
-    /// Announce `device` on this segment and remember it. The device needs a
-    /// hostname and an address of this segment's family; the address is
-    /// advertised as-is, so it must be reachable by this segment's clients.
+    /// Announce `device` on this segment and remember it, under its
+    /// hostname. It needs a hostname and at least one address, all of this
+    /// segment's family, and announces exactly the addresses it has: a
+    /// reflected device should arrive with only its routable one, since a
+    /// link-local address is no use on another link.
     ///
     /// Returns false (and sends nothing) if an identical device is already
-    /// present. Replacing a device also sends goodbyes for services it no
-    /// longer has. If sending fails nothing is recorded.
+    /// present. Replacing a device also sends goodbyes for services and
+    /// addresses it no longer has. If sending fails nothing is recorded.
     pub fn add_manual(&self, device: Device) -> Result<bool> {
-        let family_ok = matches!(
-            (self.family, device.addr),
-            (Family::V4, IpAddr::V4(_)) | (Family::V6, IpAddr::V6(_))
-        );
-        if !family_ok {
-            bail!("{} is not an {:?} address", device.addr, self.family);
-        }
-        if device.hostname.is_none() {
+        let Some(key) = device.key() else {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
+        };
+        if device.addrs().next().is_none() {
+            bail!("{key} has no address to announce");
+        }
+        let family = self.family;
+        if let Some(bad) = device.addrs().find(|a| !matches!((family, a), (Family::V4, IpAddr::V4(_)) | (Family::V6, IpAddr::V6(_)))) {
+            bail!("{bad} is not an {family:?} address");
         }
 
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        let old = state.manual.get(&device.addr).map(|m| &m.device);
+        let old = state.manual.get(&key).map(|m| &m.device);
         if old == Some(&device) {
             return Ok(false);
         }
@@ -365,26 +438,28 @@ impl Segment {
             for svc in old.services.iter().filter(|s| !kept.contains(&s.instance)) {
                 records.extend(service_records(old, svc, 0));
             }
+            let host = old.hostname.clone().unwrap_or_default();
+            for gone in old.addrs().filter(|a| !device.addrs().any(|n| n == *a)) {
+                records.push(record(host.clone(), true, 0, address_data(gone)));
+            }
         }
         send(&state.outbound, &records)?;
         let now = Instant::now();
-        state.manual.insert(
-            device.addr,
-            Manual { device, announced: now, last_sent: now },
-        );
+        state.manual.insert(key, Manual { device, announced: now, last_sent: now });
         Ok(true)
     }
 
-    /// Send goodbyes for the device at `addr` and forget it. Returns false
-    /// if there was no such device. If sending fails it is kept.
-    pub fn remove_manual(&self, addr: IpAddr) -> Result<bool> {
+    /// Send goodbyes for the device called `hostname` and forget it. Returns
+    /// false if there was no such device. If sending fails it is kept.
+    pub fn remove_manual(&self, hostname: &str) -> Result<bool> {
+        let key = hostname.to_ascii_lowercase();
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        let Some(manual) = state.manual.get(&addr) else {
+        let Some(manual) = state.manual.get(&key) else {
             return Ok(false);
         };
         send(&state.outbound, &announcement(&manual.device, 0, 0))?;
-        state.manual.remove(&addr);
+        state.manual.remove(&key);
         Ok(true)
     }
 
@@ -436,7 +511,7 @@ impl Segment {
         let mut answers: Vec<Record> = Vec::new();
         let mut additionals: Vec<Record> = Vec::new();
         let mut used = Vec::new();
-        for (addr, m) in &state.manual {
+        for (key, m) in &state.manual {
             let (a, x) = answers_for(query, &m.device);
             if a.is_empty() {
                 continue;
@@ -454,7 +529,7 @@ impl Segment {
                     additionals.push(r);
                 }
             }
-            used.push(*addr);
+            used.push(key.clone());
         }
         if answers.is_empty() {
             return Ok(());
@@ -488,8 +563,8 @@ impl Segment {
         transmit(&state.outbound, &msg, dest)?;
 
         if !legacy {
-            for addr in used {
-                if let Some(m) = state.manual.get_mut(&addr) {
+            for key in used {
+                if let Some(m) = state.manual.get_mut(&key) {
                     m.last_sent = now;
                 }
             }
@@ -524,15 +599,27 @@ impl Segment {
         // Records in a query are other devices' known answers, not the
         // sender's own data.
         let msg = msg.filter(|m| m.header.response);
-        let mut state = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        let mut events: Vec<Event> = Vec::new();
 
-        if let Some(msg) = msg {
-            if is_goodbye(msg, src) {
-                if let Some(entry) = state.discovered.remove(&src) {
-                    state.notify(Event::Removed(entry.device(src)));
-                }
-                return;
+        // Which device is this? The one a response names (by its own address
+        // record, or as the target of its services), else whatever the sender
+        // address is already known to belong to, else a new one known only by
+        // that address.
+        let host = msg.and_then(|m| device_name(m, src));
+        let key = match &host {
+            Some(h) => Key::Host(h.to_ascii_lowercase()),
+            None => state.by_addr.get(&src).cloned().unwrap_or(Key::Source(src)),
+        };
+
+        if msg.is_some_and(|m| is_goodbye(m, src)) {
+            let gone = [state.forget(&key), state.forget(&Key::Source(src))];
+            events.extend(gone.into_iter().flatten().map(|e| Event::Removed(e.device())));
+            for event in events {
+                state.notify(event);
             }
+            return;
         }
 
         for rec in msg.into_iter().flat_map(|m| m.records()) {
@@ -547,12 +634,33 @@ impl Segment {
             }
         }
 
-        let before = state.discovered.get(&src).map(|e| e.device(src));
-        let entry = state.discovered.entry(src).or_insert_with(|| Entry {
-            expires: now,
-            hostname: None,
-            services: BTreeMap::new(),
-        });
+        // The addresses this packet vouches for: those the device announces
+        // for its own name. The address the packet came from counts too, unless
+        // the device announced addresses of its own and this is not one of
+        // them (a reflector announcing someone else's device).
+        let mut addrs = match (&host, msg) {
+            (Some(h), Some(m)) => announced_addrs(m, h, self.family),
+            _ => Vec::new(),
+        };
+        let src_is_device = addrs.is_empty() || addrs.contains(&src);
+        if src_is_device && !addrs.contains(&src) {
+            addrs.push(src);
+        }
+
+        // A device first heard only by address becomes the named device.
+        let earlier = match (&key, src_is_device) {
+            (Key::Host(_), true) => state.discovered.remove(&Key::Source(src)),
+            _ => None,
+        };
+        if let Some(earlier) = &earlier {
+            events.push(Event::Removed(earlier.device()));
+        }
+
+        let before = state.discovered.get(&key).map(Entry::device);
+        let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now));
+        if let Some(earlier) = earlier {
+            entry.absorb(earlier);
+        }
 
         let max_ttl = msg
             .into_iter()
@@ -562,15 +670,25 @@ impl Segment {
             .unwrap_or_default();
         entry.expires = entry.expires.max(now + max_ttl.max(DEVICE_TIMEOUT));
 
+        if host.is_some() {
+            entry.hostname = host;
+        }
+        entry.set_addrs(&addrs, src);
         if let Some(msg) = msg {
-            merge_records(entry, src, msg);
+            merge_records(entry, msg);
         }
 
-        let after = entry.device(src);
+        let after = entry.device();
+        for addr in addrs {
+            state.by_addr.insert(addr, key.clone());
+        }
         match before {
-            None => state.notify(Event::Added(after)),
-            Some(before) if before != after => state.notify(Event::Updated(after)),
+            None => events.push(Event::Added(after)),
+            Some(before) if before != after => events.push(Event::Updated(after)),
             Some(_) => {}
+        }
+        for event in events {
+            state.notify(event);
         }
     }
 
@@ -638,15 +756,15 @@ impl Segment {
     /// Drop devices whose lifetime has run out as of `now`.
     pub fn expire(&self, now: Instant) {
         let mut state = self.state.lock().unwrap();
-        let stale: Vec<IpAddr> = state
+        let stale: Vec<Key> = state
             .discovered
             .iter()
             .filter(|&(_, e)| e.expires <= now)
-            .map(|(&addr, _)| addr)
+            .map(|(key, _)| key.clone())
             .collect();
-        for addr in stale {
-            if let Some(entry) = state.discovered.remove(&addr) {
-                state.notify(Event::Removed(entry.device(addr)));
+        for key in stale {
+            if let Some(entry) = state.forget(&key) {
+                state.notify(Event::Removed(entry.device()));
             }
         }
     }
@@ -667,17 +785,42 @@ fn is_goodbye(msg: &Message, src: IpAddr) -> bool {
         .any(|r| r.ttl == 0 && addr_of(&r.data) == Some(src))
 }
 
-fn merge_records(entry: &mut Entry, src: IpAddr, msg: &Message) {
-    let mut own_name = None;
-    let mut srv_target = None;
+/// The hostname of the device a response is about: the name of its address
+/// record for the sender's own address, else the target its services point
+/// at, else the one name its address records share.
+fn device_name(msg: &Message, src: IpAddr) -> Option<String> {
+    let by_source = msg.records().find(|r| addr_of(&r.data) == Some(src));
+    let by_target = msg.records().find_map(|r| match &r.data {
+        RData::Srv { target, .. } => Some(target),
+        _ => None,
+    });
+    if let Some(r) = by_source {
+        return Some(r.name.clone());
+    }
+    if let Some(target) = by_target {
+        return Some(target.clone());
+    }
+    let mut names = msg.records().filter(|r| addr_of(&r.data).is_some()).map(|r| &r.name);
+    let first = names.next()?;
+    names.all(|n| n.eq_ignore_ascii_case(first)).then(|| first.clone())
+}
 
+/// The usable addresses of `family` that `msg` announces for `host`.
+fn announced_addrs(msg: &Message, host: &str, family: Family) -> Vec<IpAddr> {
+    let mut found: Vec<IpAddr> = Vec::new();
+    for rec in msg.records().filter(|r| r.ttl > 0 && r.name.eq_ignore_ascii_case(host)) {
+        let Some(addr) = addr_of(&rec.data) else { continue };
+        let family_ok = matches!((family, addr), (Family::V4, IpAddr::V4(_)) | (Family::V6, IpAddr::V6(_)));
+        if family_ok && !addr.is_loopback() && !addr.is_unspecified() && !addr.is_multicast() && !found.contains(&addr) {
+            found.push(addr);
+        }
+    }
+    found
+}
+
+fn merge_records(entry: &mut Entry, msg: &Message) {
     for rec in msg.records() {
         match &rec.data {
-            data @ (RData::A(_) | RData::Aaaa(_)) => {
-                if addr_of(data) == Some(src) {
-                    own_name.get_or_insert(&rec.name);
-                }
-            }
             RData::Ptr(instance) => {
                 // Only service-instance PTRs; skip the `_services._dns-sd`
                 // meta-enumeration, reverse lookups and subtype duplicates.
@@ -695,7 +838,6 @@ fn merge_records(entry: &mut Entry, src: IpAddr, msg: &Message) {
                 if rec.ttl == 0 {
                     entry.services.remove(&rec.name);
                 } else {
-                    srv_target.get_or_insert(target);
                     let svc = service(entry, &rec.name);
                     svc.port = *port;
                     svc.target = Some(target.clone());
@@ -712,10 +854,6 @@ fn merge_records(entry: &mut Entry, src: IpAddr, msg: &Message) {
             }
             _ => {}
         }
-    }
-
-    if let Some(name) = own_name.or(srv_target) {
-        entry.hostname = Some(name.clone());
     }
 }
 
@@ -738,11 +876,10 @@ fn service<'a>(entry: &'a mut Entry, instance: &str) -> &'a mut Service {
 /// Callers must have checked that the device has a hostname.
 fn announcement(device: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
     let host = device.hostname.clone().expect("hostname checked on add");
-    let data = match device.addr {
-        IpAddr::V4(a) => RData::A(a),
-        IpAddr::V6(a) => RData::Aaaa(a),
-    };
-    let mut records = vec![record(host, true, host_ttl, data)];
+    let mut records: Vec<Record> = device
+        .addrs()
+        .map(|addr| record(host.clone(), true, host_ttl, address_data(addr)))
+        .collect();
 
     for svc in &device.services {
         records.extend(service_records(device, svc, other_ttl));
@@ -777,6 +914,13 @@ fn service_records(device: &Device, svc: &Service, ttl: u32) -> Vec<Record> {
             RData::Txt(svc.txt.iter().map(|t| t.as_bytes().to_vec()).collect()),
         ),
     ]
+}
+
+fn address_data(addr: IpAddr) -> RData {
+    match addr {
+        IpAddr::V4(a) => RData::A(a),
+        IpAddr::V6(a) => RData::Aaaa(a),
+    }
 }
 
 fn record(name: String, cache_flush: bool, ttl: u32, data: RData) -> Record {
@@ -955,6 +1099,13 @@ mod tests {
         p
     }
 
+    /// A device heard only by address, as `observe` records it.
+    fn unnamed(addr: &str) -> Device {
+        let a = ip(addr);
+        let (link_local, routable) = if is_link_local(&a) { (Some(a), None) } else { (None, Some(a)) };
+        Device { hostname: None, link_local, routable, services: vec![] }
+    }
+
     #[test]
     fn observe_adds_once_and_notifies() {
         let seg = Segment::new("test", Family::V4);
@@ -962,7 +1113,7 @@ mod tests {
         seg.observe(ip("10.0.1.5"));
         seg.observe(ip("10.0.1.5"));
         assert_eq!(seg.devices().len(), 1);
-        assert_eq!(rx.try_recv(), Ok(Event::Added(Device::bare(ip("10.0.1.5")))));
+        assert_eq!(rx.try_recv(), Ok(Event::Added(unnamed("10.0.1.5"))));
         assert!(rx.try_recv().is_err());
     }
 
@@ -975,7 +1126,7 @@ mod tests {
         assert_eq!(seg.devices().len(), 1);
         seg.expire(Instant::now() + DEVICE_TIMEOUT + Duration::from_secs(1));
         assert!(seg.devices().is_empty());
-        assert_eq!(rx.try_recv(), Ok(Event::Removed(Device::bare(ip("10.0.1.5")))));
+        assert_eq!(rx.try_recv(), Ok(Event::Removed(unnamed("10.0.1.5"))));
     }
 
     /// A v4 segment whose "multicast group" is a local socket we can read.
@@ -996,8 +1147,9 @@ mod tests {
 
     fn tv(addr: &str, instances: &[&str]) -> Device {
         Device {
-            addr: ip(addr),
             hostname: Some("tv.local".into()),
+            link_local: None,
+            routable: Some(ip(addr)),
             services: instances
                 .iter()
                 .map(|i| Service {
@@ -1020,8 +1172,8 @@ mod tests {
         assert!(seg.devices().is_empty());
         assert!(rx.try_recv().is_err());
         assert_eq!(seg.manual_devices().len(), 1);
-        assert!(seg.remove_manual(ip("10.0.1.9")).unwrap());
-        assert!(!seg.remove_manual(ip("10.0.1.9")).unwrap());
+        assert!(seg.remove_manual("TV.local").unwrap(), "by hostname, ignoring case");
+        assert!(!seg.remove_manual("tv.local").unwrap());
     }
 
     #[test]
@@ -1055,7 +1207,7 @@ mod tests {
         assert!(!seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap());
         assert!(recv(&rx).is_none());
 
-        seg.remove_manual(ip("10.0.1.9")).unwrap();
+        seg.remove_manual("tv.local").unwrap();
         let bye = recv(&rx).expect("goodbye");
         assert_eq!(bye.answers.len(), m.answers.len());
         assert!(bye.answers.iter().all(|r| r.ttl == 0));
@@ -1363,7 +1515,12 @@ mod tests {
     #[test]
     fn a_device_without_services_can_be_advertised() {
         let (seg, rx) = wired();
-        let router = Device { addr: ip("10.0.1.1"), hostname: Some("router.local".into()), services: vec![] };
+        let router = Device {
+            hostname: Some("router.local".into()),
+            link_local: None,
+            routable: Some(ip("10.0.1.1")),
+            services: vec![],
+        };
         seg.add_manual(router).unwrap();
 
         let m = recv(&rx).expect("announcement");
@@ -1380,7 +1537,7 @@ mod tests {
         // ...is re-announced, and says goodbye when removed.
         seg.reannounce(Instant::now() + REANNOUNCE + Duration::from_secs(1)).unwrap();
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL));
-        seg.remove_manual(ip("10.0.1.1")).unwrap();
+        seg.remove_manual("router.local").unwrap();
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
     }
 
@@ -1396,6 +1553,180 @@ mod tests {
             assert!(!addr.is_loopback() && !addr.is_unspecified());
             assert_eq!(addr.is_ipv4(), family == Family::V4);
         }
+    }
+
+    /// A segment of `family` whose "multicast group" is a local socket.
+    fn wired_family(family: Family) -> (Segment, UdpSocket) {
+        let (_, rx) = wired();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let seg = Segment::new("test", family);
+        seg.attach(tx, rx.local_addr().unwrap());
+        (seg, rx)
+    }
+
+    fn aaaa(host: &str, addr: &str) -> Record {
+        record(host.into(), true, 120, RData::Aaaa(addr.parse().unwrap()))
+    }
+
+    fn a_record(host: &str, addr: &str) -> Record {
+        record(host.into(), true, 120, RData::A(addr.parse().unwrap()))
+    }
+
+    fn srv(instance: &str, port: u16, target: &str) -> Record {
+        record(instance.into(), true, 120, RData::Srv { priority: 0, weight: 0, port, target: target.into() })
+    }
+
+    fn ptr(kind: &str, instance: &str) -> Record {
+        record(kind.into(), false, 4500, RData::Ptr(instance.into()))
+    }
+
+    #[test]
+    fn an_ipv6_device_has_a_link_local_and_a_routable_address() {
+        let seg = Segment::new("test", Family::V6);
+        // It sends from its link-local address and announces that, a ULA, and
+        // (wrongly for this segment) an IPv4 address, which is ignored.
+        hear(&seg, "fe80::7", vec![
+            aaaa("tv.local", "fd00:0:1::7"),
+            aaaa("tv.local", "fe80::7"),
+            a_record("tv.local", "10.0.1.7"),
+        ]);
+        let devices = seg.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].hostname.as_deref(), Some("tv.local"));
+        assert_eq!(devices[0].routable, Some(ip("fd00:0:1::7")));
+        assert_eq!(devices[0].link_local, Some(ip("fe80::7")));
+    }
+
+    #[test]
+    fn a_device_first_heard_by_address_becomes_the_named_device() {
+        let seg = Segment::new("test", Family::V4);
+        let rx = seg.subscribe();
+
+        // A browse answer: an instance, but not yet who or where it is.
+        hear(&seg, "10.0.2.73", vec![ptr("_airplay._tcp.local", "Speaker._airplay._tcp.local")]);
+        assert_eq!(seg.devices().len(), 1);
+        assert!(seg.devices()[0].hostname.is_none());
+
+        // The resolve answer names it.
+        hear(&seg, "10.0.2.73", vec![
+            srv("Speaker._airplay._tcp.local", 7000, "speaker.local"),
+            a_record("speaker.local", "10.0.2.73"),
+        ]);
+        let devices = seg.devices();
+        assert_eq!(devices.len(), 1, "one device, not an unnamed one and a named one");
+        assert_eq!(devices[0].hostname.as_deref(), Some("speaker.local"));
+        assert_eq!(devices[0].routable, Some(ip("10.0.2.73")));
+        assert_eq!(devices[0].services.len(), 1, "the service learned before the name is kept");
+        assert_eq!((devices[0].services[0].port, devices[0].services[0].target.as_deref()), (7000, Some("speaker.local")));
+
+        let kinds: Vec<&str> = rx
+            .try_iter()
+            .map(|e| match e {
+                Event::Added(d) if d.hostname.is_none() => "added unnamed",
+                Event::Removed(d) if d.hostname.is_none() => "removed unnamed",
+                Event::Added(_) => "added named",
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, ["added unnamed", "removed unnamed", "added named"]);
+    }
+
+    /// A reflector announces other devices from its own address. Each is
+    /// its own device, at the address it announces, and the reflector itself
+    /// is not mistaken for any of them.
+    #[test]
+    fn a_reflector_announcing_other_devices_is_not_mistaken_for_them() {
+        let seg = Segment::new("test", Family::V4);
+        hear(&seg, "10.0.0.1", vec![
+            a_record("speaker.local", "10.0.2.73"),
+            ptr("_airplay._tcp.local", "Speaker._airplay._tcp.local"),
+            srv("Speaker._airplay._tcp.local", 7000, "speaker.local"),
+        ]);
+        hear(&seg, "10.0.0.1", vec![
+            a_record("tv.local", "10.0.2.179"),
+            ptr("_airplay._tcp.local", "TV._airplay._tcp.local"),
+            srv("TV._airplay._tcp.local", 7000, "tv.local"),
+        ]);
+
+        let mut devices = seg.devices();
+        devices.sort_by_key(|d| d.hostname.clone());
+        let found: Vec<_> = devices.iter().map(|d| (d.hostname.as_deref().unwrap(), d.routable.unwrap(), d.services.len())).collect();
+        assert_eq!(found, [("speaker.local", ip("10.0.2.73"), 1), ("tv.local", ip("10.0.2.179"), 1)]);
+    }
+
+    #[test]
+    fn packets_that_do_not_name_their_sender_belong_to_the_device_it_is() {
+        let seg = Segment::new("test", Family::V4);
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        assert_eq!(seg.devices().len(), 1);
+
+        // A query from the same address names nobody, but is that device.
+        seg.handle(sa("10.0.1.7"), &query("other.local", rtype::A, vec![])).unwrap();
+        assert_eq!(seg.devices().len(), 1, "no second, unnamed device");
+        // A different address is a different device.
+        seg.handle(sa("10.0.1.8"), &query("other.local", rtype::A, vec![])).unwrap();
+        assert_eq!(seg.devices().len(), 2);
+    }
+
+    #[test]
+    fn goodbye_and_expiry_also_forget_the_addresses() {
+        for goodbye in [true, false] {
+            let seg = Segment::new("test", Family::V4);
+            seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+            if goodbye {
+                seg.handle(sa("10.0.1.7"), &announcement(0)).unwrap();
+            } else {
+                seg.expire(Instant::now() + Duration::from_secs(36000));
+            }
+            assert!(seg.devices().is_empty());
+
+            // The address no longer points at the old device.
+            seg.handle(sa("10.0.1.7"), &query("x.local", rtype::A, vec![])).unwrap();
+            let devices = seg.devices();
+            assert_eq!(devices.len(), 1);
+            assert!(devices[0].hostname.is_none() && devices[0].services.is_empty(), "goodbye={goodbye}");
+        }
+    }
+
+    #[test]
+    fn a_link_local_only_device_can_be_advertised_on_its_own_link() {
+        let (seg, rx) = wired_family(Family::V6);
+        let router = Device {
+            hostname: Some("router.local".into()),
+            link_local: Some(ip("fe80::1")),
+            routable: None,
+            services: vec![],
+        };
+        seg.add_manual(router).unwrap();
+        let m = recv(&rx).unwrap();
+        assert_eq!(m.answers.len(), 1);
+        assert_eq!(m.answers[0].data, RData::Aaaa("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn replacing_a_device_withdraws_the_addresses_it_no_longer_has() {
+        let (seg, rx) = wired();
+        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        recv(&rx).unwrap();
+
+        seg.add_manual(tv("10.0.1.10", &["TV"])).unwrap();
+        let m = recv(&rx).unwrap();
+        let ttl_of = |a: &str| m.answers.iter().find(|r| r.data == RData::A(a.parse().unwrap())).map(|r| r.ttl);
+        assert_eq!((ttl_of("10.0.1.9"), ttl_of("10.0.1.10")), (Some(0), Some(HOST_TTL)));
+        assert_eq!(seg.manual_devices().len(), 1, "same hostname, so it replaced the device");
+    }
+
+    #[test]
+    fn add_rejects_a_device_with_no_addresses_or_the_wrong_family() {
+        let (seg, rx) = wired();
+        let mut none = tv("10.0.1.9", &["TV"]);
+        none.routable = None;
+        assert!(seg.add_manual(none).is_err());
+        let mut v6 = tv("10.0.1.9", &["TV"]);
+        v6.link_local = Some(ip("fe80::1"));
+        assert!(seg.add_manual(v6).is_err(), "a v4 segment cannot announce an IPv6 address");
+        assert!(seg.manual_devices().is_empty());
+        assert!(recv(&rx).is_none());
     }
 
     #[test]
@@ -1437,8 +1768,10 @@ mod tests {
         seg.observe(ip("10.0.1.7"));
         let rx = seg.subscribe();
 
+        // The device heard only by address now says who it is.
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
-        assert!(matches!(rx.try_recv(), Ok(Event::Updated(d)) if d.services.len() == 1));
+        assert!(matches!(rx.try_recv(), Ok(Event::Removed(d)) if d.hostname.is_none()));
+        assert!(matches!(rx.try_recv(), Ok(Event::Added(d)) if d.hostname.is_some() && d.services.len() == 1));
 
         // Goodbye for the service records only (no address record).
         let mut p = response(1);
@@ -1510,7 +1843,7 @@ mod tests {
             };
             seg.add_manual(tv(&addr.to_string(), &["LiveTV"])).unwrap();
             std::thread::sleep(Duration::from_millis(200));
-            seg.remove_manual(addr).unwrap();
+            seg.remove_manual("tv.local").unwrap();
         }
     }
 

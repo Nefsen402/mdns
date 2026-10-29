@@ -39,7 +39,8 @@ that have not announced a name yet have no DNS name to show, so they are only
 counted.
 With
 .B \-v
-every device is listed with its interface, family, address and hostname (a
+every device is listed with its interface, family, addresses (routable first,
+then link-local) and hostname (a
 hostname of
 .B \-
 means the device has been heard but has not announced a name), followed by its
@@ -158,9 +159,11 @@ or
 .BR probed ;
 failures are
 .BR {"ok":false,"error":"..."} .
-.B hostname
+.BR hostname ,
+.BR target ,
+.B routable
 and
-.B target
+.B link_local
 are
 .B null
 when unknown.

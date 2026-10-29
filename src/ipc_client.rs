@@ -222,8 +222,9 @@ fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
     struct Named {
         host: String,
         pretty: Vec<String>,
-        /// (is IPv6, address): sorting on this puts IPv4 first.
-        addrs: Vec<(bool, String)>,
+        /// (link-local, IPv6, address): sorting on this puts routable IPv4
+        /// first, then routable IPv6, then link-local ones.
+        addrs: Vec<(bool, bool, String)>,
     }
 
     let name = reply["name"].as_str().ok_or_else(bad_reply)?;
@@ -246,12 +247,13 @@ fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
                 named.last_mut().unwrap()
             }
         };
-        let addr = (
-            device["family"].as_str() == Some("v6"),
-            device["addr"].as_str().ok_or_else(bad_reply)?.to_string(),
-        );
-        if !entry.addrs.contains(&addr) {
-            entry.addrs.push(addr);
+        for (link_local, field) in [(false, "routable"), (true, "link_local")] {
+            if let Some(addr) = device[field].as_str() {
+                let item = (link_local, addr.contains(':'), addr.to_string());
+                if !entry.addrs.contains(&item) {
+                    entry.addrs.push(item);
+                }
+            }
         }
         for p in pretty_names(device) {
             if !entry.pretty.contains(&p) {
@@ -264,9 +266,9 @@ fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
     let rows: Vec<[String; 3]> = named
         .iter_mut()
         .map(|n| {
-            n.addrs.sort_by_key(|(v6, _)| *v6);
+            n.addrs.sort_by_key(|(link_local, v6, _)| (*link_local, *v6));
             let pretty = if n.pretty.is_empty() { "-".to_string() } else { n.pretty.join(", ") };
-            let addrs: Vec<&str> = n.addrs.iter().map(|(_, a)| a.as_str()).collect();
+            let addrs: Vec<&str> = n.addrs.iter().map(|(_, _, a)| a.as_str()).collect();
             [n.host.clone(), pretty, addrs.join(", ")]
         })
         .collect();
@@ -322,6 +324,12 @@ fn unescape_label(label: &str) -> String {
     out
 }
 
+/// A device's addresses, the routable one first; `-` if it has none.
+fn device_addrs(device: &Value) -> String {
+    let addrs: Vec<&str> = ["routable", "link_local"].iter().filter_map(|f| device[*f].as_str()).collect();
+    if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") }
+}
+
 fn render_devices(reply: &Value) -> Result<String, Failure> {
     let name = reply["name"].as_str().ok_or_else(bad_reply)?;
     let devices = reply["devices"].as_array().ok_or_else(bad_reply)?;
@@ -335,7 +343,7 @@ fn render_devices(reply: &Value) -> Result<String, Failure> {
             Ok(vec![
                 d["interface"].as_str().ok_or_else(bad_reply)?.to_string(),
                 d["family"].as_str().ok_or_else(bad_reply)?.to_string(),
-                d["addr"].as_str().ok_or_else(bad_reply)?.to_string(),
+                device_addrs(d),
                 d["hostname"].as_str().unwrap_or("-").to_string(),
             ])
         })
@@ -508,7 +516,22 @@ mod tests {
     }
 
     const SEGMENTS: &str = r#"{"ok":true,"segments":[{"name":"media_stuff","interfaces":["br0","media"],"families":["v4","v6"]},{"name":"IoT","interfaces":["wifi"],"families":["v4"]}]}"#;
-    const DEVICES: &str = r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"br0","family":"v4","addr":"10.0.0.10","hostname":"printer.local","services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp","ty=hp"]}]},{"interface":"wifi","family":"v4","addr":"10.0.1.7","hostname":null,"services":[]}]}"#;
+    const DEVICES: &str = r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"br0","family":"v4","hostname":"printer.local","routable":"10.0.0.10","link_local":null,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp","ty=hp"]}]},{"interface":"wifi","family":"v4","hostname":null,"routable":"10.0.1.7","link_local":null,"services":[]}]}"#;
+
+    /// A device entry as the daemon sends it.
+    fn entry(interface: &str, family: &str, host: Option<&str>, routable: Option<&str>, link_local: Option<&str>, services: &str) -> String {
+        let q = |v: Option<&str>| v.map_or("null".to_string(), |v| format!("\"{v}\""));
+        format!(
+            r#"{{"interface":"{interface}","family":"{family}","hostname":{},"routable":{},"link_local":{},"services":[{services}]}}"#,
+            q(host),
+            q(routable),
+            q(link_local)
+        )
+    }
+
+    fn reply(name: &str, entries: &[String]) -> String {
+        format!(r#"{{"ok":true,"name":"{name}","devices":[{}]}}"#, entries.join(","))
+    }
 
     #[test]
     fn renders_segments_as_a_table() {
@@ -530,6 +553,22 @@ mod tests {
         assert_eq!(render_devices(&empty).unwrap(), "IoT: no devices\n");
     }
 
+    #[test]
+    fn verbose_listing_shows_both_addresses() {
+        let json = reply(
+            "x",
+            &[
+                entry("a", "v6", Some("h.local"), Some("fd00::5"), Some("fe80::5"), ""),
+                entry("a", "v6", None, None, Some("fe80::9"), ""),
+            ],
+        );
+        let out = render_devices(&serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(
+            out,
+            format!("x: 2 devices\n  a  v6  fd00::5, fe80::5  h.local\n  a  v6  fe80::9{}-\n", " ".repeat(11))
+        );
+    }
+
     fn brief(json: &str) -> String {
         render_devices_brief(&serde_json::from_str(json).unwrap()).unwrap()
     }
@@ -549,21 +588,25 @@ mod tests {
         let svc = |instance: &str, kind: &str| {
             format!(r#"{{"instance":"{instance}","type":"{kind}","port":7000,"target":"x.local","txt":[]}}"#)
         };
-        let device = |family: &str, addr: &str| {
-            format!(
-                r#"{{"interface":"media","family":"{family}","addr":"{addr}","hostname":"OZAL-Speakers.local","services":[{},{}]}}"#,
-                svc("04098643E3F7@OZAL Speakers._raop._tcp.local", "_raop._tcp.local"),
-                svc("OZAL Speakers._airplay._tcp.local", "_airplay._tcp.local"),
-            )
-        };
-        let other = format!(
-            r#"{{"interface":"media","family":"v4","addr":"10.0.2.9","hostname":"tv.local","services":[{}]}}"#,
-            svc(r"Living Room\\. TV._http._tcp.local", "_http._tcp.local")
+        let services = format!(
+            "{},{}",
+            svc("04098643E3F7@OZAL Speakers._raop._tcp.local", "_raop._tcp.local"),
+            svc("OZAL Speakers._airplay._tcp.local", "_airplay._tcp.local"),
         );
-        let json = format!(
-            r#"{{"ok":true,"name":"media","devices":[{},{},{other}]}}"#,
-            device("v4", "10.0.2.73"),
-            device("v6", "fe80::1")
+        let json = reply(
+            "media",
+            &[
+                entry("media", "v4", Some("OZAL-Speakers.local"), Some("10.0.2.73"), None, &services),
+                entry("media", "v6", Some("OZAL-Speakers.local"), None, Some("fe80::1"), &services),
+                entry(
+                    "media",
+                    "v4",
+                    Some("tv.local"),
+                    Some("10.0.2.9"),
+                    None,
+                    &svc(r"Living Room\\. TV._http._tcp.local", "_http._tcp.local"),
+                ),
+            ],
         );
         assert_eq!(
             brief(&json),
@@ -572,43 +615,48 @@ mod tests {
     }
 
     #[test]
-    fn brief_listing_shows_every_address_ipv4_first_without_duplicates() {
-        let entry = |host: &str, family: &str, addr: &str| {
-            format!(r#"{{"interface":"a","family":"{family}","addr":"{addr}","hostname":"{host}","services":[]}}"#)
-        };
-        let json = format!(
-            r#"{{"ok":true,"name":"x","devices":[{},{},{},{},{}]}}"#,
-            entry("dual.local", "v6", "fe80::1"),
-            entry("dual.local", "v4", "10.0.0.5"),
-            entry("dual.local", "v4", "10.0.1.5"),
-            entry("v6only.local", "v6", "fe80::2"),
-            entry("v6only.local", "v6", "fe80::2"),
+    fn brief_listing_shows_every_address_routable_before_link_local_without_duplicates() {
+        let json = reply(
+            "x",
+            &[
+                entry("a", "v6", Some("dual.local"), Some("fd00::5"), Some("fe80::1"), ""),
+                entry("a", "v4", Some("dual.local"), Some("10.0.0.5"), None, ""),
+                entry("b", "v4", Some("dual.local"), Some("10.0.1.5"), None, ""),
+                entry("a", "v6", Some("v6only.local"), None, Some("fe80::2"), ""),
+                entry("b", "v6", Some("v6only.local"), None, Some("fe80::2"), ""),
+            ],
         );
+        // Routable IPv4, then routable IPv6, then link-local; each address once.
         assert_eq!(
             brief(&json),
-            "x: 2 devices\n  dual.local    -  10.0.0.5, 10.0.1.5, fe80::1\n  v6only.local  -  fe80::2\n"
+            "x: 2 devices\n  dual.local    -  10.0.0.5, 10.0.1.5, fd00::5, fe80::1\n  v6only.local  -  fe80::2\n"
         );
     }
 
     #[test]
     fn brief_listing_edge_cases() {
         // Several distinct names are all shown; no services shows a dash.
-        let json = r#"{"ok":true,"name":"x","devices":[
-            {"interface":"a","family":"v4","addr":"1.1.1.1","hostname":"b.local","services":[
-                {"instance":"Kitchen._a._tcp.local","type":"_a._tcp.local","port":1,"target":null,"txt":[]},
-                {"instance":"Hall._b._tcp.local","type":"_b._tcp.local","port":2,"target":null,"txt":[]}]},
-            {"interface":"a","family":"v4","addr":"1.1.1.2","hostname":"A.local","services":[]}]}"#;
+        let two = r#"{"instance":"Kitchen._a._tcp.local","type":"_a._tcp.local","port":1,"target":null,"txt":[]},
+                     {"instance":"Hall._b._tcp.local","type":"_b._tcp.local","port":2,"target":null,"txt":[]}"#;
+        let json = reply(
+            "x",
+            &[
+                entry("a", "v4", Some("b.local"), Some("1.1.1.1"), None, two),
+                entry("a", "v4", Some("A.local"), Some("1.1.1.2"), None, ""),
+            ],
+        );
         assert_eq!(
-            brief(json),
+            brief(&json),
             "x: 2 devices\n  A.local  -              1.1.1.2\n  b.local  Kitchen, Hall  1.1.1.1\n"
         );
 
         // Only unnamed devices, none at all.
-        let only_unnamed = r#"{"ok":true,"name":"x","devices":[
-            {"interface":"a","family":"v4","addr":"1.1.1.1","hostname":null,"services":[]},
-            {"interface":"a","family":"v6","addr":"fe80::1","hostname":null,"services":[]}]}"#;
+        let only_unnamed = reply(
+            "x",
+            &[entry("a", "v4", None, Some("1.1.1.1"), None, ""), entry("a", "v6", None, None, Some("fe80::1"), "")],
+        );
         assert_eq!(
-            brief(only_unnamed),
+            brief(&only_unnamed),
             "x: no named devices\n\n(2 devices without a name not shown; use -v to list everything)\n"
         );
         assert_eq!(brief(r#"{"ok":true,"name":"x","devices":[]}"#), "x: no devices\n");

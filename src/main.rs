@@ -95,9 +95,9 @@ fn main() -> Result<()> {
     // With the reflectors gone, what is left in the manual lists is the
     // advertised name: say goodbye to it too.
     for link in links.values() {
-        for device in link.manual_devices() {
-            if let Err(e) = link.remove_manual(device.addr) {
-                eprintln!("{}/{:?}: withdrawing {} failed: {e:#}", link.interface(), link.family(), device.addr);
+        for host in link.manual_devices().into_iter().filter_map(|d| d.hostname) {
+            if let Err(e) = link.remove_manual(&host) {
+                eprintln!("{}/{:?}: withdrawing {host} failed: {e:#}", link.interface(), link.family());
             }
         }
     }
@@ -141,8 +141,12 @@ fn start_link(interface: &str, family: Family, advertise: Option<&str>) -> Resul
     link.attach(tx, dest);
 
     if let Some(name) = advertise {
+        // On its own link, the router's link-local address is as good as any,
+        // and for IPv6 it is the one the kernel picks.
         let router = sock.local_addr().and_then(|addr| {
-            link.add_manual(Device { addr, hostname: Some(name.to_string()), services: Vec::new() })
+            let (link_local, routable) =
+                if socket::is_link_local(&addr) { (Some(addr), None) } else { (None, Some(addr)) };
+            link.add_manual(Device { hostname: Some(name.to_string()), link_local, routable, services: Vec::new() })
                 .map(|_| addr)
         });
         match router {

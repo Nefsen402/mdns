@@ -11,7 +11,6 @@
 //! single segment only tracks and reflects nothing.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -42,11 +41,11 @@ struct Inner {
 #[derive(Default)]
 struct Book {
     /// Reflectable devices currently discovered on each source segment,
-    /// keyed by (segment index, address).
-    sources: BTreeMap<(usize, IpAddr), Device>,
+    /// keyed by (segment index, lowercase hostname).
+    sources: BTreeMap<(usize, String), Device>,
     /// What each target segment has been told, as last sent successfully,
-    /// keyed by (segment index, address).
-    pushed: HashMap<(usize, IpAddr), Device>,
+    /// keyed by (segment index, lowercase hostname).
+    pushed: HashMap<(usize, String), Device>,
 }
 
 impl Reflector {
@@ -151,27 +150,31 @@ impl Inner {
         match event {
             Event::Added(device) | Event::Updated(device) => track(&mut book, src, device),
             Event::Removed(device) => {
-                book.sources.remove(&(src, device.addr));
+                // A device that never had a name was never tracked.
+                if let Some(key) = device.key() {
+                    book.sources.remove(&(src, key));
+                }
             }
         }
         self.reconcile(&mut book);
     }
 
     /// What `target` should be announcing: every reflectable device from the
-    /// other segments. If two devices clash on address or hostname (the
-    /// cache-flush bit would make them overwrite each other), the one from
-    /// the lowest-numbered segment wins; the other takes over when it goes.
-    fn desired(&self, book: &Book, target: usize) -> HashMap<IpAddr, Device> {
-        let mut out: HashMap<IpAddr, Device> = HashMap::new();
-        let mut names = HashSet::new();
-        for (&(src, addr), device) in &book.sources {
-            if src == target || out.contains_key(&addr) {
+    /// other segments, by hostname. If two devices clash on hostname or
+    /// address (the cache-flush bit would make them overwrite each other), the
+    /// one from the lowest-numbered segment wins; the other takes over when it
+    /// goes.
+    ///
+    /// A device's link-local address is dropped: it only means something on
+    /// the link the device is on, and on any other it names nobody.
+    fn desired(&self, book: &Book, target: usize) -> HashMap<String, Device> {
+        let mut out: HashMap<String, Device> = HashMap::new();
+        let mut addrs = HashSet::new();
+        for ((src, key), device) in &book.sources {
+            if *src == target || out.contains_key(key) || !addrs.insert(device.routable) {
                 continue;
             }
-            let name = device.hostname.as_deref().unwrap_or_default().to_ascii_lowercase();
-            if names.insert(name) {
-                out.insert(addr, device.clone());
-            }
+            out.insert(key.clone(), Device { link_local: None, ..device.clone() });
         }
         out
     }
@@ -182,45 +185,49 @@ impl Inner {
         for (target, seg) in self.segments.iter().enumerate() {
             let desired = self.desired(book, target);
 
-            let stale: Vec<IpAddr> = book
+            let stale: Vec<String> = book
                 .pushed
                 .keys()
-                .filter(|(t, addr)| *t == target && !desired.contains_key(addr))
-                .map(|&(_, addr)| addr)
+                .filter(|(t, key)| *t == target && !desired.contains_key(key))
+                .map(|(_, key)| key.clone())
                 .collect();
-            for addr in stale {
-                match seg.remove_manual(addr) {
+            for key in stale {
+                match seg.remove_manual(&key) {
                     Ok(_) => {
-                        book.pushed.remove(&(target, addr));
+                        book.pushed.remove(&(target, key));
                     }
-                    Err(e) => eprintln!("{}/{:?}: withdrawing {addr} failed: {e:#}", seg.interface(), seg.family()),
+                    Err(e) => eprintln!("{}/{:?}: withdrawing {key} failed: {e:#}", seg.interface(), seg.family()),
                 }
             }
 
-            for (addr, device) in desired {
-                if book.pushed.get(&(target, addr)) == Some(&device) {
+            for (key, device) in desired {
+                if book.pushed.get(&(target, key.clone())) == Some(&device) {
                     continue;
                 }
                 match seg.add_manual(device.clone()) {
                     Ok(_) => {
-                        book.pushed.insert((target, addr), device);
+                        book.pushed.insert((target, key), device);
                     }
-                    Err(e) => eprintln!("{}/{:?}: announcing {addr} failed: {e:#}", seg.interface(), seg.family()),
+                    Err(e) => eprintln!("{}/{:?}: announcing {key} failed: {e:#}", seg.interface(), seg.family()),
                 }
             }
         }
     }
 }
 
-/// Only devices that can actually be announced are reflected: that takes a
-/// hostname for the address record, and services give clients a reason to
-/// care (bare chatty clients such as phones are skipped).
+/// Only devices that can actually be announced elsewhere are reflected: that
+/// takes a hostname for the address record and a routable address to put in it
+/// (a device known only by a link-local address cannot be reached from another
+/// network), and services give clients a reason to care (bare chatty clients
+/// such as phones are skipped).
 fn reflectable(device: &Device) -> bool {
-    device.hostname.is_some() && !device.services.is_empty()
+    device.hostname.is_some() && device.routable.is_some() && !device.services.is_empty()
 }
 
 fn track(book: &mut Book, src: usize, device: Device) {
-    let key = (src, device.addr);
+    // Without a name there is nothing to key it by, and it is not reflectable.
+    let Some(key) = device.key() else { return };
+    let key = (src, key);
     if reflectable(&device) {
         book.sources.insert(key, device);
     } else {
@@ -230,7 +237,7 @@ fn track(book: &mut Book, src: usize, device: Device) {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
     use super::*;
     use crate::parser::{Header, Message, RData, Record};
@@ -242,6 +249,15 @@ mod tests {
         rx.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let seg = Segment::new(name, Family::V4);
+        seg.attach(tx, rx.local_addr().unwrap());
+        (seg, rx)
+    }
+
+    /// Like [`wired`], for an IPv6 segment.
+    fn wired_v6(name: &str) -> (Segment, UdpSocket) {
+        let (_, rx) = wired(name);
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let seg = Segment::new(name, Family::V6);
         seg.attach(tx, rx.local_addr().unwrap());
         (seg, rx)
     }
@@ -289,6 +305,26 @@ mod tests {
         };
         let from = SocketAddr::new(IpAddr::V4(addr), 5353);
         seg.handle(from, &msg.encode().unwrap()).unwrap();
+    }
+
+    /// Make an IPv6 `seg` hear `host` announcing `addrs` (AAAA records) and one
+    /// service, from the link-local address `from`.
+    fn announce6(seg: &Segment, from: &str, host: &str, addrs: &[&str], instance: &str) {
+        let mut answers: Vec<Record> =
+            addrs.iter().map(|a| rec(host, RData::Aaaa(a.parse::<Ipv6Addr>().unwrap()))).collect();
+        answers.push(rec("_http._tcp.local", RData::Ptr(format!("{instance}._http._tcp.local"))));
+        answers.push(rec(
+            &format!("{instance}._http._tcp.local"),
+            RData::Srv { priority: 0, weight: 0, port: 80, target: host.into() },
+        ));
+        let msg = Message {
+            header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+            questions: vec![],
+            answers,
+            authorities: vec![],
+            additionals: vec![],
+        };
+        seg.handle(SocketAddr::new(ip(from), 5353), &msg.encode().unwrap()).unwrap();
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -392,13 +428,13 @@ mod tests {
         announce(&a, "10.0.1.5", "TV.local", &["TV"]);
         wait_for(|| {
             let d = c.manual_devices();
-            d.len() == 1 && d[0].addr == ip("10.0.1.5")
+            d.len() == 1 && d[0].routable == Some(ip("10.0.1.5"))
         });
 
         a.expire(Instant::now() + Duration::from_secs(36000));
         wait_for(|| {
             let d = c.manual_devices();
-            d.len() == 1 && d[0].addr == ip("10.0.2.5")
+            d.len() == 1 && d[0].routable == Some(ip("10.0.2.5"))
         });
     }
 
@@ -423,15 +459,58 @@ mod tests {
 
         announce(&b, "10.0.2.5", "tv-b.local", &["B"]);
         wait_for(|| a.manual_devices().len() == 1 && c.manual_devices().len() == 1);
-        assert_eq!(a.manual_devices()[0].addr, ip("10.0.2.5"));
-        assert_eq!(c.manual_devices()[0].addr, ip("10.0.2.5"));
+        assert_eq!(a.manual_devices()[0].routable, Some(ip("10.0.2.5")));
+        assert_eq!(c.manual_devices()[0].routable, Some(ip("10.0.2.5")));
 
         // Dropping one reflector withdraws only what it announced.
         drop(r_ab);
         assert!(a.manual_devices().is_empty());
-        let on_b: Vec<_> = b.manual_devices().iter().map(|d| d.addr).collect();
+        let on_b: Vec<_> = b.manual_devices().iter().map(|d| d.routable.unwrap()).collect();
         assert_eq!(on_b, [ip("10.0.3.5")]);
         assert_eq!(c.manual_devices().len(), 1);
+    }
+
+    /// The bug this guards against: a device on one network announced to
+    /// another with its link-local address, which only exists on its own link.
+    #[test]
+    fn link_local_addresses_never_leave_their_link() {
+        let (a, _arx) = wired_v6("a");
+        let (b, brx) = wired_v6("b");
+        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+
+        // It sends from its link-local address and announces that and a ULA.
+        announce6(&a, "fe80::5", "tv.local", &["fd00:0:1::5", "fe80::5"], "TV");
+        wait_for(|| b.manual_devices().len() == 1);
+
+        // Where it lives, both addresses are known...
+        let home = &a.devices()[0];
+        assert_eq!((home.routable, home.link_local), (Some(ip("fd00:0:1::5")), Some(ip("fe80::5"))));
+        // ...but the other network is told only the routable one.
+        let there = &b.manual_devices()[0];
+        assert_eq!((there.routable, there.link_local), (Some(ip("fd00:0:1::5")), None));
+        let on_the_wire: Vec<Ipv6Addr> = drain(&brx)
+            .iter()
+            .flat_map(|m| &m.answers)
+            .filter_map(|r| match &r.data {
+                RData::Aaaa(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(on_the_wire, ["fd00:0:1::5".parse::<Ipv6Addr>().unwrap()]);
+    }
+
+    #[test]
+    fn a_device_known_only_by_a_link_local_address_is_not_reflected() {
+        let (a, _arx) = wired_v6("a");
+        let (b, brx) = wired_v6("b");
+        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+
+        announce6(&a, "fe80::6", "mute.local", &["fe80::6"], "Mute");
+        wait_for(|| !a.devices().is_empty());
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(a.devices()[0].routable, None);
+        assert!(b.manual_devices().is_empty());
+        assert!(drain(&brx).is_empty());
     }
 
     #[test]

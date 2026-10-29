@@ -199,10 +199,19 @@ instances and resolves each instance's hostname and port. Many devices answer
 only when asked, and a device needs a hostname to be reflected, so without
 probing they would stay invisible.
 
-- Only devices that announced **a hostname and at least one service** are
-  reflected. Chatty clients that merely send queries (phones, laptops) are
-  tracked but not reflected.
-- A reflected device is announced on the other interface with its **original
+- A device is identified by its **hostname**, and its addresses are the ones it
+  announces in its own A and AAAA records (plus the address it sent from, if it
+  announced none of its own). Per address family it has up to two: a
+  **link-local** address, and a **routable** one (IPv4, or global/ULA IPv6).
+- Only devices that announced **a hostname, a routable address and at least one
+  service** are reflected. Chatty clients that merely send queries (phones,
+  laptops) are tracked but not reflected.
+- **Link-local addresses are never reflected.** `fe80::/10` only means
+  something on the link the device is on; announced to another network it would
+  name nobody. A reflected device is announced with its routable address only,
+  so a device that has only a link-local IPv6 address is not reflected over
+  IPv6 (over IPv4 it still is, if it has an address there).
+- A reflected device is announced on the other interface with that **routable
   address**. Your firewall must allow the actual connections between the
   networks; mDNS only makes the device discoverable.
 - If two devices would clash on hostname or address on a target interface, the
@@ -272,8 +281,8 @@ IoT to br0: 1 device
 (1 device without a name not shown; use -v to list everything)
 ```
 
-`-v` (`--verbose`) lists everything: interface, family, address and hostname for
-every entry, with each device's services underneath (instance, type, port,
+`-v` (`--verbose`) lists everything: interface, family, addresses (routable
+first, then link-local) and hostname for every entry, with each device's services underneath (instance, type, port,
 target and TXT records), including the devices without a name.
 
 ```
@@ -335,11 +344,11 @@ printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
 | Request           | Reply                                                                  |
 |-------------------|------------------------------------------------------------------------|
 | `segments`        | `{"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}` |
-| `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4","addr":"10.0.1.7","hostname":"tv.local","services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
+| `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4","hostname":"tv.local","routable":"10.0.1.7","link_local":null,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
 | `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":9,"error":null}]}` (replies after about 4 seconds) |
 | anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
 
-`hostname` and `target` are `null` when unknown. Requests over 4 KiB are
+`hostname`, `target`, `routable` and `link_local` are `null` when unknown. Requests over 4 KiB are
 refused, and idle connections are closed after 60 seconds.
 
 ## Shutdown
