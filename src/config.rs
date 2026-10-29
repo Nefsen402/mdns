@@ -32,7 +32,8 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use systemd_unit_edit::{Entry, Parse, SystemdUnit};
 
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
@@ -86,62 +87,56 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Config> {
+        let unit = parse_syntax(text)?;
         let mut config = Config::default();
-        let mut section = String::new();
         // Header line of each [Segment], for error messages.
         let mut segment_lines = Vec::new();
 
-        for (idx, raw) in text.lines().enumerate() {
-            let line = raw.trim();
-            let lineno = idx + 1;
-            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-                continue;
+        for section in unit.sections() {
+            let name = section.name().unwrap_or_default().to_ascii_lowercase();
+            if name == "segment" {
+                config.segments.push(SegmentConfig::default());
+                segment_lines.push(section.line() + 1);
             }
-            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                section = name.trim().to_ascii_lowercase();
-                if section == "segment" {
-                    config.segments.push(SegmentConfig::default());
-                    segment_lines.push(lineno);
-                }
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                bail!("line {lineno}: expected Key=Value, got {line:?}");
-            };
-            let key = key.trim().to_ascii_lowercase();
-            let value = value.trim();
 
-            match (section.as_str(), key.as_str()) {
-                ("segment", "name") => {
-                    config.segments.last_mut().unwrap().name = unquote(value);
-                }
-                ("segment", "interfaces") => {
-                    let list = &mut config.segments.last_mut().unwrap().interfaces;
-                    if value.is_empty() {
-                        list.clear();
-                    } else {
-                        list.extend(
-                            unquote(value)
-                                .split(|c: char| c == ',' || c.is_whitespace())
-                                .filter(|s| !s.is_empty())
-                                .map(String::from),
-                        );
+            for entry in section.entries() {
+                // Comments and blank lines come back as entries without a key.
+                let Some(key) = entry.key() else { continue };
+                let key = key.to_ascii_lowercase();
+                let lineno = entry.line() + 1;
+                // An empty assignment has no value at all.
+                let value = entry.unquoted_value().unwrap_or_default();
+
+                match (name.as_str(), key.as_str()) {
+                    ("segment", "name") => {
+                        config.segments.last_mut().unwrap().name = value;
                     }
-                }
-                ("listen", "ipv4") => config.ipv4 = parse_bool(value, lineno)?,
-                ("listen", "ipv6") => config.ipv6 = parse_bool(value, lineno)?,
-                ("advertise", "hostname") => {
-                    config.advertise = Some(local_name(&unquote(value), lineno)?);
-                }
-                ("ipc", "socket") => {
-                    let path = unquote(value);
-                    if path.is_empty() {
-                        bail!("line {lineno}: Socket= needs a path");
+                    ("segment", "interfaces") => {
+                        let list = &mut config.segments.last_mut().unwrap().interfaces;
+                        if value.is_empty() {
+                            list.clear();
+                        } else {
+                            list.extend(
+                                value
+                                    .split(|c: char| c == ',' || c.is_whitespace())
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from),
+                            );
+                        }
                     }
-                    config.socket = PathBuf::from(path);
+                    ("listen", "ipv4") => config.ipv4 = parse_bool(&entry, lineno)?,
+                    ("listen", "ipv6") => config.ipv6 = parse_bool(&entry, lineno)?,
+                    ("advertise", "hostname") => {
+                        config.advertise = Some(local_name(&value, lineno)?);
+                    }
+                    ("ipc", "socket") => {
+                        if value.is_empty() {
+                            bail!("line {lineno}: Socket= needs a path");
+                        }
+                        config.socket = PathBuf::from(value);
+                    }
+                    (s, k) => bail!("line {lineno}: unknown setting {k:?} in [{s}]"),
                 }
-                ("", _) => bail!("line {lineno}: assignment outside of a section"),
-                (s, k) => bail!("line {lineno}: unknown setting {k:?} in [{s}]"),
             }
         }
 
@@ -223,23 +218,45 @@ fn local_name(value: &str, lineno: usize) -> Result<String> {
     Ok(name)
 }
 
-/// Strip one pair of matching surrounding quotes.
-fn unquote(value: &str) -> String {
-    let value = value.trim();
-    for quote in ['"', '\''] {
-        if let Some(inner) = value.strip_prefix(quote).and_then(|v| v.strip_suffix(quote)) {
-            return inner.trim().to_string();
-        }
+/// Parse the text as systemd unit syntax, reporting the first error with the
+/// line it is on.
+fn parse_syntax(text: &str) -> Result<SystemdUnit> {
+    let parse = Parse::<SystemdUnit>::parse_unit(text);
+    if parse.ok() {
+        return Ok(parse.to_result().expect("no syntax errors"));
     }
-    value.to_string()
+    let message = match parse.errors().first().map(String::as_str) {
+        // The parser calls an assignment before any [Section] header a missing header.
+        Some(m) if m.starts_with("expected section header") => "assignment outside of a section",
+        Some(m) => m,
+        None => "syntax error",
+    };
+    match failing_line(text) {
+        Some(line) => bail!("line {line}: {message}"),
+        None => bail!("{message}"),
+    }
 }
 
-fn parse_bool(value: &str, lineno: usize) -> Result<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "yes" | "true" | "on" => Ok(true),
-        "0" | "no" | "false" | "off" => Ok(false),
-        _ => bail!("line {lineno}: invalid boolean {value:?}"),
+/// The line a syntax error is on. The parser reports its errors without a
+/// position, so ask it: the error is on the first line at which the text up to
+/// and including that line no longer parses. Config files are small, so
+/// parsing every prefix costs nothing.
+fn failing_line(text: &str) -> Option<usize> {
+    let mut end = 0;
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        end += line.len();
+        if !Parse::<SystemdUnit>::parse_unit(&text[..end]).ok() {
+            return Some(i + 1);
+        }
     }
+    None
+}
+
+/// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
+fn parse_bool(entry: &Entry, lineno: usize) -> Result<bool> {
+    entry
+        .value_as_bool()
+        .ok_or_else(|| anyhow!("line {lineno}: invalid boolean {:?}", entry.unquoted_value().unwrap_or_default()))
 }
 
 #[cfg(test)]
@@ -359,6 +376,53 @@ interfaces=br0,wifi
     #[test]
     fn overlap_of_a_single_interface_is_fine() {
         assert!(Config::parse("[Segment]\nName=a\nInterfaces=x,y\n[Segment]\nName=b\nInterfaces=x,z\n").is_ok());
+    }
+
+    fn error_of(text: &str) -> String {
+        format!("{:#}", Config::parse(text).unwrap_err())
+    }
+
+    #[test]
+    fn syntax_errors_name_their_line() {
+        assert!(error_of("[Segment]\nName=a\nInterfaces\n").contains("line 3"), "no '='");
+        assert!(error_of("# c\n\nInterfaces=a\n").contains("line 3"), "outside a section");
+        assert!(error_of("# c\n\nInterfaces=a\n").contains("assignment outside of a section"));
+        assert!(error_of("[Segment\nName=a\n").contains("line 1"), "unterminated header");
+    }
+
+    #[test]
+    fn semantic_errors_name_their_line() {
+        let with = |body: &str| error_of(&format!("\n# comment\n{body}"));
+        assert!(with("[Segment]\nName=a\nInterfaces=x\nBogus=1\n").contains("line 6"), "unknown key");
+        assert!(with("[Listen]\nIPv4=maybe\n[Segment]\nName=a\nInterfaces=x\n").contains("line 4"), "bad boolean");
+        assert!(with("[Segment]\nInterfaces=x\n").contains("line 3"), "segment without a name, at its header");
+        assert!(with("[Advertise]\nHostname=router.lan\n").contains("line 4"), "hostname outside .local");
+    }
+
+    #[test]
+    fn booleans_follow_systemd() {
+        let parse = |v: &str| Config::parse(&format!("[Listen]\nIPv4={v}\nIPv6=no\n[Segment]\nName=a\nInterfaces=x\n"));
+        for yes in ["1", "yes", "true", "on", "YES", "True", "\"on\""] {
+            assert!(parse(yes).unwrap().ipv4, "{yes}");
+        }
+        for no in ["0", "no", "false", "off", "OFF"] {
+            // IPv6=no as well makes both families off, which is its own error.
+            assert!(error_of(&format!("[Listen]\nIPv4={no}\nIPv6=no\n[Segment]\nName=a\nInterfaces=x\n")).contains("both disabled"), "{no}");
+        }
+        assert!(parse("enabled").is_err());
+    }
+
+    #[test]
+    fn comments_blank_lines_crlf_and_continuations_are_fine() {
+        // Comments and blank lines inside a section, and Windows line endings.
+        let c = Config::parse("[Segment]\r\n# c\r\nName=a\r\n\r\n; d\r\nInterfaces=x,y\r\n").unwrap();
+        assert_eq!(c.segments, [seg("a", &["x", "y"])]);
+        // A line ending in a backslash continues on the next, as in unit files.
+        let c = Config::parse("[Segment]\nName=a\nInterfaces=x \\\n    y,z\n").unwrap();
+        assert_eq!(c.segments[0].interfaces, ["x", "y", "z"]);
+        // A value may contain an equals sign.
+        let c = Config::parse("[Segment]\nName=a=b\nInterfaces=x\n").unwrap();
+        assert_eq!(c.segments[0].name, "a=b");
     }
 
     #[test]

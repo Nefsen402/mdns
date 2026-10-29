@@ -16,3 +16,4 @@ anyhow = "1.0.104"
 libc = "0.2.191"
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 socket2 = { version = "0.6.5", features = ["all"] }
+systemd-unit-edit = "0.1.4"

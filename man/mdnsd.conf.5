@@ -38,7 +38,11 @@ Booleans accept
 .BR on / off
 and
 .BR 1 / 0 .
+.IP \(bu 2
+A line ending in a backslash continues on the next line, as in systemd unit
+files.
 .PP
+Syntax errors and unknown settings are reported with the line they are on.
 Unknown sections and keys are errors, so that typos fail loudly.
 .SH SECTIONS
 .SS [Listen]

@@ -128,6 +128,8 @@ Interfaces=br0,wifi
 - Repeating a key **appends** to list values (`Interfaces=`); an empty
   assignment (`Interfaces=`) **resets** the list.
 - Booleans accept `yes`/`no`, `true`/`false`, `on`/`off`, `1`/`0`.
+- A line ending in a backslash continues on the next line, as in unit files.
+- Syntax errors and unknown settings are reported with the line they are on.
 - Unknown sections or keys are an error, so typos fail loudly.
 
 ### `[Listen]` (optional)
