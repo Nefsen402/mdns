@@ -36,6 +36,13 @@ Its addresses are those of its own address records (and the address it sent
 from, if it announced none of its own); per address family it has up to two, a
 link-local one and a routable one.
 Its DNS-SD services are taken from the records it announces.
+A packet may describe several devices, as a reflector's answer to a browse
+query does, so each record is attributed to the device it names: an address
+record to the host that owns the name, and a service to the host its SRV record
+points at, together with the PTR and TXT records of that instance.
+The address a packet came from is credited to a host only if that host
+announced it, or announced no address at all and is the only host described;
+a reflector announcing other devices is not mistaken for any of them.
 A device expires after it has been silent for at least five minutes, or for the
 TTL of its records if that is longer.
 A goodbye packet (TTL 0) removes it immediately.
@@ -46,9 +53,12 @@ The daemon therefore also asks.
 A probe is three rounds of multicast queries, a few seconds in all: the first
 asks which service types exist; the next browses every type learned so far for
 instances; and instances that have not yet said where they are (their target
-and port) are resolved by asking for their service and text records.
-A device needs a hostname and a service to be reflected, and the resolve step is
-what supplies the hostname for devices that only answer browse queries.
+and port) are resolved by asking for their service and text records; and a
+device that has a name but no routable address yet, because it only ever showed
+a link-local one, is asked for all of its addresses.
+A device needs a hostname, a routable address and a service to be reflected, and
+the resolve steps are what supply the hostname and the address for devices that
+only answer browse queries.
 .PP
 A probe runs on every interface once at startup, and again whenever
 .B mdnsctl probe

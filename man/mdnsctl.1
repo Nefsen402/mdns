@@ -59,8 +59,8 @@ Actively look for devices instead of waiting for them to announce themselves:
 ask the interfaces of the segment called
 .I name
 (of every segment if no name is given) which service types exist, browse each
-type for instances, and resolve every instance that has not yet said where it
-is.
+type for instances, resolve every instance that has not yet said where it is,
+and ask for the addresses of any named device that has no routable one yet.
 This takes three rounds of queries over about four seconds, and the command
 returns once the answers have been processed.
 It prints how many queries were sent on each interface; use

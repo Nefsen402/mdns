@@ -195,13 +195,19 @@ pair of them**. Think of each segment as "these networks may see each other".
 
 Devices are found by listening, and by probing: at startup, and whenever you
 run `mdnsctl probe`, the daemon browses every interface for service types and
-instances and resolves each instance's hostname and port. Many devices answer
-only when asked, and a device needs a hostname to be reflected, so without
-probing they would stay invisible.
+instances, resolves each instance's hostname and port, and asks for the
+addresses of devices that have a name but no routable address yet. Many devices
+answer only when asked, and a device needs a hostname and a routable address to
+be reflected, so without probing they would stay invisible.
 
 - A device is identified by its **hostname**, and its addresses are the ones it
   announces in its own A and AAAA records (plus the address it sent from, if it
-  announced none of its own). Per address family it has up to two: a
+  announced none of its own). A packet may describe several devices (a
+  reflector's answer to a browse query does), so each record goes to the device
+  it names: an address to the host that owns the name, a service to the host its
+  SRV record points at. The address a packet came from is credited to a host
+  only if that host announced it, or announced none and is the only host
+  described, so a reflector is not mistaken for the devices it announces. Per address family it has up to two: a
   **link-local** address, and a **routable** one (IPv4, or global/ULA IPv6).
 - Only devices that announced **a hostname, a routable address and at least one
   service** are reflected. Chatty clients that merely send queries (phones,
@@ -300,8 +306,9 @@ yet. `--json` always prints the full reply, regardless of `-v`.
 
 Actively looks for devices on the interfaces of the named segment, or of every
 segment if no name is given. It asks which service types exist, browses each
-type for instances, and resolves instances that have not yet said where they
-are, in three rounds over about four seconds. It replies once the answers have
+type for instances, resolves instances that have not yet said where they are,
+and asks for the addresses of named devices that have no routable one yet, in
+three rounds over about four seconds. It replies once the answers have
 been processed, with the number of queries sent on each interface:
 
 ```
