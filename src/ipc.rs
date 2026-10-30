@@ -415,6 +415,7 @@ fn device_json(interface: &str, family: Family, d: &Device) -> Value {
                 "port": s.port,
                 "target": s.target,
                 "txt": s.txt,
+                "subtypes": s.subtypes,
                 "ttl": (s.ttl != 0).then_some(s.ttl),
             })
         })
@@ -580,7 +581,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains(r#"{"instance":"My \"TV\"._http._tcp.local","type":"_http._tcp.local","port":80,"target":"tv.local","txt":["k=v"],"ttl":120}"#),
+            out.contains(r#"{"instance":"My \"TV\"._http._tcp.local","type":"_http._tcp.local","port":80,"target":"tv.local","txt":["k=v"],"subtypes":[],"ttl":120}"#),
             "{out}"
         );
         assert!(out.contains(r#""interface":"b","family":"v4","hostname":null,"routable":"10.0.2.1""#), "{out}");

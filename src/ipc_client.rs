@@ -518,6 +518,12 @@ fn service_lines(device: &Value) -> String {
         if let Some(ttl) = svc["ttl"].as_u64() {
             out.push_str(&format!("  ttl={ttl}"));
         }
+        // `_universal._sub._ipp._tcp.local` is `_universal`.
+        let subtypes: Vec<&str> =
+            strings(&svc["subtypes"]).into_iter().map(|sub| sub.split_once("._sub.").map_or(sub, |(label, _)| label)).collect();
+        if !subtypes.is_empty() {
+            out.push_str(&format!("  sub={}", subtypes.join(",")));
+        }
         let txt = strings(&svc["txt"]);
         if !txt.is_empty() {
             out.push_str(&format!("  [{}]", txt.join(", ")));
@@ -777,6 +783,19 @@ mod tests {
         assert_eq!(
             out,
             format!("x: 2 devices\n  a  v6  fd00::5, fe80::5  h.local\n  a  v6  fe80::9{}-\n", " ".repeat(11))
+        );
+    }
+
+    #[test]
+    fn verbose_service_lines_show_subtypes_by_their_label() {
+        let device: Value = serde_json::from_str(
+            r#"{"services":[{"instance":"Office._ipp._tcp.local","type":"_ipp._tcp.local","port":631,"target":"printer.local",
+                "txt":[],"subtypes":["_universal._sub._ipp._tcp.local","_cups._sub._ipp._tcp.local"],"ttl":120}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            service_lines(&device),
+            "      Office  _ipp._tcp.local  :631 -> printer.local  ttl=120  sub=_universal,_cups\n"
         );
     }
 

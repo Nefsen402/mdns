@@ -117,6 +117,12 @@ A link-local address is never reflected: it only means something on the link
 the device is on.
 A device is announced with its routable address only, so one that has only a
 link-local IPv6 address is not reflected over IPv6.
+With its services go the subtypes they announced, which a probe also asks for
+(the well-known ones of the types around, and those heard before); with its
+hostname, the NSEC record it announced, so a query for a kind of address it lacks
+is answered at once, and the reverse mapping of its routable address, if it
+announced one.
+Names are compared without regard to case.
 Reflection is never transitive: a device reflected onto an interface is not
 reflected again.
 .PP

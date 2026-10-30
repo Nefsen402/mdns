@@ -350,6 +350,20 @@ be reflected, so without probing they would stay invisible.
 - A reflected device is announced on the other interface with that **routable
   address**. Your firewall must allow the actual connections between the
   networks; mDNS only makes the device discoverable.
+- Along with its addresses and services, a reflected device carries:
+  - the **subtypes** its services announced (`_universal._sub._ipp._tcp.local`,
+    which is how an iPhone finds AirPrint printers). A device only sends these
+    when it announces itself or is asked for one by name, so a probe asks for the
+    well-known ones (`_universal` for IPP, `_printer` for HTTP, Matter's `_CM`)
+    of the types around, and for every one heard before.
+  - the **NSEC** record it announced for its hostname, which says what kinds of
+    address it has: asked for one it lacks (an IPv6 address of an IPv4-only
+    printer), the copy says so at once instead of leaving the asker to wait. The
+    copy only ever denies what the device denied itself.
+  - the **reverse mapping** (`9.1.0.10.in-addr.arpa PTR printer.local`) of its
+    routable address, if it announced one.
+- Names are compared **without regard to case**, as DNS does: `TV._http._tcp.local`
+  and `tv._HTTP._tcp.local` are the same service.
 - If devices on different interfaces announce the **same hostname**, the one
   from the interface listed **first** in the segment wins; the other takes over
   automatically if the winner goes away. When segments share an interface, the
@@ -440,8 +454,9 @@ IoT to br0: 1 device
 `-v` (`--verbose`) lists everything: interface, family, addresses (routable
 first, then link-local) and hostname for every entry, then `addr-ttl=`, the TTL
 its address records were announced with. Each device's services are underneath
-(instance, type, port, target, the `ttl=` their records were announced with, and
-TXT records), including the devices without a name.
+(instance, type, port, target, the `ttl=` their records were announced with,
+`sub=` and the subtypes it is of, and TXT records), including the devices without
+a name.
 
 ```
 $ mdnsctl -v devices IoT to br0

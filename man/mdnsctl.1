@@ -50,7 +50,11 @@ after it: the TTL, in seconds, its address records were announced with, if it
 announced any, followed by its
 services: instance, type, port, target, the
 .B ttl=
-its records were announced with, and TXT records.
+its records were announced with,
+.B sub=
+and the subtypes it is of (such as
+.B _universal
+for an AirPrint printer), and TXT records.
 These are the TTLs a reflected copy is announced with (see
 .B ReflectTTL=
 in

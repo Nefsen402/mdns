@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub mod rtype {
     pub const A: u16 = 1;
@@ -332,6 +332,49 @@ pub fn split_instance(name: &str) -> Option<(&str, &str)> {
         }
     }
     None
+}
+
+/// The reverse-mapping name of `addr`: `9.1.0.10.in-addr.arpa` for 10.0.1.9,
+/// and the 32 nibbles of an IPv6 address, last first, under `ip6.arpa`.
+pub fn reverse_name(addr: IpAddr) -> String {
+    match addr {
+        IpAddr::V4(a) => {
+            let [a, b, c, d] = a.octets();
+            format!("{d}.{c}.{b}.{a}.in-addr.arpa")
+        }
+        IpAddr::V6(a) => {
+            let nibbles: Vec<String> =
+                a.octets().iter().rev().flat_map(|b| [b & 0xf, b >> 4]).map(|n| format!("{n:x}")).collect();
+            format!("{}.ip6.arpa", nibbles.join("."))
+        }
+    }
+}
+
+/// The address a reverse-mapping name is of, if it is one: the inverse of
+/// [`reverse_name`], ignoring case.
+pub fn reverse_addr(name: &str) -> Option<IpAddr> {
+    let lower = name.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_suffix(".in-addr.arpa") {
+        let octets: Vec<u8> = rest.split('.').map(|l| l.parse().ok()).collect::<Option<_>>()?;
+        let [d, c, b, a] = octets[..] else { return None };
+        return Some(IpAddr::V4(Ipv4Addr::new(a, b, c, d)));
+    }
+    let rest = lower.strip_suffix(".ip6.arpa")?;
+    let nibbles: Vec<u8> = rest
+        .split('.')
+        .map(|l| match l.as_bytes() {
+            [c] => (*c as char).to_digit(16).map(|n| n as u8),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if nibbles.len() != 32 {
+        return None;
+    }
+    let mut octets = [0u8; 16];
+    for (i, pair) in nibbles.rchunks(2).enumerate() {
+        octets[i] = pair[1] << 4 | pair[0];
+    }
+    Some(IpAddr::V6(Ipv6Addr::from(octets)))
 }
 
 struct Reader<'a> {
@@ -741,6 +784,24 @@ mod tests {
             ],
         };
         assert_eq!(Message::parse(&msg.encode().unwrap()).unwrap(), msg);
+    }
+
+    #[test]
+    fn reverse_names_round_trip() {
+        let v4: IpAddr = "10.0.1.9".parse().unwrap();
+        assert_eq!(reverse_name(v4), "9.1.0.10.in-addr.arpa");
+        let v6: IpAddr = "fd00:0:1::5".parse().unwrap();
+        assert_eq!(
+            reverse_name(v6),
+            "5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa"
+        );
+        for addr in [v4, v6, "2001:db8:abcd:12::fe".parse().unwrap()] {
+            assert_eq!(reverse_addr(&reverse_name(addr)), Some(addr));
+            assert_eq!(reverse_addr(&reverse_name(addr).to_ascii_uppercase()), Some(addr), "case does not matter");
+        }
+        for not in ["tv.local", "1.0.10.in-addr.arpa", "256.1.0.10.in-addr.arpa", "x.ip6.arpa", "10.in-addr.arpa.local"] {
+            assert_eq!(reverse_addr(not), None, "{not}");
+        }
     }
 
     #[test]

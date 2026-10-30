@@ -66,6 +66,18 @@ const QUESTIONS_PER_PACKET: usize = 16;
 /// without bound by announcing endless made-up types.
 const MAX_TYPES: usize = 256;
 
+/// Subtypes a probe asks for when their type is around. A device sends its
+/// subtypes only when it announces itself and when asked for one by name,
+/// not when its type is browsed, yet some clients browse by subtype alone:
+/// iOS finds AirPrint printers by `_universal`, and Matter controllers find
+/// devices that are ready to be added by `_CM`.
+const KNOWN_SUBTYPES: [&str; 4] = [
+    "_universal._sub._ipp._tcp.local",
+    "_universal._sub._ipps._tcp.local",
+    "_printer._sub._http._tcp.local",
+    "_CM._sub._matterc._udp.local",
+];
+
 /// A record may not be multicast more than once a second (RFC 6762 section 6).
 const MIN_MULTICAST_GAP: Duration = Duration::from_secs(1);
 
@@ -213,6 +225,9 @@ pub struct Service {
     pub target: Option<String>,
     /// TXT strings, usually `key=value`.
     pub txt: Vec<String>,
+    /// The subtypes it said it is of, by the name of their PTR record, such as
+    /// `_universal._sub._ipp._tcp.local` (an AirPrint printer).
+    pub subtypes: Vec<String>,
     /// The TTL its records were last announced with, in seconds: that of the
     /// SRV record, or else of the PTR or TXT; 0 if not known.
     pub ttl: u32,
@@ -233,6 +248,12 @@ pub struct Device {
     /// The TTL its address records were last announced with, in seconds;
     /// `None` if it has not announced any (it was only heard from).
     pub ttl: Option<u32>,
+    /// The record types it said its hostname has, by an NSEC record (such as
+    /// A but no AAAA); `None` if it has not said.
+    pub nsec: Option<Vec<u16>>,
+    /// The addresses it announced a reverse-mapping PTR for, naming its
+    /// hostname (`9.1.0.10.in-addr.arpa PTR tv.local`).
+    pub reverse: Vec<IpAddr>,
 }
 
 impl Device {
@@ -290,9 +311,15 @@ struct Entry {
     refreshed: Option<Instant>,
     /// The TTL its address records were last announced with.
     addr_ttl: Option<u32>,
+    /// The types its NSEC record says its hostname has.
+    nsec: Option<Vec<u16>>,
+    /// The addresses it announced a reverse-mapping PTR for.
+    reverse: Vec<IpAddr>,
     hostname: Option<String>,
     link_local: Option<IpAddr>,
     routable: Option<IpAddr>,
+    /// By instance name in lowercase: names that differ only in case are one
+    /// and the same.
     services: BTreeMap<String, Service>,
 }
 
@@ -302,6 +329,8 @@ impl Entry {
             expires: now,
             refreshed: None,
             addr_ttl: None,
+            nsec: None,
+            reverse: Vec::new(),
             hostname: None,
             link_local: None,
             routable: None,
@@ -321,6 +350,8 @@ impl Entry {
             routable: self.routable,
             services: self.services.values().cloned().collect(),
             ttl: self.addr_ttl,
+            nsec: self.nsec.clone(),
+            reverse: self.reverse.clone(),
         }
     }
 
@@ -572,6 +603,11 @@ impl State {
         // device here has under the same name.
         for r in records.iter_mut().filter(|r| r.ttl == 0) {
             r.cache_flush = false;
+        }
+        // Nor is the NSEC taken back from under a device here of that name:
+        // its own may say just the same.
+        if self.discovered.contains_key(&Key::Host(key.to_string())) {
+            records.retain(|r| r.ttl != 0 || !matches!(r.data, RData::Nsec { .. }));
         }
         let sent = !records.is_empty();
         if sent {
@@ -1072,7 +1108,7 @@ impl Segment {
                     && is_service_type(kind)
                     && state.types.len() < MAX_TYPES
                 {
-                    state.types.insert(kind.clone());
+                    state.types.insert(kind.to_ascii_lowercase());
                 }
             }
         }
@@ -1156,14 +1192,14 @@ impl Segment {
                 .discovered
                 .iter()
                 .filter(|(k, e)| {
-                    **k != owner && e.services.get(&instance).is_some_and(|s| s.target.is_none())
+                    **k != owner && e.services.get(&instance.to_ascii_lowercase()).is_some_and(|s| s.target.is_none())
                 })
                 .map(|(k, _)| k.clone())
                 .collect();
             for k in others {
                 touched.note(&state.discovered, &k);
                 if let Some(e) = state.discovered.get_mut(&k) {
-                    e.services.remove(&instance);
+                    e.services.remove(&instance.to_ascii_lowercase());
                 }
             }
         }
@@ -1210,8 +1246,17 @@ impl Segment {
         let mut kinds: BTreeSet<&str> = state.types.iter().map(String::as_str).collect();
         let services = || state.discovered.values().flat_map(|e| e.services.values());
         kinds.extend(services().map(|s| s.kind.as_str()).filter(|k| !k.is_empty()));
+        let known: HashSet<String> = kinds.iter().map(|k| k.to_ascii_lowercase()).collect();
         for kind in kinds {
             qs.ask(kind, rtype::PTR);
+        }
+        // Subtypes are not sent when their type is browsed: ask for the ones
+        // clients browse by, and to keep up the ones heard of here.
+        let wanted = KNOWN_SUBTYPES.into_iter().filter(|sub| {
+            sub.split_once("._sub.").is_some_and(|(_, kind)| known.contains(&kind.to_ascii_lowercase()))
+        });
+        for sub in wanted.chain(services().flat_map(|s| &s.subtypes).map(String::as_str)) {
+            qs.ask(sub, rtype::PTR);
         }
         for svc in services().filter(|s| s.target.is_none()) {
             qs.ask(&svc.instance, rtype::SRV);
@@ -1343,6 +1388,12 @@ fn partition<'a>(msg: &'a Message, family: Family) -> (Vec<Group<'a>>, Vec<&'a R
                 let i = group_index(&mut groups, target);
                 instance_host.insert(rec.name.to_ascii_lowercase(), i);
             }
+            RData::Nsec { .. } if !is_instance(&rec.name) => {
+                group_index(&mut groups, &rec.name);
+            }
+            RData::Ptr(host) if parser::reverse_addr(&rec.name).is_some() => {
+                group_index(&mut groups, host);
+            }
             _ => {}
         }
     }
@@ -1353,6 +1404,18 @@ fn partition<'a>(msg: &'a Message, family: Family) -> (Vec<Group<'a>>, Vec<&'a R
             RData::A(_) | RData::Aaaa(_) => {
                 let i = group_index(&mut groups, &rec.name);
                 groups[i].max_ttl = groups[i].max_ttl.max(rec.ttl);
+                continue;
+            }
+            // What types a host has; those of service instances are not kept.
+            RData::Nsec { .. } if !is_instance(&rec.name) => {
+                let i = group_index(&mut groups, &rec.name);
+                groups[i].records.push(rec);
+                continue;
+            }
+            // `9.1.0.10.in-addr.arpa PTR tv.local` is about the host it names.
+            RData::Ptr(host) if parser::reverse_addr(&rec.name).is_some() => {
+                let i = group_index(&mut groups, host);
+                groups[i].records.push(rec);
                 continue;
             }
             RData::Srv { .. } | RData::Txt(_) => &rec.name,
@@ -1429,15 +1492,38 @@ fn announced_addrs(msg: &Message, host: &str, family: Family) -> Vec<IpAddr> {
 fn merge_records<'a>(entry: &mut Entry, records: impl Iterator<Item = &'a Record>) {
     for rec in records {
         match &rec.data {
+            RData::Ptr(host) if parser::reverse_addr(&rec.name).is_some() => {
+                let addr = parser::reverse_addr(&rec.name).expect("checked above");
+                if entry.hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(host)) {
+                    entry.reverse.retain(|a| *a != addr);
+                    if rec.ttl != 0 {
+                        entry.reverse.push(addr);
+                    }
+                }
+            }
             RData::Ptr(instance) => {
-                // Only service-instance PTRs; skip the `_services._dns-sd`
-                // meta-enumeration, reverse lookups and subtype duplicates.
-                let is_service = rec.name.ends_with("._tcp.local") || rec.name.ends_with("._udp.local");
-                if !is_service || rec.name.starts_with("_services.") || rec.name.contains("._sub.") {
+                // Only service-instance PTRs and their subtypes; skip the
+                // `_services._dns-sd` meta-enumeration.
+                if !is_service_type(&rec.name) || starts_with_ci(&rec.name, "_services.") {
+                    continue;
+                }
+                // `_universal._sub._ipp._tcp.local`: the instance is also of a subtype.
+                if rec.name.to_ascii_lowercase().contains("._sub.") {
+                    let same = |sub: &String| sub.eq_ignore_ascii_case(&rec.name);
+                    if rec.ttl == 0 {
+                        if let Some(svc) = entry.services.get_mut(&instance.to_ascii_lowercase()) {
+                            svc.subtypes.retain(|sub| !same(sub));
+                        }
+                    } else {
+                        let svc = service(entry, instance);
+                        if !svc.subtypes.iter().any(same) {
+                            svc.subtypes.push(rec.name.clone());
+                        }
+                    }
                     continue;
                 }
                 if rec.ttl == 0 {
-                    entry.services.remove(instance);
+                    entry.services.remove(&instance.to_ascii_lowercase());
                 } else {
                     let svc = service(entry, instance);
                     svc.kind = rec.name.clone();
@@ -1449,12 +1535,17 @@ fn merge_records<'a>(entry: &mut Entry, records: impl Iterator<Item = &'a Record
             }
             RData::Srv { port, target, .. } => {
                 if rec.ttl == 0 {
-                    entry.services.remove(&rec.name);
+                    entry.services.remove(&rec.name.to_ascii_lowercase());
                 } else {
                     let svc = service(entry, &rec.name);
                     svc.port = *port;
                     svc.target = Some(target.clone());
                     svc.ttl = rec.ttl;
+                }
+            }
+            RData::Nsec { types, .. } => {
+                if entry.hostname.as_deref().is_some_and(|host| host.eq_ignore_ascii_case(&rec.name)) {
+                    entry.nsec = (rec.ttl != 0).then(|| types.clone());
                 }
             }
             RData::Txt(strings) => {
@@ -1476,11 +1567,12 @@ fn merge_records<'a>(entry: &mut Entry, records: impl Iterator<Item = &'a Record
 }
 
 /// Get or create a service, deriving its type from the instance name until a
-/// PTR record states it explicitly.
+/// PTR record states it explicitly. It keeps the spelling it was first heard
+/// with, whatever the case of later records.
 fn service<'a>(entry: &'a mut Entry, instance: &str) -> &'a mut Service {
     entry
         .services
-        .entry(instance.to_string())
+        .entry(instance.to_ascii_lowercase())
         .or_insert_with(|| Service {
             instance: instance.to_string(),
             kind: parser::split_instance(instance)
@@ -1498,13 +1590,16 @@ fn announcement(device: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
         .addrs()
         .map(|addr| record(host.clone(), true, host_ttl, address_data(addr)))
         .collect();
+    records.extend(host_nsec(device, host_ttl));
+    records.extend(reverse_records(device, host_ttl));
 
     for svc in &device.services {
         records.extend(service_records(device, svc, service_ttl(svc, other_ttl)));
     }
     // DNS-SD service type enumeration, once per distinct type.
-    let kinds: BTreeSet<_> = device.services.iter().map(|s| &s.kind).collect();
-    for kind in kinds {
+    let kinds: BTreeMap<String, &String> =
+        device.services.iter().map(|s| (s.kind.to_ascii_lowercase(), &s.kind)).collect();
+    for kind in kinds.into_values() {
         records.push(record(
             "_services._dns-sd._udp.local".into(),
             false,
@@ -1520,13 +1615,25 @@ fn announcement(device: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
 /// addresses of `old` that `new` does not have.
 fn replacement(old: &Device, new: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
     let mut records = announcement(new, host_ttl, other_ttl);
-    let kept: BTreeSet<_> = new.services.iter().map(|s| &s.instance).collect();
-    for svc in old.services.iter().filter(|s| !kept.contains(&s.instance)) {
-        records.extend(service_records(old, svc, 0));
+    let kept: HashMap<String, &Service> = new.services.iter().map(|s| (s.instance.to_ascii_lowercase(), s)).collect();
+    for svc in &old.services {
+        match kept.get(&svc.instance.to_ascii_lowercase()) {
+            None => records.extend(service_records(old, svc, 0)),
+            Some(now) => {
+                let gone = svc.subtypes.iter().filter(|sub| !now.subtypes.iter().any(|n| n.eq_ignore_ascii_case(sub)));
+                records.extend(gone.map(|sub| record(sub.clone(), false, 0, RData::Ptr(svc.instance.clone()))));
+            }
+        }
     }
     let host = old.hostname.clone().unwrap_or_default();
     for gone in old.addrs().filter(|a| !new.addrs().any(|n| n == *a)) {
         records.push(record(host.clone(), true, 0, address_data(gone)));
+    }
+    let still = reverse_records(new, 1);
+    for gone in reverse_records(old, 0) {
+        if !still.iter().any(|r| r.name == gone.name && r.data == gone.data) {
+            records.push(gone);
+        }
     }
     records
 }
@@ -1537,6 +1644,35 @@ fn without(device: &Device, taken: &HashSet<String>) -> Device {
     let mut device = device.clone();
     device.services.retain(|s| !taken.contains(&s.instance.to_ascii_lowercase()));
     device
+}
+
+/// The reverse-mapping PTRs of `device`'s addresses, for those it announced
+/// one for itself: a device with several hostnames names one of them, and two
+/// copies saying different things would flush each other.
+fn reverse_records(device: &Device, ttl: u32) -> Vec<Record> {
+    let Some(host) = &device.hostname else { return Vec::new() };
+    device
+        .addrs()
+        .filter(|addr| device.reverse.contains(addr))
+        .map(|addr| record(parser::reverse_name(addr), true, ttl, RData::Ptr(host.clone())))
+        .collect()
+}
+
+/// The NSEC record that says which types `device`'s hostname has, if the
+/// device said so itself: never more than it denied, so whatever it has
+/// that is announced is listed too. A responder may only deny what it owns
+/// (RFC 6762 section 6.1), so a device that said nothing gets none.
+fn host_nsec(device: &Device, ttl: u32) -> Option<Record> {
+    let host = device.hostname.clone()?;
+    let said = device.nsec.as_ref()?;
+    let ours = device.addrs().map(|addr| match addr {
+        IpAddr::V4(_) => rtype::A,
+        IpAddr::V6(_) => rtype::AAAA,
+    });
+    // The restricted form mDNS uses: block 0 only, without NSEC itself.
+    let types: BTreeSet<u16> = said.iter().copied().chain(ours).filter(|&t| t < 256 && t != rtype::NSEC).collect();
+    let data = RData::Nsec { next: host.clone(), types: types.into_iter().collect() };
+    Some(record(host, true, ttl, data))
 }
 
 /// The TTL to announce `svc` with: the one it announced itself with (at least
@@ -1552,7 +1688,8 @@ fn service_ttl(svc: &Service, other_ttl: u32) -> u32 {
 
 fn service_records(device: &Device, svc: &Service, ttl: u32) -> Vec<Record> {
     let target = svc.target.clone().or_else(|| device.hostname.clone()).unwrap_or_default();
-    vec![
+    let subtypes = svc.subtypes.iter().map(|sub| record(sub.clone(), false, ttl, RData::Ptr(svc.instance.clone())));
+    let mut records = vec![
         record(svc.kind.clone(), false, ttl, RData::Ptr(svc.instance.clone())),
         record(
             svc.instance.clone(),
@@ -1566,7 +1703,9 @@ fn service_records(device: &Device, svc: &Service, ttl: u32) -> Vec<Record> {
             ttl,
             RData::Txt(svc.txt.iter().map(|t| t.as_bytes().to_vec()).collect()),
         ),
-    ]
+    ];
+    records.extend(subtypes);
+    records
 }
 
 fn address_data(addr: IpAddr) -> RData {
@@ -1591,10 +1730,25 @@ fn answers_for(query: &Message, device: &Device, host_ttl: u32, other_ttl: u32) 
         if q.class != 1 && q.class != 255 {
             continue;
         }
+        let mut found = false;
         for rec in &all {
-            let type_ok = q.qtype == rtype::ANY || q.qtype == rec.rtype();
-            if type_ok && rec.name.eq_ignore_ascii_case(&q.name) && !answers.contains(rec) {
-                answers.push(rec.clone());
+            // An NSEC is not one of the records a name has.
+            let type_ok = (q.qtype == rtype::ANY && rec.rtype() != rtype::NSEC) || q.qtype == rec.rtype();
+            if type_ok && rec.name.eq_ignore_ascii_case(&q.name) {
+                found = true;
+                if !answers.contains(rec) {
+                    answers.push(rec.clone());
+                }
+            }
+        }
+        // A type the name has not got, by its NSEC: say so (RFC 6762
+        // section 6.1), so the asker need not wait for an answer.
+        let denies = |r: &&Record| {
+            r.name.eq_ignore_ascii_case(&q.name) && matches!(&r.data, RData::Nsec { types, .. } if !types.contains(&q.qtype))
+        };
+        if !found && q.qtype != rtype::ANY {
+            if let Some(nsec) = all.iter().find(denies).filter(|r| !answers.contains(r)) {
+                answers.push(nsec.clone());
             }
         }
     }
@@ -1636,6 +1790,20 @@ fn answers_for(query: &Message, device: &Device, host_ttl: u32, other_ttl: u32) 
     for rec in &all {
         let wanted = matches!(rec.data, RData::A(_) | RData::Aaaa(_))
             && targets.iter().any(|t| rec.name.eq_ignore_ascii_case(t));
+        if wanted && !answers.contains(rec) && !extra.contains(rec) {
+            extra.push(rec.clone());
+        }
+    }
+    // An address comes with the NSEC that says which kinds of address there
+    // are (RFC 6762 section 6.2).
+    let hosts: Vec<String> = answers
+        .iter()
+        .chain(&extra)
+        .filter(|r| matches!(r.data, RData::A(_) | RData::Aaaa(_)))
+        .map(|r| r.name.clone())
+        .collect();
+    for rec in &all {
+        let wanted = matches!(rec.data, RData::Nsec { .. }) && hosts.iter().any(|h| rec.name.eq_ignore_ascii_case(h));
         if wanted && !answers.contains(rec) && !extra.contains(rec) {
             extra.push(rec.clone());
         }
@@ -1692,8 +1860,25 @@ fn query(questions: &[Question]) -> Message {
     }
 }
 
+/// Whether `name` is that of a service instance, such as
+/// `Office._ipp._tcp.local`, rather than of a host.
+fn is_instance(name: &str) -> bool {
+    parser::split_instance(name).is_some_and(|(_, kind)| is_service_type(kind))
+}
+
 fn is_service_type(name: &str) -> bool {
-    name.ends_with("._tcp.local") || name.ends_with("._udp.local")
+    ends_with_ci(name, "._tcp.local") || ends_with_ci(name, "._udp.local")
+}
+
+/// Whether `name` starts with `prefix`, ignoring case as DNS does.
+fn starts_with_ci(name: &str, prefix: &str) -> bool {
+    name.as_bytes().get(..prefix.len()).is_some_and(|b| b.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// Whether `name` ends with `suffix`, ignoring case as DNS does.
+fn ends_with_ci(name: &str, suffix: &str) -> bool {
+    let at = name.len().wrapping_sub(suffix.len());
+    name.as_bytes().get(at..).is_some_and(|b| b.eq_ignore_ascii_case(suffix.as_bytes()))
 }
 
 fn send(outbound: &Option<Outbound>, records: &[Record]) -> Result<()> {
@@ -1842,9 +2027,12 @@ mod tests {
                     target: None,
                     txt: vec!["a=b".into()],
                     ttl: 0,
+                    ..Service::default()
                 })
                 .collect(),
             ttl: None,
+            nsec: None,
+            reverse: Vec::new(),
         }
     }
 
@@ -3143,6 +3331,276 @@ mod tests {
         drop(seg.subscribe());
         seg.observe(ip("10.0.1.5"));
         assert!(seg.state.lock().unwrap().subscribers.is_empty());
+    }
+
+    /// DNS compares names without regard to case, and devices are not
+    /// consistent about it, not even within one packet.
+    #[test]
+    fn names_that_differ_only_in_case_are_one_and_the_same() {
+        let seg = Segment::new("test", Family::V4);
+        hear(&seg, "10.0.1.7", vec![
+            a_record("tv.local", "10.0.1.7"),
+            ptr("_HTTP._TCP.LOCAL", "TV._http._tcp.local"),
+            srv("tv._HTTP._tcp.local", 80, "tv.local"),
+        ]);
+        let services = seg.devices()[0].services.clone();
+        assert_eq!(services.len(), 1, "{services:?}");
+        let svc = &services[0];
+        assert_eq!((svc.instance.as_str(), svc.kind.as_str(), svc.port), ("TV._http._tcp.local", "_HTTP._TCP.LOCAL", 80));
+
+        // A goodbye in yet another spelling still says goodbye to it.
+        let bye = Record { ttl: 0, ..srv("Tv._Http._Tcp.Local", 80, "tv.local") };
+        hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), bye]);
+        assert!(seg.devices()[0].services.is_empty());
+
+        // Service types learned from the enumeration are one per type, too.
+        let meta = |kind: &str| ptr("_services._dns-sd._udp.local", kind);
+        hear(&seg, "10.0.1.7", vec![meta("_http._tcp.local"), meta("_HTTP._tcp.LOCAL")]);
+        assert_eq!(seg.state.lock().unwrap().types.len(), 1);
+    }
+
+    /// A printer says it is an AirPrint one with a subtype PTR next to its
+    /// usual one. That is kept with the service, and a goodbye for it drops
+    /// the subtype, not the service.
+    #[test]
+    fn subtypes_are_kept_with_their_service() {
+        let seg = Segment::new("test", Family::V4);
+        let printer = |sub_ttl| {
+            vec![
+                a_record("printer.local", "10.0.1.8"),
+                ptr("_ipp._tcp.local", "Office._ipp._tcp.local"),
+                Record { ttl: sub_ttl, ..ptr("_universal._sub._ipp._tcp.local", "Office._ipp._tcp.local") },
+                srv("Office._ipp._tcp.local", 631, "printer.local"),
+            ]
+        };
+        let services = |seg: &Segment| seg.devices()[0].services.clone();
+
+        hear(&seg, "10.0.1.8", printer(4500));
+        assert_eq!(services(&seg).len(), 1);
+        assert_eq!(services(&seg)[0].subtypes, ["_universal._sub._ipp._tcp.local"]);
+        assert_eq!(services(&seg)[0].kind, "_ipp._tcp.local", "the type is not the subtype's");
+
+        // Heard again, in another case and on its own: still one.
+        hear(&seg, "10.0.1.8", vec![ptr("_UNIVERSAL._sub._ipp._tcp.local", "Office._ipp._tcp.local")]);
+        assert_eq!(services(&seg)[0].subtypes.len(), 1);
+
+        hear(&seg, "10.0.1.8", printer(0));
+        assert!(services(&seg)[0].subtypes.is_empty());
+        assert_eq!(services(&seg)[0].port, 631);
+    }
+
+    #[test]
+    fn subtypes_are_announced_answered_and_withdrawn() {
+        let (seg, rx) = wired();
+        let mut printer = tv("10.0.1.9", &["Office"]);
+        printer.services[0].subtypes = vec!["_printer._sub._http._tcp.local".into()];
+        let subtype = |m: &Message| m.answers.iter().find(|r| r.name == "_printer._sub._http._tcp.local").cloned();
+
+        seg.add_manual(Owner::Reflector(0), printer.clone()).unwrap();
+        let r = subtype(&recv(&rx).unwrap()).expect("announced");
+        assert_eq!((r.data, r.cache_flush), (RData::Ptr("Office._http._tcp.local".into()), false));
+
+        // Browsing by the subtype finds it, with what it takes to resolve it.
+        age(&seg, 2);
+        seg.handle(sa("10.0.1.50"), &query("_printer._sub._http._tcp.local", rtype::PTR, vec![])).unwrap();
+        let m = recv(&rx).unwrap();
+        assert_eq!(m.answers.len(), 1);
+        assert!(subtype(&m).is_some());
+        assert!(m.additionals.iter().any(|r| matches!(r.data, RData::Srv { .. })));
+        assert!(m.additionals.iter().any(|r| matches!(r.data, RData::A(_))));
+
+        // No longer of the subtype: that alone is withdrawn.
+        printer.services[0].subtypes.clear();
+        seg.add_manual(Owner::Reflector(0), printer).unwrap();
+        let m = recv(&rx).unwrap();
+        assert_eq!(subtype(&m).map(|r| r.ttl), Some(0));
+        assert_eq!(m.answers.iter().filter(|r| r.ttl == 0).count(), 1);
+    }
+
+    /// Subtypes are not sent in answers to a browse of their type, so a probe
+    /// asks for the well-known ones of the types around, and for those heard.
+    #[test]
+    fn probe_asks_for_the_subtypes_clients_browse_by_and_those_heard_of() {
+        let (seg, rx) = wired();
+        hear(&seg, "10.0.1.8", vec![
+            a_record("printer.local", "10.0.1.8"),
+            ptr("_ipp._tcp.local", "Office._ipp._tcp.local"),
+            ptr("_scanner._sub._http._tcp.local", "Office._http._tcp.local"),
+            srv("Office._ipp._tcp.local", 631, "printer.local"),
+            srv("Office._http._tcp.local", 80, "printer.local"),
+        ]);
+        seg.probe_round().unwrap();
+        let mut all = BTreeSet::new();
+        while let Some(m) = recv(&rx) {
+            all.extend(asked(&m));
+        }
+        assert!(all.contains(&q("_universal._sub._ipp._tcp.local", rtype::PTR)));
+        assert!(all.contains(&q("_printer._sub._http._tcp.local", rtype::PTR)));
+        assert!(all.contains(&q("_scanner._sub._http._tcp.local", rtype::PTR)), "heard of here");
+        assert!(!all.contains(&q("_universal._sub._ipps._tcp.local", rtype::PTR)), "no _ipps here");
+        assert!(!all.iter().any(|(name, _)| name.contains("_matterc")));
+    }
+
+    fn nsec(name: &str, types: &[u16]) -> Record {
+        record(name.into(), true, 120, RData::Nsec { next: name.into(), types: types.to_vec() })
+    }
+
+    /// A device says which types its hostname has with an NSEC record, in
+    /// its announcements or on its own as a negative answer. That of its
+    /// service instances is not kept, nor taken for a host.
+    #[test]
+    fn what_a_device_says_its_hostname_has_is_kept() {
+        let seg = Segment::new("test", Family::V4);
+        hear(&seg, "10.0.1.7", vec![
+            a_record("tv.local", "10.0.1.7"),
+            nsec("tv.local", &[rtype::A]),
+            srv("TV._http._tcp.local", 80, "tv.local"),
+            nsec("TV._http._tcp.local", &[rtype::TXT, rtype::SRV]),
+        ]);
+        let devices = seg.devices();
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        assert_eq!(devices[0].nsec, Some(vec![rtype::A]));
+
+        // On its own, from the device, it is still the device's.
+        hear(&seg, "10.0.1.7", vec![nsec("TV.local", &[rtype::A, rtype::AAAA])]);
+        assert_eq!(seg.devices()[0].nsec, Some(vec![rtype::A, rtype::AAAA]));
+        hear(&seg, "10.0.1.7", vec![Record { ttl: 0, ..nsec("tv.local", &[rtype::A]) }]);
+        assert_eq!(seg.devices()[0].nsec, None);
+    }
+
+    #[test]
+    fn a_reflected_device_denies_only_what_it_denied_itself() {
+        let (seg, rx) = wired();
+        let mut v4_only = tv("10.0.1.9", &["TV"]);
+        v4_only.nsec = Some(vec![rtype::A]);
+        seg.add_manual(Owner::Reflector(0), v4_only.clone()).unwrap();
+        let nsec_of = |records: &[Record]| records.iter().find(|r| matches!(r.data, RData::Nsec { .. })).cloned();
+        let r = nsec_of(&recv(&rx).unwrap().answers).expect("announced");
+        assert_eq!((r.name.as_str(), r.cache_flush, r.ttl), ("tv.local", true, HOST_TTL));
+        assert_eq!(r.data, RData::Nsec { next: "tv.local".into(), types: vec![rtype::A] });
+
+        // Asked for an address it has not got, it says so...
+        age(&seg, 2);
+        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::AAAA, vec![])).unwrap();
+        let m = recv(&rx).unwrap();
+        assert_eq!(m.answers.len(), 1);
+        assert!(nsec_of(&m.answers).is_some());
+
+        // ...and its address comes with it.
+        age(&seg, 2);
+        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::A, vec![])).unwrap();
+        let m = recv(&rx).unwrap();
+        assert!(matches!(m.answers[..], [Record { data: RData::A(_), .. }]));
+        assert!(nsec_of(&m.additionals).is_some());
+
+        // It is not among what the name has.
+        age(&seg, 2);
+        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::ANY, vec![])).unwrap();
+        assert!(nsec_of(&recv(&rx).unwrap().answers).is_none());
+
+        // What it announces is never denied, and NSEC itself is not listed.
+        let mut said_less = v4_only.clone();
+        said_less.nsec = Some(vec![rtype::AAAA, rtype::NSEC, 300]);
+        let types = |d: &Device| match host_nsec(d, 120).map(|r| r.data) {
+            Some(RData::Nsec { types, .. }) => types,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(types(&said_less), [rtype::A, rtype::AAAA]);
+
+        // A device that said nothing is denied nothing.
+        let mut silent = v4_only;
+        silent.nsec = None;
+        assert!(host_nsec(&silent, 120).is_none());
+        seg.add_manual(Owner::Reflector(0), silent).unwrap();
+        recv(&rx).unwrap();
+        age(&seg, 2);
+        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::AAAA, vec![])).unwrap();
+        assert!(recv(&rx).is_none());
+    }
+
+    /// A copy giving way to a device here of the same name takes back its
+    /// address, but not its NSEC, which may be just what the device's says.
+    #[test]
+    fn a_copy_giving_way_leaves_the_nsec_of_the_device_here_alone() {
+        let (seg, rx) = wired();
+        let mut copy = tv("10.0.2.9", &[]);
+        copy.nsec = Some(vec![rtype::A]);
+        seg.add_manual(Owner::Reflector(0), copy).unwrap();
+        recv(&rx).unwrap();
+
+        hear(&seg, "10.0.1.5", vec![a_record("tv.local", "10.0.1.5"), nsec("tv.local", &[rtype::A])]);
+        let bye = recv(&rx).unwrap();
+        assert_eq!(bye.answers.len(), 1, "{:?}", bye.answers);
+        assert_eq!((&bye.answers[0].data, bye.answers[0].ttl), (&RData::A("10.0.2.9".parse().unwrap()), 0));
+    }
+
+    fn reverse(addr: &str, host: &str) -> Record {
+        record(parser::reverse_name(ip(addr)), true, 120, RData::Ptr(host.into()))
+    }
+
+    /// A device announces a reverse-mapping PTR for its address. That is kept
+    /// with the host it names, not taken for a service or a device of its own.
+    #[test]
+    fn reverse_mappings_are_kept_with_the_host_they_name() {
+        let seg = Segment::new("test", Family::V4);
+        hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), reverse("10.0.1.7", "tv.local")]);
+        let devices = seg.devices();
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        assert_eq!(devices[0].reverse, [ip("10.0.1.7")]);
+        assert!(devices[0].services.is_empty());
+
+        // On its own, as an answer to a reverse lookup: still the same.
+        hear(&seg, "10.0.1.7", vec![reverse("10.0.1.7", "TV.local")]);
+        assert_eq!(seg.devices()[0].reverse, [ip("10.0.1.7")]);
+        hear(&seg, "10.0.1.7", vec![Record { ttl: 0, ..reverse("10.0.1.7", "tv.local") }]);
+        assert!(seg.devices()[0].reverse.is_empty());
+    }
+
+    /// A sleep proxy or Thread border router announces a host's records from
+    /// its own address. Its NSEC and reverse mapping go to that host, as its
+    /// address does, not to the proxy.
+    #[test]
+    fn what_a_proxy_says_of_a_host_goes_to_that_host() {
+        let seg = Segment::new("test", Family::V4);
+        hear(&seg, "10.0.1.1", vec![
+            a_record("tv.local", "10.0.1.7"),
+            nsec("tv.local", &[rtype::A]),
+            reverse("10.0.1.7", "tv.local"),
+        ]);
+        let devices = seg.devices();
+        assert_eq!(devices.len(), 1, "nothing is put down to the proxy: {devices:?}");
+        assert_eq!(devices[0].hostname.as_deref(), Some("tv.local"));
+        assert_eq!((devices[0].nsec.clone(), devices[0].reverse.clone()), (Some(vec![rtype::A]), vec![ip("10.0.1.7")]));
+    }
+
+    #[test]
+    fn reverse_mappings_are_announced_answered_and_withdrawn() {
+        let (seg, rx) = wired();
+        let name = "9.1.0.10.in-addr.arpa";
+        let mut mapped = tv("10.0.1.9", &["TV"]);
+        mapped.reverse = vec![ip("10.0.1.9")];
+        let of = |records: &[Record]| records.iter().find(|r| r.name == name).cloned();
+
+        // Only for an address the device announced one for.
+        seg.add_manual(Owner::Reflector(0), tv("10.0.1.9", &["TV"])).unwrap();
+        assert!(of(&recv(&rx).unwrap().answers).is_none());
+        seg.add_manual(Owner::Reflector(0), mapped.clone()).unwrap();
+        let r = of(&recv(&rx).unwrap().answers).expect("announced");
+        assert_eq!((r.data, r.cache_flush), (RData::Ptr("tv.local".into()), true));
+
+        age(&seg, 2);
+        seg.handle(sa("10.0.1.50"), &query(name, rtype::PTR, vec![])).unwrap();
+        let m = recv(&rx).unwrap();
+        assert_eq!(m.answers.len(), 1);
+        assert!(of(&m.answers).is_some());
+
+        // Moved: the old mapping is withdrawn along with the old address.
+        let mut moved = tv("10.0.1.10", &["TV"]);
+        moved.reverse = vec![ip("10.0.1.10")];
+        seg.add_manual(Owner::Reflector(0), moved).unwrap();
+        let m = recv(&rx).unwrap();
+        assert_eq!(of(&m.answers).map(|r| r.ttl), Some(0));
+        assert!(m.answers.iter().any(|r| r.name == "10.1.0.10.in-addr.arpa" && r.ttl > 0));
     }
 
     #[test]
