@@ -453,7 +453,7 @@ mod tests {
 
     fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Segment>) {
         let segs: Vec<Segment> = interfaces.iter().map(|i| Segment::new(i, family)).collect();
-        let reflector = Reflector::new(segs.clone()).unwrap();
+        let reflector = Reflector::new(0, segs.clone()).unwrap();
         (Group { name: name.into(), family, reflector }, segs)
     }
 
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn segments_say_which_interfaces_are_untrusted() {
         let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| Segment::new(i, Family::V4)).collect();
-        let reflector = Reflector::with_untrusted(segs, &["wifi".to_string()]).unwrap();
+        let reflector = Reflector::with_untrusted(0, segs, &["wifi".to_string()]).unwrap();
         let groups = [Group { name: "IoT to br0".into(), family: Family::V4, reflector }];
         assert_eq!(
             handle(&groups, &Watcher::default(), "segments"),
@@ -606,8 +606,8 @@ mod tests {
             Segment::new("c", Family::V4),
         );
         let groups = [
-            Group { name: "x".into(), family: Family::V4, reflector: Reflector::new(vec![a.clone(), b.clone()]).unwrap() },
-            Group { name: "y".into(), family: Family::V4, reflector: Reflector::new(vec![a, c]).unwrap() },
+            Group { name: "x".into(), family: Family::V4, reflector: Reflector::new(0, vec![a.clone(), b.clone()]).unwrap() },
+            Group { name: "y".into(), family: Family::V4, reflector: Reflector::new(1, vec![a, c]).unwrap() },
         ];
         let interfaces = |request: &str| -> Vec<String> {
             let reply: Value = serde_json::from_str(&handle(&groups, &Watcher::default(), request)).unwrap();

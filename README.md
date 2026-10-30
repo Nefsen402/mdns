@@ -277,8 +277,10 @@ Addresses are read once, at startup; restart the daemon after changing them.
 
 Internally the name is just a reflected device that has a hostname and an
 address but no services, so it is announced, kept alive, answered for and
-withdrawn with a goodbye on shutdown like any other. There is no conflict
-detection; the name is assumed to be yours alone.
+withdrawn with a goodbye on shutdown like any other. A device on another
+network that announces the same name is never reflected in its place. There is
+no conflict detection with devices on the same network; the name is assumed to
+be yours alone.
 
 ### `[Segment]` (one or more, required)
 
@@ -341,7 +343,11 @@ be reflected, so without probing they would stay invisible.
   networks; mDNS only makes the device discoverable.
 - If devices on different interfaces announce the **same hostname**, the one
   from the interface listed **first** in the segment wins; the other takes over
-  automatically if the winner goes away. Different hostnames never clash, even
+  automatically if the winner goes away. When segments share an interface, the
+  **segment listed first in the config** wins there in the same way: with
+  `br0,media` above `br0,wifi`, a `tv.local` on `media` is the one `br0` sees,
+  and the one on `wifi` takes over only when it goes. The
+  [advertised name](#advertise-optional) always wins over a reflected device. Different hostnames never clash, even
   on one address: a device with several names (a TV often has two) has each of
   them reflected.
 - Reflected devices are kept alive with periodic re-announcements, answer

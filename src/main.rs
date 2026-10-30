@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 
 use config::Config;
 use reflector::Reflector;
-use socket::{Device, Family, MdnsSocket, Segment};
+use socket::{Device, Family, MdnsSocket, Owner, Segment};
 use timer::Timer;
 
 /// One configured segment for one address family.
@@ -63,16 +63,17 @@ fn main() -> Result<()> {
     }
 
     // One reflector per configured segment and family, each over the shared
-    // per-interface links of that family.
+    // per-interface links of that family. Where segments share an interface
+    // and both want a hostname announced there, the one listed first wins.
     let mut segments = Vec::new();
-    for seg in &config.segments {
+    for (rank, seg) in (0..).zip(&config.segments) {
         for &family in &families {
             let members = seg
                 .interfaces
                 .iter()
                 .map(|iface| links[&(iface.as_str(), family)].clone())
                 .collect();
-            let reflector = Reflector::with_untrusted(members, &seg.untrusted)
+            let reflector = Reflector::with_untrusted(rank, members, &seg.untrusted)
                 .with_context(|| format!("starting segment {:?} ({family:?})", seg.name))?;
             eprintln!("segment {:?} ({family:?}): {}", seg.name, seg.interfaces.join(", "));
             if !seg.untrusted.is_empty() {
@@ -165,7 +166,7 @@ fn main() -> Result<()> {
     // advertised name: say goodbye to it too.
     for link in links.values() {
         for host in link.manual_devices().into_iter().filter_map(|d| d.hostname) {
-            if let Err(e) = link.remove_manual(&host) {
+            if let Err(e) = link.remove_manual(Owner::Own, &host) {
                 eprintln!("{}/{:?}: withdrawing {host} failed: {e:#}", link.interface(), link.family());
             }
         }
@@ -227,7 +228,7 @@ fn start_link(
             let (link_local, routable) =
                 if socket::is_link_local(&addr) { (Some(addr), None) } else { (None, Some(addr)) };
             let device = Device { hostname: Some(name.to_string()), link_local, routable, ..Device::default() };
-            link.add_manual_ttl(device, ttl).map(|_| addr)
+            link.add_manual_ttl(Owner::Own, device, ttl).map(|_| addr)
         });
         match router {
             Ok(addr) => eprintln!("{interface}/{family:?}: advertising {name} as {addr} (TTL {}s)", ttl.as_secs()),

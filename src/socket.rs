@@ -353,8 +353,31 @@ struct Outbound {
     dest: SocketAddr,
 }
 
+/// Who wants a device announced on a segment. Several may want the same
+/// hostname announced there: two reflectors that share the interface, or a
+/// reflected device named like the advertised one. The lowest owner's device
+/// is announced, and the next one's takes over when it goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Owner {
+    /// The daemon's own name (`[Advertise]`), which always wins.
+    Own,
+    /// A reflector, ranked by where its segment is in the config: the first
+    /// segment wins.
+    Reflector(u32),
+}
+
+/// One owner's wish to have a device announced, with the TTL of its address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Claim {
+    device: Device,
+    host_ttl: u32,
+}
+
 /// A reflected device plus the timing needed to keep it announced.
 struct Manual {
+    /// Everyone who wants this hostname announced. Never empty; the first is
+    /// the one announced, as `device` and `host_ttl`.
+    claims: BTreeMap<Owner, Claim>,
     device: Device,
     /// When the full record set was last multicast; drives re-announcement.
     announced: Instant,
@@ -379,6 +402,22 @@ impl Manual {
     fn reannounce_at(&self) -> Instant {
         let at = self.announced.checked_add(reannounce_after(self.shortest_ttl())).unwrap_or(self.announced);
         self.retry.map_or(at, |retry| at.max(retry))
+    }
+
+    /// Announce `claim` in place of what is announced now, with goodbyes for
+    /// what it does not have. Nothing is sent if it is the same, and nothing
+    /// changes if sending fails.
+    fn switch_to(&mut self, outbound: &Option<Outbound>, claim: &Claim, now: Instant) -> Result<()> {
+        if self.device == claim.device && self.host_ttl == claim.host_ttl {
+            return Ok(());
+        }
+        send(outbound, &replacement(&self.device, &claim.device, claim.host_ttl, self.other_ttl))?;
+        self.device = claim.device.clone();
+        self.host_ttl = claim.host_ttl;
+        self.announced = now;
+        self.last_sent = now;
+        self.retry = None;
+        Ok(())
     }
 }
 
@@ -653,28 +692,33 @@ impl Segment {
 
     // 3. Reflected devices, invisible to 1 and 2.
 
-    /// Announce `device` on this segment and remember it, under its
-    /// hostname. It needs a hostname and at least one address, all of this
-    /// segment's family, and announces exactly the addresses it has: a
+    /// Announce `device` on this segment for `owner` and remember it, under
+    /// its hostname. It needs a hostname and at least one address, all of
+    /// this segment's family, and announces exactly the addresses it has: a
     /// reflected device should arrive with only its routable one, since a
     /// link-local address is no use on another link.
     ///
-    /// Returns false (and sends nothing) if an identical device is already
-    /// present. Replacing a device also sends goodbyes for services and
-    /// addresses it no longer has. If sending fails nothing is recorded.
-    pub fn add_manual(&self, device: Device) -> Result<bool> {
+    /// If another owner wants the same hostname announced, the lower
+    /// [`Owner`] wins: an outranked device is only remembered, and announced
+    /// once the ones ahead of it are removed. Replacing what is announced
+    /// also sends goodbyes for services and addresses that are no longer
+    /// there.
+    ///
+    /// Returns false (and sends nothing) if `owner` already has an identical
+    /// device here. If sending fails nothing is recorded.
+    pub fn add_manual(&self, owner: Owner, device: Device) -> Result<bool> {
         let ttl = {
             let state = self.state.lock().unwrap();
             state.reflect_ttl.or(device.ttl.map(|t| t.max(MIN_REFLECT_TTL))).unwrap_or(HOST_TTL)
         };
-        self.add_manual_ttl(device, Duration::from_secs(ttl.into()))
+        self.add_manual_ttl(owner, device, Duration::from_secs(ttl.into()))
     }
 
     /// Like [`add_manual`](Segment::add_manual), with the address records
     /// announced for `host_ttl` (whole seconds, at least one) whatever the
     /// device or the segment's [reflect TTL](Segment::set_reflect_ttl) say,
     /// and re-announced at 80% of it.
-    pub fn add_manual_ttl(&self, device: Device, host_ttl: Duration) -> Result<bool> {
+    pub fn add_manual_ttl(&self, owner: Owner, device: Device, host_ttl: Duration) -> Result<bool> {
         let host_ttl = u32::try_from(host_ttl.as_secs()).unwrap_or(u32::MAX);
         if host_ttl == 0 {
             bail!("a TTL of zero would withdraw the device");
@@ -690,47 +734,67 @@ impl Segment {
             bail!("{bad} is not an {family:?} address");
         }
 
+        let claim = Claim { device, host_ttl };
+        let now = Instant::now();
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        let old = state.manual.get(&key).map(|m| &m.device);
-        if old == Some(&device) {
-            return Ok(false);
-        }
-
-        let mut records = announcement(&device, host_ttl, OTHER_TTL);
-        if let Some(old) = old {
-            let kept: BTreeSet<_> = device.services.iter().map(|s| &s.instance).collect();
-            for svc in old.services.iter().filter(|s| !kept.contains(&s.instance)) {
-                records.extend(service_records(old, svc, 0));
+        match state.manual.get_mut(&key) {
+            Some(m) if m.claims.get(&owner) == Some(&claim) => return Ok(false),
+            Some(m) => {
+                // Announced if nobody ahead of it wants the name.
+                if m.claims.keys().next().is_none_or(|first| owner <= *first) {
+                    m.switch_to(&state.outbound, &claim, now)?;
+                }
+                m.claims.insert(owner, claim);
             }
-            let host = old.hostname.clone().unwrap_or_default();
-            for gone in old.addrs().filter(|a| !device.addrs().any(|n| n == *a)) {
-                records.push(record(host.clone(), true, 0, address_data(gone)));
+            None => {
+                send(&state.outbound, &announcement(&claim.device, host_ttl, OTHER_TTL))?;
+                let manual = Manual {
+                    claims: BTreeMap::new(),
+                    device: claim.device.clone(),
+                    announced: now,
+                    last_sent: now,
+                    retry: None,
+                    host_ttl,
+                    other_ttl: OTHER_TTL,
+                };
+                state.manual.entry(key).or_insert(manual).claims.insert(owner, claim);
             }
         }
-        send(&state.outbound, &records)?;
-        let now = Instant::now();
-        let manual = Manual { device, announced: now, last_sent: now, retry: None, host_ttl, other_ttl: OTHER_TTL };
-        state.manual.insert(key, manual);
         drop(guard);
         self.rearm();
         Ok(true)
     }
 
-    /// Send goodbyes for the device called `hostname` and forget it. Returns
-    /// false if there was no such device. If sending fails it is kept.
-    pub fn remove_manual(&self, hostname: &str) -> Result<bool> {
+    /// Forget what `owner` wanted announced as `hostname`. If that is what is
+    /// announced, the next owner's device takes its place, or, if there is
+    /// none, goodbyes are sent for it. Returns false if `owner` had no such
+    /// device. If sending fails it is kept.
+    pub fn remove_manual(&self, owner: Owner, hostname: &str) -> Result<bool> {
         let key = hostname.to_ascii_lowercase();
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        let Some(manual) = state.manual.get(&key) else {
+        let Some(m) = state.manual.get_mut(&key).filter(|m| m.claims.contains_key(&owner)) else {
             return Ok(false);
         };
-        send(&state.outbound, &announcement(&manual.device, 0, 0))?;
-        state.manual.remove(&key);
+        let announced = m.claims.keys().next() == Some(&owner);
+        match m.claims.values().nth(1).cloned() {
+            Some(next) if announced => m.switch_to(&state.outbound, &next, Instant::now())?,
+            None => send(&state.outbound, &announcement(&m.device, 0, 0))?,
+            // Outranked, so never announced: nothing to take back.
+            Some(_) => {}
+        }
+        m.claims.remove(&owner);
+        if m.claims.is_empty() {
+            state.manual.remove(&key);
+        }
+        drop(guard);
+        self.rearm();
         Ok(true)
     }
 
+    /// The devices announced on this segment: for each hostname, the one
+    /// that won.
     pub fn manual_devices(&self) -> Vec<Device> {
         let state = self.state.lock().unwrap();
         state.manual.values().map(|m| m.device.clone()).collect()
@@ -1339,6 +1403,22 @@ fn announcement(device: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
     records
 }
 
+/// The records that take a segment from announcing `old` to announcing `new`
+/// under the same hostname: all of `new`, and goodbyes for the services and
+/// addresses of `old` that `new` does not have.
+fn replacement(old: &Device, new: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
+    let mut records = announcement(new, host_ttl, other_ttl);
+    let kept: BTreeSet<_> = new.services.iter().map(|s| &s.instance).collect();
+    for svc in old.services.iter().filter(|s| !kept.contains(&s.instance)) {
+        records.extend(service_records(old, svc, 0));
+    }
+    let host = old.hostname.clone().unwrap_or_default();
+    for gone in old.addrs().filter(|a| !new.addrs().any(|n| n == *a)) {
+        records.push(record(host.clone(), true, 0, address_data(gone)));
+    }
+    records
+}
+
 /// The TTL to announce `svc` with: the one it announced itself with (at least
 /// [`MIN_REFLECT_TTL`]) or, if that is not known, `other_ttl`. Zero stays zero:
 /// that is a goodbye.
@@ -1652,19 +1732,19 @@ mod tests {
     fn manual_list_is_separate() {
         let seg = Segment::new("test", Family::V4);
         let rx = seg.subscribe();
-        assert!(seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap());
-        assert!(!seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap());
+        assert!(seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap());
+        assert!(!seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap());
         assert!(seg.devices().is_empty());
         assert!(rx.try_recv().is_err());
         assert_eq!(seg.manual_devices().len(), 1);
-        assert!(seg.remove_manual("TV.local").unwrap(), "by hostname, ignoring case");
-        assert!(!seg.remove_manual("tv.local").unwrap());
+        assert!(seg.remove_manual(Owner::Own, "TV.local").unwrap(), "by hostname, ignoring case");
+        assert!(!seg.remove_manual(Owner::Own, "tv.local").unwrap());
     }
 
     #[test]
     fn add_announces_and_remove_says_goodbye() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
 
         let m = recv(&rx).expect("announcement");
         assert!(m.header.response && m.header.authoritative);
@@ -1689,10 +1769,10 @@ mod tests {
         assert!(m.answers.iter().any(|r| r.data == RData::Txt(vec![b"a=b".to_vec()])));
 
         // Identical re-add is a no-op on the wire.
-        assert!(!seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap());
+        assert!(!seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap());
         assert!(recv(&rx).is_none());
 
-        seg.remove_manual("tv.local").unwrap();
+        seg.remove_manual(Owner::Own, "tv.local").unwrap();
         let bye = recv(&rx).expect("goodbye");
         assert_eq!(bye.answers.len(), m.answers.len());
         assert!(bye.answers.iter().all(|r| r.ttl == 0));
@@ -1702,10 +1782,10 @@ mod tests {
     #[test]
     fn replacing_sends_goodbye_for_dropped_services() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["A", "B"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["A", "B"])).unwrap();
         recv(&rx).unwrap();
 
-        seg.add_manual(tv("10.0.1.9", &["A"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["A"])).unwrap();
         let m = recv(&rx).unwrap();
         let gone: Vec<_> = m.answers.iter().filter(|r| r.ttl == 0).collect();
         assert_eq!(gone.len(), 3); // PTR, SRV, TXT of "B"
@@ -1714,12 +1794,46 @@ mod tests {
     }
 
     #[test]
+    fn a_hostname_two_owners_want_goes_to_the_lower_and_passes_to_the_next() {
+        let (seg, rx) = wired();
+        let (first, second) = (Owner::Reflector(0), Owner::Reflector(1));
+        let has = |m: &Message, data: RData, live: bool| m.answers.iter().any(|r| r.data == data && (r.ttl > 0) == live);
+        let a = |s: &str| RData::A(s.parse().unwrap());
+        let b_ptr = || RData::Ptr("B._http._tcp.local".into());
+
+        assert!(seg.add_manual(second, tv("10.0.1.9", &["A", "B"])).unwrap());
+        recv(&rx).unwrap();
+
+        // The lower owner takes over, and what it does not have is withdrawn.
+        assert!(seg.add_manual(first, tv("10.0.2.9", &["A"])).unwrap());
+        let m = recv(&rx).unwrap();
+        assert!(has(&m, a("10.0.2.9"), true) && has(&m, a("10.0.1.9"), false) && has(&m, b_ptr(), false));
+        assert_eq!(seg.manual_devices(), [tv("10.0.2.9", &["A"])]);
+
+        // The outranked one changing is remembered, not sent.
+        assert!(seg.add_manual(second, tv("10.0.1.10", &["A", "B"])).unwrap());
+        assert!(recv(&rx).is_none());
+
+        // When the winner goes, the next one is announced in its place.
+        assert!(seg.remove_manual(first, "tv.local").unwrap());
+        let m = recv(&rx).unwrap();
+        assert!(has(&m, a("10.0.1.10"), true) && has(&m, a("10.0.2.9"), false) && has(&m, b_ptr(), true));
+        assert_eq!(seg.manual_devices(), [tv("10.0.1.10", &["A", "B"])]);
+
+        // An owner without a claim removes nothing; the last one says goodbye.
+        assert!(!seg.remove_manual(first, "tv.local").unwrap());
+        assert!(seg.remove_manual(second, "tv.local").unwrap());
+        assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
+        assert!(seg.manual_devices().is_empty());
+    }
+
+    #[test]
     fn add_rejects_unannounceable_devices() {
         let (seg, rx) = wired();
-        assert!(seg.add_manual(tv("fd00::9", &["TV"])).is_err());
+        assert!(seg.add_manual(Owner::Own, tv("fd00::9", &["TV"])).is_err());
         let mut nameless = tv("10.0.1.9", &["TV"]);
         nameless.hostname = None;
-        assert!(seg.add_manual(nameless).is_err());
+        assert!(seg.add_manual(Owner::Own, nameless).is_err());
         assert!(seg.manual_devices().is_empty());
         assert!(recv(&rx).is_none());
     }
@@ -1749,7 +1863,7 @@ mod tests {
     #[test]
     fn answers_ptr_query_with_additionals() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         recv(&rx).unwrap();
         age(&seg, 2);
 
@@ -1769,7 +1883,7 @@ mod tests {
     #[test]
     fn matches_names_case_insensitively_and_any_type() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         recv(&rx).unwrap();
         age(&seg, 2);
 
@@ -1786,7 +1900,7 @@ mod tests {
     #[test]
     fn multicast_replies_are_rate_limited() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         recv(&rx).unwrap();
 
         // Just announced: a query within the second gets nothing.
@@ -1804,7 +1918,7 @@ mod tests {
     #[test]
     fn known_answers_suppress_replies() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         recv(&rx).unwrap();
         age(&seg, 2);
 
@@ -1822,7 +1936,7 @@ mod tests {
     #[test]
     fn legacy_resolvers_get_unicast_replies() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         recv(&rx).unwrap();
 
         // Rate limit does not apply to unicast replies.
@@ -1842,7 +1956,7 @@ mod tests {
     #[test]
     fn ignores_responses_and_odd_queries() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         recv(&rx).unwrap();
         age(&seg, 2);
 
@@ -1858,7 +1972,7 @@ mod tests {
     #[test]
     fn reannounces_after_eighty_percent_of_ttl() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         let first = recv(&rx).unwrap();
 
         seg.reannounce(Instant::now()).unwrap();
@@ -2006,7 +2120,7 @@ mod tests {
             routable: Some(ip("10.0.1.1")),
             ..Device::default()
         };
-        seg.add_manual(router).unwrap();
+        seg.add_manual(Owner::Own, router).unwrap();
 
         let m = recv(&rx).expect("announcement");
         assert_eq!(m.answers.len(), 1, "just the address record: {:?}", m.answers);
@@ -2022,7 +2136,7 @@ mod tests {
         // ...is re-announced, and says goodbye when removed.
         seg.reannounce(Instant::now() + reannounce_after(HOST_TTL) + Duration::from_secs(1)).unwrap();
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL));
-        seg.remove_manual("router.local").unwrap();
+        seg.remove_manual(Owner::Own, "router.local").unwrap();
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
     }
 
@@ -2182,7 +2296,7 @@ mod tests {
             routable: None,
             ..Device::default()
         };
-        seg.add_manual(router).unwrap();
+        seg.add_manual(Owner::Own, router).unwrap();
         let m = recv(&rx).unwrap();
         assert_eq!(m.answers.len(), 1);
         assert_eq!(m.answers[0].data, RData::Aaaa("fe80::1".parse().unwrap()));
@@ -2191,10 +2305,10 @@ mod tests {
     #[test]
     fn replacing_a_device_withdraws_the_addresses_it_no_longer_has() {
         let (seg, rx) = wired();
-        seg.add_manual(tv("10.0.1.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         recv(&rx).unwrap();
 
-        seg.add_manual(tv("10.0.1.10", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.1.10", &["TV"])).unwrap();
         let m = recv(&rx).unwrap();
         let ttl_of = |a: &str| m.answers.iter().find(|r| r.data == RData::A(a.parse().unwrap())).map(|r| r.ttl);
         assert_eq!((ttl_of("10.0.1.9"), ttl_of("10.0.1.10")), (Some(0), Some(HOST_TTL)));
@@ -2206,10 +2320,10 @@ mod tests {
         let (seg, rx) = wired();
         let mut none = tv("10.0.1.9", &["TV"]);
         none.routable = None;
-        assert!(seg.add_manual(none).is_err());
+        assert!(seg.add_manual(Owner::Own, none).is_err());
         let mut v6 = tv("10.0.1.9", &["TV"]);
         v6.link_local = Some(ip("fe80::1"));
-        assert!(seg.add_manual(v6).is_err(), "a v4 segment cannot announce an IPv6 address");
+        assert!(seg.add_manual(Owner::Own, v6).is_err(), "a v4 segment cannot announce an IPv6 address");
         assert!(seg.manual_devices().is_empty());
         assert!(recv(&rx).is_none());
     }
@@ -2581,7 +2695,7 @@ mod tests {
         assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)));
 
         // A reflected device is due for re-announcement, and a failed one not before its retry.
-        seg.add_manual(tv("10.0.9.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.9.9", &["TV"])).unwrap();
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
         assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + reannounce_after(HOST_TTL))));
         seg.state.lock().unwrap().manual.get_mut("tv.local").unwrap().retry = Some(announced + Duration::from_secs(500));
@@ -2598,7 +2712,7 @@ mod tests {
 
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         seg.observe(ip("10.0.1.99")); // heard, but never named
-        seg.add_manual(tv("10.0.9.9", &["TV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.0.9.9", &["TV"])).unwrap();
 
         let expires = expiry_of(&seg, "printer.local");
         let pending = seg.pending();
@@ -2621,7 +2735,7 @@ mod tests {
     #[test]
     fn a_name_can_be_announced_with_its_own_ttl_and_is_kept_up_at_80_percent_of_it() {
         let (seg, rx) = wired();
-        seg.add_manual_ttl(tv("10.0.1.1", &[]), Duration::from_secs(1000)).unwrap();
+        seg.add_manual_ttl(Owner::Own, tv("10.0.1.1", &[]), Duration::from_secs(1000)).unwrap();
         let first = recv(&rx).unwrap();
         assert!(first.answers.iter().all(|r| r.ttl == 1000));
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
@@ -2641,9 +2755,9 @@ mod tests {
 
         // The usual way is unchanged, and a TTL of zero (a goodbye) is refused.
         let (usual, rx) = wired();
-        usual.add_manual(tv("10.0.1.1", &[])).unwrap();
+        usual.add_manual(Owner::Own, tv("10.0.1.1", &[])).unwrap();
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL || r.ttl == OTHER_TTL));
-        assert!(usual.add_manual_ttl(tv("10.0.1.2", &[]), Duration::from_millis(900)).is_err());
+        assert!(usual.add_manual_ttl(Owner::Own, tv("10.0.1.2", &[]), Duration::from_millis(900)).is_err());
     }
 
     /// `tv.local` as it announced itself: an address with `addr` seconds, and a
@@ -2669,7 +2783,7 @@ mod tests {
     #[test]
     fn a_device_is_announced_with_the_ttls_it_announced_itself_with() {
         let (seg, rx) = wired();
-        seg.add_manual(tv_with_ttls(Some(300), 600)).unwrap();
+        seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 600)).unwrap();
         let ttls = announced_ttls(&rx);
         assert!(ttls.contains(&(true, 300)), "{ttls:?}");
         assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
@@ -2682,7 +2796,7 @@ mod tests {
     #[test]
     fn a_short_service_ttl_brings_the_reannouncement_forward() {
         let (seg, rx) = wired();
-        seg.add_manual(tv_with_ttls(Some(300), 50)).unwrap();
+        seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 50)).unwrap();
         assert!(announced_ttls(&rx).contains(&(false, 50)));
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
         assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(40));
@@ -2691,12 +2805,12 @@ mod tests {
     #[test]
     fn what_a_device_did_not_say_gets_the_usual_ttl_and_tiny_ones_are_raised() {
         let (seg, rx) = wired();
-        seg.add_manual(tv_with_ttls(None, 0)).unwrap();
+        seg.add_manual(Owner::Own, tv_with_ttls(None, 0)).unwrap();
         let ttls = announced_ttls(&rx);
         assert!(ttls.contains(&(true, HOST_TTL)) && ttls.contains(&(false, OTHER_TTL)), "{ttls:?}");
 
         let (seg, rx) = wired();
-        seg.add_manual(tv_with_ttls(Some(2), 3)).unwrap();
+        seg.add_manual(Owner::Own, tv_with_ttls(Some(2), 3)).unwrap();
         let ttls = announced_ttls(&rx);
         assert!(ttls.iter().all(|(_, ttl)| *ttl == MIN_REFLECT_TTL), "{ttls:?}");
     }
@@ -2705,7 +2819,7 @@ mod tests {
     fn a_configured_reflect_ttl_wins_for_the_address_only() {
         let (seg, rx) = wired();
         seg.set_reflect_ttl(Some(Duration::from_secs(900)));
-        seg.add_manual(tv_with_ttls(Some(300), 600)).unwrap();
+        seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 600)).unwrap();
         let ttls = announced_ttls(&rx);
         assert!(ttls.contains(&(true, 900)), "{ttls:?}");
         assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
@@ -2948,9 +3062,9 @@ mod tests {
                 Family::V4 => ip("10.9.9.9"),
                 Family::V6 => ip("fd00::9"),
             };
-            seg.add_manual(tv(&addr.to_string(), &["LiveTV"])).unwrap();
+            seg.add_manual(Owner::Own, tv(&addr.to_string(), &["LiveTV"])).unwrap();
             std::thread::sleep(Duration::from_millis(200));
-            seg.remove_manual("tv.local").unwrap();
+            seg.remove_manual(Owner::Own, "tv.local").unwrap();
         }
     }
 
@@ -2965,7 +3079,7 @@ mod tests {
         let seg = Segment::new(&iface, Family::V4);
         let (tx, dest) = sock.sender().unwrap();
         seg.attach(tx, dest);
-        seg.add_manual(tv("10.9.9.9", &["LiveTV"])).unwrap();
+        seg.add_manual(Owner::Own, tv("10.9.9.9", &["LiveTV"])).unwrap();
         age(&seg, 2);
 
         let udp: UdpSocket = sock.socket.try_clone().unwrap().into();

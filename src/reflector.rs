@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use crate::socket::{Device, Event, Family, Segment};
+use crate::socket::{Device, Event, Family, Owner, Segment};
 
 /// How often a worker checks for shutdown while waiting for events.
 const TICK: Duration = Duration::from_millis(250);
@@ -46,6 +46,9 @@ pub struct Reflector {
 }
 
 struct Inner {
+    /// Whose the devices it announces are, on segments it shares with other
+    /// reflectors.
+    owner: Owner,
     segments: Vec<Segment>,
     /// Whether each segment is untrusted: it is not announced anything.
     untrusted: Vec<bool>,
@@ -68,8 +71,13 @@ impl Reflector {
     /// Start reflecting between `segments`, which must all be the same
     /// address family and on different interfaces. Devices already
     /// discovered are reflected before this returns.
-    pub fn new(segments: Vec<Segment>) -> Result<Reflector> {
-        Self::with_untrusted(segments, &[])
+    ///
+    /// `rank` settles clashes with other reflectors that share an interface:
+    /// if both want a hostname announced there, the lower rank's device is,
+    /// and the other's takes over when it goes. The daemon ranks reflectors
+    /// by the order of their segments in the config.
+    pub fn new(rank: u32, segments: Vec<Segment>) -> Result<Reflector> {
+        Self::with_untrusted(rank, segments, &[])
     }
 
     /// Like [`new`](Reflector::new), but the segments on the interfaces named
@@ -77,7 +85,7 @@ impl Reflector {
     /// announced to the others, but they do not learn about the devices of the
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
-    pub fn with_untrusted(segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
+    pub fn with_untrusted(rank: u32, segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
         if segments.is_empty() {
             bail!("a reflector needs at least one segment");
         }
@@ -102,6 +110,7 @@ impl Reflector {
         let untrusted = segments.iter().map(|s| untrusted.iter().any(|name| name == s.interface())).collect();
 
         let inner = Arc::new(Inner {
+            owner: Owner::Reflector(rank),
             segments,
             untrusted,
             book: Mutex::default(),
@@ -256,7 +265,7 @@ impl Inner {
                 .map(|(_, key)| key.clone())
                 .collect();
             for key in stale {
-                match seg.remove_manual(&key) {
+                match seg.remove_manual(self.owner, &key) {
                     Ok(_) => {
                         book.pushed.remove(&(target, key));
                     }
@@ -268,7 +277,7 @@ impl Inner {
                 if book.pushed.get(&(target, key.clone())) == Some(&device) {
                     continue;
                 }
-                match seg.add_manual(device.clone()) {
+                match seg.add_manual(self.owner, device.clone()) {
                     Ok(_) => {
                         book.pushed.insert((target, key), device);
                     }
@@ -330,7 +339,7 @@ mod tests {
     fn watching_a_reflector_follows_every_segment_it_spans() {
         let (a, _ra) = wired("a");
         let (b, _rb) = wired("b");
-        let reflector = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let reflector = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
         let (tx, notices) = std::sync::mpsc::channel();
         reflector.watch(tx);
         let next = || notices.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -356,7 +365,7 @@ mod tests {
     fn a_watcher_that_is_dropped_is_forgotten_and_reflecting_goes_on() {
         let (a, _ra) = wired("a");
         let (b, rb) = wired("b");
-        let reflector = Reflector::new(vec![a.clone(), b]).unwrap();
+        let reflector = Reflector::new(0, vec![a.clone(), b]).unwrap();
         let (tx, notices) = std::sync::mpsc::channel();
         reflector.watch(tx);
         drop(notices);
@@ -454,7 +463,7 @@ mod tests {
         let (a, arx) = wired("a");
         let (b, brx) = wired("b");
         let (c, _crx) = wired("c");
-        let _r = Reflector::new(vec![a.clone(), b.clone(), c.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone(), c.clone()]).unwrap();
 
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
         wait_for(|| b.manual_devices().len() == 1 && c.manual_devices().len() == 1);
@@ -473,7 +482,7 @@ mod tests {
         let (b, brx) = wired("b");
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
 
-        let _r = Reflector::new(vec![a, b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a, b.clone()]).unwrap();
         assert_eq!(b.manual_devices().len(), 1);
         assert_eq!(drain(&brx).len(), 1);
     }
@@ -482,7 +491,7 @@ mod tests {
     fn removal_withdraws_with_goodbye() {
         let (a, _arx) = wired("a");
         let (b, brx) = wired("b");
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
         wait_for(|| b.manual_devices().len() == 1);
         drain(&brx);
@@ -498,7 +507,7 @@ mod tests {
     fn updates_follow_the_source() {
         let (a, _arx) = wired("a");
         let (b, _brx) = wired("b");
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
         wait_for(|| b.manual_devices().len() == 1);
 
@@ -510,7 +519,7 @@ mod tests {
     fn skips_devices_that_cannot_be_announced() {
         let (a, _arx) = wired("a");
         let (b, brx) = wired("b");
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
 
         a.observe(ip("10.0.1.5")); // no hostname, no services
         announce(&a, "10.0.1.6", "bare.local", &[]); // hostname only
@@ -523,7 +532,7 @@ mod tests {
     fn drop_withdraws_everything() {
         let (a, _arx) = wired("a");
         let (b, brx) = wired("b");
-        let r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
         wait_for(|| b.manual_devices().len() == 1);
         drain(&brx);
@@ -540,7 +549,7 @@ mod tests {
         let (a, _arx) = wired("a");
         let (b, _brx) = wired("b");
         let (c, _crx) = wired("c");
-        let _r = Reflector::new(vec![a.clone(), b.clone(), c.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone(), c.clone()]).unwrap();
 
         announce(&b, "10.0.2.5", "tv.local", &["TV"]);
         announce(&a, "10.0.1.5", "TV.local", &["TV"]);
@@ -569,6 +578,7 @@ mod tests {
         let (media, media_rx) = wired("media");
         let (wifi, wifi_rx) = wired("wifi");
         let r = Reflector::with_untrusted(
+            0,
             vec![br0.clone(), media.clone(), wifi.clone()],
             &["media".to_string(), "wifi".to_string()],
         )
@@ -598,8 +608,8 @@ mod tests {
     fn untrusted_must_name_a_segment_of_the_reflector_and_trusted_is_the_default() {
         let (a, _ra) = wired("a");
         let (b, _rb) = wired("b");
-        assert!(Reflector::with_untrusted(vec![a.clone(), b.clone()], &["c".to_string()]).is_err());
-        let r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        assert!(Reflector::with_untrusted(0, vec![a.clone(), b.clone()], &["c".to_string()]).is_err());
+        let r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
         assert!(r.untrusted().is_empty());
 
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
@@ -621,7 +631,7 @@ mod tests {
     fn reflected_devices_are_announced_with_the_ttls_they_announced_themselves_with() {
         let (a, _arx) = wired("a");
         let (b, brx) = wired("b");
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
 
         announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
         wait_for(|| b.manual_devices().len() == 1);
@@ -636,7 +646,7 @@ mod tests {
         let (a, _arx) = wired("a");
         let (b, brx) = wired("b");
         b.set_reflect_ttl(Some(Duration::from_secs(900)));
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
 
         announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
         wait_for(|| b.manual_devices().len() == 1);
@@ -650,7 +660,7 @@ mod tests {
     fn a_device_with_two_hostnames_on_one_address_has_both_reflected() {
         let (a, _arx) = wired("a");
         let (b, _brx) = wired("b");
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
 
         announce(&a, "10.0.1.5", "tv.local", &["Airplay"]);
         announce(&a, "10.0.1.5", "tv-nsas-1.local", &["Display"]);
@@ -670,8 +680,8 @@ mod tests {
         let (a, _arx) = wired("a");
         let (b, _brx) = wired("b");
         let (c, _crx) = wired("c");
-        let r_ab = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
-        let _r_bc = Reflector::new(vec![b.clone(), c.clone()]).unwrap();
+        let r_ab = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
+        let _r_bc = Reflector::new(1, vec![b.clone(), c.clone()]).unwrap();
 
         announce(&a, "10.0.1.5", "tv-a.local", &["A"]);
         announce(&c, "10.0.3.5", "tv-c.local", &["C"]);
@@ -695,13 +705,73 @@ mod tests {
         assert_eq!(c.manual_devices().len(), 1);
     }
 
+    /// Two segments that share br0, with a `tv.local` on each of the others.
+    /// br0 is told about the one from the segment listed first, and about the
+    /// other once that one goes; the loser going takes nothing with it.
+    #[test]
+    fn segments_sharing_an_interface_keep_both_and_the_first_segment_wins() {
+        let (br0, br0_rx) = wired("br0");
+        let (media, _media_rx) = wired("media");
+        let (wifi, _wifi_rx) = wired("wifi");
+        let _first = Reflector::new(0, vec![br0.clone(), media.clone()]).unwrap();
+        let _second = Reflector::new(1, vec![br0.clone(), wifi.clone()]).unwrap();
+        let on_br0 = || br0.manual_devices().iter().map(|d| d.routable).collect::<Vec<_>>();
+        let gone = || Instant::now() + Duration::from_secs(3600);
+
+        // Media's wins, and is not displaced by the one heard after it.
+        announce(&media, "10.0.2.5", "TV.local", &["Media TV"]);
+        wait_for(|| on_br0() == [Some(ip("10.0.2.5"))]);
+        announce(&wifi, "10.0.3.5", "tv.local", &["Wifi TV"]);
+        wait_for(|| wifi.devices().len() == 1);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(on_br0(), [Some(ip("10.0.2.5"))]);
+
+        wifi.expire(gone());
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(on_br0(), [Some(ip("10.0.2.5"))]);
+
+        // The winner going hands the name over instead of withdrawing it.
+        announce(&wifi, "10.0.3.5", "tv.local", &["Wifi TV"]);
+        thread::sleep(Duration::from_millis(100));
+        drain(&br0_rx);
+        media.expire(gone());
+        wait_for(|| on_br0() == [Some(ip("10.0.3.5"))]);
+        assert!(drain(&br0_rx).iter().all(|m| m.answers.iter().any(|r| r.ttl > 0)), "handed over, not withdrawn");
+
+        wifi.expire(gone());
+        wait_for(|| on_br0().is_empty());
+    }
+
+    /// A device elsewhere that calls itself like the router's own name
+    /// neither displaces it nor, when it goes, withdraws it.
+    #[test]
+    fn a_device_named_like_the_advertised_name_leaves_it_alone() {
+        let (br0, br0_rx) = wired("br0");
+        let (media, _media_rx) = wired("media");
+        let router = Device { hostname: Some("router.local".into()), routable: Some(ip("10.0.0.1")), ..Device::default() };
+        br0.add_manual_ttl(Owner::Own, router.clone(), Duration::from_secs(120)).unwrap();
+        let _r = Reflector::new(0, vec![br0.clone(), media.clone()]).unwrap();
+        drain(&br0_rx);
+
+        announce(&media, "10.0.2.5", "Router.local", &["Admin"]);
+        wait_for(|| media.devices().len() == 1);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(br0.manual_devices(), [router.clone()]);
+
+        media.expire(Instant::now() + Duration::from_secs(3600));
+        wait_for(|| media.devices().is_empty());
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(br0.manual_devices(), [router]);
+        assert!(drain(&br0_rx).is_empty(), "nothing about it was sent, or withdrawn");
+    }
+
     /// The bug this guards against: a device on one network announced to
     /// another with its link-local address, which only exists on its own link.
     #[test]
     fn link_local_addresses_never_leave_their_link() {
         let (a, _arx) = wired_v6("a");
         let (b, brx) = wired_v6("b");
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
 
         // It sends from its link-local address and announces that and a ULA.
         announce6(&a, "fe80::5", "tv.local", &["fd00:0:1::5", "fe80::5"], "TV");
@@ -728,7 +798,7 @@ mod tests {
     fn a_device_known_only_by_a_link_local_address_is_not_reflected() {
         let (a, _arx) = wired_v6("a");
         let (b, brx) = wired_v6("b");
-        let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
 
         announce6(&a, "fe80::6", "mute.local", &["fe80::6"], "Mute");
         wait_for(|| !a.devices().is_empty());
@@ -741,7 +811,7 @@ mod tests {
     #[test]
     fn single_segment_reflects_nothing() {
         let (a, arx) = wired("a");
-        let _r = Reflector::new(vec![a.clone()]).unwrap();
+        let _r = Reflector::new(0, vec![a.clone()]).unwrap();
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
         thread::sleep(Duration::from_millis(100));
         assert!(a.manual_devices().is_empty());
@@ -752,9 +822,9 @@ mod tests {
     fn rejects_bad_construction() {
         let (a, _) = wired("a");
         let (b, _) = wired("b");
-        assert!(Reflector::new(vec![]).is_err());
-        assert!(Reflector::new(vec![a.clone(), a.clone()]).is_err());
+        assert!(Reflector::new(0, vec![]).is_err());
+        assert!(Reflector::new(0, vec![a.clone(), a.clone()]).is_err());
         let v6 = Segment::new("c", Family::V6);
-        assert!(Reflector::new(vec![a, b, v6]).is_err());
+        assert!(Reflector::new(0, vec![a, b, v6]).is_err());
     }
 }

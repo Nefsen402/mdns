@@ -137,7 +137,10 @@ An interface listed in
 is announced nothing by its segment, though its own devices are announced to the
 others, so a network can be seen from another without seeing it back.
 If devices on different interfaces announce the same hostname, the one from the
-interface listed first in the segment wins.
+interface listed first in the segment wins, and where segments share an
+interface, the one from the segment listed first in the config; the other takes
+over when it goes.
+The advertised name always wins over a reflected device.
 Different hostnames never clash, even on one address: a device with several
 names has each of them reflected.
 .SS Control socket

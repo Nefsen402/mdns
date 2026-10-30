@@ -270,6 +270,8 @@ but nothing is reflected.
 .IP \(bu 2
 An interface may appear in several segments.
 This is how one network can see two others that must not see each other.
+If two segments would both announce a hostname on the interface they share, the
+one listed first in this file wins, and the other takes over when it goes.
 Reflection is never transitive, because a device reflected onto an interface is
 not reflected again.
 .IP \(bu 2
