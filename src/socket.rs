@@ -138,6 +138,7 @@ const MAX_MAX_PACKET: usize = 9000;
 
 /// The MTU of the interface called `name`, as its network namespace has it.
 pub fn mtu(name: &str) -> Result<u32> {
+    // SAFETY: an all-zero ifreq is valid: an empty name and a zero union.
     let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
     let bytes = name.as_bytes();
     if bytes.len() >= req.ifr_name.len() || bytes.contains(&0) {
@@ -146,7 +147,7 @@ pub fn mtu(name: &str) -> Result<u32> {
     for (dst, &b) in req.ifr_name.iter_mut().zip(bytes) {
         *dst = b as libc::c_char;
     }
-    // SAFETY: a plain socket for the ioctl, closed when `sock` drops.
+    // Any socket will do for the ioctl; it is closed when `sock` drops.
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
     // SAFETY: `req` is a valid ifreq naming the interface; SIOCGIFMTU fills
     // in its MTU.

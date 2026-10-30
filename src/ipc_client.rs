@@ -470,9 +470,7 @@ fn detach(socket: &Path, line: &str, log: Option<&File>) -> Result<BufReader<Uni
         -1 => Err(Failure::Connect(format!("cannot go into the background: {}", io::Error::last_os_error()))),
         0 => {
             drop(report_rx);
-            // SAFETY: the child leaves the caller's session.
-            unsafe { libc::setsid() };
-            let opened = open_watch(socket, line);
+            let opened = settle_in_background(log).and_then(|()| open_watch(socket, line));
             // How it went: `+`, or a letter for the kind of error and the
             // message.
             let report = match &opened {
@@ -483,16 +481,6 @@ fn detach(socket: &Path, line: &str, log: Option<&File>) -> Result<BufReader<Uni
             let _ = report_tx.write_all(report.as_bytes());
             drop(report_tx);
             let Ok(reader) = opened else { std::process::exit(1) };
-            let null = File::options().read(true).write(true).open("/dev/null");
-            let null = null.map_err(|e| Failure::Connect(format!("cannot open /dev/null: {e}")))?;
-            let out = log.unwrap_or(&null);
-            // SAFETY: plain descriptor calls on descriptors open in this
-            // process; the duplicates replace stdin, stdout and stderr.
-            unsafe {
-                libc::dup2(null.as_raw_fd(), 0);
-                libc::dup2(out.as_raw_fd(), 1);
-                libc::dup2(out.as_raw_fd(), 2);
-            }
             Ok(reader)
         }
         pid => {
@@ -511,6 +499,29 @@ fn detach(socket: &Path, line: &str, log: Option<&File>) -> Result<BufReader<Uni
             }
         }
     }
+}
+
+/// In the child of [`detach`]: leave the caller's session, so that its
+/// terminal going away does not take the subscriber with it, and send stdin
+/// from `/dev/null` and stdout and stderr to `log`, or there.
+fn settle_in_background(log: Option<&File>) -> Result<(), Failure> {
+    let failed = |what: &str| Failure::Connect(format!("cannot go into the background: {what}: {}", io::Error::last_os_error()));
+    // SAFETY: setsid takes no arguments; it fails only for a process group
+    // leader, which a child just forked is not.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(failed("setsid"));
+    }
+    let null = File::options().read(true).write(true).open("/dev/null");
+    let null = null.map_err(|e| Failure::Connect(format!("cannot open /dev/null: {e}")))?;
+    let out = log.unwrap_or(&null);
+    for (from, to) in [(&null, 0), (out, 1), (out, 2)] {
+        // SAFETY: both descriptors are open in this process; dup2 replaces
+        // `to` (stdin, stdout or stderr) with a copy of `from`.
+        if unsafe { libc::dup2(from.as_raw_fd(), to) } == -1 {
+            return Err(failed("dup2"));
+        }
+    }
+    Ok(())
 }
 
 /// Pass each event of the watch on `reader` to `events`, opening the watch
