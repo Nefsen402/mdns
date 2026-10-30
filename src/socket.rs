@@ -700,10 +700,10 @@ impl State {
         let local = self.local_instances();
         let keys: Vec<String> = self.manual.keys().cloned().collect();
         for key in keys {
-            if self.settle(&key, &local, now).is_err() {
-                if let Some(m) = self.manual.get_mut(&key) {
-                    m.retry = Some(now + ANNOUNCE_RETRY);
-                }
+            if self.settle(&key, &local, now).is_err()
+                && let Some(m) = self.manual.get_mut(&key)
+            {
+                m.retry = Some(now + ANNOUNCE_RETRY);
             }
         }
     }
@@ -819,10 +819,10 @@ impl Segment {
         // dropped, then ask the devices about to expire to answer again.
         // Routine refreshes are not worth a journal line each.
         self.expire(now);
-        if let Some(before) = before {
-            if let Err(e) = self.refresh(now, before) {
-                eprintln!("{}: refresh failed: {e:#}", self.interface);
-            }
+        if let Some(before) = before
+            && let Err(e) = self.refresh(now, before)
+        {
+            eprintln!("{}: refresh failed: {e:#}", self.interface);
         }
         if let Err(e) = self.reannounce(now) {
             eprintln!("{}: re-announce failed: {e:#}", self.interface);
@@ -1225,15 +1225,14 @@ impl Segment {
         }
 
         for rec in msg.into_iter().flat_map(|m| m.records()) {
-            if let RData::Ptr(kind) = &rec.data {
-                if rec.ttl > 0
-                    && rec.name.eq_ignore_ascii_case(META_QUERY)
-                    && rec.class == 1
-                    && is_type(kind)
-                    && state.types.len() < MAX_TYPES
-                {
-                    state.types.insert(kind.to_ascii_lowercase());
-                }
+            if let RData::Ptr(kind) = &rec.data
+                && rec.ttl > 0
+                && rec.name.eq_ignore_ascii_case(META_QUERY)
+                && rec.class == 1
+                && is_type(kind)
+                && state.types.len() < MAX_TYPES
+            {
+                state.types.insert(kind.to_ascii_lowercase());
             }
         }
 

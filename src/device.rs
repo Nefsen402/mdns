@@ -949,10 +949,11 @@ impl Device {
                 r.name.eq_ignore_ascii_case(&q.name)
                     && matches!(&r.data, RData::Nsec { types, .. } if !types.contains(&q.qtype))
             };
-            if !found && q.qtype != rtype::ANY {
-                if let Some(nsec) = all.iter().find(denies).filter(|r| !answers.contains(r)) {
-                    answers.push(nsec.clone());
-                }
+            if !found
+                && q.qtype != rtype::ANY
+                && let Some(nsec) = all.iter().find(denies).filter(|r| !answers.contains(r))
+            {
+                answers.push(nsec.clone());
             }
         }
 

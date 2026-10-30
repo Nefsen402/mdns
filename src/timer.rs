@@ -250,7 +250,7 @@ impl Shared {
             slot.runs += 1;
             slot.last_run = Some(now);
             drop(state);
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| callback()));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(&mut callback));
             state = self.lock();
             if let Some(dead) = state.finish(id, epoch, callback, outcome) {
                 drop(state);

@@ -342,10 +342,10 @@ fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Fa
         } else {
             render_event(&reply, opts.verbose, &mut seen)?
         };
-        if let Some(shown) = shown {
-            if out.write_all(shown.as_bytes()).and_then(|()| out.flush()).is_err() {
-                return Ok(());
-            }
+        if let Some(shown) = shown
+            && out.write_all(shown.as_bytes()).and_then(|()| out.flush()).is_err()
+        {
+            return Ok(());
         }
     }
 }
