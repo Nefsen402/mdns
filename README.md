@@ -347,7 +347,14 @@ be reflected, so without probing they would stay invisible.
   **segment listed first in the config** wins there in the same way: with
   `br0,media` above `br0,wifi`, a `tv.local` on `media` is the one `br0` sees,
   and the one on `wifi` takes over only when it goes. The
-  [advertised name](#advertise-optional) always wins over a reflected device. Different hostnames never clash, even
+  [advertised name](#advertise-optional) always wins over a reflected device.
+- A device **on the network itself** comes first of all. While a device on
+  `br0` has a hostname, no reflected device of that name is announced on `br0`
+  (the device would take it for a conflict and rename itself), and a service
+  whose instance name (`Living Room._airplay._tcp.local`) a device on `br0`
+  offers is left out of what is reflected there. Each is announced once the
+  device on `br0` goes, and withdrawn again when it is back. Nor are devices
+  that are probing for a name answered with a reflected copy of it. Different hostnames never clash, even
   on one address: a device with several names (a TV often has two) has each of
   them reflected.
 - Reflected devices are kept alive with periodic re-announcements, answer

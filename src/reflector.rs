@@ -742,6 +742,40 @@ mod tests {
         wait_for(|| on_br0().is_empty());
     }
 
+    /// A device on br0 and one on media both called `tv.local`. Neither is
+    /// told about the other, which it would take for a conflict and rename
+    /// itself over; each network is told about the other's once its own goes.
+    #[test]
+    fn a_device_here_keeps_its_name_and_the_copy_gives_way() {
+        let (br0, br0_rx) = wired("br0");
+        let (media, _media_rx) = wired("media");
+        let _r = Reflector::new(0, vec![br0.clone(), media.clone()]).unwrap();
+        let on_br0 = || br0.manual_devices().iter().map(|d| d.routable).collect::<Vec<_>>();
+        let tv_records = |msgs: Vec<Message>| -> Vec<Record> {
+            msgs.into_iter().flat_map(|m| m.answers).filter(|r| r.name.eq_ignore_ascii_case("tv.local")).collect()
+        };
+
+        announce(&br0, "10.0.0.5", "tv.local", &["Living Room"]);
+        announce(&media, "10.0.2.5", "TV.local", &["Living Room"]);
+        wait_for(|| br0.devices().len() == 1 && media.devices().len() == 1);
+        thread::sleep(Duration::from_millis(100));
+        assert!(on_br0().is_empty() && media.manual_devices().is_empty());
+        assert!(tv_records(drain(&br0_rx)).is_empty(), "nothing about tv.local was sent onto br0");
+
+        // The one on br0 goes: media's is shown in its place.
+        br0.expire(Instant::now() + Duration::from_secs(3600));
+        wait_for(|| on_br0() == [Some(ip("10.0.2.5"))]);
+        drain(&br0_rx);
+
+        // It is back: the copy is withdrawn, without flushing what it says.
+        announce(&br0, "10.0.0.5", "tv.local", &["Living Room"]);
+        wait_for(|| on_br0().is_empty());
+        let bye = tv_records(drain(&br0_rx));
+        assert_eq!(bye.len(), 1);
+        assert_eq!((bye[0].ttl, bye[0].cache_flush), (0, false));
+        assert_eq!(bye[0].data, RData::A("10.0.2.5".parse().unwrap()));
+    }
+
     /// A device elsewhere that calls itself like the router's own name
     /// neither displaces it nor, when it goes, withdraws it.
     #[test]
@@ -756,7 +790,7 @@ mod tests {
         announce(&media, "10.0.2.5", "Router.local", &["Admin"]);
         wait_for(|| media.devices().len() == 1);
         thread::sleep(Duration::from_millis(100));
-        assert_eq!(br0.manual_devices(), [router.clone()]);
+        assert_eq!(br0.manual_devices(), std::slice::from_ref(&router));
 
         media.expire(Instant::now() + Duration::from_secs(3600));
         wait_for(|| media.devices().is_empty());

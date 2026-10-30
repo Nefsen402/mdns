@@ -6,7 +6,7 @@
 
 use std::ffi::CString;
 use std::fmt;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -373,17 +373,21 @@ struct Claim {
     host_ttl: u32,
 }
 
-/// A reflected device plus the timing needed to keep it announced.
+/// A hostname announced on behalf of somewhere else, plus the timing needed
+/// to keep it announced.
 struct Manual {
-    /// Everyone who wants this hostname announced. Never empty; the first is
-    /// the one announced, as `device` and `host_ttl`.
+    /// Everyone who wants this hostname announced. The first one wins; empty
+    /// only while what was shown is still to be withdrawn.
     claims: BTreeMap<Owner, Claim>,
-    device: Device,
+    /// What is announced: the winning claim, less what devices on this
+    /// segment have themselves (see [`State::wanted`]). `None` while a device
+    /// here has the hostname.
+    shown: Option<Device>,
     /// When the full record set was last multicast; drives re-announcement.
     announced: Instant,
     /// When any of its records was last multicast; drives the rate limit.
     last_sent: Instant,
-    /// Not before this, after a re-announcement failed to send.
+    /// Not before this, after sending failed.
     retry: Option<Instant>,
     /// The TTLs it is announced with: of its address records, and of the rest.
     host_ttl: u32,
@@ -391,33 +395,30 @@ struct Manual {
 }
 
 impl Manual {
+    fn new(now: Instant) -> Manual {
+        Manual {
+            claims: BTreeMap::new(),
+            shown: None,
+            announced: now,
+            last_sent: now,
+            retry: None,
+            host_ttl: HOST_TTL,
+            other_ttl: OTHER_TTL,
+        }
+    }
+
     /// The shortest TTL anything of it is announced with: it has to be
     /// announced again before that runs out.
     fn shortest_ttl(&self) -> u32 {
-        let services = self.device.services.iter().map(|svc| service_ttl(svc, self.other_ttl));
+        let services = self.shown.iter().flat_map(|d| &d.services).map(|svc| service_ttl(svc, self.other_ttl));
         services.chain([self.host_ttl]).min().unwrap_or(self.host_ttl)
     }
 
-    /// When it is next due for re-announcing.
-    fn reannounce_at(&self) -> Instant {
-        let at = self.announced.checked_add(reannounce_after(self.shortest_ttl())).unwrap_or(self.announced);
-        self.retry.map_or(at, |retry| at.max(retry))
-    }
-
-    /// Announce `claim` in place of what is announced now, with goodbyes for
-    /// what it does not have. Nothing is sent if it is the same, and nothing
-    /// changes if sending fails.
-    fn switch_to(&mut self, outbound: &Option<Outbound>, claim: &Claim, now: Instant) -> Result<()> {
-        if self.device == claim.device && self.host_ttl == claim.host_ttl {
-            return Ok(());
-        }
-        send(outbound, &replacement(&self.device, &claim.device, claim.host_ttl, self.other_ttl))?;
-        self.device = claim.device.clone();
-        self.host_ttl = claim.host_ttl;
-        self.announced = now;
-        self.last_sent = now;
-        self.retry = None;
-        Ok(())
+    /// When it is next due for re-announcing, or for another try after
+    /// sending failed; `None` if nothing is shown and nothing is pending.
+    fn reannounce_at(&self) -> Option<Instant> {
+        let due = |_: &Device| self.announced.checked_add(reannounce_after(self.shortest_ttl())).unwrap_or(self.announced);
+        self.retry.or_else(|| self.shown.as_ref().map(due))
     }
 }
 
@@ -502,7 +503,9 @@ impl State {
             }
         }
         for (name, m) in &self.manual {
-            f("re-announce", name, m.reannounce_at());
+            if let Some(at) = m.reannounce_at() {
+                f("re-announce", name, at);
+            }
         }
     }
 
@@ -524,6 +527,89 @@ impl State {
     fn forget(&mut self, key: &Key) -> Option<Entry> {
         self.by_addr.retain(|_, k| k != key);
         self.discovered.remove(key)
+    }
+
+    /// The instance names, in lowercase, of the services that devices on this
+    /// segment offer themselves.
+    fn local_instances(&self) -> HashSet<String> {
+        self.discovered.values().flat_map(|e| e.services.keys()).map(|i| i.to_ascii_lowercase()).collect()
+    }
+
+    /// What should be announced as `key`: the winning claim, less the
+    /// services whose instance names devices here have (`local`), or nothing
+    /// if a device here has the hostname. Announced on top of a device here,
+    /// a copy would be a conflict, and the device would rename itself. The
+    /// advertised name is ours, and announced whatever is here.
+    fn wanted(&self, key: &str, m: &Manual, local: &HashSet<String>) -> Option<Claim> {
+        let (owner, claim) = m.claims.iter().next()?;
+        if *owner == Owner::Own {
+            return Some(claim.clone());
+        }
+        if self.discovered.contains_key(&Key::Host(key.to_string())) {
+            return None;
+        }
+        Some(Claim { device: without(&claim.device, local), host_ttl: claim.host_ttl })
+    }
+
+    /// Bring what is announced as `key` in line with [`State::wanted`], with
+    /// goodbyes for what is no longer to be, and forget it once nobody wants
+    /// it and nothing of it is shown. Returns whether anything was sent. If
+    /// sending fails, nothing changes.
+    fn settle(&mut self, key: &str, local: &HashSet<String>, now: Instant) -> Result<bool> {
+        let Some(m) = self.manual.get(key) else {
+            return Ok(false);
+        };
+        let want = self.wanted(key, m, local);
+        // What a device here has is its own: no goodbye takes it back.
+        let mut records = match (&m.shown, &want) {
+            (Some(old), Some(new)) if *old == new.device && m.host_ttl == new.host_ttl => Vec::new(),
+            (None, None) => Vec::new(),
+            (None, Some(new)) => announcement(&new.device, new.host_ttl, m.other_ttl),
+            (Some(old), Some(new)) => replacement(&without(old, local), &new.device, new.host_ttl, m.other_ttl),
+            (Some(old), None) => announcement(&without(old, local), 0, 0),
+        };
+        // A goodbye with the cache-flush bit would also flush the records a
+        // device here has under the same name.
+        for r in records.iter_mut().filter(|r| r.ttl == 0) {
+            r.cache_flush = false;
+        }
+        let sent = !records.is_empty();
+        if sent {
+            send(&self.outbound, &records)?;
+        }
+
+        let m = self.manual.get_mut(key).expect("looked up above");
+        if sent {
+            m.announced = now;
+            m.last_sent = now;
+            m.retry = None;
+        }
+        match want {
+            Some(claim) => {
+                m.shown = Some(claim.device);
+                m.host_ttl = claim.host_ttl;
+            }
+            None => m.shown = None,
+        }
+        if m.claims.is_empty() && m.shown.is_none() {
+            self.manual.remove(key);
+        }
+        Ok(sent)
+    }
+
+    /// [Settle](State::settle) every announced hostname, after the devices
+    /// on this segment changed. One that fails to send is tried again by
+    /// [`Segment::reannounce`], which reports it if it fails again.
+    fn settle_all(&mut self, now: Instant) {
+        let local = self.local_instances();
+        let keys: Vec<String> = self.manual.keys().cloned().collect();
+        for key in keys {
+            if self.settle(&key, &local, now).is_err() {
+                if let Some(m) = self.manual.get_mut(&key) {
+                    m.retry = Some(now + ANNOUNCE_RETRY);
+                }
+            }
+        }
     }
 }
 
@@ -702,7 +788,10 @@ impl Segment {
     /// [`Owner`] wins: an outranked device is only remembered, and announced
     /// once the ones ahead of it are removed. Replacing what is announced
     /// also sends goodbyes for services and addresses that are no longer
-    /// there.
+    /// there. A device on this segment comes first of all: while one has the
+    /// hostname, a reflected device of that name is not announced, and
+    /// services whose instance names one has are left out (the advertised
+    /// name is announced regardless).
     ///
     /// Returns false (and sends nothing) if `owner` already has an identical
     /// device here. If sending fails nothing is recorded.
@@ -738,28 +827,24 @@ impl Segment {
         let now = Instant::now();
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        match state.manual.get_mut(&key) {
-            Some(m) if m.claims.get(&owner) == Some(&claim) => return Ok(false),
-            Some(m) => {
-                // Announced if nobody ahead of it wants the name.
-                if m.claims.keys().next().is_none_or(|first| owner <= *first) {
-                    m.switch_to(&state.outbound, &claim, now)?;
-                }
-                m.claims.insert(owner, claim);
-            }
-            None => {
-                send(&state.outbound, &announcement(&claim.device, host_ttl, OTHER_TTL))?;
-                let manual = Manual {
-                    claims: BTreeMap::new(),
-                    device: claim.device.clone(),
-                    announced: now,
-                    last_sent: now,
-                    retry: None,
-                    host_ttl,
-                    other_ttl: OTHER_TTL,
+        let m = state.manual.entry(key.clone()).or_insert_with(|| Manual::new(now));
+        if m.claims.get(&owner) == Some(&claim) {
+            return Ok(false);
+        }
+        let previous = m.claims.insert(owner, claim);
+        let local = state.local_instances();
+        if let Err(e) = state.settle(&key, &local, now) {
+            // Nothing is recorded: put back what was there.
+            if let Some(m) = state.manual.get_mut(&key) {
+                match previous {
+                    Some(previous) => m.claims.insert(owner, previous),
+                    None => m.claims.remove(&owner),
                 };
-                state.manual.entry(key).or_insert(manual).claims.insert(owner, claim);
+                if m.claims.is_empty() && m.shown.is_none() {
+                    state.manual.remove(&key);
+                }
             }
+            return Err(e);
         }
         drop(guard);
         self.rearm();
@@ -774,54 +859,62 @@ impl Segment {
         let key = hostname.to_ascii_lowercase();
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        let Some(m) = state.manual.get_mut(&key).filter(|m| m.claims.contains_key(&owner)) else {
+        let Some(previous) = state.manual.get_mut(&key).and_then(|m| m.claims.remove(&owner)) else {
             return Ok(false);
         };
-        let announced = m.claims.keys().next() == Some(&owner);
-        match m.claims.values().nth(1).cloned() {
-            Some(next) if announced => m.switch_to(&state.outbound, &next, Instant::now())?,
-            None => send(&state.outbound, &announcement(&m.device, 0, 0))?,
-            // Outranked, so never announced: nothing to take back.
-            Some(_) => {}
-        }
-        m.claims.remove(&owner);
-        if m.claims.is_empty() {
-            state.manual.remove(&key);
+        let local = state.local_instances();
+        if let Err(e) = state.settle(&key, &local, Instant::now()) {
+            if let Some(m) = state.manual.get_mut(&key) {
+                m.claims.insert(owner, previous);
+            }
+            return Err(e);
         }
         drop(guard);
         self.rearm();
         Ok(true)
     }
 
-    /// The devices announced on this segment: for each hostname, the one
-    /// that won.
+    /// The devices announced on this segment: for each hostname, what is
+    /// shown of the one that won.
     pub fn manual_devices(&self) -> Vec<Device> {
         let state = self.state.lock().unwrap();
-        state.manual.values().map(|m| m.device.clone()).collect()
+        state.manual.values().filter_map(|m| m.shown.clone()).collect()
     }
 
     /// Re-announce reflected devices that have not had a full announcement
-    /// for 80% of their TTL. A failed send is retried after [`ANNOUNCE_RETRY`]; the
-    /// first error is returned after every device was tried. Run by
-    /// [`Segment::schedule`] when due.
+    /// for 80% of their TTL, and try again what failed to send. A failed send
+    /// is retried after [`ANNOUNCE_RETRY`]; the first error is returned after
+    /// every device was tried. Run by [`Segment::schedule`] when due.
     pub fn reannounce(&self, now: Instant) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
-        let State { manual, outbound, .. } = &mut *guard;
+        let state = &mut *guard;
+        let local = state.local_instances();
+        let due: Vec<String> = state
+            .manual
+            .iter()
+            .filter(|(_, m)| m.reannounce_at().is_some_and(|at| at <= now))
+            .map(|(key, _)| key.clone())
+            .collect();
         let mut first_err = None;
-        for m in manual.values_mut() {
-            if now < m.reannounce_at() {
-                continue;
-            }
-            match send(outbound, &announcement(&m.device, m.host_ttl, m.other_ttl)) {
-                Ok(()) => {
+        for key in due {
+            // What is out of line is settled first, which announces it.
+            let result = state.settle(&key, &local, now).and_then(|sent| {
+                let Some(m) = state.manual.get_mut(&key).filter(|_| !sent) else {
+                    return Ok(());
+                };
+                if let Some(device) = &m.shown {
+                    send(&state.outbound, &announcement(device, m.host_ttl, m.other_ttl))?;
                     m.announced = now;
                     m.last_sent = now;
-                    m.retry = None;
                 }
-                Err(e) => {
+                m.retry = None;
+                Ok(())
+            });
+            if let Err(e) = result {
+                if let Some(m) = state.manual.get_mut(&key) {
                     m.retry = Some(now + ANNOUNCE_RETRY);
-                    first_err.get_or_insert(e);
                 }
+                first_err.get_or_insert(e);
             }
         }
         first_err.map_or(Ok(()), Err)
@@ -832,13 +925,16 @@ impl Segment {
     /// Replies are multicast, except to legacy resolvers (source port other
     /// than 5353), which get a unicast reply that echoes the question. Known
     /// answers in the query suppress our answer, and a device's records are
-    /// not multicast more than once a second.
+    /// not multicast more than once a second. A device probing for names it
+    /// is about to take is not answered with reflected copies: it would take
+    /// them for a conflict, and once it announces, the copy gives way.
     fn respond(&self, from: SocketAddr, query: &Message) -> Result<()> {
         let h = &query.header;
         if h.response || h.opcode != 0 || h.rcode != 0 || query.questions.is_empty() {
             return Ok(());
         }
         let legacy = from.port() != MDNS_PORT;
+        let probing = !query.authorities.is_empty();
         let now = Instant::now();
 
         let mut guard = self.state.lock().unwrap();
@@ -847,7 +943,11 @@ impl Segment {
         let mut additionals: Vec<Record> = Vec::new();
         let mut used = Vec::new();
         for (key, m) in &state.manual {
-            let (a, x) = answers_for(query, &m.device, m.host_ttl, m.other_ttl);
+            let Some(device) = &m.shown else { continue };
+            if probing && m.claims.keys().next() != Some(&Owner::Own) {
+                continue;
+            }
+            let (a, x) = answers_for(query, device, m.host_ttl, m.other_ttl);
             if a.is_empty() {
                 continue;
             }
@@ -956,6 +1056,9 @@ impl Segment {
                 state.forget(key);
             }
             let events = touched.events(&state.discovered);
+            if !events.is_empty() {
+                state.settle_all(now);
+            }
             for event in events {
                 state.notify(event);
             }
@@ -1066,6 +1169,9 @@ impl Segment {
         }
 
         let events = touched.events(&state.discovered);
+        if !events.is_empty() {
+            state.settle_all(now);
+        }
         for event in events {
             state.notify(event);
         }
@@ -1175,11 +1281,17 @@ impl Segment {
             .filter(|&(_, e)| e.expires <= now)
             .map(|(key, _)| key.clone())
             .collect();
+        if stale.is_empty() {
+            return;
+        }
         for key in stale {
             if let Some(entry) = state.forget(&key) {
                 state.notify(Event::Removed(entry.device()));
             }
         }
+        // What they had here may be shown again. `now` may be ahead of the
+        // clock, but what is announced is announced now.
+        state.settle_all(Instant::now());
     }
 }
 
@@ -1417,6 +1529,14 @@ fn replacement(old: &Device, new: &Device, host_ttl: u32, other_ttl: u32) -> Vec
         records.push(record(host.clone(), true, 0, address_data(gone)));
     }
     records
+}
+
+/// `device` without the services whose instance names are in `taken`
+/// (lowercase).
+fn without(device: &Device, taken: &HashSet<String>) -> Device {
+    let mut device = device.clone();
+    device.services.retain(|s| !taken.contains(&s.instance.to_ascii_lowercase()));
+    device
 }
 
 /// The TTL to announce `svc` with: the one it announced itself with (at least
@@ -1825,6 +1945,73 @@ mod tests {
         assert!(seg.remove_manual(second, "tv.local").unwrap());
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
         assert!(seg.manual_devices().is_empty());
+    }
+
+    /// A device here offering a service of the same instance name as one of
+    /// a reflected device's: the copy leaves it out while that device is here.
+    #[test]
+    fn a_service_named_like_one_here_is_left_out_of_the_copy() {
+        let (seg, rx) = wired();
+        let kitchen = || {
+            vec![
+                a_record("nas.local", "10.0.1.20"),
+                ptr("_http._tcp.local", "Kitchen._http._tcp.local"),
+                srv("Kitchen._http._tcp.local", 80, "nas.local"),
+            ]
+        };
+        let mentions_kitchen = |m: &Message| {
+            m.answers.iter().any(|r| r.name.starts_with("Kitchen.") || r.data == RData::Ptr("Kitchen._http._tcp.local".into()))
+        };
+        hear(&seg, "10.0.1.20", kitchen());
+
+        seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["Kitchen", "Den"])).unwrap();
+        assert!(!mentions_kitchen(&recv(&rx).unwrap()));
+        assert_eq!(seg.manual_devices(), [tv("10.0.2.9", &["Den"])]);
+
+        // Shown once the device here goes...
+        seg.expire(Instant::now() + Duration::from_secs(36000));
+        let m = recv(&rx).unwrap();
+        assert!(m.answers.iter().any(|r| r.name == "Kitchen._http._tcp.local" && r.ttl > 0));
+        assert_eq!(seg.manual_devices(), [tv("10.0.2.9", &["Kitchen", "Den"])]);
+
+        // ...and left out again, without a goodbye, when it is back: that
+        // would take back its records too.
+        hear(&seg, "10.0.1.20", kitchen());
+        assert!(!mentions_kitchen(&recv(&rx).unwrap()));
+        assert_eq!(seg.manual_devices(), [tv("10.0.2.9", &["Den"])]);
+    }
+
+    /// A query with proposed records in its authority section is a device
+    /// probing for a name: a reflected copy does not answer it, the
+    /// advertised name does.
+    #[test]
+    fn a_device_probing_for_a_name_is_not_answered_with_a_copy() {
+        let (seg, rx) = wired();
+        let router = Device { hostname: Some("router.local".into()), routable: Some(ip("10.0.1.1")), ..Device::default() };
+        seg.add_manual(Owner::Own, router).unwrap();
+        seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+        while recv(&rx).is_some() {}
+        age(&seg, 2);
+        let probe = |name: &str| {
+            Message {
+                header: Header { id: 0, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 },
+                questions: vec![parser::Question { name: name.into(), qtype: rtype::ANY, class: 1, unicast_response: false }],
+                answers: vec![],
+                authorities: vec![a_record(name, "10.0.1.5")],
+                additionals: vec![],
+            }
+            .encode()
+            .unwrap()
+        };
+
+        seg.handle(sa("10.0.1.5"), &probe("tv.local")).unwrap();
+        assert!(recv(&rx).is_none());
+        seg.handle(sa("10.0.1.5"), &probe("router.local")).unwrap();
+        assert_eq!(recv(&rx).unwrap().answers[0].data, RData::A("10.0.1.1".parse().unwrap()));
+
+        // An ordinary query is answered as ever.
+        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::ANY, vec![])).unwrap();
+        assert!(recv(&rx).is_some());
     }
 
     #[test]
@@ -2739,7 +2926,7 @@ mod tests {
         let first = recv(&rx).unwrap();
         assert!(first.answers.iter().all(|r| r.ttl == 1000));
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(800));
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), Some(announced + Duration::from_secs(800)));
 
         // Queries are answered with it too.
         age(&seg, 2);
@@ -2790,7 +2977,7 @@ mod tests {
 
         // It is announced again before the shortest of them runs out: 80% of 300.
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(240));
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), Some(announced + Duration::from_secs(240)));
     }
 
     #[test]
@@ -2799,7 +2986,7 @@ mod tests {
         seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 50)).unwrap();
         assert!(announced_ttls(&rx).contains(&(false, 50)));
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(40));
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), Some(announced + Duration::from_secs(40)));
     }
 
     #[test]
@@ -2825,7 +3012,7 @@ mod tests {
         assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
         // The services run out first, and it is announced again before that.
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), announced + Duration::from_secs(480));
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), Some(announced + Duration::from_secs(480)));
 
         // Even a tiny setting is kept to the floor.
         seg.set_reflect_ttl(Some(Duration::from_secs(1)));

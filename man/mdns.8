@@ -141,6 +141,8 @@ interface listed first in the segment wins, and where segments share an
 interface, the one from the segment listed first in the config; the other takes
 over when it goes.
 The advertised name always wins over a reflected device.
+A device on the interface itself comes first of all: while it has a hostname,
+or a service instance name, no reflected copy of it is announced there.
 Different hostnames never clash, even on one address: a device with several
 names has each of them reflected.
 .SS Control socket
