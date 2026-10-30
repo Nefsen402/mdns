@@ -1979,6 +1979,138 @@ mod tests {
         assert_eq!(Segment::new("quiet", &[Family::V4]).query_types_with(&kinds, &[Duration::ZERO]).unwrap(), 0);
     }
 
+    /// A way to send over IPv4 that always fails: its group is an IPv6
+    /// address, which an IPv4 socket refuses at once.
+    fn broken() -> (UdpSocket, SocketAddr) {
+        (UdpSocket::bind("127.0.0.1:0").unwrap(), "[::1]:5353".parse().unwrap())
+    }
+
+    /// Give `seg` a working way to send again, to `rx`.
+    fn repair(seg: &Segment, rx: &UdpSocket) {
+        seg.attach(Family::V4, UdpSocket::bind("127.0.0.1:0").unwrap(), rx.local_addr().unwrap());
+    }
+
+    fn retry_of(seg: &Segment, host: &str) -> Option<Instant> {
+        seg.state.lock().unwrap().manual[host].retry
+    }
+
+    /// A device that cannot be announced is not recorded, so that it is
+    /// offered again and announced once sending works; one that cannot be
+    /// replaced stays as it was announced.
+    #[test]
+    fn a_device_that_cannot_be_announced_is_not_recorded() {
+        let (seg, rx) = wired();
+        let (socket, dest) = broken();
+        seg.attach(Family::V4, socket, dest);
+        let err = seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap_err();
+        assert!(format!("{err:#}").contains("sending to [::1]:5353"), "{err:#}");
+        assert!(seg.manual_devices().is_empty());
+        assert!(seg.state.lock().unwrap().manual.is_empty(), "nothing left behind");
+
+        repair(&seg, &rx);
+        assert!(seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap());
+        recv(&rx).unwrap();
+
+        let (socket, dest) = broken();
+        seg.attach(Family::V4, socket, dest);
+        assert!(seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV", "Cast"])).is_err());
+        let shown: Vec<String> = seg.manual_devices()[0].services.iter().map(|s| s.instance.clone()).collect();
+        assert_eq!(shown, ["TV._http._tcp.local"], "still what was announced");
+        // And it is what is recorded: offering it again changes nothing.
+        assert!(!seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap());
+    }
+
+    /// A device whose goodbye cannot be sent is kept, so that withdrawing it
+    /// is tried again, and goes out once sending works.
+    #[test]
+    fn a_device_that_cannot_be_withdrawn_is_kept() {
+        let (seg, rx) = wired();
+        seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+        recv(&rx).unwrap();
+
+        let (socket, dest) = broken();
+        seg.attach(Family::V4, socket, dest);
+        assert!(seg.remove_manual(Owner::Reflector(0), "tv.local").is_err());
+        assert_eq!(seg.manual_devices().len(), 1, "kept");
+
+        repair(&seg, &rx);
+        assert!(seg.remove_manual(Owner::Reflector(0), "tv.local").unwrap());
+        let goodbye = recv(&rx).unwrap();
+        assert!(!goodbye.answers.is_empty() && goodbye.answers.iter().all(|r| r.ttl == 0));
+        assert!(seg.manual_devices().is_empty());
+    }
+
+    /// An announcement that fails is tried again after [`ANNOUNCE_RETRY`],
+    /// and again after that while it still fails; once it goes out, the
+    /// device is back on its usual schedule.
+    #[test]
+    fn an_announcement_that_fails_is_tried_again() {
+        let (seg, rx) = wired();
+        seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+        recv(&rx).unwrap();
+
+        let (socket, dest) = broken();
+        seg.attach(Family::V4, socket, dest);
+        let before = Instant::now();
+        assert!(seg.announce_all().is_err());
+        let retry = retry_of(&seg, "tv.local").expect("to be tried again");
+        assert!(retry >= before + ANNOUNCE_RETRY && retry <= Instant::now() + ANNOUNCE_RETRY);
+
+        // Not before then.
+        seg.reannounce(before).unwrap();
+        assert_eq!(retry_of(&seg, "tv.local"), Some(retry));
+        // Then, still failing: put off again.
+        assert!(seg.reannounce(retry).is_err());
+        let again = retry_of(&seg, "tv.local").expect("to be tried again");
+        assert_eq!(again, retry + ANNOUNCE_RETRY);
+
+        repair(&seg, &rx);
+        seg.reannounce(again).unwrap();
+        let announced = recv(&rx).expect("announced once it can be");
+        assert!(announced.answers.iter().any(|r| r.data == RData::A("10.0.2.9".parse().unwrap()) && r.ttl > 0));
+        assert_eq!(retry_of(&seg, "tv.local"), None, "on its usual schedule again");
+    }
+
+    /// A copy that has to give way to a device here, but whose goodbye
+    /// cannot be sent, stays shown and is tried again; once sending works the
+    /// goodbye goes out and the copy is no longer shown.
+    #[test]
+    fn a_copy_that_cannot_give_way_is_withdrawn_once_it_can() {
+        let (seg, rx) = wired();
+        seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+        recv(&rx).unwrap();
+
+        let (socket, dest) = broken();
+        seg.attach(Family::V4, socket, dest);
+        hear(&seg, "10.0.1.50", vec![a_record("tv.local", "10.0.1.50"), srv("Den._http._tcp.local", 80, "tv.local")]);
+        let retry = retry_of(&seg, "tv.local").expect("to be tried again");
+        assert_eq!(seg.manual_devices().len(), 1, "still shown: the goodbye did not go out");
+
+        repair(&seg, &rx);
+        seg.reannounce(retry).unwrap();
+        let goodbye = recv(&rx).unwrap();
+        assert!(goodbye.answers.iter().any(|r| r.data == RData::A("10.0.2.9".parse().unwrap()) && r.ttl == 0));
+        assert!(seg.manual_devices().is_empty(), "given way");
+        assert_eq!(retry_of(&seg, "tv.local"), None);
+    }
+
+    /// Every family is tried, whichever fails: the announcement goes out over
+    /// the one that works, and the failure of the other is reported.
+    #[test]
+    fn every_family_is_tried_when_one_fails() {
+        // The one that fails comes first, so the other is only tried if
+        // sending goes on past a failure.
+        let (_, rx) = wired();
+        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let (socket, dest) = broken();
+        seg.attach(Family::V4, socket, dest);
+        seg.attach(Family::V6, UdpSocket::bind("127.0.0.1:0").unwrap(), rx.local_addr().unwrap());
+        let err = seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap_err();
+        assert!(format!("{err:#}").contains("[::1]:5353"), "{err:#}");
+        let sent = recv(&rx).expect("sent over the other family all the same");
+        assert!(sent.answers.iter().any(|r| r.data == RData::A("10.0.2.9".parse().unwrap())));
+    }
+
     /// One sender may describe only so many hosts: a sleep proxy speaks for
     /// several, but not for thousands. Others are not held back, and the
     /// hosts it described are still kept up to date.

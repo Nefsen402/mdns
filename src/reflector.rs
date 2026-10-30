@@ -26,7 +26,7 @@ use crate::socket::{Asked, Event, Owner, Segment};
 const TICK: Duration = Duration::from_millis(250);
 
 /// How often a worker reconciles even without events, to retry failed sends.
-const RETRY: Duration = Duration::from_secs(5);
+const RETRY: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 5000 });
 
 /// Which of the questions asked on one of a reflector's segments it puts to
 /// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
@@ -988,6 +988,39 @@ mod tests {
             let asked = asked_names(&drain(&media_rx));
             assert_eq!(asked.is_empty(), forward == Forward::Never, "{forward:?}: {asked:?}");
         }
+    }
+
+    /// A copy that cannot be announced is tried again until it can be, and
+    /// one whose device is gone stays until its goodbye can go out: none is
+    /// missing for good, and none outlives its source.
+    #[test]
+    fn failed_sends_are_retried_until_they_go_through() {
+        let (a, _a_rx) = wired("a");
+        let (b, b_rx) = wired("b");
+        let broken = || (UdpSocket::bind("127.0.0.1:0").unwrap(), "[::1]:5353".parse::<SocketAddr>().unwrap());
+        let repair = || b.attach(Family::V4, UdpSocket::bind("127.0.0.1:0").unwrap(), b_rx.local_addr().unwrap());
+        let (socket, dest) = broken();
+        b.attach(Family::V4, socket, dest);
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
+
+        announce(&a, "10.0.1.5", "tv.local", &["TV"]);
+        thread::sleep(RETRY * 3);
+        assert!(b.manual_devices().is_empty(), "it could not be announced");
+        repair();
+        wait_for(|| b.manual_devices().len() == 1);
+        let told: Vec<Record> = drain(&b_rx).into_iter().flat_map(|m| m.answers).collect();
+        assert!(told.iter().any(|r| r.data == RData::A("10.0.1.5".parse().unwrap()) && r.ttl > 0), "{told:?}");
+
+        // Gone from a while b cannot send: the copy stays until its goodbye goes out.
+        let (socket, dest) = broken();
+        b.attach(Family::V4, socket, dest);
+        a.expire(Instant::now() + Duration::from_secs(100_000));
+        thread::sleep(RETRY * 3);
+        assert_eq!(b.manual_devices().len(), 1, "kept: its goodbye did not go out");
+        repair();
+        wait_for(|| b.manual_devices().is_empty());
+        let told: Vec<Record> = drain(&b_rx).into_iter().flat_map(|m| m.answers).collect();
+        assert!(told.iter().any(|r| r.data == RData::A("10.0.1.5".parse().unwrap()) && r.ttl == 0), "{told:?}");
     }
 
     /// A device's IPv6 address heard over IPv4 is reflected with it, for
