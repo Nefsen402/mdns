@@ -1177,13 +1177,20 @@ impl Segment {
             if !state.discovered.contains_key(&key) && !state.room_for(src) {
                 continue;
             }
+            // Goodbyes alone for a device not known here (one that already
+            // left by its other family's goodbye) leave nothing to forget, and
+            // are not to bring it back.
+            if report.addrs.is_empty() && !report.gone.is_empty() && !state.discovered.contains_key(&key) {
+                continue;
+            }
             // The sender, if it announced the address the packet came from, or
             // is the only host described and announced no address of that
-            // family: not even one no one can be reached at, which is not to be
-            // made good with the sender's.
+            // family: not even one no one can be reached at, or one it says
+            // goodbye to, which are not to be made good with the sender's.
             let same_family = |a: &IpAddr| a.is_ipv4() == src.is_ipv4();
             let is_sender = report.addrs.contains(&src)
-                || (!report.addrs.iter().chain(&report.refused).any(same_family) && reports.len() == 1);
+                || (!report.addrs.iter().chain(&report.refused).chain(&report.gone).any(same_family)
+                    && reports.len() == 1);
             let mut addrs = report.addrs.clone();
             if is_sender && !addrs.contains(&src) {
                 addrs.push(src);
@@ -1982,6 +1989,34 @@ mod tests {
 
         hear(&seg, "2001:db8::6", vec![bye("2001:db8::6"), bye("fd00::5")]);
         assert!(seg.devices().iter().all(|d| d.hostname.is_none()), "gone");
+    }
+
+    /// A device saying goodbye once over each family, the same records each
+    /// time, leaves in whichever order the two arrive. The IPv6 one comes from
+    /// a link-local address it never announced: it is not to be credited with
+    /// that, nor brought back by it once the IPv4 one has seen it off.
+    #[test]
+    fn goodbyes_over_both_families_leave_in_either_order() {
+        let records = |ttl| {
+            vec![
+                Record { ttl, ..a_record("test.local", "10.0.2.160") },
+                Record { ttl, ..aaaa("test.local", "fd00:2::160") },
+                Record { ttl, ..aaaa("test.local", "2001:db8:2::160") },
+                Record { ttl, ..srv("Test._http._tcp.local", 8080, "test.local") },
+            ]
+        };
+        for (first, second) in [("10.0.2.160", "fe80::160"), ("fe80::160", "10.0.2.160")] {
+            let seg = Segment::new("test", &[Family::V4, Family::V6]);
+            hear(&seg, "10.0.2.160", records(120));
+            hear(&seg, first, records(0));
+            assert!(
+                seg.devices().iter().all(|d| !d.addresses.contains(&ip("fe80::160"))),
+                "goodbye from {first}: {:?}",
+                seg.devices()
+            );
+            hear(&seg, second, records(0));
+            assert!(seg.devices().is_empty(), "goodbyes from {first} then {second}: {:?}", seg.devices());
+        }
     }
 
     /// When the interface goes, the segment lets go of its sockets and of the
