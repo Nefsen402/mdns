@@ -26,6 +26,7 @@
 //! Name="IoT"
 //! Interfaces=wifi
 //! ProbeInterval=1min  ; [Probe] ProbeInterval= unless set
+//! ForwardQuestions=unknown  ; always, unknown or never; always unless set
 //! ```
 //!
 //! Each `[Segment]` is a group of interfaces whose devices are reflected
@@ -43,6 +44,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use systemd_unit_edit::{parse_timespan, Entry, Parse, SystemdUnit, TimespanParseError};
+
+use crate::reflector::Forward;
 
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
@@ -81,6 +84,8 @@ pub struct SegmentConfig {
     /// How often to probe its interfaces for devices: `None` follows
     /// `[Probe] ProbeInterval=`, and `Some(None)` is off for this segment.
     pub probe_interval: Option<Option<Duration>>,
+    /// Which questions asked on one of its interfaces are put to the others.
+    pub forward: Forward,
 }
 
 #[derive(Debug)]
@@ -215,6 +220,9 @@ impl Config {
                     ("segment", "probeinterval") => {
                         let interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
                         config.segments.last_mut().unwrap().probe_interval = Some(interval);
+                    }
+                    ("segment", "forwardquestions") => {
+                        config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
                     }
                     ("listen", "ipv4") => config.ipv4 = parse_bool(&entry, lineno)?,
                     ("listen", "ipv6") => config.ipv6 = parse_bool(&entry, lineno)?,
@@ -435,6 +443,16 @@ fn parse_span(value: &str, lineno: usize, key: &str, min: Duration) -> Result<Op
 }
 
 /// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
+fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
+    match value.to_ascii_lowercase().as_str() {
+        // An empty assignment resets, as everywhere.
+        "always" | "" => Ok(Forward::Always),
+        "unknown" => Ok(Forward::Unknown),
+        "never" => Ok(Forward::Never),
+        _ => bail!("line {lineno}: invalid ForwardQuestions {value:?}: always, unknown or never"),
+    }
+}
+
 fn parse_bool(entry: &Entry, lineno: usize) -> Result<bool> {
     entry
         .value_as_bool()
@@ -566,7 +584,7 @@ interfaces=br0,wifi
         let man = include_str!("../man/mdnsd.conf.5");
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
-            "ReflectTTL=", "MaxAddresses=", "Name=", "Interfaces=", "Untrusted=",
+            "ReflectTTL=", "MaxAddresses=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
@@ -668,6 +686,21 @@ interfaces=br0,wifi
         // A value may contain an equals sign.
         let c = Config::parse("[Segment]\nName=a=b\nInterfaces=x\n").unwrap();
         assert_eq!(c.segments[0].name, "a=b");
+    }
+
+    /// Each segment forwards every question unless it says otherwise.
+    #[test]
+    fn forwarding_questions_is_set_per_segment_and_always_by_default() {
+        let forward = |extra: &str| {
+            let c = Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=z")).unwrap();
+            (c.segments[0].forward, c.segments[1].forward)
+        };
+        assert_eq!(forward(""), (Forward::Always, Forward::Always));
+        assert_eq!(forward("ForwardQuestions=Unknown"), (Forward::Unknown, Forward::Always));
+        assert_eq!(forward("ForwardQuestions=never"), (Forward::Never, Forward::Always));
+        assert_eq!(forward("ForwardQuestions=never\nForwardQuestions="), (Forward::Always, Forward::Always));
+        let bad = error_of("[Segment]\nName=a\nInterfaces=x\nForwardQuestions=sometimes");
+        assert!(bad.contains("line 4") && bad.contains("ForwardQuestions"), "{bad}");
     }
 
     #[test]

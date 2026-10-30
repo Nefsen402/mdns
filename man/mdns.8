@@ -76,11 +76,18 @@ section of
 .BR mdnsd.conf (5)
 (it is not by default).
 .PP
-A query that nothing the daemon announces on an interface can answer, and that
-is not about a name a device there owns, is also asked by the daemon on the
-other interfaces of that interface's segments, in a query of its own: the answer
-is reflected, and the client asking again is answered.
-Only the question crosses, not the client's address or known answers.
+A query that is not about a name a device on the interface owns is also asked
+by the daemon on the other interfaces of that interface's segments, in a query
+of its own: the answer is reflected, and the client asking again is answered.
+This finds devices that only answer when asked, even of a type another device
+was already heard to have; a segment can ask only what nothing announced on the
+interface answers, or nothing, with
+.B ForwardQuestions=
+in
+.BR mdnsd.conf (5).
+Only the question crosses, not the client's address or known answers; the
+daemon's query carries what it already knows of the answer on that interface as
+known answers, so that only devices it has not heard of answer.
 A question is asked on an interface at most once a second; an untrusted
 interface's questions are asked nowhere.
 .PP

@@ -320,6 +320,7 @@ be yours alone.
 | `Name`       | Required. Unique name, used by `mdnsctl`. Quote it if it has spaces. |
 | `Interfaces` | Required. Interfaces in the segment, separated by commas and/or spaces. |
 | `Untrusted`  | Optional. Interfaces of the segment that are announced nothing (see below). |
+| `ForwardQuestions` | Optional. Which questions asked on one of its interfaces are asked on the others: `always` (the default), `unknown` (only those nothing announced there answers) or `never` (see below). |
 | `ProbeInterval` | Optional. How often to probe its interfaces, in place of [`[Probe] ProbeInterval`](#probe-optional); `0`/`off` turns it off for this segment. |
 
 Probing is done per interface, so an interface in several segments is probed as
@@ -358,14 +359,24 @@ addresses of devices that have a name but no routable address yet. Many devices
 answer only when asked, and a device needs a hostname and a routable address to
 be reflected, so without probing they would stay invisible.
 
-Devices are also found by **asking on a client's behalf**. A query that nothing
-the daemon announces on that interface can answer (and that is not about a name
-a device there owns) is asked again, by the daemon, on the other interfaces of
-its segments: those whose devices it is told about. The answer is reflected like
-any other, and the client, asking again a second later as clients do, is
-answered. Only the question crosses, in the daemon's own query: not the client's
-address, nor the known answers in its query, nor its wish for a unicast reply.
-A question is asked on an interface at most once a second. An untrusted
+Devices are also found by **asking on a client's behalf**. A query that is not
+about a name a device on that interface owns is asked again, by the daemon, on
+the other interfaces of its segments: those whose devices it is told about. The
+answer is reflected like any other, and the client, asking again a second later
+as clients do, is answered. Only the question crosses, in the daemon's own
+query: not the client's address, nor the known answers in its query, nor its
+wish for a unicast reply. The daemon's query carries what it already knows of
+the answer on that interface as known answers, each with the time it has left,
+so that only devices it has not heard of (or is about to forget) answer.
+A question is asked on an interface at most once a second.
+
+That is `ForwardQuestions=always`, the default, and it is what finds a device
+that only answers when asked, even when another device of its type is known: a
+browse has as many answers as devices of the type. `ForwardQuestions=unknown`
+asks only what nothing the daemon announces on the asking interface answers,
+which is less traffic but misses such a device once one of its type is
+reflected; `ForwardQuestions=never` asks nothing, leaving devices to be found by
+what they announce and by probing. An untrusted
 interface's questions are asked nowhere, since nothing could be reflected back
 to it, but questions are asked *on* untrusted interfaces, so they see the names
 the others look for (not who looks).

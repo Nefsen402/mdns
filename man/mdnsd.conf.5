@@ -294,6 +294,24 @@ Several untrusted interfaces do not learn about each other either.
 Devices are still tracked on an untrusted interface, and listed by
 .BR mdnsctl (1).
 .TP
+.B ForwardQuestions=
+Optional.
+Which questions asked on an interface of this segment the daemon asks on its
+other interfaces, in a query of its own, so that the answer is reflected:
+.B always
+(the default) asks every one,
+.B unknown
+only those that nothing announced on the asking interface answers, and
+.B never
+none.
+With
+.BR unknown ,
+a device that only answers when asked is not found once another device of its
+type has been: a browse for that type is answered from the copy of the other.
+Questions about a name a device on the asking interface owns, and those of a
+device probing for its names, are never asked elsewhere; nor are those of an
+untrusted interface.
+.TP
 .B ProbeInterval=
 Optional.
 How often to probe the interfaces of this segment for devices, in place of the

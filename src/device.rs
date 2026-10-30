@@ -27,6 +27,11 @@ pub const META_QUERY: &str = "_services._dns-sd._udp.local";
 /// Questions per query packet, to stay well inside one Ethernet frame.
 pub const QUESTIONS_PER_PACKET: usize = 16;
 
+/// The most a query with known answers is let grow to, to stay inside one
+/// Ethernet frame. Known answers that do not fit are left out: those devices
+/// answer, which is only more traffic.
+const KNOWN_ANSWERS_SIZE: usize = 1400;
+
 /// Subtypes a probe asks for when their type is around. A device sends its
 /// subtypes only when it announces itself and when asked for one by name,
 /// not when its type is browsed, yet some clients browse by subtype alone:
@@ -724,12 +729,39 @@ impl Device {
     /// Queries that ask `questions`, put on another segment, as this
     /// daemon's own: each once, a few to a packet, and for a multicast answer
     /// whatever the asker wanted, so that it is heard and can be reflected.
-    pub fn forward_queries<'a>(questions: impl IntoIterator<Item = &'a Question>) -> Vec<Message> {
+    /// Each packet carries the `known` answers to its questions, as many as
+    /// fit, so that devices already heard of need not answer.
+    pub fn forward_queries<'a>(
+        questions: impl IntoIterator<Item = &'a Question>,
+        known: impl Fn(&Question) -> Vec<Record>,
+    ) -> Vec<Message> {
         let mut qs = Questions::default();
         for q in questions {
             qs.ask(&q.name, q.qtype);
         }
-        qs.into_queries()
+        let mut queries = qs.into_queries();
+        for msg in &mut queries {
+            let records: Vec<Record> = msg.questions.iter().flat_map(&known).collect();
+            for rec in records {
+                if msg.answers.contains(&rec) {
+                    continue;
+                }
+                msg.answers.push(rec);
+                if msg.encode().map_or(true, |b| b.len() > KNOWN_ANSWERS_SIZE) {
+                    msg.answers.pop();
+                    break;
+                }
+            }
+        }
+        queries
+    }
+
+    /// Its records that answer `q`, with these TTLs, without the additional
+    /// records an answer brings, nor an NSEC saying it has none.
+    pub fn records_for(&self, q: &Question, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
+        let (mut records, _) = self.answers(&query(std::slice::from_ref(q)), host_ttl, other_ttl);
+        records.retain(|r| r.rtype() != rtype::NSEC);
+        records
     }
 
     /// Whether it has an answer to `q`: a record, or, by its NSEC, the word
@@ -1296,16 +1328,59 @@ mod tests {
     fn forwarded_queries_ask_each_question_once_for_a_multicast_answer() {
         let ask = |name: &str, qtype: u16, unicast_response: bool| Question { name: name.into(), qtype, class: 255, unicast_response };
         let questions = [ask("printer.local", rtype::A, true), ask("Printer.local", rtype::A, false), ask("_ipp._tcp.local", rtype::PTR, false)];
-        let queries = Device::forward_queries(&questions);
+        let none = |_: &Question| Vec::new();
+        let queries = Device::forward_queries(&questions, none);
         assert_eq!(asked(&queries), [q("printer.local", rtype::A), q("_ipp._tcp.local", rtype::PTR)]);
         assert!(queries.iter().flat_map(|m| &m.questions).all(|q| !q.unicast_response && q.class == 1));
-        assert!(Device::forward_queries(&[]).is_empty());
+        assert!(queries.iter().all(|m| m.answers.is_empty()));
+        assert!(Device::forward_queries(&[], none).is_empty());
 
         // A name that cannot be encoded again (a label past 63 bytes) is
         // skipped, not the whole query failed.
         let long = format!("{}.local", "x".repeat(64));
-        let queries = Device::forward_queries(&[ask(&long, rtype::A, false), ask("ok.local", rtype::A, false)]);
+        let queries = Device::forward_queries(&[ask(&long, rtype::A, false), ask("ok.local", rtype::A, false)], none);
         assert_eq!(asked(&queries), [q("ok.local", rtype::A)]);
+    }
+
+    /// The records a device has for a question, as known answers: not the
+    /// additional ones an answer brings, nor the NSEC saying it has none.
+    #[test]
+    fn records_for_a_question_are_only_the_records_it_has() {
+        let ask = |name: &str, qtype: u16| Question { name: name.into(), qtype, class: 1, unicast_response: false };
+        let mut device = tv("10.0.1.9", &["TV"]);
+        device.nsec = Some(vec![rtype::A]);
+        let records = device.records_for(&ask("_http._tcp.local", rtype::PTR), 120, 4500);
+        let kinds: Vec<u16> = records.iter().map(Record::rtype).collect();
+        assert_eq!(kinds, [rtype::PTR]);
+        assert!(device.knows(&ask("tv.local", rtype::AAAA)), "its NSEC says it has none");
+        assert!(device.records_for(&ask("tv.local", rtype::AAAA), 120, 4500).is_empty());
+    }
+
+    /// The known answers to each question go along with it, once each, and
+    /// only as many as fit in a frame: the rest of the devices just answer.
+    #[test]
+    fn forwarded_queries_carry_what_fits_of_the_known_answers() {
+        let browse = |name: &str| Question { name: name.into(), qtype: rtype::PTR, class: 1, unicast_response: false };
+        let ptr = |kind: &str, i: usize| Record {
+            name: kind.into(),
+            class: 1,
+            cache_flush: false,
+            ttl: 4500,
+            data: RData::Ptr(format!("Device {i}.{kind}")),
+        };
+        let known = |q: &Question| (0..3).map(|i| ptr(&q.name, i)).collect::<Vec<_>>();
+        let questions = [browse("_http._tcp.local"), browse("_ipp._tcp.local"), browse("_http._tcp.local")];
+        let queries = Device::forward_queries(&questions, known);
+        assert_eq!(queries.len(), 1);
+        let mut expected = known(&questions[0]);
+        expected.extend(known(&questions[1]));
+        assert_eq!(queries[0].answers, expected);
+
+        let many = |q: &Question| (0..200).map(|i| ptr(&q.name, i)).collect::<Vec<_>>();
+        let queries = Device::forward_queries(&questions[..1], many);
+        let size = queries[0].encode().unwrap().len();
+        assert!(size <= KNOWN_ANSWERS_SIZE && size > KNOWN_ANSWERS_SIZE - 100, "{size}");
+        assert!(queries[0].answers.len() < 200 && !queries[0].answers.is_empty());
     }
 
     #[test]

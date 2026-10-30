@@ -20,14 +20,28 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 
 use crate::device::{Device, Service};
-use crate::parser::Question;
-use crate::socket::{Event, Owner, Segment};
+use crate::socket::{Asked, Event, Owner, Segment};
 
 /// How often a worker checks for shutdown while waiting for events.
 const TICK: Duration = Duration::from_millis(250);
 
 /// How often a worker reconciles even without events, to retry failed sends.
 const RETRY: Duration = Duration::from_secs(5);
+
+/// Which of the questions asked on one of a reflector's segments it puts to
+/// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
+/// device on the asking segment owns: it answers for itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Forward {
+    /// Every one. A browse for a type that one device was heard to have can
+    /// have other answers still, from devices that only answer when asked.
+    #[default]
+    Always,
+    /// Those that nothing announced on the asking segment has an answer to.
+    Unknown,
+    /// None: only what devices announce, or answer a probe with, is reflected.
+    Never,
+}
 
 /// A change to a device discovered on one of a reflector's segments, as
 /// [`Reflector::watch`] delivers it.
@@ -53,6 +67,7 @@ struct Inner {
     segments: Vec<Segment>,
     /// Whether each segment is untrusted: it is not announced anything.
     untrusted: Vec<bool>,
+    forward: Forward,
     book: Mutex<Book>,
     stop: AtomicBool,
     subscribers: Mutex<Vec<Sender<Notice>>>,
@@ -87,6 +102,12 @@ impl Reflector {
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
     pub fn with_untrusted(rank: u32, segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
+        Self::with_options(rank, segments, untrusted, Forward::default())
+    }
+
+    /// Like [`with_untrusted`](Reflector::with_untrusted), putting the
+    /// questions asked on each segment to the others as `forward` says.
+    pub fn with_options(rank: u32, segments: Vec<Segment>, untrusted: &[String], forward: Forward) -> Result<Reflector> {
         if segments.is_empty() {
             bail!("a reflector needs at least one segment");
         }
@@ -105,6 +126,7 @@ impl Reflector {
             owner: Owner::Reflector(rank),
             segments,
             untrusted,
+            forward,
             book: Mutex::default(),
             stop: AtomicBool::new(false),
             subscribers: Mutex::default(),
@@ -226,19 +248,31 @@ impl Inner {
         self.reconcile(&mut book);
     }
 
-    /// Put the questions asked on `src` that it had no answer to, to the
-    /// other segments: those whose devices are announced on it, so whose
+    /// Put the questions asked on `src`, those [`Forward`] lets through, to
+    /// the other segments: those whose devices are announced on it, so whose
     /// answers will be. An untrusted segment is announced nothing, so its
     /// questions are put nowhere.
-    fn forward(&self, src: usize, questions: &[Question]) {
+    fn forward(&self, src: usize, asked: &[Asked]) {
         if self.untrusted[src] {
+            return;
+        }
+        let questions: Vec<_> = asked
+            .iter()
+            .filter(|a| match self.forward {
+                Forward::Always => true,
+                Forward::Unknown => !a.answered,
+                Forward::Never => false,
+            })
+            .map(|a| a.question.clone())
+            .collect();
+        if questions.is_empty() {
             return;
         }
         for (target, seg) in self.segments.iter().enumerate() {
             if target == src {
                 continue;
             }
-            if let Err(e) = seg.query_question(questions) {
+            if let Err(e) = seg.query_question(&questions) {
                 eprintln!("{}: asking on behalf of {} failed: {e:#}", seg.interface(), self.segments[src].interface());
             }
         }
@@ -336,7 +370,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
     use super::*;
-    use crate::parser::{rtype, Header, Message, RData, Record};
+    use crate::parser::{rtype, Header, Message, Question, RData, Record};
     use crate::socket::Family;
 
     /// Its first routable IPv4 or IPv6 address, and link-local one.
@@ -863,9 +897,14 @@ mod tests {
 
     /// A client on `seg` asks `name` (type A), from port 5353.
     fn ask(seg: &Segment, client: &str, name: &str) {
+        ask_type(seg, client, name, rtype::A);
+    }
+
+    /// Like [`ask`], for records of `qtype`.
+    fn ask_type(seg: &Segment, client: &str, name: &str, qtype: u16) {
         let msg = Message {
             header: Header { id: 0, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 },
-            questions: vec![Question { name: name.into(), qtype: rtype::A, class: 1, unicast_response: false }],
+            questions: vec![Question { name: name.into(), qtype, class: 1, unicast_response: false }],
             answers: vec![],
             authorities: vec![],
             additionals: vec![],
@@ -880,14 +919,16 @@ mod tests {
 
     /// A question br0 has no answer to is asked, by the daemon, on the
     /// segments whose devices br0 is told about, untrusted ones included.
-    /// Their answer is reflected, and the client asking again is answered.
-    /// An untrusted segment's questions go nowhere: nothing would come back.
+    /// Their answer is reflected, and the client asking again is answered,
+    /// and, forwarding only what is unknown, not asked about elsewhere. An
+    /// untrusted segment's questions go nowhere: nothing would come back.
     #[test]
     fn a_question_nothing_answers_is_asked_where_the_answer_could_come_from() {
         let (br0, br0_rx) = wired("br0");
         let (media, media_rx) = wired("media");
         let (wifi, wifi_rx) = wired("wifi");
-        let _r = Reflector::with_untrusted(0, vec![br0.clone(), media.clone(), wifi.clone()], &["wifi".to_string()]).unwrap();
+        let segments = vec![br0.clone(), media.clone(), wifi.clone()];
+        let _r = Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown).unwrap();
 
         ask(&br0, "10.0.0.50", "printer.local");
         thread::sleep(Duration::from_millis(100));
@@ -911,6 +952,42 @@ mod tests {
         ask(&wifi, "10.0.3.50", "nas.local");
         thread::sleep(Duration::from_millis(100));
         assert!(asked_names(&drain(&br0_rx)).is_empty() && asked_names(&drain(&media_rx)).is_empty());
+    }
+
+    /// A browse that a copy answers may have other answers still, from
+    /// devices that only answer when asked: it is asked elsewhere unless the
+    /// segment forwards only what it has no answer to, or nothing. What is
+    /// known there goes along as known answers, so that only the others
+    /// answer.
+    #[test]
+    fn a_browse_a_copy_answers_is_asked_elsewhere_as_configured() {
+        for forward in [Forward::Always, Forward::Unknown, Forward::Never] {
+            let (br0, _br0_rx) = wired("br0");
+            let (media, media_rx) = wired("media");
+            let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward).unwrap();
+            announce(&media, "10.0.2.7", "tv.local", &["TV"]);
+            wait_for(|| br0.manual_devices().len() == 1);
+            drain(&media_rx);
+
+            ask_type(&br0, "10.0.0.50", "_http._tcp.local", rtype::PTR);
+            thread::sleep(Duration::from_millis(100));
+            let queries: Vec<Message> = drain(&media_rx).into_iter().filter(|m| !m.header.response).collect();
+            if forward == Forward::Always {
+                assert_eq!(asked_names(&queries), ["_http._tcp.local"]);
+                let known = &queries[0].answers;
+                assert_eq!(known.len(), 1, "{known:?}");
+                assert_eq!(known[0].data, RData::Ptr("TV._http._tcp.local".into()));
+                assert!(known[0].ttl > 0 && known[0].ttl <= 120, "the time it has left: {}", known[0].ttl);
+            } else {
+                assert!(queries.is_empty(), "{forward:?}: {queries:?}");
+            }
+
+            // Never forwarding, not even what nothing answers is asked.
+            ask(&br0, "10.0.0.50", "printer.local");
+            thread::sleep(Duration::from_millis(100));
+            let asked = asked_names(&drain(&media_rx));
+            assert_eq!(asked.is_empty(), forward == Forward::Never, "{forward:?}: {asked:?}");
+        }
     }
 
     /// A device's IPv6 address heard over IPv4 is reflected with it, for

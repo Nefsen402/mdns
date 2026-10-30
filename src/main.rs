@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use config::Config;
 use links::Link;
 use netlink::Netlink;
-use reflector::Reflector;
+use reflector::{Forward, Reflector};
 use socket::{Family, Owner, Segment};
 use timer::Timer;
 
@@ -72,12 +72,18 @@ fn main() -> Result<()> {
     let mut segments = Vec::new();
     for (rank, seg) in (0..).zip(&config.segments) {
         let members = seg.interfaces.iter().map(|iface| links[iface.as_str()].clone()).collect();
-        let reflector = Reflector::with_untrusted(rank, members, &seg.untrusted)
+        let reflector = Reflector::with_options(rank, members, &seg.untrusted, seg.forward)
             .with_context(|| format!("starting segment {:?}", seg.name))?;
         eprintln!("segment {:?}: {}", seg.name, seg.interfaces.join(", "));
         if !seg.untrusted.is_empty() {
             eprintln!("segment {:?}: {} not told about the others", seg.name, seg.untrusted.join(", "));
         }
+        let forwarding = match seg.forward {
+            Forward::Always => "every question asked on one interface",
+            Forward::Unknown => "only questions nothing announced on an interface answers",
+            Forward::Never => "no questions",
+        };
+        eprintln!("segment {:?}: asking {forwarding} on the others", seg.name);
         segments.push(Group { name: seg.name.clone(), reflector });
     }
 
