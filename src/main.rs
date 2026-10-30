@@ -115,24 +115,31 @@ fn main() -> Result<()> {
         }
         None => eprintln!("refreshing devices before they expire is off"),
     }
-    match config.probe_interval {
-        Some(interval) => {
-            eprintln!("probing every {}s", interval.as_secs());
-            // With refreshing on, each device is asked just before it would
-            // expire, so a long interval only delays finding new devices.
-            if config.refresh_before.is_none() && interval > config.min_lifetime {
-                eprintln!(
-                    "warning: that is longer than the {}s a device is kept without being heard from, \
-                     so devices whose records all expire sooner will come and go between probes",
-                    config.min_lifetime.as_secs()
-                );
+    // Each interface is probed as often as the most frequent of its segments
+    // asks.
+    for interface in config.interfaces() {
+        match config.probe_interval_of(interface) {
+            Some(interval) => {
+                eprintln!("{interface}: probing every {}s", interval.as_secs());
+                // With refreshing on, each device is asked just before it
+                // would expire, so a long interval only delays finding new
+                // devices.
+                if config.refresh_before.is_none() && interval > config.min_lifetime {
+                    eprintln!(
+                        "warning: that is longer than the {}s a device is kept without being heard from, \
+                         so devices on {interface} whose records all expire sooner will come and go between probes",
+                        config.min_lifetime.as_secs()
+                    );
+                }
             }
+            None => eprintln!(
+                "{interface}: not probing periodically (no ProbeInterval= for it): only at startup and on request"
+            ),
         }
-        None => eprintln!("not probing periodically (Interval= is not set): only at startup and on request"),
     }
     for link in links.values() {
         let link = link.clone();
-        let interval = config.probe_interval;
+        let interval = config.probe_interval_of(link.interface());
         thread::spawn(move || {
             let name = format!("{}/{:?}", link.interface(), link.family());
             let mut first = true;

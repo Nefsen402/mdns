@@ -78,9 +78,11 @@ It prints how many queries were sent on each interface; use
 to see what answered.
 .IP
 The daemon already does this at startup, and again every
-.B Interval=
+.B ProbeInterval=
 if one is set (see
 .B [Probe]
+and
+.B [Segment]
 in
 .BR mdnsd.conf (5)).
 Run it to probe right now, for example to pick up a device you have just

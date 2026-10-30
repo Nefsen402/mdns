@@ -165,10 +165,15 @@ other networks, for up to that long.
 A margin longer than the lifetime makes every device due all the time; it is then
 asked once per quarter of the margin, not continuously.
 .TP
-.B Interval=
-Also probe every interface for devices this often: browse for service types and
-instances.
+.B ProbeInterval=
+Also probe the interfaces of every segment for devices this often: browse for
+service types and instances.
+A segment can set its own (see
+.BR [Segment] ).
 Not set by default.
+It used to be called
+.BR Interval= ,
+which is now an error that names this key.
 It must be at least 10 seconds.
 This is how a new quiet device that never announces itself is found; without it,
 new devices are found at startup, when they announce themselves (most do when
@@ -176,8 +181,8 @@ they join a network) and by
 .BR "mdnsctl probe" .
 With
 .B RefreshBefore=
-off, an
-.B Interval=
+off, a
+.B ProbeInterval=
 has to stay under
 .B MinimumLifetime=
 to keep devices listed, and the daemon warns about it at startup.
@@ -259,6 +264,20 @@ and at least one interface of a segment of two or more must be trusted.
 Several untrusted interfaces do not learn about each other either.
 Devices are still tracked on an untrusted interface, and listed by
 .BR mdnsctl (1).
+.TP
+.B ProbeInterval=
+Optional.
+How often to probe the interfaces of this segment for devices, in place of the
+.B ProbeInterval=
+of
+.BR [Probe] ;
+.B 0
+or
+.B off
+turns it off for this segment.
+Probing is done per interface, so an interface in several segments is probed as
+often as the most frequent of them asks.
+It must be at least 10 seconds.
 .PP
 A segment is a group of interfaces whose devices are reflected between
 .I every pair

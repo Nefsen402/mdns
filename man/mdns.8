@@ -67,12 +67,12 @@ only answer browse queries.
 A probe runs on every interface at startup, and again whenever
 .B mdnsctl probe
 is run, or every
-.B Interval=
-of the
+.B ProbeInterval=
+if one is set for a segment the interface is in, or in the
 .B [Probe]
 section of
 .BR mdnsd.conf (5)
-if one is set (it is not by default).
+(it is not by default).
 .PP
 Most devices only answer when asked, and one that is not heard from expires, so
 a device that is about to expire is asked to answer again, on its own: this long

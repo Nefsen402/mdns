@@ -114,8 +114,8 @@ ReflectTTL=auto
 # Most devices (speakers especially) only answer when asked, and one that is
 # not heard from expires and is withdrawn from the other networks. So a device
 # is asked to answer again this long before it would expire (`0` or `off` turns
-# this off). `Interval=` would also probe every network that often, to find new
-# quiet devices; it is not set by default.
+# this off). `ProbeInterval=` would also probe every network that often, to find
+# new quiet devices; it is not set by default, and a segment can set its own.
 [Probe]
 RefreshBefore=30s
 
@@ -218,7 +218,7 @@ copy of a device that went silent is withdrawn when the device expires, up to
 | Key             | Default | Meaning                                                                               |
 |-----------------|---------|---------------------------------------------------------------------------------------|
 | `RefreshBefore` | `30s`   | Ask a device to answer again this long before it would expire. `0`/`off` disables it. |
-| `Interval`      | off     | Also probe every interface for devices this often.                                    |
+| `ProbeInterval` | off     | Also probe the interfaces of every segment for devices this often.                    |
 
 Both are systemd time spans: `30s`, `4min`, `1h 30min`, or a bare number of
 seconds.
@@ -248,13 +248,16 @@ margin longer than the lifetime (with `MinimumLifetime=0` and short TTLs, say)
 makes every device due all the time; it is then asked once per quarter of the
 margin, not continuously.
 
-**`Interval`** is not set by default. It probes every interface (browsing for
-service types and instances) on a timer, which is the way to find a **new**
+**`ProbeInterval`** is not set by default. It probes every interface (browsing
+for service types and instances) on a timer, which is the way to find a **new**
 quiet device that never announces itself. Without it, new devices are found at
 startup, when they announce themselves (most do when they join a network), and by
-`mdnsctl probe`. The minimum is 10 seconds. With `RefreshBefore` off, an
-`Interval` has to stay under `MinimumLifetime` to keep devices listed, and the
-daemon warns at startup if it does not.
+`mdnsctl probe`. A [segment](#segment-one-or-more-required) can set its own
+`ProbeInterval` instead, or turn probing off for itself. The minimum is 10
+seconds. With `RefreshBefore` off, a `ProbeInterval` has to stay under
+`MinimumLifetime` to keep devices listed, and the daemon warns at startup if it
+does not. (It used to be called `Interval`, which is now an error that names
+the new key.)
 
 A probe is a handful of multicast queries per interface and takes about four
 seconds; a refresh is a few questions. Routine ones are not logged; failures
@@ -289,6 +292,12 @@ be yours alone.
 | `Name`       | Required. Unique name, used by `mdnsctl`. Quote it if it has spaces. |
 | `Interfaces` | Required. Interfaces in the segment, separated by commas and/or spaces. |
 | `Untrusted`  | Optional. Interfaces of the segment that are announced nothing (see below). |
+| `ProbeInterval` | Optional. How often to probe its interfaces, in place of [`[Probe] ProbeInterval`](#probe-optional); `0`/`off` turns it off for this segment. |
+
+Probing is done per interface, so an interface in several segments is probed as
+often as the most frequent of them asks: with `ProbeInterval=1min` on
+`br0,media` and none on `br0,wifi`, `br0` and `media` are probed every minute
+and `wifi` only as `[Probe]` says.
 
 A segment is a group of interfaces **whose devices are reflected between every
 pair of them**. Think of each segment as "these networks may see each other".
@@ -315,7 +324,7 @@ devices on an untrusted interface are still tracked and listed by `mdnsctl`.
 ### What gets reflected
 
 Devices are found by listening, and by probing: at startup, and whenever you
-run `mdnsctl probe` (or every [`Interval`](#probe-optional), if set), the daemon browses every interface for service types and
+run `mdnsctl probe` (or every [`ProbeInterval`](#probe-optional), if set), the daemon browses every interface for service types and
 instances, resolves each instance's hostname and port, and asks for the
 addresses of devices that have a name but no routable address yet. Many devices
 answer only when asked, and a device needs a hostname and a routable address to
@@ -467,7 +476,7 @@ List what answered with: mdnsctl devices <name>
 ```
 
 The daemon already probes every interface at startup, and again every
-[`Interval`](#probe-optional) if you set one; run this to probe right now, for
+[`ProbeInterval`](#probe-optional) if you set one; run this to probe right now, for
 example to pick up a device you have just switched on.
 
 ### `mdnsctl watch <name>`
