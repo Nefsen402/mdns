@@ -185,7 +185,7 @@ fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watc
             return Ok(());
         }
         if !line.ends_with('\n') && n as u64 >= MAX_LINE {
-            writeln!(writer, "{}", error("request too long"))?;
+            write_line(&mut writer, &error("request too long"))?;
             return Ok(());
         }
         let request = line.trim();
@@ -201,14 +201,14 @@ fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watc
                     let _listed = watches.add(&watch, peer);
                     stream_events(&mut writer, groups, watch)
                 }
-                Err(reply) => writeln!(writer, "{reply}"),
+                Err(reply) => write_line(&mut writer, &reply),
             };
         }
         let reply = match groups.upgrade() {
             Some(groups) => handle(&groups, timers, watches, request),
             None => error("shutting down").to_string(),
         };
-        writeln!(writer, "{reply}")?;
+        write_line(&mut writer, &reply)?;
     }
 }
 
@@ -294,6 +294,13 @@ fn peer_of(stream: &UnixStream) -> Option<Peer> {
         )
     };
     (rc == 0 && cred.pid > 0).then_some(Peer { pid: cred.pid, uid: cred.uid })
+}
+
+/// Write `line` and a newline to a client in one go: a daemon that stops (or
+/// a write that times out) partway leaves the client no half a line to take
+/// for a whole one.
+fn write_line(writer: &mut impl Write, line: &impl std::fmt::Display) -> io::Result<()> {
+    writer.write_all(format!("{line}\n").as_bytes())
 }
 
 /// The arguments of a `watch` request, if it is one.
@@ -440,7 +447,7 @@ fn ask_in_background(groups: &Weak<Vec<Group>>, name: &str, kinds: &[String]) {
 fn stream_events(writer: &mut UnixStream, groups: &Weak<Vec<Group>>, watch: Watch) -> io::Result<()> {
     let Watch { name, query, events, present } = watch;
     writer.set_write_timeout(Some(STREAM_WRITE))?;
-    writeln!(writer, "{}", json!({ "ok": true, "name": name, "watching": true }))?;
+    write_line(writer, &json!({ "ok": true, "name": name, "watching": true }))?;
     // The devices of the query's types shown, so that one that loses its last
     // service of them is shown to go.
     let mut shown: HashSet<(String, String)> = HashSet::new();
@@ -448,7 +455,7 @@ fn stream_events(writer: &mut UnixStream, groups: &Weak<Vec<Group>>, watch: Watc
         if let (Some(interface), Some(host)) = (line["device"]["interface"].as_str(), line["device"]["hostname"].as_str()) {
             shown.insert((interface.to_string(), host.to_ascii_lowercase()));
         }
-        writeln!(writer, "{line}")?;
+        write_line(writer, &line)?;
     }
     let mut next_ask = (!query.kinds.is_empty()).then(Instant::now);
     loop {
@@ -465,7 +472,7 @@ fn stream_events(writer: &mut UnixStream, groups: &Weak<Vec<Group>>, watch: Watc
                     narrowed(&name, notice, &query.kinds, &mut shown)
                 };
                 if let Some(json) = line {
-                    writeln!(writer, "{json}")?;
+                    write_line(writer, &json)?;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -473,7 +480,7 @@ fn stream_events(writer: &mut UnixStream, groups: &Weak<Vec<Group>>, watch: Watc
                     return Ok(());
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => return writeln!(writer, "{}", error("shutting down")),
+            Err(RecvTimeoutError::Disconnected) => return write_line(writer, &error("shutting down")),
         }
     }
 }

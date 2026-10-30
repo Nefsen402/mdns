@@ -2,12 +2,18 @@
 //! `ipc.rs` for the protocol). Every IPC command has a subcommand here.
 
 use std::collections::HashSet;
-use std::io::{self, BufRead, BufReader, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::IpAddr;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::time::Duration;
+use std::process::{ExitCode, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -26,12 +32,33 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Keep in sync with `ipc::MIN_QUERY_INTERVAL` in the daemon.
 const MIN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long a subscriber waits to connect again after losing the daemon, at
+/// first and at most: the wait doubles with each failed try.
+const RECONNECT_FIRST: Duration = Duration::from_millis(if cfg!(test) { 10 } else { 1000 });
+const RECONNECT_MOST: Duration = Duration::from_millis(if cfg!(test) { 50 } else { 30_000 });
+
+/// Events a subscriber holds while its script is busy; one past that is
+/// dropped, and said so in the log.
+const QUEUE: usize = 1024;
+
+/// How often a subscriber looks up from waiting to see whether it was told
+/// to stop.
+const STOP_CHECK: Duration = Duration::from_millis(50);
+
+/// Set by SIGTERM or SIGINT: a subscriber stops its script and exits.
+static STOP: AtomicBool = AtomicBool::new(false);
+
 /// (command, arguments, description): the whole IPC surface.
 const COMMANDS: &[(&str, &str, &str)] = &[
     ("segments", "", "list the configured segments"),
     ("devices", "[--query TYPE]... <name>", "list the devices discovered in a segment"),
     ("probe", "[<name>]", "actively query for devices (all segments, or one)"),
     ("watch", "[--query TYPE]... [--interval SPAN] <name>", "print the devices of a segment as they appear and go"),
+    (
+        "subscribe",
+        "[--query TYPE]... [--interval SPAN] [--foreground] [--log FILE] <name> -- SCRIPT [ARG]...",
+        "run SCRIPT for each change in a segment, in the background",
+    ),
     ("watchers", "", "list the watches open on the daemon, and who holds them"),
     ("timers", "", "list the timers the daemon has scheduled"),
 ];
@@ -42,6 +69,7 @@ enum Command {
     Devices(Target),
     Probe(Option<String>),
     Watch(Target),
+    Subscribe(Subscription),
     Watchers,
     Timers,
 }
@@ -53,6 +81,19 @@ struct Target {
     segment: String,
     query: Vec<String>,
     interval: Option<Duration>,
+}
+
+/// What `subscribe` watches, and the script it runs for each event.
+#[derive(Debug, PartialEq, Eq)]
+struct Subscription {
+    target: Target,
+    /// The script and its arguments, run directly (its shebang says how).
+    script: Vec<String>,
+    /// Stay attached instead of going into the background.
+    foreground: bool,
+    /// Where a subscriber in the background writes what it has to say, and
+    /// its script's output.
+    log: Option<PathBuf>,
 }
 
 impl From<&str> for Target {
@@ -161,6 +202,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
             Command::Probe((!segment.trim().is_empty()).then_some(segment))
         }
         "watch" => Command::Watch(target("watch", rest, true)?),
+        "subscribe" => Command::Subscribe(subscription(rest)?),
         "watchers" if rest.is_empty() => Command::Watchers,
         "watchers" => return Err(Failure::Usage("watchers takes no arguments".into())),
         "timers" if rest.is_empty() => Command::Timers,
@@ -260,12 +302,29 @@ fn target(command: &str, rest: &[String], watching: bool) -> Result<Target, Fail
     Ok(target)
 }
 
+/// Send the watch request `line` and wait for the daemon to accept it: the
+/// stream its events will come on, with no time limit from then on.
+fn open_watch(socket: &Path, line: &str) -> Result<BufReader<UnixStream>, Failure> {
+    let mut reader = BufReader::new(send(socket, line, TIMEOUT)?);
+    let mut ack = String::new();
+    if reader.read_line(&mut ack).map_err(|e| connect_err(socket, e))? == 0 {
+        return Err(Failure::Connect("the daemon closed the connection".into()));
+    }
+    let reply: Value =
+        serde_json::from_str(ack.trim_end()).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
+    if let Some(failure) = server_error(&reply) {
+        return Err(failure);
+    }
+    // Now it waits for changes, however long that takes.
+    reader.get_ref().set_read_timeout(None).map_err(|e| connect_err(socket, e))?;
+    Ok(reader)
+}
+
 fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
     let socket = &opts.socket;
-    let mut reader = BufReader::new(send(socket, &target.request("watch"), TIMEOUT)?);
+    let mut reader = open_watch(socket, &target.request("watch"))?;
     let mut line = String::new();
     let mut seen = HashSet::new();
-    let mut acknowledged = false;
     loop {
         line.clear();
         let n = reader.read_line(&mut line).map_err(|e| connect_err(socket, e))?;
@@ -277,12 +336,6 @@ fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Fa
             serde_json::from_str(text).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
         if let Some(failure) = server_error(&reply) {
             return Err(failure);
-        }
-        if !acknowledged {
-            // Now it waits for changes, however long that takes.
-            reader.get_ref().set_read_timeout(None).map_err(|e| connect_err(socket, e))?;
-            acknowledged = true;
-            continue;
         }
         let shown = if opts.json {
             Some(format!("{text}\n"))
@@ -297,6 +350,319 @@ fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Fa
     }
 }
 
+/// The subscription the words after `subscribe` describe: options and the
+/// segment name as for `watch`, then `--` and the script, with its
+/// arguments.
+fn subscription(rest: &[String]) -> Result<Subscription, Failure> {
+    let split = rest
+        .iter()
+        .position(|w| w == "--")
+        .ok_or_else(|| Failure::Usage("subscribe needs `-- SCRIPT` to run for each change".into()))?;
+    let (before, script) = (&rest[..split], &rest[split + 1..]);
+    if script.is_empty() {
+        return Err(Failure::Usage("subscribe needs a script after --".into()));
+    }
+    let mut foreground = false;
+    let mut log = None;
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < before.len() {
+        let word = before[i].as_str();
+        i += 1;
+        let file = match word {
+            "--foreground" => {
+                foreground = true;
+                continue;
+            }
+            "--log" => {
+                i += 1;
+                before.get(i - 1).map(String::as_str)
+            }
+            _ => match word.strip_prefix("--log=") {
+                Some(file) => Some(file),
+                None => {
+                    words.push(before[i - 1].clone());
+                    continue;
+                }
+            },
+        };
+        match file {
+            Some(file) if !file.is_empty() => log = Some(PathBuf::from(file)),
+            _ => return Err(Failure::Usage("--log needs a file".into())),
+        }
+    }
+    Ok(Subscription { target: target("subscribe", &words, true)?, script: script.to_vec(), foreground, log })
+}
+
+/// Subscribe: open the watch, then (unless in the foreground) go into the
+/// background, printing the PID, and run the script for each event until
+/// told to stop. What can go wrong before the first event is reported here,
+/// for the caller; what goes wrong later is logged.
+fn subscribe(opts: &Options, sub: &Subscription) -> Result<(), Failure> {
+    let script = executable(&sub.script[0]).map_err(Failure::Usage)?;
+    let log = match &sub.log {
+        Some(path) => Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| Failure::Usage(format!("cannot write to {}: {e}", path.display())))?,
+        ),
+        None => None,
+    };
+    let line = sub.target.request("watch");
+    // In the background, the watch is opened by the process that holds it,
+    // so that `watchers` lists the subscriber's PID, not its parent's.
+    let reader = if sub.foreground { open_watch(&opts.socket, &line)? } else { detach(&opts.socket, &line, log.as_ref())? };
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler only stores to an atomic, which is
+        // async-signal-safe.
+        unsafe { libc::signal(signal, on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    }
+    note(&format!("watching {}, running {} for each change", sub.target.segment, script.display()));
+
+    let (tx, rx) = mpsc::sync_channel(QUEUE);
+    let socket = opts.socket.clone();
+    thread::spawn(move || feed(&socket, &line, reader, &tx));
+    run_scripts(&rx, &script, &sub.script[1..], &STOP);
+    note("stopped");
+    Ok(())
+}
+
+extern "C" fn on_stop(_: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// `name` as a script to run: a path, or a name looked up in `PATH`, of an
+/// executable file. Made absolute, so that it is the same file whatever
+/// happens to the working directory or `PATH` later, but not resolved
+/// through symlinks: `sh` linked to `bash`, or a busybox applet, behaves by
+/// the name it is run under.
+fn executable(name: &str) -> Result<PathBuf, String> {
+    let candidates: Vec<PathBuf> = if name.contains('/') {
+        vec![PathBuf::from(name)]
+    } else {
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).map(|dir| dir.join(name)).collect())
+            .unwrap_or_default()
+    };
+    let runnable = |p: &PathBuf| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    let found = candidates.into_iter().find(runnable).ok_or_else(|| format!("{name}: not an executable file"))?;
+    std::path::absolute(&found).map_err(|e| format!("{name}: {e}"))
+}
+
+/// Go into the background, and open the watch `line` there. The child, in a
+/// session of its own, opens it and tells the parent how that went: the
+/// parent then prints the child's PID and exits, or returns the error, for
+/// the caller to hear of. The child carries on with the watch, its output
+/// going to `log`, or nowhere.
+fn detach(socket: &Path, line: &str, log: Option<&File>) -> Result<BufReader<UnixStream>, Failure> {
+    let _ = io::stdout().flush();
+    let mut fds = [0; 2];
+    // SAFETY: `fds` has room for the two descriptors pipe2 returns.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(Failure::Connect(format!("cannot go into the background: {}", io::Error::last_os_error())));
+    }
+    // SAFETY: both were just opened, and are owned by nothing else.
+    let (mut report_rx, mut report_tx) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    // SAFETY: no other thread has been started, so the child is a full copy.
+    match unsafe { libc::fork() } {
+        -1 => Err(Failure::Connect(format!("cannot go into the background: {}", io::Error::last_os_error()))),
+        0 => {
+            drop(report_rx);
+            // SAFETY: the child leaves the caller's session.
+            unsafe { libc::setsid() };
+            let opened = open_watch(socket, line);
+            // How it went: `+`, or a letter for the kind of error and the
+            // message.
+            let report = match &opened {
+                Ok(_) => "+".to_string(),
+                Err(Failure::Server(m)) => format!("S{m}"),
+                Err(Failure::Connect(m) | Failure::Usage(m)) => format!("C{m}"),
+            };
+            let _ = report_tx.write_all(report.as_bytes());
+            drop(report_tx);
+            let Ok(reader) = opened else { std::process::exit(1) };
+            let null = File::options().read(true).write(true).open("/dev/null");
+            let null = null.map_err(|e| Failure::Connect(format!("cannot open /dev/null: {e}")))?;
+            let out = log.unwrap_or(&null);
+            // SAFETY: plain descriptor calls on descriptors open in this
+            // process; the duplicates replace stdin, stdout and stderr.
+            unsafe {
+                libc::dup2(null.as_raw_fd(), 0);
+                libc::dup2(out.as_raw_fd(), 1);
+                libc::dup2(out.as_raw_fd(), 2);
+            }
+            Ok(reader)
+        }
+        pid => {
+            drop(report_tx);
+            let mut report = String::new();
+            let _ = report_rx.read_to_string(&mut report);
+            // Nothing at all: the child died before it could say.
+            match (report.chars().next(), report.get(1..).unwrap_or_default()) {
+                (Some('+'), _) => {
+                    println!("{pid}");
+                    std::process::exit(0);
+                }
+                (None, _) => Err(Failure::Connect("the subscriber died before it was watching".into())),
+                (Some('S'), message) => Err(Failure::Server(message.into())),
+                (_, message) => Err(Failure::Connect(message.into())),
+            }
+        }
+    }
+}
+
+/// Pass each event of the watch on `reader` to `events`, opening the watch
+/// again whenever it is lost (the daemon restarted, say), until whatever
+/// takes the events is gone.
+fn feed(socket: &Path, line: &str, mut reader: BufReader<UnixStream>, events: &SyncSender<String>) {
+    loop {
+        match forward(&mut reader, events) {
+            Ok(()) => return,
+            Err(why) => note(&format!("{why}; watching again once the daemon is back")),
+        }
+        let mut wait = RECONNECT_FIRST;
+        reader = loop {
+            thread::sleep(wait);
+            match open_watch(socket, line) {
+                Ok(reader) => {
+                    note("watching again");
+                    break reader;
+                }
+                Err(Failure::Server(why)) => note(&format!("the daemon refuses the watch: {why}")),
+                Err(_) => {}
+            }
+            wait = (wait * 2).min(RECONNECT_MOST);
+        };
+    }
+}
+
+/// Pass the events on `reader` to `events` until the watch is lost (`Err`,
+/// saying how) or whatever takes them is gone (`Ok`). One that does not fit
+/// because the script is that far behind is dropped, and said so.
+fn forward(reader: &mut BufReader<UnixStream>, events: &SyncSender<String>) -> Result<(), String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err("the daemon closed the connection".into()),
+            // Cut off by the end of the stream: not a line to trust.
+            Ok(_) if !line.ends_with('\n') => return Err("the daemon closed the connection".into()),
+            Ok(_) => {}
+            Err(e) => return Err(format!("lost the daemon: {e}")),
+        }
+        let text = line.trim_end();
+        let event: Value = match serde_json::from_str(text) {
+            Ok(event) => event,
+            Err(e) => {
+                note(&format!("skipped an unreadable line from the daemon ({e}): {text}"));
+                continue;
+            }
+        };
+        if let Some(Failure::Server(why)) = server_error(&event) {
+            return Err(format!("the daemon ended the watch: {why}"));
+        }
+        if event["event"].as_str().is_none() {
+            note(&format!("skipped a line from the daemon that is not an event: {text}"));
+            continue;
+        }
+        match events.try_send(text.to_string()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => note(&format!("dropped an event: the script is {QUEUE} events behind")),
+            Err(TrySendError::Disconnected(_)) => return Ok(()),
+        }
+    }
+}
+
+/// Run `script` with `args` for each event that comes, one at a time, until
+/// `stop` is set.
+fn run_scripts(events: &Receiver<String>, script: &Path, args: &[String], stop: &AtomicBool) {
+    while !stop.load(Ordering::SeqCst) {
+        let event = match events.recv_timeout(STOP_CHECK) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        match run_script(script, args, &event, stop) {
+            Ok(Some(status)) if status.success() => {}
+            Ok(Some(status)) => note(&format!("{} {status}, for: {event}", script.display())),
+            Ok(None) => return,
+            Err(e) => note(&format!("cannot run {}: {e}", script.display())),
+        }
+    }
+}
+
+/// Run `script` with `args` for `event`: its JSON line on stdin, and what
+/// [`event_env`] takes from it in the environment. Its exit status, or `None`
+/// if `stop` was set while it ran, in which case it was sent SIGTERM.
+fn run_script(script: &Path, args: &[String], event: &str, stop: &AtomicBool) -> io::Result<Option<ExitStatus>> {
+    let mut child = std::process::Command::new(script)
+        .args(args)
+        .envs(event_env(event))
+        .stdin(Stdio::piped())
+        .spawn()?;
+    // From a thread of its own: a script that does not read its input must
+    // not hold the subscriber up.
+    if let Some(mut stdin) = child.stdin.take() {
+        let line = format!("{event}\n");
+        thread::spawn(move || {
+            let _ = stdin.write_all(line.as_bytes());
+        });
+    }
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if stop.load(Ordering::SeqCst) {
+            // SAFETY: a plain signal to the child, which has not been reaped.
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            child.wait()?;
+            return Ok(None);
+        }
+        thread::sleep(STOP_CHECK);
+    }
+}
+
+/// The environment a script gets for `event`, for scripts that would rather
+/// not read JSON: what happened, where, and the device's name and first
+/// address. Empty for what the event does not have.
+fn event_env(event: &str) -> Vec<(&'static str, String)> {
+    let event: Value = serde_json::from_str(event).unwrap_or(Value::Null);
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    let device = &event["device"];
+    vec![
+        ("MDNS_EVENT", text(&event["event"])),
+        ("MDNS_SEGMENT", text(&event["segment"])),
+        ("MDNS_TTL", event["ttl"].as_u64().map(|t| t.to_string()).unwrap_or_default()),
+        ("MDNS_INTERFACE", text(&device["interface"])),
+        ("MDNS_HOSTNAME", text(&device["hostname"])),
+        ("MDNS_ADDRESS", text(&device["addresses"][0])),
+    ]
+}
+
+/// Say something in a subscriber's log (its stderr), with the time.
+fn note(message: &str) {
+    eprintln!("{} mdnsctl[{}]: {message}", utc_now(), std::process::id());
+}
+
+/// The time now, in UTC, as `2026-10-30T15:52:01Z`.
+fn utc_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+    // From days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3600, rest / 60 % 60, rest % 60)
+}
+
 /// Run a command and return the text to print.
 fn execute(opts: &Options) -> Result<String, Failure> {
     let (line, timeout) = match &opts.command {
@@ -308,6 +674,7 @@ fn execute(opts: &Options) -> Result<String, Failure> {
         Command::Watchers => ("watchers".to_string(), TIMEOUT),
         Command::Timers => ("timers".to_string(), TIMEOUT),
         Command::Watch(_) => unreachable!("watch streams: see watch()"),
+        Command::Subscribe(_) => unreachable!("subscribe streams: see subscribe()"),
     };
     let raw = request(&opts.socket, &line, timeout)?;
     let reply: Value =
@@ -327,6 +694,7 @@ fn execute(opts: &Options) -> Result<String, Failure> {
         Command::Watchers => render_watchers(&reply, user_name, command_line),
         Command::Timers => render_timers(&reply),
         Command::Watch(_) => unreachable!("watch streams: see watch()"),
+        Command::Subscribe(_) => unreachable!("subscribe streams: see subscribe()"),
     }
 }
 
@@ -759,6 +1127,7 @@ fn main() -> ExitCode {
 
     let result = match &opts.command {
         Command::Watch(target) => watch(&opts, target, &mut io::stdout().lock()),
+        Command::Subscribe(sub) => subscribe(&opts, sub),
         _ => execute(&opts).map(|text| print!("{text}")),
     };
     match result {
@@ -1067,6 +1436,216 @@ mod tests {
             render_probe(&reply).unwrap(),
             "INTERFACE  RESULT\nbr0        14 queries sent\nwifi       error: sending to ff02::fb: Network is unreachable\n\nList what answered with: mdnsctl devices <name>\n"
         );
+    }
+
+    /// Everything after `--` is the script and its arguments, options
+    /// included; before it, the options and the segment name, as for
+    /// `watch`, and `--foreground` and `--log`.
+    #[test]
+    fn subscribe_takes_a_watch_and_a_script() {
+        let o = opts(&[
+            "subscribe", "--query", "_shelly._tcp", "--interval=1min", "--log", "/var/log/plugs.log", "IoT", "to", "br0",
+            "--", "/usr/local/bin/configure", "--fast", "--query", "--",
+        ]);
+        let Command::Subscribe(sub) = o.command else { panic!("{o:?}") };
+        assert_eq!(sub.target.segment, "IoT to br0");
+        assert_eq!(sub.target.query, ["_shelly._tcp"]);
+        assert_eq!(sub.target.interval, Some(Duration::from_secs(60)));
+        assert_eq!(sub.log, Some(PathBuf::from("/var/log/plugs.log")));
+        assert!(!sub.foreground);
+        assert_eq!(sub.script, ["/usr/local/bin/configure", "--fast", "--query", "--"]);
+        assert_eq!(sub.target.request("watch"), "watch --query=_shelly._tcp --interval=60 IoT to br0");
+
+        let Command::Subscribe(sub) = opts(&["subscribe", "--foreground", "--log=x.log", "lan", "--", "s"]).command else { panic!() };
+        assert!(sub.foreground);
+        assert_eq!((sub.log, sub.target.segment.as_str()), (Some(PathBuf::from("x.log")), "lan"));
+
+        for args in [
+            &["subscribe", "lan"][..],
+            &["subscribe", "lan", "--"],
+            &["subscribe", "--", "script"],
+            &["subscribe", "--log", "--", "script"],
+            &["subscribe", "--log=", "lan", "--", "script"],
+            &["subscribe", "--interval=1min", "lan", "--", "script"],
+        ] {
+            assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_script_gets_the_event_in_its_environment_too() {
+        let event = r#"{"event":"added","segment":"IoT","ttl":4500,"device":{"interface":"wifi","hostname":"plug.local","addresses":["10.0.1.9","fd00::9"],"services":[]}}"#;
+        assert_eq!(event_env(event), [
+            ("MDNS_EVENT", "added".to_string()),
+            ("MDNS_SEGMENT", "IoT".into()),
+            ("MDNS_TTL", "4500".into()),
+            ("MDNS_INTERFACE", "wifi".into()),
+            ("MDNS_HOSTNAME", "plug.local".into()),
+            ("MDNS_ADDRESS", "10.0.1.9".into()),
+        ]);
+        // What the event has not got is empty.
+        let nameless = r#"{"event":"removed","segment":"IoT","ttl":0,"device":{"interface":"wifi","hostname":null,"addresses":[],"services":[]}}"#;
+        let env = event_env(nameless);
+        assert_eq!((env[4].1.as_str(), env[5].1.as_str(), env[2].1.as_str()), ("", "", "0"));
+        assert!(event_env("not json").iter().all(|(_, v)| v.is_empty()));
+    }
+
+    #[test]
+    fn a_script_is_an_executable_file_found_by_path_or_in_path() {
+        let sh = executable("sh").unwrap();
+        assert!(sh.is_absolute() && sh.file_name() == Some("sh".as_ref()), "not followed through a symlink: {}", sh.display());
+        assert_eq!(executable(sh.to_str().unwrap()).unwrap(), sh);
+        assert!(executable("target").is_err(), "a directory");
+        assert!(executable("Cargo.toml").is_err(), "not on PATH, and no slash");
+        assert!(executable("./Cargo.toml").unwrap_err().contains("not an executable"));
+        assert!(executable("./no-such-script").is_err());
+    }
+
+    /// A script under `target/` that appends its stdin and environment to
+    /// `out`, then exits with `status`.
+    fn script(tag: &str, status: u8) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all("target").unwrap();
+        let path = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.sh", std::process::id()));
+        let out = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.out", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n{{ cat; echo \"$1|$MDNS_EVENT|$MDNS_HOSTNAME|$MDNS_ADDRESS\"; }} >> {}\nexit {status}\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (executable(path.to_str().unwrap()).unwrap(), out)
+    }
+
+    const EVENT: &str = r#"{"event":"added","segment":"IoT","ttl":4500,"device":{"interface":"wifi","hostname":"plug.local","addresses":["10.0.1.9"],"services":[]}}"#;
+
+    #[test]
+    fn a_script_is_run_with_the_event_on_stdin_and_in_its_environment() {
+        let (path, out) = script("run", 3);
+        let status = run_script(&path, &["arg".into()], EVENT, &AtomicBool::new(false)).unwrap().unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), format!("{EVENT}\narg|added|plug.local|10.0.1.9\n"));
+    }
+
+    #[test]
+    fn a_script_running_when_told_to_stop_is_stopped() {
+        let stop = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let sleeper = executable("sleep").unwrap();
+        let ran = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(200));
+                stop.store(true, Ordering::SeqCst);
+            });
+            run_script(&sleeper, &["30".into()], EVENT, &stop).unwrap()
+        });
+        assert_eq!(ran, None);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// Events are run in the order they came, one at a time, a failing script
+    /// holding up none; with nothing more to come, it is done.
+    #[test]
+    fn scripts_are_run_for_each_event_in_turn() {
+        let (path, out) = script("turns", 1);
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        for host in ["a.local", "b.local", "c.local"] {
+            tx.send(EVENT.replace("plug.local", host)).unwrap();
+        }
+        drop(tx);
+        run_scripts(&rx, &path, &[], &AtomicBool::new(false));
+        let lines: Vec<String> = std::fs::read_to_string(&out).unwrap().lines().filter(|l| l.starts_with('|')).map(String::from).collect();
+        assert_eq!(lines, ["|added|a.local|10.0.1.9", "|added|b.local|10.0.1.9", "|added|c.local|10.0.1.9"]);
+    }
+
+    /// A subscriber that loses the daemon watches again once it is back, and
+    /// the events of both connections come through, in order.
+    #[test]
+    fn a_subscriber_watches_again_after_losing_the_daemon() {
+        std::fs::create_dir_all("target").unwrap();
+        let path = PathBuf::from(format!("target/mdnsctl-test-{}-again.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let daemon = thread::spawn(move || {
+            let mut asked = Vec::new();
+            for event in ["first", "second"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                asked.push(line);
+                writeln!(stream, "{ACK}").unwrap();
+                writeln!(stream, "{}", EVENT.replace("plug.local", event)).unwrap();
+                if event == "second" {
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+            asked
+        });
+
+        let reader = open_watch(&path, "watch --query=_x._tcp IoT").unwrap();
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        let socket = path.clone();
+        thread::spawn(move || feed(&socket, "watch --query=_x._tcp IoT", reader, &tx));
+        let next = || rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(next().contains("first"));
+        assert!(next().contains("second"));
+        assert_eq!(daemon.join().unwrap(), ["watch --query=_x._tcp IoT\n"; 2], "the same watch, again");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Only events reach a script: a line that is not JSON, or not an event,
+    /// is skipped, and one cut off by the end of the stream (a daemon that
+    /// stopped while writing it) ends the watch, not taken for whole.
+    #[test]
+    fn only_whole_events_reach_a_script() {
+        let (path, daemon) = streaming_daemon(
+            "whole",
+            vec![ACK.into(), "not json".into(), r#"{"ok":true}"#.into(), EVENT.into()],
+        );
+        let mut reader = open_watch(&path, "watch IoT").unwrap();
+        let cut = thread::spawn(move || {
+            daemon.join().unwrap();
+        });
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        assert_eq!(forward(&mut reader, &tx), Err("the daemon closed the connection".into()));
+        cut.join().unwrap();
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [EVENT]);
+
+        // A last line without its newline is not an event, even if it reads
+        // as one.
+        let path = PathBuf::from(format!("target/mdnsctl-test-{}-cut.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let daemon = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut String::new()).unwrap();
+            stream.write_all(format!("{ACK}\n{EVENT}\n{EVENT}").as_bytes()).unwrap();
+        });
+        let mut reader = open_watch(&path, "watch IoT").unwrap();
+        daemon.join().unwrap();
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        assert_eq!(forward(&mut reader, &tx), Err("the daemon closed the connection".into()));
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [EVENT], "the cut-off second one is not passed on");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_refused_subscription_is_an_error_at_once() {
+        let (path, _daemon) = fake_daemon("refused", r#"{"ok":false,"error":"no such segment: nope"}"#);
+        assert_eq!(
+            open_watch(&path, "watch nope").unwrap_err(),
+            Failure::Server("no such segment: nope".into())
+        );
+    }
+
+    #[test]
+    fn the_time_is_told_in_utc() {
+        let now = utc_now();
+        assert_eq!(now.len(), 20, "{now}");
+        assert!(now.starts_with("20") && now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
     }
 
     /// A watcher is shown with what it watches and who holds it; what the

@@ -179,6 +179,73 @@ It exits with status 2 if the daemon stops or the connection is lost, and
 quietly with status 0 if its output is closed, as with
 .BR "mdnsctl watch IoT | head" .
 .TP
+\fBsubscribe\fR [\fB\-\-query\fR \fItype\fR]... [\fB\-\-interval\fR \fIspan\fR] [\fB\-\-foreground\fR] [\fB\-\-log\fR \fIfile\fR] \fIname\fR \fB\-\-\fR \fIscript\fR [\fIarg\fR ...]
+Watch the segment called
+.I name
+as
+.B watch
+does, with the same
+.B \-\-query
+and
+.BR \-\-interval ,
+and run
+.I script
+with its
+.IR arg s
+for each change, one at a time, in the order they come.
+It is for scripts that run and are gone: the watch is opened, and anything
+wrong with it (no daemon, no such segment, a script that is not an executable
+file) is reported, before
+.B mdnsctl
+goes into the background, prints its PID and returns.
+The subscriber then runs as the user who started it, with that user's
+permissions, until it is killed; the daemon runs nothing.
+.IP
+The script is run directly, not through a shell, so its first line
+.RB ( #!/bin/sh ,
+say) says what runs it; a name without a slash is looked up in
+.BR PATH .
+It gets the change on its standard input, as one line of JSON the same as
+.B "watch \-\-json"
+prints, and in its environment:
+.BR MDNS_EVENT
+.RB ( present ,
+.BR added ,
+.B updated
+or
+.BR removed ),
+.BR MDNS_SEGMENT ,
+.BR MDNS_TTL ,
+.BR MDNS_INTERFACE ,
+.B MDNS_HOSTNAME
+and
+.B MDNS_ADDRESS
+(the device's first address), each empty when the change has none.
+A script that fails is logged, and the next change runs it again.
+Changes that come while it runs wait for it, up to 1024 of them; one more is
+dropped, and logged.
+.IP
+If the daemon goes away (it is restarted, say), the subscriber watches again
+once it is back, trying after a second and then less and less often, up to
+every 30 seconds; with
+.BR \-\-query ,
+the devices of the type already known come again as
+.BR present .
+.B mdnsctl watchers
+lists a subscriber, and
+.B kill
+with its PID stops it, and a script it is running then.
+.IP
+.B \-\-log
+.I file
+appends what the subscriber has to say (when it starts, stops, loses the
+daemon, or a script fails) and the script's output to
+.IR file ;
+without it they are discarded.
+.B \-\-foreground
+keeps it attached instead, with both on the terminal, for running it under a
+supervisor or trying a script out.
+.TP
 .B watchers
 List the watches open on the daemon, oldest first, one line each: its id, the
 segment it watches, its
