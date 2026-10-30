@@ -663,13 +663,16 @@ mod tests {
     #[test]
     fn replies_stay_on_one_line_whatever_the_names_contain() {
         let (g, segs) = group("media", Family::V4, &["a", "b"]);
-        announce(&segs[0], "10.0.1.5", "tv.local", "My\nTV\"\\");
+        // Control characters are refused when heard; what is left to escape
+        // is quotes and backslashes.
+        // A backslash in a label is `\\` in the escaped form names are kept in.
+        announce(&segs[0], "10.0.1.5", "tv.local", "My \"TV\" \\\\ back");
         let out = handle(&[g], &Watcher::default(), "devices media");
         assert!(!out.contains('\n'), "{out}");
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             parsed["devices"][0]["services"][0]["instance"],
-            "My\nTV\"\\._http._tcp.local"
+            "My \"TV\" \\\\ back._http._tcp.local"
         );
     }
 

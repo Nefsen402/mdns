@@ -84,6 +84,14 @@ pub fn hand_over(pid: u32) -> io::Result<()> {
         ip(&["addr", "add", addr, "dev", iface])?;
         ip(&["link", "set", iface, "up"])?;
     }
+    // The canaries' own addresses, each sent from by its canary.
+    let canaries: String = (100..250).map(|i| format!("addr add 10.0.1.{i}/24 dev {FUZZ_A}\n")).collect();
+    let mut batch = Command::new("ip").args(["-batch", "-"]).stdin(std::process::Stdio::piped()).spawn()?;
+    std::io::Write::write_all(batch.stdin.as_mut().expect("piped"), canaries.as_bytes())?;
+    drop(batch.stdin.take());
+    if !batch.wait()?.success() {
+        return Err(io::Error::other("adding the canaries' addresses failed"));
+    }
     Ok(())
 }
 
@@ -139,6 +147,17 @@ pub fn sender(iface: &str, v6: bool) -> io::Result<(UdpSocket, SocketAddr)> {
         socket.bind(&SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT)).into())?;
         Ok((socket.into(), SocketAddr::V4(SocketAddrV4::new(GROUP_V4, PORT))))
     }
+}
+
+/// A socket that sends to the mDNS group on `iface` from `addr`, port 5353,
+/// and where to send to: for a device that is its own sender.
+pub fn sender_from(iface: &str, addr: Ipv4Addr) -> io::Result<(UdpSocket, SocketAddr)> {
+    let socket = base(Domain::IPV4, iface)?;
+    socket.set_multicast_if_v4(&addr)?;
+    socket.set_multicast_ttl_v4(255)?;
+    socket.set_multicast_loop_v4(false)?;
+    socket.bind(&SocketAddr::V4(SocketAddrV4::new(addr, PORT)).into())?;
+    Ok((socket.into(), SocketAddr::V4(SocketAddrV4::new(GROUP_V4, PORT))))
 }
 
 /// A socket that hears everything sent to the mDNS group on `iface`.

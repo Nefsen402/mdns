@@ -345,6 +345,12 @@ pub fn canary_instance(k: u64) -> String {
     format!("Canary {k}._http._tcp.local")
 }
 
+/// Canary `k`'s address, from which it is also sent, as a device announces
+/// itself: one of its own, so that no one sender describes many devices.
+pub fn canary_addr(k: u64) -> Ipv4Addr {
+    Ipv4Addr::new(10, 0, 1, 100 + (k % 150) as u8)
+}
+
 /// Canary `k`: a well-formed device that must be reflected.
 pub fn canary(k: u64) -> Vec<u8> {
     let host = name(&canary_host(k));
@@ -352,7 +358,7 @@ pub fn canary(k: u64) -> Vec<u8> {
     let rr = |name: &Name, cache_flush, rdata| Rr { name: name.clone(), class: IN, cache_flush, ttl: 120, rdata };
     let packet = Packet {
         answers: vec![
-            rr(&host, true, Rdata::A(Ipv4Addr::new(10, 0, 1, 10 + (k % 240) as u8))),
+            rr(&host, true, Rdata::A(canary_addr(k))),
             rr(&name("_http._tcp.local"), false, Rdata::Ptr(instance.clone())),
             rr(&instance, true, Rdata::Srv { port: 8000, target: host.clone() }),
             rr(&instance, true, Rdata::Txt(vec![format!("canary={k}").into_bytes()])),

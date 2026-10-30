@@ -119,8 +119,16 @@ No conflict detection is done: the name is assumed to be yours alone.
 Within a segment, every interface announces the devices discovered on every
 other interface of that segment.
 Only devices that announced a hostname, a routable address and at least one
-service are reflected; chatty clients such as phones are tracked but not
-reflected.
+service with its SRV record are reflected; chatty clients such as phones are
+tracked but not reflected.
+What no device could have announced is ignored: records of a class other than
+IN, hostnames not under
+.BR .local
+or with a dot, space, control character or invalid UTF-8 in a label, malformed
+service types and instance names, SRV port 0, and addresses no device can be
+reached at.
+Each interface remembers at most 1024 devices, at most 64 hosts first described
+by any one sender, and at most 64 services a device.
 A link-local address is never reflected: it only means something on the link
 the device is on.
 A device is announced with its routable address only, so one that has only a

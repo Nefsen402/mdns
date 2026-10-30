@@ -352,8 +352,22 @@ the others look for (not who looks).
   described, so a reflector is not mistaken for the devices it announces. Per address family it has up to two: a
   **link-local** address, and a **routable** one (IPv4, or global/ULA IPv6).
 - Only devices that announced **a hostname, a routable address and at least one
-  service** are reflected. Chatty clients that merely send queries (phones,
-  laptops) are tracked but not reflected.
+  service** (with its SRV record, so a host and a port) are reflected. Chatty
+  clients that merely send queries (phones, laptops) are tracked but not
+  reflected.
+- **What no device could have announced is ignored**, as if it had not been
+  sent: records of a class other than IN; hostnames not under `.local`, or with
+  a dot, backslash, space, control character or invalid UTF-8 in a label;
+  service types other than `_name._tcp.local` or `_name._udp.local`; instance
+  names with control characters or invalid UTF-8; a PTR naming an instance of
+  another type; SRV port 0; and addresses no device can be reached at
+  (unspecified, loopback, multicast, broadcast, `0.0.0.0/8`, `240.0.0.0/4`, and
+  IPv4 addresses dressed as IPv6). A host that announced only such an address
+  is not given the address its packet came from instead.
+- **One sender cannot flood the others.** Each interface remembers at most
+  1024 devices, of which at most 64 hosts first described by any one sender (a
+  sleep proxy speaks for several hosts, but not for that many), and a device at
+  most 64 services. Beyond that, new ones are ignored until old ones expire.
 - **Link-local addresses are never reflected.** `fe80::/10` only means
   something on the link the device is on; announced to another network it would
   name nobody. A reflected device is announced with its routable address only,

@@ -17,9 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 
-use crate::device::{
-    addr_of, is_service_type, service_ttl, Device, Report, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
-};
+use crate::device::{addr_of, is_type, service_ttl, Device, Report, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL};
 use crate::parser::{Header, Message, Question, RData, Record};
 use crate::timer::{self, Next, Timer};
 
@@ -49,6 +47,14 @@ const PROBE_GAPS: [Duration; 3] = if cfg!(test) {
 /// Service types remembered per segment, so a hostile device cannot grow it
 /// without bound by announcing endless made-up types.
 const MAX_TYPES: usize = 256;
+
+/// Devices remembered per segment, and of them, hosts first described by any
+/// one sender: one sender inventing endless devices (or many forged ones)
+/// must neither fill the other segments nor grow the list without bound. A
+/// sleep proxy or Thread border router speaks for several hosts, but not
+/// for this many.
+const MAX_DEVICES: usize = 1024;
+const MAX_PER_SENDER: usize = 64;
 
 /// A record may not be multicast more than once a second (RFC 6762 section 6).
 const MIN_MULTICAST_GAP: Duration = Duration::from_secs(1);
@@ -227,14 +233,16 @@ enum Key {
 /// A discovered device, and when to drop it or ask it again.
 struct Entry {
     device: Device,
+    /// The address of the packet it was first heard of in.
+    from: IpAddr,
     expires: Instant,
     /// When it was last asked to answer again because it was about to expire.
     refreshed: Option<Instant>,
 }
 
 impl Entry {
-    fn new(now: Instant) -> Entry {
-        Entry { device: Device::default(), expires: now, refreshed: None }
+    fn new(now: Instant, from: IpAddr) -> Entry {
+        Entry { device: Device::default(), from, expires: now, refreshed: None }
     }
 
     /// Whether there is anything to ask it about: a name or a service.
@@ -431,6 +439,14 @@ impl State {
     fn forget(&mut self, key: &Key) -> Option<Entry> {
         self.by_addr.retain(|_, k| k != key);
         self.discovered.remove(key)
+    }
+
+    /// Whether a new host may be learned of from `src`: the segment has
+    /// fewer than [`MAX_DEVICES`], and `src` first described fewer than
+    /// [`MAX_PER_SENDER`] of them.
+    fn room_for(&self, src: IpAddr) -> bool {
+        let named = |e: &&Entry| e.from == src && e.device.hostname.is_some();
+        self.discovered.len() < MAX_DEVICES && self.discovered.values().filter(named).count() < MAX_PER_SENDER
     }
 
     /// The instance names, in lowercase, of the services that devices on this
@@ -991,7 +1007,8 @@ impl Segment {
             if let RData::Ptr(kind) = &rec.data {
                 if rec.ttl > 0
                     && rec.name.eq_ignore_ascii_case(META_QUERY)
-                    && is_service_type(kind)
+                    && rec.class == 1
+                    && is_type(kind)
                     && state.types.len() < MAX_TYPES
                 {
                     state.types.insert(kind.to_ascii_lowercase());
@@ -1015,7 +1032,13 @@ impl Segment {
 
         for report in &reports {
             let key = host_key(&report.host);
-            let is_sender = report.addrs.contains(&src) || (report.addrs.is_empty() && reports.len() == 1);
+            if !state.discovered.contains_key(&key) && !state.room_for(src) {
+                continue;
+            }
+            // A host that announced only addresses no one can be reached at
+            // is not given the sender's instead.
+            let is_sender = report.addrs.contains(&src)
+                || (report.addrs.is_empty() && !report.refused && reports.len() == 1);
             let mut addrs = report.addrs.clone();
             if is_sender && !addrs.contains(&src) {
                 addrs.push(src);
@@ -1030,7 +1053,7 @@ impl Segment {
             };
 
             touched.note(&state.discovered, &key);
-            let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now));
+            let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now, src));
             if let Some(earlier) = earlier {
                 entry.absorb(earlier);
             }
@@ -1051,11 +1074,11 @@ impl Segment {
         // bare browse answer, text records), or just a sign of life such as a
         // query. A packet that only describes other devices says nothing about
         // its sender, which is then not recorded at all.
-        if reports.is_empty() || !rest.is_empty() {
-            let key = sender
-                .unwrap_or_else(|| state.by_addr.get(&src).cloned().unwrap_or(Key::Source(src)));
+        let key = sender.unwrap_or_else(|| state.by_addr.get(&src).cloned().unwrap_or(Key::Source(src)));
+        let room = state.discovered.contains_key(&key) || state.discovered.len() < MAX_DEVICES;
+        if (reports.is_empty() || !rest.is_empty()) && room {
             touched.note(&state.discovered, &key);
-            let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now));
+            let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now, src));
             let ttl = rest.iter().map(|r| r.ttl).max().unwrap_or(0);
             let ttl = Duration::from_secs(ttl as u64);
             entry.expires = entry.expires.max(now + ttl.max(floor));
@@ -1625,6 +1648,50 @@ mod tests {
         assert_eq!(Segment::new("quiet", Family::V4).query_question(&questions).unwrap(), 0);
     }
 
+    /// One sender may describe only so many hosts: a sleep proxy speaks for
+    /// several, but not for thousands. Others are not held back, and the
+    /// hosts it described are still kept up to date.
+    #[test]
+    fn one_sender_may_describe_only_so_many_hosts() {
+        let seg = Segment::new("test", Family::V4);
+        for i in 0..MAX_PER_SENDER + 10 {
+            hear(&seg, "10.0.1.1", vec![a_record(&format!("h{i}.local"), &format!("10.0.2.{}", i % 250 + 1))]);
+        }
+        let named = |seg: &Segment| seg.devices().iter().filter(|d| d.hostname.is_some()).count();
+        assert_eq!(named(&seg), MAX_PER_SENDER);
+
+        hear(&seg, "10.0.1.2", vec![a_record("other.local", "10.0.1.2")]);
+        assert_eq!(named(&seg), MAX_PER_SENDER + 1, "another sender is not held back");
+
+        hear(&seg, "10.0.1.1", vec![a_record("h0.local", "10.0.3.3")]);
+        let h0 = seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("h0.local")).unwrap();
+        assert_eq!(h0.routable, Some(ip("10.0.3.3")), "what it described is kept up to date");
+    }
+
+    #[test]
+    fn a_segment_remembers_only_so_many_devices() {
+        let seg = Segment::new("test", Family::V4);
+        for i in 0..MAX_DEVICES + 20 {
+            seg.observe(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i as u32 + 1)));
+        }
+        assert_eq!(seg.devices().len(), MAX_DEVICES);
+    }
+
+    /// A host that announced only an address no one can be reached at is not
+    /// given the address the packet came from instead.
+    #[test]
+    fn a_host_with_only_unusable_addresses_is_not_given_the_senders() {
+        let seg = Segment::new("test", Family::V4);
+        hear(&seg, "10.0.1.7", vec![a_record("tv.local", "0.0.0.0"), srv("TV._http._tcp.local", 80, "tv.local")]);
+        let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
+        assert_eq!((tv.routable, tv.link_local), (None, None));
+
+        // One that announced none at all still is: it is the sender.
+        hear(&seg, "10.0.1.8", vec![srv("NAS._smb._tcp.local", 445, "nas.local")]);
+        let nas = seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("nas.local")).unwrap();
+        assert_eq!(nas.routable, Some(ip("10.0.1.8")));
+    }
+
     #[test]
     fn add_rejects_unannounceable_devices() {
         let (seg, rx) = wired();
@@ -1902,10 +1969,10 @@ mod tests {
     }
 
     #[test]
-    fn probe_skips_names_it_cannot_encode() {
+    fn a_name_that_is_not_valid_utf8_is_never_learned_or_asked_about() {
         let (seg, rx) = wired();
-        // An instance whose label is 60 invalid UTF-8 bytes: decoding turns
-        // each into U+FFFD, so the name no longer fits in a 63-byte label.
+        // An instance whose label is 60 invalid UTF-8 bytes: decoded, it would
+        // not even fit in a label again.
         let mut p = response(1);
         let mut instance = vec![60];
         instance.extend([0xff; 60]);
@@ -1913,10 +1980,9 @@ mod tests {
         rr(&mut p, &["_x", "_tcp", "local"], 12, 4500, &instance);
         seg.handle(sa("10.0.2.73"), &p).unwrap();
 
+        assert!(seg.devices().iter().all(|d| d.services.is_empty()));
         assert!(seg.probe_round().is_ok());
-        let asked = asked(&recv(&rx).unwrap());
-        assert!(asked.contains(&q("_x._tcp.local", rtype::PTR)));
-        assert_eq!(asked.len(), 2, "the unencodable instance is skipped: {asked:?}");
+        assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([q(META_QUERY, rtype::PTR)]));
     }
 
     #[test]

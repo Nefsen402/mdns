@@ -238,6 +238,13 @@ fn drive(opts: &Options, run: &Path, socket: &Path, daemon: &mut Child) -> Resul
         let _ = socket.send_to(bytes, to);
     };
 
+    let send_canary = |k: u64| {
+        // A packet refused is a canary late, which the ledger will notice.
+        if let Ok((socket, to)) = net::sender_from(net::FUZZ_A, bogus::canary_addr(k)) {
+            let _ = socket.send_to(&bogus::canary(k), to);
+        }
+    };
+
     let mut sent_log = BufWriter::new(File::create(run.join("sent.log")).map_err(|e| e.to_string())?);
     let mut inputs: Vec<Input> = Vec::new();
     let mut generator = Generator::new(opts.seed);
@@ -266,7 +273,7 @@ fn drive(opts: &Options, run: &Path, socket: &Path, daemon: &mut Child) -> Resul
         if feeding && now >= next_canary {
             canary += 1;
             ledger.lock().unwrap().canary_sent(canary);
-            send(&bogus::canary(canary), false);
+            send_canary(canary);
             next_canary += CANARY_EVERY;
         }
         {
@@ -275,7 +282,7 @@ fn drive(opts: &Options, run: &Path, socket: &Path, daemon: &mut Child) -> Resul
             for (&k, c) in &ledger.canaries {
                 let age = now.saturating_duration_since(c.sent);
                 if c.seen.is_none() && age > CANARY_RESEND && resent.insert(k) {
-                    send(&bogus::canary(k), false);
+                    send_canary(k);
                 }
                 if c.seen.is_none() && age > CANARY_TIMEOUT && late.insert(k) {
                     stalled.push(k);

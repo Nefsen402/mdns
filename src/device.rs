@@ -39,6 +39,12 @@ const KNOWN_SUBTYPES: [&str; 4] = [
     "_CM._sub._matterc._udp.local",
 ];
 
+/// What one device may have, however much it announces: more would be a
+/// flood, not a device.
+const MAX_SERVICES: usize = 64;
+const MAX_SUBTYPES: usize = 16;
+const MAX_REVERSE: usize = 8;
+
 /// A reflected device is never announced for less than this, however short a
 /// TTL it announced itself with: it is announced again at 80% of its TTL, and
 /// a few seconds would be a flood.
@@ -110,6 +116,10 @@ pub struct Report<'a> {
     pub max_ttl: u32,
     /// The TTL its address records announced, if it has any of this family.
     pub addr_ttl: Option<u32>,
+    /// It announced addresses of this family that no device can be reached
+    /// at. Having announced addresses, it is not one to credit with the
+    /// address the packet came from instead.
+    pub refused: bool,
 }
 
 impl<'a> Report<'a> {
@@ -123,10 +133,14 @@ impl<'a> Report<'a> {
     /// A response may describe several devices (a reflector answering a
     /// browse query does), so each record goes to the device it names
     /// instead of the whole packet to one.
+    ///
+    /// A record that is not [well formed](well_formed) is left out, as if it
+    /// were not there.
     pub fn all(msg: &'a Message, family: Family) -> (Vec<Report<'a>>, Vec<&'a Record>) {
+        let records: Vec<&'a Record> = msg.records().filter(|r| well_formed(r)).collect();
         let mut reports: Vec<Report<'a>> = Vec::new();
         let mut instance_host: HashMap<String, usize> = HashMap::new();
-        for rec in msg.records() {
+        for &rec in &records {
             match &rec.data {
                 RData::A(_) | RData::Aaaa(_) => {
                     report_index(&mut reports, &rec.name);
@@ -146,7 +160,7 @@ impl<'a> Report<'a> {
         }
 
         let mut rest: Vec<&'a Record> = Vec::new();
-        for rec in msg.records() {
+        for &rec in &records {
             let instance = match &rec.data {
                 RData::A(_) | RData::Aaaa(_) => {
                     let i = report_index(&mut reports, &rec.name);
@@ -179,9 +193,9 @@ impl<'a> Report<'a> {
         }
 
         for r in &mut reports {
-            r.addrs = announced_addrs(msg, &r.host, family);
-            r.addr_ttl = msg
-                .records()
+            (r.addrs, r.refused) = announced_addrs(&records, &r.host, family);
+            r.addr_ttl = records
+                .iter()
                 .filter(|rec| rec.name.eq_ignore_ascii_case(&r.host))
                 .filter(|rec| addr_of(&rec.data).is_some_and(|a| r.addrs.contains(&a)))
                 .map(|rec| rec.ttl)
@@ -200,21 +214,143 @@ fn report_index(reports: &mut Vec<Report<'_>>, host: &str) -> usize {
     if let Some(i) = reports.iter().position(|r| r.host.eq_ignore_ascii_case(host)) {
         return i;
     }
-    reports.push(Report { host: host.to_string(), addrs: Vec::new(), records: Vec::new(), max_ttl: 0, addr_ttl: None });
+    reports.push(Report {
+        host: host.to_string(),
+        addrs: Vec::new(),
+        records: Vec::new(),
+        max_ttl: 0,
+        addr_ttl: None,
+        refused: false,
+    });
     reports.len() - 1
 }
 
-/// The usable addresses of `family` that `msg` announces for `host`.
-fn announced_addrs(msg: &Message, host: &str, family: Family) -> Vec<IpAddr> {
+/// The usable addresses of `family` that `records` announce for `host`, and
+/// whether they announced any of that family that are not.
+fn announced_addrs(records: &[&Record], host: &str, family: Family) -> (Vec<IpAddr>, bool) {
     let mut found: Vec<IpAddr> = Vec::new();
-    for rec in msg.records().filter(|r| r.ttl > 0 && r.name.eq_ignore_ascii_case(host)) {
+    let mut refused = false;
+    for rec in records.iter().filter(|r| r.ttl > 0 && r.name.eq_ignore_ascii_case(host)) {
         let Some(addr) = addr_of(&rec.data) else { continue };
-        let family_ok = matches!((family, addr), (Family::V4, IpAddr::V4(_)) | (Family::V6, IpAddr::V6(_)));
-        if family_ok && !addr.is_loopback() && !addr.is_unspecified() && !addr.is_multicast() && !found.contains(&addr) {
+        if !matches!((family, addr), (Family::V4, IpAddr::V4(_)) | (Family::V6, IpAddr::V6(_))) {
+            continue;
+        }
+        if !is_usable(addr) {
+            refused = true;
+        } else if !found.contains(&addr) {
             found.push(addr);
         }
     }
-    found
+    (found, refused)
+}
+
+/// Whether a device could be reached at `addr`. Not at an unspecified,
+/// loopback, multicast or broadcast address, nor in `0.0.0.0/8` or the
+/// reserved `240.0.0.0/4`, nor at an IPv4 address dressed as IPv6 (mapped or
+/// compatible), which no IPv6 network routes to. A link-local address is
+/// usable, on its own link.
+pub fn is_usable(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(a) => {
+            let first = a.octets()[0];
+            !(a.is_unspecified() || a.is_loopback() || a.is_multicast() || first == 0 || first >= 240)
+        }
+        IpAddr::V6(a) => {
+            let ipv4 = a.to_ipv4_mapped().is_some() || a.segments()[..6] == [0; 6];
+            !(a.is_unspecified() || a.is_loopback() || a.is_multicast() || ipv4)
+        }
+    }
+}
+
+/// Whether `rec` is one a device could have announced, as far as it alone
+/// tells: of class IN, about a [host](is_hostname) or a service
+/// [instance](is_instance_name), pointing at ones that can be, and a
+/// service on a port. Records of other types are none the daemon keeps.
+fn well_formed(rec: &Record) -> bool {
+    if rec.class != 1 {
+        return false;
+    }
+    match &rec.data {
+        RData::A(_) | RData::Aaaa(_) => is_hostname(&rec.name),
+        RData::Nsec { .. } => is_hostname(&rec.name) || is_instance_name(&rec.name),
+        RData::Srv { port, target, .. } => *port != 0 && is_instance_name(&rec.name) && is_hostname(target),
+        RData::Txt(_) => is_instance_name(&rec.name),
+        RData::Ptr(target) if parser::reverse_addr(&rec.name).is_some() => is_hostname(target),
+        RData::Ptr(target) if rec.name.eq_ignore_ascii_case(META_QUERY) => is_type(target),
+        // A browse answer: an instance of the type, or the subtype's type.
+        RData::Ptr(target) => {
+            let kind = match browsed_type(&rec.name) {
+                Some(kind) => kind,
+                None => return false,
+            };
+            is_instance_name(target) && parser::split_instance(target).is_some_and(|(_, k)| k.eq_ignore_ascii_case(kind))
+        }
+        RData::Other { .. } => false,
+    }
+}
+
+/// The type a browse PTR's name is of: itself, if a [type](is_type), or the
+/// type of a subtype, `_universal._sub._ipp._tcp.local`.
+fn browsed_type(name: &str) -> Option<&str> {
+    if is_type(name) {
+        return Some(name);
+    }
+    let (sub, rest) = parser::split_instance(name)?;
+    let kind = rest.get(5..).filter(|_| starts_with_ci(rest, "_sub."))?;
+    (proper(&unescape(sub)) && is_type(kind)).then_some(kind)
+}
+
+/// Whether `name` can be a host's: under `.local`, and each of its labels
+/// [proper](proper), with no dot, backslash or space in it.
+pub fn is_hostname(name: &str) -> bool {
+    if name.contains('\\') {
+        return false;
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    labels.len() >= 2
+        && labels.last().is_some_and(|l| l.eq_ignore_ascii_case("local"))
+        && labels.iter().all(|l| proper(l) && !l.contains(' '))
+}
+
+/// Whether `name` is a service type: `_name._tcp.local` or `_name._udp.local`,
+/// the name of letters, digits, hyphens and underscores.
+pub fn is_type(name: &str) -> bool {
+    let labels: Vec<&str> = name.split('.').collect();
+    let [service, proto, local] = labels[..] else { return false };
+    let ok = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    service.len() >= 2
+        && service.starts_with('_')
+        && service.chars().all(ok)
+        && (proto.eq_ignore_ascii_case("_tcp") || proto.eq_ignore_ascii_case("_udp"))
+        && local.eq_ignore_ascii_case("local")
+}
+
+/// Whether `name` is a service instance's: a [proper](proper) label (which
+/// may hold spaces and dots), of a [type](is_type).
+pub fn is_instance_name(name: &str) -> bool {
+    parser::split_instance(name).is_some_and(|(label, kind)| proper(&unescape(label)) && is_type(kind))
+}
+
+/// A label that can be in a name: not empty, at most 63 bytes, without
+/// control characters, and of valid UTF-8 (which the parser turns invalid
+/// bytes from).
+fn proper(label: &str) -> bool {
+    !label.is_empty() && label.len() <= 63 && !label.chars().any(|c| c.is_control() || c == char::REPLACEMENT_CHARACTER)
+}
+
+/// A label as it was on the wire, without the parser's escapes.
+fn unescape(label: &str) -> String {
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in label.chars() {
+        if c == '\\' && !escaped {
+            escaped = true;
+        } else {
+            escaped = false;
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl Device {
@@ -272,7 +408,7 @@ impl Device {
                     let addr = parser::reverse_addr(&rec.name).expect("checked above");
                     if self.hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(host)) {
                         self.reverse.retain(|a| *a != addr);
-                        if rec.ttl != 0 {
+                        if rec.ttl != 0 && self.reverse.len() < MAX_REVERSE {
                             self.reverse.push(addr);
                         }
                     }
@@ -290,18 +426,17 @@ impl Device {
                             if let Some(svc) = self.services.iter_mut().find(|s| s.instance.eq_ignore_ascii_case(instance)) {
                                 svc.subtypes.retain(|sub| !same(sub));
                             }
-                        } else {
-                            let svc = self.service_mut(instance);
-                            if !svc.subtypes.iter().any(same) {
-                                svc.subtypes.push(rec.name.clone());
-                            }
+                        } else if let Some(svc) = self.service_mut(instance)
+                            && !svc.subtypes.iter().any(same)
+                            && svc.subtypes.len() < MAX_SUBTYPES
+                        {
+                            svc.subtypes.push(rec.name.clone());
                         }
                         continue;
                     }
                     if rec.ttl == 0 {
                         self.forget_service(instance);
-                    } else {
-                        let svc = self.service_mut(instance);
+                    } else if let Some(svc) = self.service_mut(instance) {
                         svc.kind = rec.name.clone();
                         // The SRV record's TTL is the one that counts, if known.
                         if svc.ttl == 0 {
@@ -312,8 +447,7 @@ impl Device {
                 RData::Srv { port, target, .. } => {
                     if rec.ttl == 0 {
                         self.forget_service(&rec.name);
-                    } else {
-                        let svc = self.service_mut(&rec.name);
+                    } else if let Some(svc) = self.service_mut(&rec.name) {
                         svc.port = *port;
                         svc.target = Some(target.clone());
                         svc.ttl = rec.ttl;
@@ -325,8 +459,9 @@ impl Device {
                     }
                 }
                 RData::Txt(strings) => {
-                    if rec.ttl != 0 {
-                        let svc = self.service_mut(&rec.name);
+                    if rec.ttl != 0
+                        && let Some(svc) = self.service_mut(&rec.name)
+                    {
                         svc.txt = strings
                             .iter()
                             .filter(|s| !s.is_empty())
@@ -345,7 +480,7 @@ impl Device {
     /// Take over the services learned about it before its name was known.
     pub fn absorb(&mut self, earlier: Device) {
         for svc in earlier.services {
-            if self.service(&svc.instance).is_none() {
+            if self.service(&svc.instance).is_none() && self.services.len() < MAX_SERVICES {
                 self.insert_service(svc);
             }
         }
@@ -353,17 +488,19 @@ impl Device {
 
     /// Get or create a service, deriving its type from the instance name
     /// until a PTR record states it explicitly. It keeps the spelling it was
-    /// first heard with, whatever the case of later records.
-    fn service_mut(&mut self, instance: &str) -> &mut Service {
+    /// first heard with, whatever the case of later records. `None` if it is
+    /// new and the device has [`MAX_SERVICES`] already.
+    fn service_mut(&mut self, instance: &str) -> Option<&mut Service> {
         let at = match self.services.iter().position(|s| s.instance.eq_ignore_ascii_case(instance)) {
             Some(at) => at,
+            None if self.services.len() >= MAX_SERVICES => return None,
             None => self.insert_service(Service {
                 instance: instance.to_string(),
                 kind: parser::split_instance(instance).map(|(_, kind)| kind.to_string()).unwrap_or_default(),
                 ..Service::default()
             }),
         };
-        &mut self.services[at]
+        Some(&mut self.services[at])
     }
 
     /// Add `svc` in its place among the services, and return where that is.
@@ -1087,6 +1224,98 @@ mod tests {
         assert_eq!(asked(&queries), [q("printer.local", rtype::A), q("_ipp._tcp.local", rtype::PTR)]);
         assert!(queries.iter().flat_map(|m| &m.questions).all(|q| !q.unicast_response && q.class == 1));
         assert!(Device::forward_queries(&[]).is_empty());
+
+        // A name that cannot be encoded again (a label past 63 bytes) is
+        // skipped, not the whole query failed.
+        let long = format!("{}.local", "x".repeat(64));
+        let queries = Device::forward_queries(&[ask(&long, rtype::A, false), ask("ok.local", rtype::A, false)]);
+        assert_eq!(asked(&queries), [q("ok.local", rtype::A)]);
+    }
+
+    #[test]
+    fn only_names_a_device_can_have_are_taken() {
+        for ok in ["tv.local", "TV-2.LOCAL", "a.b.local", "fernseh-küche.local"] {
+            assert!(is_hostname(ok), "{ok}");
+        }
+        for bad in ["tv", "tv.com", "local", "tv.local.evil", "bad\\.dot.local", "sp ace.local", "nul\0.local", "bad\u{FFFD}.local", ".local", ""] {
+            assert!(!is_hostname(bad), "{bad:?}");
+        }
+        for ok in ["_http._tcp.local", "_androidtvremote2._tcp.local", "_x._udp.LOCAL", "_home-sharing._tcp.local"] {
+            assert!(is_type(ok), "{ok}");
+        }
+        for bad in ["http._tcp.local", "_._tcp.local", "_http._xyz.local", "_http.local", "_http._tcp.com", "_ht tp._tcp.local", "a._http._tcp.local"] {
+            assert!(!is_type(bad), "{bad}");
+        }
+        for ok in ["My TV._http._tcp.local", "Dots\\.in\\.it._http._tcp.local", "Wohnzimmer Ü._ipp._tcp.local"] {
+            assert!(is_instance_name(ok), "{ok}");
+        }
+        for bad in ["._http._tcp.local", "Bell\u{7}._http._tcp.local", "X._http._tcp.com", "X.tv.local", "\u{FFFD}._http._tcp.local"] {
+            assert!(!is_instance_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_addresses_a_device_can_be_reached_at_are_taken() {
+        for ok in ["10.0.1.5", "192.168.1.1", "169.254.1.2", "fd00::1", "2001:db8::1", "fe80::1"] {
+            assert!(is_usable(ip(ok)), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0", "0.1.2.3", "127.0.0.1", "224.0.0.251", "239.1.2.3", "240.0.0.1", "255.255.255.255",
+            "::", "::1", "ff02::fb", "::ffff:10.0.1.5", "::10.0.1.5",
+        ] {
+            assert!(!is_usable(ip(bad)), "{bad}");
+        }
+    }
+
+    /// Records no device could have announced are left out of a report, as
+    /// if they were not there.
+    #[test]
+    fn records_no_device_could_have_announced_are_left_out() {
+        let msg = response(vec![
+            a_record("tv.local", "10.0.1.7"),
+            a_record("tv.com", "10.0.1.8"),
+            Record { class: 3, ..a_record("tv.local", "10.0.1.9") },
+            srv("Port Zero._http._tcp.local", 0, "tv.local"),
+            ptr("_http._tcp.local", "Other Type._ipp._tcp.local"),
+            srv("TV._http._tcp.local", 80, "tv.local"),
+        ]);
+        let (reports, rest) = Report::all(&msg, Family::V4);
+        let [report] = &reports[..] else { panic!("{} reports", reports.len()) };
+        assert_eq!((report.host.as_str(), report.addrs.clone()), ("tv.local", vec![ip("10.0.1.7")]));
+        let kept: Vec<&str> = report.records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(kept, ["TV._http._tcp.local"]);
+        assert!(rest.is_empty(), "{rest:?}");
+    }
+
+    #[test]
+    fn a_host_that_announced_only_unusable_addresses_is_refused() {
+        let refused = |records| {
+            let msg = response(records);
+            let (reports, _) = Report::all(&msg, Family::V4);
+            (reports[0].addrs.clone(), reports[0].refused)
+        };
+        assert_eq!(refused(vec![a_record("tv.local", "0.0.0.0")]), (vec![], true));
+        assert_eq!(refused(vec![a_record("tv.local", "0.0.0.0"), a_record("tv.local", "10.0.1.7")]), (vec![ip("10.0.1.7")], true));
+        assert_eq!(refused(vec![srv("TV._http._tcp.local", 80, "tv.local")]), (vec![], false), "it said nothing");
+        // Another family's address is neither.
+        assert_eq!(refused(vec![aaaa("tv.local", "::1")]), (vec![], false));
+    }
+
+    #[test]
+    fn a_device_holds_only_so_much() {
+        let mut device = Device { hostname: Some("tv.local".into()), routable: Some(ip("10.0.1.7")), ..Device::default() };
+        let services: Vec<Record> = (0..MAX_SERVICES + 10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
+        device.learn_records(services.iter());
+        assert_eq!(device.services.len(), MAX_SERVICES);
+
+        let subtypes: Vec<Record> =
+            (0..MAX_SUBTYPES + 5).map(|i| ptr(&format!("_s{i}._sub._http._tcp.local"), "S0._http._tcp.local")).collect();
+        device.learn_records(subtypes.iter());
+        assert_eq!(device.service("S0._http._tcp.local").unwrap().subtypes.len(), MAX_SUBTYPES);
+
+        let mappings: Vec<Record> = (0..MAX_REVERSE + 5).map(|i| reverse(&format!("10.0.2.{i}"), "tv.local")).collect();
+        device.learn_records(mappings.iter());
+        assert_eq!(device.reverse.len(), MAX_REVERSE);
     }
 
     #[test]

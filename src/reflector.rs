@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use crate::device::Device;
+use crate::device::{Device, Service};
 use crate::parser::Question;
 use crate::socket::{Event, Family, Owner, Segment};
 
@@ -272,7 +272,8 @@ impl Inner {
             if *src == target || out.contains_key(key) {
                 continue;
             }
-            out.insert(key.clone(), Device { link_local: None, ..device.clone() });
+            let services = device.services.iter().filter(|s| resolved(s)).cloned().collect();
+            out.insert(key.clone(), Device { link_local: None, services, ..device.clone() });
         }
         out
     }
@@ -316,10 +317,17 @@ impl Inner {
 /// Only devices that can actually be announced elsewhere are reflected: that
 /// takes a hostname for the address record and a routable address to put in it
 /// (a device known only by a link-local address cannot be reached from another
-/// network), and services give clients a reason to care (bare chatty clients
-/// such as phones are skipped).
+/// network), and a resolved service to give clients a reason to care (bare
+/// chatty clients such as phones are skipped).
 fn reflectable(device: &Device) -> bool {
-    device.hostname.is_some() && device.routable.is_some() && !device.services.is_empty()
+    device.hostname.is_some() && device.routable.is_some() && device.services.iter().any(resolved)
+}
+
+/// Whether it is known where `svc` is, by its SRV record: a host and a port.
+/// One known only by name from a browse answer or a TXT record is not
+/// reflected, since a copy would have to make up the rest.
+fn resolved(svc: &Service) -> bool {
+    svc.target.is_some() && svc.port != 0
 }
 
 fn track(book: &mut Book, src: usize, device: Device) {
@@ -822,6 +830,34 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert_eq!(br0.manual_devices(), [router]);
         assert!(drain(&br0_rx).is_empty(), "nothing about it was sent, or withdrawn");
+    }
+
+    /// A service known only by its text (Apple's `_device-info` has no SRV)
+    /// is not reflected: a copy would have to make up its port and host.
+    #[test]
+    fn only_services_known_where_they_are_are_reflected() {
+        let (a, _arx) = wired("a");
+        let (b, _brx) = wired("b");
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
+        let msg = Message {
+            header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+            questions: vec![],
+            answers: vec![
+                rec("tv.local", RData::A("10.0.1.5".parse().unwrap())),
+                rec("TV._device-info._tcp.local", RData::Txt(vec![b"model=X".to_vec()])),
+            ],
+            authorities: vec![],
+            additionals: vec![],
+        };
+        a.handle(SocketAddr::new(ip("10.0.1.5"), 5353), &msg.encode().unwrap()).unwrap();
+        wait_for(|| a.devices().iter().any(|d| !d.services.is_empty()));
+        thread::sleep(Duration::from_millis(100));
+        assert!(b.manual_devices().is_empty(), "nothing resolved to reflect");
+
+        announce(&a, "10.0.1.5", "tv.local", &["TV"]);
+        wait_for(|| b.manual_devices().len() == 1);
+        let names: Vec<String> = b.manual_devices()[0].services.iter().map(|s| s.instance.clone()).collect();
+        assert_eq!(names, ["TV._http._tcp.local"]);
     }
 
     /// A client on `seg` asks `name` (type A), from port 5353.
