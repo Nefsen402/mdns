@@ -71,7 +71,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::reflector::Notice;
-use crate::socket::{Device, Event, Family, Segment};
+use crate::device::Device;
+use crate::socket::{Event, Family, Segment};
 use crate::timer::Watcher;
 use crate::Group;
 

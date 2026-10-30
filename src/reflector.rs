@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use crate::socket::{Device, Event, Family, Owner, Segment};
+use crate::device::Device;
+use crate::socket::{Event, Family, Owner, Segment};
 
 /// How often a worker checks for shutdown while waiting for events.
 const TICK: Duration = Duration::from_millis(250);

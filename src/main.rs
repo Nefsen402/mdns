@@ -1,4 +1,5 @@
 mod config;
+mod device;
 mod ipc;
 mod parser;
 mod reflector;
@@ -17,7 +18,8 @@ use anyhow::{Context, Result};
 
 use config::Config;
 use reflector::Reflector;
-use socket::{Device, Family, MdnsSocket, Owner, Segment};
+use device::Device;
+use socket::{Family, MdnsSocket, Owner, Segment};
 use timer::Timer;
 
 /// One configured segment for one address family.
@@ -233,7 +235,7 @@ fn start_link(
         // and for IPv6 it is the one the kernel picks.
         let router = sock.local_addr().and_then(|addr| {
             let (link_local, routable) =
-                if socket::is_link_local(&addr) { (Some(addr), None) } else { (None, Some(addr)) };
+                if device::is_link_local(&addr) { (Some(addr), None) } else { (None, Some(addr)) };
             let device = Device { hostname: Some(name.to_string()), link_local, routable, ..Device::default() };
             link.add_manual_ttl(Owner::Own, device, ttl).map(|_| addr)
         });
