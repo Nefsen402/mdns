@@ -5,3 +5,6 @@
 /packaging/arch/pkg/
 /packaging/arch/*.pkg.tar*
 /packaging/arch/*.log
+
+# The fuzzer builds on its own
+/fuzz/target

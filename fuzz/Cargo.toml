@@ -1,0 +1,14 @@
+[package]
+name = "mdns-fuzz"
+version = "0.1.0"
+edition = "2024"
+description = "Feeds bogus mDNS devices to the reflector in a network namespace, and checks none come out the other side"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+libc = "0.2.191"
+socket2 = { version = "0.6.5", features = ["all"] }
+
+# Not part of the daemon's package: built on its own, from this directory.
+[workspace]

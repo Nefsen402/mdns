@@ -618,6 +618,44 @@ the reflected devices immediately. If the daemon is killed with `SIGKILL` or
 crashes, no goodbyes are sent and clients keep the reflected devices until
 their records expire (up to 75 minutes).
 
+## Fuzzing
+
+Every packet the daemon hears is untrusted, and what it reflects is what one
+network tells another. `fuzz/` holds a fuzzer that tests that boundary from the
+outside, as a network would:
+
+```sh
+cd fuzz
+cargo run --release -- --duration 60
+```
+
+It builds the daemon on its own (a debug build, so that overflow checks and
+debug assertions are on), and runs it in a network namespace of its own with
+one segment of two interfaces. On one it sends nothing but bogus devices, each
+an otherwise valid announcement with one thing wrong with it:
+
+- **unparseable**: cut short, reserved label bytes, looping or forward
+  compression pointers, wrong counts, junk;
+- **names**: not under `.local`, a dot or a control character in a host label,
+  invalid UTF-8, a bad service type, a class other than IN;
+- **addresses**: unspecified, broadcast, multicast, loopback, reserved,
+  link-local or IPv4-mapped addresses, and SRV port 0;
+- **floods**: thousands of well-formed devices from one sender, of which no
+  more than 64 may get through.
+
+None of them may come out on the other interface. Among them go canaries,
+well-formed devices that must come out within six seconds, to show that the
+daemon has neither stalled nor died.
+
+It needs no privileges: it runs itself under `unshare -rn`, which needs
+unprivileged user namespaces. Options: `--seed N` (a run is the same from the
+same seed), `--duration SECS`, `--rate INPUTS_PER_SEC` (200),
+`--only unparseable,names,addresses,floods`, `--stop-on-first`, and
+`--daemon PATH` to test a daemon built elsewhere. Each run is logged to
+`target/fuzz-runs/<seed>/`: `sent.log` (every input, in hex), `daemon.log`,
+and `failures.txt` (each failure, with the input that caused it). It exits
+non-zero if anything failed.
+
 ## License
 
 GPL-3.0-only. See [`LICENSE`](LICENSE).
