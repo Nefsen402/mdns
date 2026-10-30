@@ -1,4 +1,4 @@
-//! Reflects devices between segments of one address family.
+//! Reflects devices between segments, over every address family they serve.
 //!
 //! Every device discovered on a segment is announced on all the *other*
 //! segments, and withdrawn again when it goes away. The reflector owns the
@@ -21,7 +21,7 @@ use anyhow::{bail, Result};
 
 use crate::device::{Device, Service};
 use crate::parser::Question;
-use crate::socket::{Event, Family, Owner, Segment};
+use crate::socket::{Event, Owner, Segment};
 
 /// How often a worker checks for shutdown while waiting for events.
 const TICK: Duration = Duration::from_millis(250);
@@ -35,7 +35,6 @@ const RETRY: Duration = Duration::from_secs(5);
 pub struct Notice {
     /// The segment the device was discovered on.
     pub interface: String,
-    pub family: Family,
     pub event: Event,
     /// How much longer the daemon keeps the device if it is not heard from
     /// again, to the second; zero if it was removed.
@@ -92,15 +91,6 @@ impl Reflector {
             bail!("a reflector needs at least one segment");
         }
         for (i, seg) in segments.iter().enumerate() {
-            if seg.family() != segments[0].family() {
-                bail!(
-                    "{} is {:?} but {} is {:?}",
-                    seg.interface(),
-                    seg.family(),
-                    segments[0].interface(),
-                    segments[0].family()
-                );
-            }
             if segments[..i].iter().any(|o| o.interface() == seg.interface()) {
                 bail!("more than one segment for interface {}", seg.interface());
             }
@@ -212,7 +202,7 @@ impl Inner {
             Event::Removed(_) | Event::Question(_) => Duration::ZERO,
             Event::Added(device) | Event::Updated(device) => seg.lifetime_left(device),
         };
-        let notice = Notice { interface: seg.interface().to_string(), family: seg.family(), event: event.clone(), ttl };
+        let notice = Notice { interface: seg.interface().to_string(), event: event.clone(), ttl };
         subscribers.retain(|tx| tx.send(notice.clone()).is_ok());
     }
 
@@ -249,7 +239,7 @@ impl Inner {
                 continue;
             }
             if let Err(e) = seg.query_question(questions) {
-                eprintln!("{}/{:?}: asking on behalf of {} failed: {e:#}", seg.interface(), seg.family(), self.segments[src].interface());
+                eprintln!("{}: asking on behalf of {} failed: {e:#}", seg.interface(), self.segments[src].interface());
             }
         }
     }
@@ -295,7 +285,7 @@ impl Inner {
                     Ok(_) => {
                         book.pushed.remove(&(target, key));
                     }
-                    Err(e) => eprintln!("{}/{:?}: withdrawing {key} failed: {e:#}", seg.interface(), seg.family()),
+                    Err(e) => eprintln!("{}: withdrawing {key} failed: {e:#}", seg.interface()),
                 }
             }
 
@@ -307,7 +297,7 @@ impl Inner {
                     Ok(_) => {
                         book.pushed.insert((target, key), device);
                     }
-                    Err(e) => eprintln!("{}/{:?}: announcing {key} failed: {e:#}", seg.interface(), seg.family()),
+                    Err(e) => eprintln!("{}: announcing {key} failed: {e:#}", seg.interface()),
                 }
             }
         }
@@ -355,8 +345,8 @@ mod tests {
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         rx.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let seg = Segment::new(name, Family::V4);
-        seg.attach(tx, rx.local_addr().unwrap());
+        let seg = Segment::new(name, &[Family::V4]);
+        seg.attach(Family::V4, tx, rx.local_addr().unwrap());
         (seg, rx)
     }
 
@@ -364,8 +354,8 @@ mod tests {
     fn wired_v6(name: &str) -> (Segment, UdpSocket) {
         let (_, rx) = wired(name);
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let seg = Segment::new(name, Family::V6);
-        seg.attach(tx, rx.local_addr().unwrap());
+        let seg = Segment::new(name, &[Family::V6]);
+        seg.attach(Family::V6, tx, rx.local_addr().unwrap());
         (seg, rx)
     }
 
@@ -380,7 +370,7 @@ mod tests {
 
         a.observe("10.0.1.1".parse().unwrap());
         let first = next();
-        assert_eq!((first.interface.as_str(), first.family), ("a", Family::V4));
+        assert_eq!(first.interface, "a");
         assert!(matches!(first.event, Event::Added(_)));
         // Kept for at least the floor, whatever its records said.
         assert_eq!(first.ttl, crate::socket::DEFAULT_MIN_LIFETIME);
@@ -1001,10 +991,7 @@ mod tests {
     #[test]
     fn rejects_bad_construction() {
         let (a, _) = wired("a");
-        let (b, _) = wired("b");
         assert!(Reflector::new(0, vec![]).is_err());
         assert!(Reflector::new(0, vec![a.clone(), a.clone()]).is_err());
-        let v6 = Segment::new("c", Family::V6);
-        assert!(Reflector::new(0, vec![a, b, v6]).is_err());
     }
 }

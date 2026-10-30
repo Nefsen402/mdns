@@ -376,6 +376,17 @@ impl Device {
         }
     }
 
+    /// The address record types to ask it for: of the families it has an
+    /// address of, or both if it has none.
+    pub fn address_types(&self) -> Vec<u16> {
+        let has = |a: &Addrs| a.routable.is_some() || a.link_local.is_some();
+        match (has(&self.ipv4), has(&self.ipv6)) {
+            (true, false) => vec![rtype::A],
+            (false, true) => vec![rtype::AAAA],
+            _ => vec![rtype::A, rtype::AAAA],
+        }
+    }
+
     /// This device without its link-local addresses, which mean nothing off
     /// its own link.
     pub fn without_link_local(&self) -> Device {
@@ -648,13 +659,13 @@ impl Device {
         records
     }
 
-    /// The queries that look for devices on a segment of `family` where
-    /// `devices` are known and `types` were said to be offered: what types
-    /// there are, the instances of each, the subtypes clients browse by (they
-    /// are not sent when their type is browsed), where each instance not yet
-    /// resolved is, and the addresses of a device known by name but without a
-    /// routable address (it only ever showed a link-local one).
-    pub fn probe_queries(devices: &[Device], types: &BTreeSet<String>, family: Family) -> Vec<Message> {
+    /// The queries that look for devices on a segment where `devices` are
+    /// known and `types` were said to be offered: what types there are, the
+    /// instances of each, the subtypes clients browse by (they are not sent
+    /// when their type is browsed), where each instance not yet resolved is,
+    /// and the addresses of a device known by name but without a routable
+    /// address (it only ever showed a link-local one), of both families.
+    pub fn probe_queries(devices: &[Device], types: &BTreeSet<String>) -> Vec<Message> {
         let mut qs = Questions::default();
         qs.ask(META_QUERY, rtype::PTR);
 
@@ -677,7 +688,8 @@ impl Device {
             qs.ask(&svc.instance, rtype::TXT);
         }
         for host in devices.iter().filter(|d| d.routable().next().is_none()).filter_map(|d| d.hostname.as_deref()) {
-            qs.ask(host, address_type(family));
+            qs.ask(host, rtype::A);
+            qs.ask(host, rtype::AAAA);
         }
         qs.into_queries()
     }
@@ -699,15 +711,17 @@ impl Device {
         !self.answers(&query(std::slice::from_ref(q)), 1, 1).0.is_empty()
     }
 
-    /// The queries that ask `devices`, on a segment of `family`, to answer
-    /// again: each for what it announced (its address, and the service and
-    /// text records of each of its instances), and not for whole service
-    /// types, so that only they answer.
-    pub fn refresh_queries(devices: &[Device], family: Family) -> Vec<Message> {
+    /// The queries that ask `devices` to answer again: each for what it
+    /// announced (its addresses, of the families it has, or both if it has
+    /// none yet, and the service and text records of each of its instances),
+    /// and not for whole service types, so that only they answer.
+    pub fn refresh_queries(devices: &[Device]) -> Vec<Message> {
         let mut qs = Questions::default();
         for device in devices {
             if let Some(host) = &device.hostname {
-                qs.ask(host, address_type(family));
+                for qtype in device.address_types() {
+                    qs.ask(host, qtype);
+                }
             }
             for svc in &device.services {
                 qs.ask(&svc.instance, rtype::SRV);
@@ -890,13 +904,7 @@ impl Device {
     }
 }
 
-/// The address record type of `family`.
-fn address_type(family: Family) -> u16 {
-    match family {
-        Family::V4 => rtype::A,
-        Family::V6 => rtype::AAAA,
-    }
-}
+
 
 /// Questions for queries, each asked once however many devices want it.
 #[derive(Default)]
@@ -1157,7 +1165,7 @@ mod tests {
         let named = Device { hostname: Some("nas.local".into()), ipv4: Addrs { link_local: Some(ip("169.254.1.1")), ..Addrs::default() }, ..Device::default() };
         let types = BTreeSet::from(["_ipp._tcp.local".to_string()]);
 
-        let questions = asked(&Device::probe_queries(&[resolved, unresolved, named], &types, Family::V4));
+        let questions = asked(&Device::probe_queries(&[resolved, unresolved, named], &types));
         for wanted in [
             q(META_QUERY, rtype::PTR),
             q("_http._tcp.local", rtype::PTR),
@@ -1178,7 +1186,7 @@ mod tests {
 
         // However many types there are, a packet has only so many questions.
         let types: BTreeSet<String> = (0..40).map(|i| format!("_t{i}._tcp.local")).collect();
-        let queries = Device::probe_queries(&[], &types, Family::V4);
+        let queries = Device::probe_queries(&[], &types);
         assert_eq!(asked(&queries).len(), 41);
         assert_eq!(queries.len(), 3);
     }
@@ -1186,7 +1194,7 @@ mod tests {
     #[test]
     fn a_refresh_asks_each_device_for_what_it_announced_and_no_more() {
         let devices = [tv("fd00::9", &["TV", "Cast"]), tv("fd00::9", &["TV"])];
-        let questions = asked(&Device::refresh_queries(&devices, Family::V6));
+        let questions = asked(&Device::refresh_queries(&devices));
         assert_eq!(questions, [
             q("tv.local", rtype::AAAA),
             q("TV._http._tcp.local", rtype::SRV),
@@ -1194,7 +1202,7 @@ mod tests {
             q("Cast._http._tcp.local", rtype::SRV),
             q("Cast._http._tcp.local", rtype::TXT),
         ]);
-        assert!(Device::refresh_queries(&[], Family::V6).is_empty());
+        assert!(Device::refresh_queries(&[]).is_empty());
     }
 
     #[test]

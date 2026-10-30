@@ -250,8 +250,17 @@ fn notice_json(segment: &str, notice: &Notice) -> Option<Value> {
         "event": event,
         "segment": segment,
         "ttl": notice.ttl.as_secs(),
-        "device": device_json(&notice.interface, notice.family, device),
+        "device": device_json(&notice.interface, listed(&[], device)[0], device),
     }))
+}
+
+/// The families a device is listed under, once each, with that family's
+/// addresses: those it has an address of, or else the first that `families`
+/// (its segment's) has, IPv4 if none.
+fn listed(families: &[Family], d: &Device) -> Vec<Family> {
+    let has = |f: Family| d.family(f).routable.is_some() || d.family(f).link_local.is_some();
+    let found: Vec<Family> = [Family::V4, Family::V6].into_iter().filter(|&f| has(f)).collect();
+    if found.is_empty() { vec![families.first().copied().unwrap_or(Family::V4)] } else { found }
 }
 
 /// Answer one request line with one line of JSON.
@@ -285,8 +294,13 @@ fn segments(groups: &[Group]) -> Value {
         .map(|name| {
             let members: Vec<&Group> = groups.iter().filter(|g| g.name == name).collect();
             let interfaces: Vec<&str> = members[0].reflector.segments().iter().map(Segment::interface).collect();
-            let mut families: Vec<&str> = members.iter().map(|g| family_name(g.family)).collect();
+            let mut families: Vec<&str> = members
+                .iter()
+                .flat_map(|g| g.reflector.segments())
+                .flat_map(|seg| seg.families().iter().map(|&f| family_name(f)))
+                .collect();
             families.sort_unstable();
+            families.dedup();
             let untrusted = members[0].reflector.untrusted();
             json!({ "name": name, "interfaces": interfaces, "untrusted": untrusted, "families": families })
         })
@@ -314,7 +328,7 @@ fn devices(groups: &[Group], name: &str) -> Value {
         for seg in g.reflector.segments() {
             let mut found = seg.devices();
             found.sort_by_key(|d| (d.key(), d.addrs().collect::<Vec<_>>()));
-            list.extend(found.iter().map(|d| device(seg, d)));
+            list.extend(found.iter().flat_map(|d| device(seg, d)));
         }
     }
     json!({ "ok": true, "name": name, "devices": list })
@@ -331,7 +345,7 @@ fn probe(groups: &[Group], name: &str) -> Value {
 
     let mut links: Vec<&Segment> = Vec::new();
     for seg in members.iter().flat_map(|g| g.reflector.segments()) {
-        if !links.iter().any(|l| l.interface() == seg.interface() && l.family() == seg.family()) {
+        if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);
         }
     }
@@ -353,7 +367,7 @@ fn probe(groups: &[Group], name: &str) -> Value {
                 };
                 json!({
                     "interface": seg.interface(),
-                    "family": family_name(seg.family()),
+                    "family": seg.families().iter().map(|&f| family_name(f)).collect::<Vec<_>>().join(","),
                     "queries": queries,
                     "error": err,
                 })
@@ -374,7 +388,7 @@ fn timer_list(groups: &[Group], timers: &Watcher) -> Value {
     // that is in several segments is asked once.
     let mut links: Vec<&Segment> = Vec::new();
     for seg in groups.iter().flat_map(|g| g.reflector.segments()) {
-        if !links.iter().any(|l| l.interface() == seg.interface() && l.family() == seg.family()) {
+        if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);
         }
     }
@@ -407,8 +421,9 @@ fn timer_list(groups: &[Group], timers: &Watcher) -> Value {
     json!({ "ok": true, "timers": list })
 }
 
-fn device(seg: &Segment, d: &Device) -> Value {
-    device_json(seg.interface(), seg.family(), d)
+/// `d` as listed: once for each family it has addresses of.
+fn device(seg: &Segment, d: &Device) -> Vec<Value> {
+    listed(seg.families(), d).into_iter().map(|f| device_json(seg.interface(), f, d)).collect()
 }
 
 fn device_json(interface: &str, family: Family, d: &Device) -> Value {
@@ -460,9 +475,9 @@ mod tests {
     use crate::reflector::Reflector;
 
     fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Segment>) {
-        let segs: Vec<Segment> = interfaces.iter().map(|i| Segment::new(i, family)).collect();
+        let segs: Vec<Segment> = interfaces.iter().map(|i| Segment::new(i, &[family])).collect();
         let reflector = Reflector::new(0, segs.clone()).unwrap();
-        (Group { name: name.into(), family, reflector }, segs)
+        (Group { name: name.into(), reflector }, segs)
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -527,7 +542,7 @@ mod tests {
         let reply: Value = serde_json::from_str(&handle(&[g, g2], &timer.watcher(), "timers")).unwrap();
         let list = reply["timers"].as_array().unwrap();
         assert_eq!(list.len(), 1, "only wifi was scheduled");
-        assert_eq!(list[0]["name"], "upkeep wifi/V4");
+        assert_eq!(list[0]["name"], "upkeep wifi");
         let pending = list[0]["pending"].as_array().unwrap();
         assert_eq!(pending.len(), 1, "an unnamed device is only expired");
         assert_eq!((pending[0]["what"].as_str(), pending[0]["who"].as_str()), (Some("expire"), Some("10.0.1.7")));
@@ -558,9 +573,9 @@ mod tests {
 
     #[test]
     fn segments_say_which_interfaces_are_untrusted() {
-        let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| Segment::new(i, Family::V4)).collect();
+        let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| Segment::new(i, &[Family::V4])).collect();
         let reflector = Reflector::with_untrusted(0, segs, &["wifi".to_string()]).unwrap();
-        let groups = [Group { name: "IoT to br0".into(), family: Family::V4, reflector }];
+        let groups = [Group { name: "IoT to br0".into(), reflector }];
         assert_eq!(
             handle(&groups, &Watcher::default(), "segments"),
             r#"{"ok":true,"segments":[{"name":"IoT to br0","interfaces":["br0","wifi"],"untrusted":["wifi"],"families":["v4"]}]}"#
@@ -609,13 +624,13 @@ mod tests {
     #[test]
     fn probes_each_interface_once_even_when_segments_share_it() {
         let (a, b, c) = (
-            Segment::new("a", Family::V4),
-            Segment::new("b", Family::V4),
-            Segment::new("c", Family::V4),
+            Segment::new("a", &[Family::V4]),
+            Segment::new("b", &[Family::V4]),
+            Segment::new("c", &[Family::V4]),
         );
         let groups = [
-            Group { name: "x".into(), family: Family::V4, reflector: Reflector::new(0, vec![a.clone(), b.clone()]).unwrap() },
-            Group { name: "y".into(), family: Family::V4, reflector: Reflector::new(1, vec![a, c]).unwrap() },
+            Group { name: "x".into(), reflector: Reflector::new(0, vec![a.clone(), b.clone()]).unwrap() },
+            Group { name: "y".into(), reflector: Reflector::new(1, vec![a, c]).unwrap() },
         ];
         let interfaces = |request: &str| -> Vec<String> {
             let reply: Value = serde_json::from_str(&handle(&groups, &Watcher::default(), request)).unwrap();

@@ -164,12 +164,14 @@ Untrusted=wifi
 | `IPv4` | `yes`   | Listen and announce on IPv4 (`224.0.0.251`).   |
 | `IPv6` | `yes`   | Listen and announce on IPv6 (`ff02::fb`).      |
 
-At least one must be enabled. Each family has its own sockets, device lists and
-reflectors, so a device reachable over both appears once per family. But mDNS
-records do not belong to the transport they come over: a device's addresses of
-both families are kept, whichever family it was heard over, and passed on to
-the other networks, so a client asking over IPv4 is told of IPv6 addresses
-too.
+At least one must be enabled. They choose the transports, not two separate
+worlds: each interface has a socket per family enabled, but one list of devices
+for both, since mDNS records do not belong to the transport they come over. A
+device's addresses of both families are kept, whichever family it was heard
+over, and passed on to the other networks over every family: a device that only
+ever spoke IPv6 is announced over IPv4 too, with its IPv6 addresses, and a
+client asking over IPv4 is answered with them. A reply goes out over the family
+the question came in on.
 
 ### `[Ipc]` (optional)
 
@@ -571,11 +573,11 @@ earliest of those that is due.
 ```
 $ mdnsctl timers
 NAME                               STATE    DUE        RUNS  LAST RUN  TOOK
-upkeep br0/V4                      waiting  in 1m 33s  4     3.5s ago  210us
+upkeep br0                         waiting  in 1m 33s  4     3.5s ago  210us
   re-announce router.local                  in 1m 33s
   expire      10.0.0.10                     in 3m 02s
   refresh     OZAL-Speakers.local           now
-upkeep wifi/V4                     idle     never      1     8.0s ago  96us
+upkeep wifi                        idle     never      1     8.0s ago  96us
 ```
 
 Under each timer is everything it is waiting for, soonest first, which is what
@@ -619,7 +621,7 @@ printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
 | `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4","hostname":"tv.local","routable":"10.0.1.7","link_local":null,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
 | `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":9,"error":null}]}` (replies after about 4 seconds) |
 | `watch <name>`    | `{"ok":true,"name":"IoT","watching":true}`, then until the client hangs up one line per change: `{"event":"added","segment":"IoT","ttl":4500,"device":{…as in devices…}}` (`added`, `updated` or `removed`; `ttl` is 0 when removed) |
-| `timers`          | `{"ok":true,"timers":[{"id":1,"name":"upkeep wifi/V4","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210}]}` |
+| `timers`          | `{"ok":true,"timers":[{"id":1,"name":"upkeep wifi","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210}]}` |
 | anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
 
 `hostname`, `target`, `routable` and `link_local` are `null` when unknown. In
