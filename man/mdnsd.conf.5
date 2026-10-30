@@ -149,10 +149,12 @@ addresses as it likes.
 Optional.
 Both settings are systemd time spans, such as
 .BR 30s ,
-.B 4min
+.BR 4min ,
+.B "1h 30min"
 or
-.BR "1h 30min" ,
-or a bare number of seconds.
+.BR 1.5h ,
+or a bare number of seconds (see
+.BR systemd.time (7)).
 .TP
 .B RefreshBefore=
 Ask a device to answer again this long before it would expire, or one of its

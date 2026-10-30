@@ -10,7 +10,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use serde_json::Value;
-use systemd_unit_edit::parse_timespan;
+
+#[path = "timespan.rs"]
+mod timespan;
 
 /// Keep in sync with `config::DEFAULT_SOCKET` in the daemon.
 const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
@@ -233,7 +235,7 @@ fn target(command: &str, rest: &[String], watching: bool) -> Result<Target, Fail
             target.query.push(value.to_string());
             continue;
         }
-        let every = parse_timespan(value).map_err(|e| Failure::Usage(format!("invalid --interval {value:?}: {e}")))?;
+        let every = timespan::parse(value).map_err(|e| Failure::Usage(format!("invalid --interval {value:?}: {e}")))?;
         if every < MIN_INTERVAL {
             return Err(Failure::Usage(format!("--interval must be at least {}s", MIN_INTERVAL.as_secs())));
         }
@@ -770,7 +772,7 @@ mod tests {
         assert_eq!(target.interval, Some(Duration::from_secs(60)));
         assert_eq!(target.request("watch"), "watch --query=_shelly._tcp --interval=60 IoT");
         // Part of a second more is a second more: never asked more often than said.
-        let Command::Watch(target) = opts(&["watch", "--interval=10500ms", "--query=_x._tcp", "IoT"]).command else { panic!() };
+        let Command::Watch(target) = opts(&["watch", "--interval=10.5s", "--query=_x._tcp", "IoT"]).command else { panic!() };
         assert_eq!(target.interval, Some(Duration::from_secs(11)));
         // devices asks once: --interval is part of the name there.
         assert_eq!(opts(&["devices", "--interval=1min"]).command, Command::Devices("--interval=1min".into()));

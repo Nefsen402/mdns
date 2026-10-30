@@ -237,8 +237,8 @@ device announce as many addresses as it likes.
 | `RefreshBefore` | `30s`   | Ask a device to answer again this long before it would expire. `0`/`off` disables it. |
 | `ProbeInterval` | off     | Also probe the interfaces of every segment for devices this often.                    |
 
-Both are systemd time spans: `30s`, `4min`, `1h 30min`, or a bare number of
-seconds.
+Both are systemd time spans: `30s`, `4min`, `1h 30min`, `1.5h`, or a bare number
+of seconds.
 
 Most devices (speakers especially) never announce themselves again after they
 start; they only answer when asked. A device that nobody has heard from expires,

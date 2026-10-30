@@ -8,6 +8,7 @@ mod reflector;
 mod signal;
 mod socket;
 mod timer;
+mod timespan;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use systemd_unit_edit::{parse_timespan, Entry, Parse, SystemdUnit, TimespanParseError};
+use systemd_unit_edit::{Entry, Parse, SystemdUnit};
 
 use crate::reflector::Forward;
 
@@ -379,15 +379,10 @@ fn failing_line(text: &str) -> Option<usize> {
     None
 }
 
-/// A systemd time span such as `4min` or `1h 30min`; one that adds up to zero
-/// (`0`, `0s`) is `Duration::ZERO`.
+/// A systemd time span such as `4min`, `1.5h` or `1h 30min`; one that adds
+/// up to zero (`0`, `0s`) is `Duration::ZERO`.
 fn timespan(value: &str, lineno: usize, key: &str) -> Result<Duration> {
-    match parse_timespan(value) {
-        Ok(span) => Ok(span),
-        // The crate reports a span that adds up to zero ("0", "0s") as empty.
-        Err(TimespanParseError::Empty) if !value.trim().is_empty() => Ok(Duration::ZERO),
-        Err(e) => bail!("line {lineno}: invalid {key} {value:?}: {e}"),
-    }
+    crate::timespan::parse(value).map_err(|e| anyhow!("line {lineno}: invalid {key} {value:?}: {e}"))
 }
 
 /// How many addresses of a family a device is kept with: a number, at least
@@ -838,7 +833,9 @@ ProbeInterval=off
         // A value that parses but would overflow the clock when added to "now".
         assert!(err("99999999999999s").contains("at most 24 hours"), "{}", err("99999999999999s"));
         assert!(err("18446744073709551615s").contains("at most 24 hours"));
-        assert!(err("99999999999y").contains("invalid MinimumLifetime"), "an unknown unit is just invalid");
+        assert!(err("99999999999y").contains("at most 24 hours"), "{}", err("99999999999y"));
+        assert!(err("5fortnights").contains("invalid MinimumLifetime"), "an unknown unit is just invalid");
+        assert_eq!(secs("1.5h"), 5400, "a fraction, as systemd takes it");
         assert!(err("soon").contains("invalid MinimumLifetime"));
         assert!(err("").contains("line 2"), "an empty value is not a time span");
         // Unlike the probe settings, `off` and `infinity` are not "never": a device must be able to expire.
