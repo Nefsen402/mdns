@@ -423,9 +423,9 @@ failures are
 .BR {"ok":false,"error":"..."} .
 .BR hostname ,
 .BR target ,
-.B routable
-and
-.B link_local
+.B address_ttl
+and a service's
+.B ttl
 are
 .B null
 when unknown.
@@ -473,7 +473,7 @@ Print every segment name, and every device address with its hostname:
 .nf
 $ mdnsctl \-\-json segments | jq \-r '.segments[].name'
 $ mdnsctl \-\-json devices media_stuff \e
-    | jq \-r '.devices[] | "\e(.addr) \e(.hostname)"'
+    | jq \-r '.devices[] | "\e(.addresses[0]) \e(.hostname)"'
 .fi
 .RE
 .PP

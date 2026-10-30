@@ -50,9 +50,6 @@ package() {
   install -Dm644 systemd/mdnsd.service "$pkgdir/usr/lib/systemd/system/mdnsd.service"
   install -Dm644 systemd/mdnsd.sysusers "$pkgdir/usr/lib/sysusers.d/mdnsd.conf"
 
-  # The example names interfaces that will not exist on most machines, so it
-  # is documentation, not an installed /etc/mdnsd.conf.
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
-  install -Dm644 examples/mdnsd.conf "$pkgdir/usr/share/doc/$pkgname/examples/mdnsd.conf"
 }

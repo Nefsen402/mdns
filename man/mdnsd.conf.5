@@ -328,7 +328,8 @@ Probing is done per interface, so an interface in several segments is probed as
 often as the most frequent of them asks.
 It must be at least 10 seconds.
 .PP
-A segment is a group of interfaces whose devices are reflected between
+A segment is a group of interfaces, as many as you like, whose devices are
+reflected between
 .I every pair
 of them: read it as "these networks may see each other".
 .IP \(bu 2
@@ -403,9 +404,6 @@ Untrusted=wifi
 .TP
 .I /etc/mdnsd.conf
 Default location.
-.TP
-.I /usr/share/doc/mdns/examples/mdnsd.conf
-Example configuration, installed with the package.
 .SH SEE ALSO
 .BR mdns (8),
 .BR mdnsctl (1)

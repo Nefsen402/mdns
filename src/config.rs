@@ -480,27 +480,6 @@ interfaces=br0,wifi
         }
     }
 
-    /// The example shipped in `examples/` (and quoted in the README) must stay valid.
-    #[test]
-    fn the_shipped_example_parses() {
-        let c = Config::parse(include_str!("../examples/mdnsd.conf")).unwrap();
-        assert_eq!(
-            c.segments,
-            [
-                seg("media_stuff", &["br0", "media"]),
-                seg("IoT", &["wifi"]),
-                SegmentConfig { untrusted: vec!["wifi".into()], ..seg("IoT to br0", &["br0", "wifi"]) },
-            ]
-        );
-        assert_eq!(c.socket, PathBuf::from("/run/mdnsd/mdnsd.sock"));
-        assert_eq!(c.advertise.as_deref(), Some("router.local"));
-        assert_eq!(c.probe_interval, None, "the example does not set an Interval");
-        assert_eq!(c.refresh_before, Some(Duration::from_secs(30)));
-        assert_eq!(c.refresh_before, Some(DEFAULT_REFRESH_BEFORE), "the example shows the default");
-        assert_eq!(c.min_lifetime, crate::socket::DEFAULT_MIN_LIFETIME, "the example shows the default");
-        assert!(c.ipv4 && c.ipv6);
-    }
-
     #[test]
     fn untrusted_interfaces_are_listed_and_checked() {
         let parse = |extra: &str| Config::parse(&format!("[Segment]\nName=s\nInterfaces=br0,media,wifi\n{extra}"));

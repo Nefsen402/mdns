@@ -1,23 +1,246 @@
 # mdns
 
-An mDNS (Bonjour/Avahi-style) discovery and reflection daemon for routers, with
-per-pair control over which networks can see each other's devices.
+An mDNS (Bonjour/Avahi-style) daemon for Linux routers and hosts. It keeps track
+of the devices on each network it is told to watch, makes chosen ones visible on
+other networks, and lets scripts ask it what is there.
 
-- **Tracks** the devices announcing on each interface (name, address, services).
-- **Reflects** devices between the interfaces you choose, and only those. With
-  `br0 <-> media` and `br0 <-> wifi`, `media` and `wifi` never learn about each
-  other, even though both talk to `br0`.
-- **Probes** for devices actively (at startup and on demand) and asks each
-  device to answer again just before it would expire, instead of only waiting
-  for devices to announce themselves.
-- **Advertises** the router's own name (`router.local`) on every network, as
-  Avahi does, if you configure one.
-- **Answers** mDNS queries for reflected devices and withdraws them (with proper
-  goodbye packets) when the source device disappears or the daemon stops.
-- **Exposes** what it knows over a local control socket, queried with `mdnsctl`.
+It has two uses, which are the same daemon with a different configuration:
 
-It never listens on the wildcard interface: every socket is bound to one
-interface and the mDNS multicast group address.
+- **[A reflector](#reflecting-between-networks)** for a router with several
+  networks (VLANs, a guest or IoT Wi-Fi): your phone on the LAN finds the
+  speakers on the media VLAN, with per-pair control over which networks may see
+  each other, and in which direction.
+- **[A device tracker for scripts](#tracking-devices-for-scripts)**: the
+  daemon watches a network all the time, so a short-lived script can ask it what
+  is there in one call, smart plugs that only answer when asked included, or
+  follow devices as they come and go.
+
+## How it works: devices, not packets
+
+Most mDNS reflectors (Avahi's included) copy packets: what is heard on one
+network is sent out again, as it was, on the others. This daemon does not
+forward any packet. It listens to each interface, **builds a model of the
+devices on it** (each one's hostname, addresses and services, with the TTL of
+every record), and announces that model on the other networks itself, under its
+own address. It answers questions from the model too: a phone on the LAN asking
+for AirPlay speakers is answered by the router, with the speaker's details, and
+the speaker never hears the phone.
+
+```
+ media VLAN                    router                      LAN
+┌──────────┐             ┌────────────────┐              ┌───────┐
+│ speaker  │  announces  │ model of media │  announces,  │ phone │
+│          │ ──────────▶ │ Speakers.local │  answers     │       │
+│          │             │ 10.0.2.73      │ ───────────▶ │       │
+│          │ ◀────────── │ _airplay :7000 │ ◀─────────── │       │
+│          │  asks, as   │                │  asks        │       │
+└──────────┘  itself     └────────────────┘              └───────┘
+```
+
+### What that makes possible
+
+- **One-way visibility.** mDNS is a conversation: clients ask, devices answer.
+  A packet reflector has to carry both halves between two networks, so it can
+  only make them see each other both ways or not at all. Here the router answers
+  from its model, so a network can be shown another's devices without being
+  shown to it: with `Untrusted=media`, the LAN finds the media VLAN's speakers,
+  and the media VLAN learns nothing about the LAN.
+- **Privacy.** Only the model crosses, never what the devices and clients sent:
+  - A client's questions are answered by the router. When the router does not
+    know the answer, it asks the other networks itself, in a query of its own:
+    they see what name was looked for, not who looked, and not what the asker
+    already had in its cache (its known answers).
+  - Clients that only ask (phones, laptops) are tracked but never announced
+    elsewhere. Only devices that offer a service are.
+  - Link-local addresses, which mean nothing off their own link, stay on it.
+  - An untrusted network is told nothing at all, and its questions are asked
+    nowhere.
+- **Robustness.** Every record is checked before it enters the model, so a
+  malformed packet, a name no device could have, an unusable address or a
+  flood from one sender never reaches another network (a
+  [fuzzer](#fuzzing) checks this from outside). Reflection is never transitive,
+  so networks that share an interface cannot echo devices back and forth.
+  Clashes are settled by the configuration: the network listed first wins a
+  hostname, and a device on the network itself always comes before a copy of
+  one from elsewhere.
+- **Quiet devices are found.** Many devices never announce themselves and only
+  answer when asked. The daemon probes at startup, asks each device to answer
+  again just before it would expire, and asks the other networks what clients
+  ask on one (`ForwardQuestions=` in `mdnsd.conf(5)`), so devices
+  stay visible while they are there.
+- **Both IP families as one.** A device is one device whichever family it spoke:
+  one that only speaks IPv6 is announced over IPv4 too, with its IPv6
+  addresses, and its global and ULA addresses are kept alike (up to
+  `MaxAddresses=`).
+
+### What it costs
+
+What the model does not hold does not cross:
+
+- Records other than A, AAAA, PTR, SRV, TXT and NSEC are not passed on, nor
+  are the priority and weight of SRV records.
+- TXT values are kept as text: one that is not valid UTF-8 is not passed on
+  byte for byte.
+- A device is reflected once it has a hostname, a routable address and a
+  service with its host and port. Until it has said all that, nothing of it
+  is shown elsewhere.
+- Only mDNS is handled: SSDP/UPnP and LLMNR discovery are not.
+
+## Reflecting between networks
+
+The configuration names groups of interfaces, called segments, whose devices
+are reflected between each other. For a router with a trusted LAN (`br0`), a
+media VLAN and an IoT Wi-Fi:
+
+```ini
+# /etc/mdnsd.conf
+#   br0   <-> media : each sees the other's devices
+#   br0   <-  wifi  : br0 sees the IoT devices, wifi sees nothing of br0
+#   media  x  wifi  : never see each other
+
+[Advertise]
+Hostname=router.local
+
+[Segment]
+Name=media_stuff
+Interfaces=br0,media
+
+[Segment]
+Name="IoT to br0"
+Interfaces=br0,wifi
+Untrusted=wifi
+```
+
+- A segment reflects between **every pair** of its interfaces, and it may have
+  as many as you like: `Interfaces=br0,media,guest,lab` lets all four see each
+  other. An interface may also be in several segments, which is how `br0` sees
+  both `media` and `wifi` while those two never see each other: a device
+  reflected onto `br0` is not reflected again.
+- An **untrusted** interface has its devices shown to the others, and is shown
+  nothing itself. `Untrusted=wifi` lets the LAN find the IoT devices without
+  the IoT network learning about the LAN.
+- A question a client asks on one interface is asked on the others of the
+  segment too (`ForwardQuestions=`), so a
+  device that only answers when asked is found the moment someone looks for it.
+- `[Advertise] Hostname=router.local` makes the router itself reachable by name
+  from every network, with its own address on each.
+- Interfaces may come and go: a VLAN that is created after the daemon starts, or
+  recreated, is picked up without a restart
+  (see `mdns(8)`).
+
+mDNS only makes devices **discoverable**. Your firewall must still allow the
+connections between the networks (the phone on the LAN connecting to the
+speaker on `media`).
+
+See what the daemon sees:
+
+```
+$ mdnsctl devices media_stuff
+media_stuff: 3 devices
+  Living-Room-TV.local  Living Room TV  10.0.2.40, fd00:2::40
+  Speakers.local        Speakers        10.0.2.73
+  desktop.local         -               10.0.0.10, fd00::10
+```
+
+The rules for what is reflected, and when, are in `mdns(8)`. Don't run another
+reflector (Avahi's `enable-reflector`) over the same interfaces.
+
+## Tracking devices for scripts
+
+This is not an mDNS client: the daemon is not started for a lookup and gone
+when it is done. It runs all the time, watching the network on your behalf,
+and a script, however short-lived, asks it what it has seen. For that, a
+segment of a single interface is enough: it reflects nothing, and its devices
+are only tracked.
+
+```ini
+# /etc/mdnsd.conf
+[Segment]
+Name=lan
+Interfaces=eth0
+```
+
+A client the script runs itself (`avahi-browse`, an mDNS library) only knows
+what answers while it is running, and most devices announce themselves once,
+when they join the network, and then stay quiet. The daemon was listening then.
+It keeps every device's records for their TTL, asks devices to answer again just
+before they would expire, and drops them when they say goodbye or stop
+answering. So a script that runs for a second, from cron or a hook, asks once
+and gets the current list:
+
+```sh
+# Every device's name and first address.
+mdnsctl --json devices lan | jq -r '.devices[] | select(.hostname) | "\(.hostname) \(.addresses[0])"'
+```
+
+**Devices that only answer when asked.** Smart plugs and many other IoT devices
+rarely announce themselves, and answer neither waiting nor a general probe:
+they answer when asked for their service type by name. `--query` does that, on
+every interface of the segment, and lists only the devices of that type:
+
+```sh
+$ mdnsctl devices --query _shelly._tcp lan
+lan: 2 devices
+  shellyplug-a1b2.local  shellyplug-a1b2  10.0.1.21
+  shellyplug-c3d4.local  shellyplug-c3d4  10.0.1.22
+```
+
+Once found, a device stays listed as long as it keeps answering, and plain
+`mdnsctl devices lan` lists it too.
+
+**Reacting as devices appear.** `watch` streams changes, so a script need not
+poll. With `--query` it starts with the devices of the type already known, and
+`--interval` asks for the type again that often, to find one switched on
+later. For example, configure each Shelly plug once as it is found:
+
+```sh
+mdnsctl --json watch --query _shelly._tcp --interval 1min lan |
+jq -r --unbuffered 'select(.event != "removed") | .device.addresses[0] // empty' |
+while read -r ip; do configure-plug "$ip"; done
+```
+
+A device usually produces several `updated` events as its records arrive, so a
+script like that should be idempotent, or remember the addresses it has done.
+
+**Without staying around.** `watch` holds on to whoever runs it. A script that
+has to be done in a moment (a hook, a cron job, an installer) subscribes
+instead, and `mdnsctl` stays behind in the background to run a script of yours
+for each change:
+
+```sh
+$ mdnsctl subscribe --query _shelly._tcp --interval 1min --log /var/log/plugs.log lan -- /usr/local/bin/configure-plug
+48213
+```
+
+It checks the watch can be opened (and the script run) before it returns, and
+prints the subscriber's PID. The script gets each change as a line of JSON on
+stdin, and `MDNS_EVENT`, `MDNS_HOSTNAME`, `MDNS_ADDRESS` (and a few more) in its
+environment, so it can be as short as:
+
+```sh
+#!/bin/sh
+[ "$MDNS_EVENT" = removed ] || curl -s "http://$MDNS_ADDRESS/settings?led_status_disable=true"
+```
+
+The subscriber runs as whoever started it, the daemon runs nothing, and it
+watches again on its own if the daemon restarts. `mdnsctl watchers` lists it,
+and `kill <pid>` stops it.
+
+The protocol behind `mdnsctl` is one line of JSON per request over a Unix
+socket, if you would rather talk to it directly (see `mdnsctl(1)`).
+
+Things to know when using it this way:
+
+- The control socket is readable only by the `mdnsd` group: add the user the
+  script runs as (`sudo usermod -aG mdnsd $USER`, then log in again).
+- It shares port 5353 with Avahi or systemd-resolved, so they can stay.
+- It still sends a little: a probe at startup, a question to each device about
+  to expire (`[Probe] RefreshBefore=off` stops that, at the cost of quiet
+  devices dropping off when their records run out), and what `--query` asks.
+  Without `[Advertise]` it announces nothing of its own.
+- Interfaces are named, there is no "every interface". A host on several
+  networks lists each, as a segment of its own (a segment of two or more
+  interfaces would reflect between them).
 
 ## Building and running
 
@@ -33,8 +256,9 @@ To run it as a service, see [Installing (Arch Linux)](#installing-arch-linux).
 
 The configuration is read once at startup; restart the daemon to apply changes.
 Startup fails, naming the problem, if the config is invalid or an interface
-that is there cannot be opened. One that is not there yet is waited for. The daemon stops cleanly on `SIGTERM` or `SIGINT` (see
-[Shutdown](#shutdown)).
+that is there cannot be opened. One that is not there yet is waited for. The
+daemon stops cleanly on `SIGTERM` or `SIGINT`, withdrawing what it reflected
+with goodbyes (see `mdns(8)`).
 
 ## Installing (Arch Linux)
 
@@ -43,19 +267,19 @@ The `PKGBUILD` in `packaging/arch/` builds a package from the working tree:
 ```sh
 cd packaging/arch
 makepkg -f          # builds, runs the test suite, and creates mdns-*.pkg.tar.zst
-sudo pacman -U mdns-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U mdns-*.pkg.tar.zst
 ```
 
 It installs `/usr/bin/mdns`, `/usr/bin/mdnsctl`, the `mdnsd.service` unit, a
 sysusers entry that creates the unprivileged `mdnsd` user, the man pages
-(`mdns(8)`, `mdnsd.conf(5)`, `mdnsctl(1)`), and this README and the example
-config under `/usr/share/doc/mdns/`, and the license under
-`/usr/share/licenses/mdns/`. No `/etc/mdnsd.conf` is
-installed, because the example names interfaces that probably do not exist on
-your machine. Create one, then start the service:
+(`mdns(8)`, `mdnsd.conf(5)`, `mdnsctl(1)`), this README under
+`/usr/share/doc/mdns/`, and the license under `/usr/share/licenses/mdns/`. No
+`/etc/mdnsd.conf` is installed, since only you know your interfaces. Write one
+(starting from [Reflecting between networks](#reflecting-between-networks) or
+[Tracking devices for scripts](#tracking-devices-for-scripts)), then start the
+service:
 
 ```sh
-sudo cp /usr/share/doc/mdns/examples/mdnsd.conf /etc/mdnsd.conf
 sudoedit /etc/mdnsd.conf
 sudo systemctl enable --now mdnsd.service
 journalctl -u mdnsd.service -f
@@ -70,8 +294,7 @@ Notes on the service:
   if it fails, so a crash shows in `systemctl status mdnsd` and the journal
   instead of being retried past. Interfaces that appear after boot (VLANs,
   Wi-Fi) need no restart: the daemon follows interfaces as they come and go
-  (see [Interfaces coming and going](#interfaces-coming-and-going)).
-  Configuration is read at start, so apply changes with
+  (see `mdns(8)`). Configuration is read at start, so apply changes with
   `systemctl restart mdnsd`.
 - `systemctl stop` sends `SIGTERM`, so reflected devices are withdrawn cleanly.
 - The control socket lives in `/run/mdnsd/`, readable only by the `mdnsd`
@@ -82,638 +305,20 @@ To run it by hand instead, point `Socket=` at a directory you can write to:
 `mdns /path/to/mdnsd.conf` as root, or as a normal user with a config whose
 `[Ipc] Socket=` is somewhere under your home or `/tmp`.
 
-## Configuration
-
-The file uses systemd-style INI syntax. The default location is
-`/etc/mdnsd.conf`; [`examples/mdnsd.conf`](examples/mdnsd.conf) is a complete
-example.
-
-```ini
-# /etc/mdnsd.conf
-#
-# Three networks: the trusted LAN (br0), a media VLAN and an IoT Wi-Fi VLAN.
-#   br0   <-> media : each sees the other's devices
-#   br0   <-> wifi  : each sees the other's devices
-#   media  x  wifi  : never see each other
-
-[Listen]
-IPv4=yes
-IPv6=yes
-
-[Ipc]
-Socket=/run/mdnsd/mdnsd.sock
-
-# A device is kept at least this long after it was last heard from, whatever
-# TTLs it announced (a device lives for its longest TTL, but not for less than
-# this). `0` keeps it for exactly its TTL.
-#
-# Reflected devices are announced on the other networks with the TTL they
-# announced themselves with (`auto`), and again at 80% of it. Set a time to
-# announce their address for that long instead, for less chatter.
-[Devices]
-MinimumLifetime=5min
-ReflectTTL=auto
-
-# Most devices (speakers especially) only answer when asked, and one that is
-# not heard from expires and is withdrawn from the other networks. So a device
-# is asked to answer again this long before it would expire (`0` or `off` turns
-# this off). `ProbeInterval=` would also probe every network that often, to find
-# new quiet devices; it is not set by default, and a segment can set its own.
-[Probe]
-RefreshBefore=30s
-
-# Answer mDNS queries for this name with the router's own address on each
-# interface, so `router.local` resolves from every network listed below. Others
-# keep the address for TTL, and it is announced again at 80% of that.
-[Advertise]
-Hostname=router.local
-TTL=2min
-
-[Segment]
-Name=media_stuff
-Interfaces=br0,media
-
-# One interface only: devices are tracked (and show up in `mdnsctl devices IoT`)
-# but nothing is reflected.
-[Segment]
-Name="IoT"
-Interfaces=wifi
-
-# wifi is untrusted: br0 learns about its devices, but wifi is not told about
-# br0's (nothing is announced to an untrusted interface).
-[Segment]
-Name="IoT to br0"
-Interfaces=br0,wifi
-Untrusted=wifi
-```
-
-### Syntax
-
-- `[Section]` headers and `Key=Value` lines. Section and key names are
-  **case-insensitive**.
-- Lines starting with `#` or `;` are comments. Blank lines are ignored.
-- Values may be wrapped in single or double quotes: `Name="IoT to br0"`.
-- Repeating a key **appends** to list values (`Interfaces=`); an empty
-  assignment (`Interfaces=`) **resets** the list.
-- Booleans accept `yes`/`no`, `true`/`false`, `on`/`off`, `1`/`0`.
-- A line ending in a backslash continues on the next line, as in unit files.
-- Syntax errors and unknown settings are reported with the line they are on.
-- Unknown sections or keys are an error, so typos fail loudly.
-
-### `[Listen]` (optional)
-
-| Key    | Default | Meaning                                        |
-|--------|---------|------------------------------------------------|
-| `IPv4` | `yes`   | Listen and announce on IPv4 (`224.0.0.251`).   |
-| `IPv6` | `yes`   | Listen and announce on IPv6 (`ff02::fb`).      |
-
-At least one must be enabled. They choose the transports, not two separate
-worlds: each interface has a socket per family enabled, but one list of devices
-for both, since mDNS records do not belong to the transport they come over. A
-device's addresses of both families are kept, whichever family it was heard
-over, and passed on to the other networks over every family: a device that only
-ever spoke IPv6 is announced over IPv4 too, with its IPv6 addresses, and a
-client asking over IPv4 is answered with them. A reply goes out over the family
-the question came in on.
-
-### `[Ipc]` (optional)
-
-| Key      | Default                  | Meaning                                    |
-|----------|--------------------------|--------------------------------------------|
-| `Socket` | `/run/mdnsd/mdnsd.sock`  | Path of the control socket `mdnsctl` uses. |
-
-The directory must already exist and be writable by the daemon (the systemd
-service creates `/run/mdnsd` for it). Unix socket paths are limited to about
-108 bytes. The socket is created with mode `0660` (owner and group only). A stale socket file from a crashed run is
-replaced; a live instance or a file that is not a socket is never overwritten.
-
-### `[Devices]` (optional)
-
-| Key               | Default | Meaning                                                     |
-|-------------------|---------|-------------------------------------------------------------|
-| `MinimumLifetime` | `5min`  | The least a device is kept after it was last heard from.    |
-| `ReflectTTL`      | `auto`  | The TTL of the address of devices reflected to other networks. |
-| `MaxAddresses`    | `8`     | How many addresses of each family a device is kept with, at most. |
-
-A systemd time span (`5min`, `90s`, `1h`), at most 1 day. A device lives for the
-longest TTL it announced, but never for less than this, so a device that
-announces tiny TTLs is not dropped between two of the daemon's checks. `0` removes
-the minimum: each device then lives for exactly its longest TTL.
-
-It is also the price of a device that vanishes without saying goodbye: it stays
-listed, and announced to the other networks, for up to this long. A lower value
-drops it sooner; a higher one keeps devices through longer silences. Keep
-[`RefreshBefore`](#probe-optional) shorter than it (the daemon warns at startup
-if it is not), because that margin is counted back from the end of this lifetime.
-
-**`ReflectTTL`** is how long the other networks keep the address of a device
-this daemon reflects onto them, and so how often it is announced again: at 80%
-of it. The default, `auto`, passes on the TTLs the device announced itself with
-(`mdnsctl devices -v` lists them): hosts conventionally say two minutes, so
-their address is announced again every 96 seconds, and services conventionally
-75 minutes. A time span overrides the TTL of the *address* only, between 10
-seconds and 24 hours: longer means less chatter, but a stale address lingers
-that long if a device moves or goes without a goodbye. The records of a
-device's services always keep their own TTL, and a device is announced again
-before the shortest of them runs out. Anything below 10 seconds is raised to
-10, and a device that did not say gets two minutes for its address and 75
-minutes for its services. The TTL is the one last heard, not counted down: a
-copy of a device that went silent is withdrawn when the device expires, up to
-`MinimumLifetime` after it was last heard. `ReflectTTL` is independent of the
-[`TTL`](#advertise-optional) of the advertised name.
-
-**`MaxAddresses`** bounds how many addresses of each family a device is kept
-(and reflected) with. Eight covers a global and a ULA IPv6 address, a few
-temporary ones and a link-local one. Addresses announced with the cache-flush
-bit replace those of their family anyway, so this only bounds what one device
-can pile up; beyond it, more are ignored. It must be at least 1, has no upper
-bound, and `infinity` lifts the limit altogether, if you would rather let a
-device announce as many addresses as it likes.
-
-### `[Probe]` (optional)
-
-| Key             | Default | Meaning                                                                               |
-|-----------------|---------|---------------------------------------------------------------------------------------|
-| `RefreshBefore` | `30s`   | Ask a device to answer again this long before it would expire. `0`/`off` disables it. |
-| `ProbeInterval` | off     | Also probe the interfaces of every segment for devices this often.                    |
-
-Both are systemd time spans: `30s`, `4min`, `1h 30min`, `1.5h`, or a bare number
-of seconds.
-
-Most devices (speakers especially) never announce themselves again after they
-start; they only answer when asked. A device that nobody has heard from expires,
-and is then withdrawn from the other networks until something asks it again.
-
-**`RefreshBefore`** renews each device just in time. A device lives for as long
-as the longest TTL it announced, **and at least
-[`MinimumLifetime`](#devices-optional)** (5 minutes by default). `RefreshBefore`
-before that runs out, the daemon asks that device, and only it, for the records
-it announced, and asks again about every quarter of the margin until it answers
-or expires. A speaker whose records live 75 minutes is asked at about 74
-minutes; a device with short records just before its minimum lifetime is up.
-Devices that are heard
-from regularly are never asked, and a device known only by the address it was
-heard from (a phone that merely sends queries) has nothing to ask and is left
-alone. The minimum is 30 seconds.
-
-*Addresses run out on their own.* Each address of a device lives for the TTL it
-was announced with, at least `MinimumLifetime`, so one the device stops
-announcing (a temporary IPv6 address that lapsed without a goodbye) is dropped
-by itself, and withdrawn from the other networks. A device is also asked again
-`RefreshBefore` before one of its addresses would run out: a host's addresses
-conventionally live two minutes while its services live 75, so it is asked
-about every five minutes, as an mDNS cache renews a record before it runs out.
-With `RefreshBefore` off, a quiet device's addresses lapse after
-`MinimumLifetime` even while its services live on, and it is no longer
-reflected until it is heard from again.
-
-*Short TTLs.* The minimum lifetime is why a TTL shorter than the margin (10
-seconds, say) is not a problem: the device is not due the moment it is heard, it
-lives `MinimumLifetime` after it was last heard (5 minutes by default) and is
-asked 30 seconds before that. The price is that a device that really vanishes is
-still listed, and still announced to the other networks, for up to that long. A
-margin longer than the lifetime (with `MinimumLifetime=0` and short TTLs, say)
-makes every device due all the time; it is then asked once per quarter of the
-margin, not continuously.
-
-**`ProbeInterval`** is not set by default. It probes every interface (browsing
-for service types and instances) on a timer, which is the way to find a **new**
-quiet device that never announces itself. Without it, new devices are found at
-startup, when they announce themselves (most do when they join a network), and by
-`mdnsctl probe`. A [segment](#segment-one-or-more-required) can set its own
-`ProbeInterval` instead, or turn probing off for itself. The minimum is 10
-seconds. With `RefreshBefore` off, a `ProbeInterval` has to stay under
-`MinimumLifetime` to keep devices listed, and the daemon warns at startup if it
-does not. (It used to be called `Interval`, which is now an error that names
-the new key.)
-
-A probe is a handful of multicast queries per interface and takes about four
-seconds; a refresh is a few questions. Routine ones are not logged; failures
-are.
-
-### `[Advertise]` (optional)
-
-| Key        | Meaning                                                              |
-|------------|----------------------------------------------------------------------|
-| `Hostname` | A name under `.local` to announce and answer for, e.g. `router.local`. A bare label such as `router` means `router.local`. |
-| `TTL`      | How long others keep the name's address, and so how often it is announced again: at 80% of it (default `2min`, so every 96 seconds). Between 10 seconds and 24 hours. A longer one means less chatter, but a stale address lingers that long after the router's changes. |
-
-The daemon answers queries for this name with **its own address on each
-interface**, so every network is told the address at which it can reach the
-router. The IPv4 socket publishes an A record with the interface's primary
-IPv4 address and the IPv6 socket an AAAA record with its link-local IPv6
-address (the source address the kernel uses towards the mDNS group there). An
-interface with no address of a family is skipped, with a message in the log.
-The addresses are read again whenever they change.
-
-Internally the name is just a reflected device that has a hostname and an
-address but no services, so it is announced, kept alive, answered for and
-withdrawn with a goodbye on shutdown like any other. A device on another
-network that announces the same name is never reflected in its place. There is
-no conflict detection with devices on the same network; the name is assumed to
-be yours alone.
-
-### `[Segment]` (one or more, required)
-
-| Key          | Meaning                                                              |
-|--------------|----------------------------------------------------------------------|
-| `Name`       | Required. Unique name, used by `mdnsctl`. Quote it if it has spaces. |
-| `Interfaces` | Required. Interfaces in the segment, separated by commas and/or spaces. |
-| `Untrusted`  | Optional. Interfaces of the segment that are announced nothing (see below). |
-| `ForwardQuestions` | Optional. Which questions asked on one of its interfaces are asked on the others: `always` (the default), `unknown` (only those nothing announced there answers) or `never` (see below). |
-| `ProbeInterval` | Optional. How often to probe its interfaces, in place of [`[Probe] ProbeInterval`](#probe-optional); `0`/`off` turns it off for this segment. |
-
-Probing is done per interface, so an interface in several segments is probed as
-often as the most frequent of them asks: with `ProbeInterval=1min` on
-`br0,media` and none on `br0,wifi`, `br0` and `media` are probed every minute
-and `wifi` only as `[Probe]` says.
-
-A segment is a group of interfaces **whose devices are reflected between every
-pair of them**. Think of each segment as "these networks may see each other".
-
-An **untrusted** interface still has its devices announced to the others, but is
-told nothing about theirs: `Interfaces=br0,wifi` with `Untrusted=wifi` lets
-`br0` find the devices on `wifi` while `wifi` learns nothing about `br0`. That
-is the one-way announcement: `Interfaces=media,br0` with `Untrusted=media` has
-`media` announce its devices to `br0` and not the other way around. Several
-untrusted interfaces do not learn about each other either. Each must be in
-`Interfaces`, and at least one interface of a segment has to be trusted. The
-devices on an untrusted interface are still tracked and listed by `mdnsctl`.
-
-- A segment with **one** interface only tracks: its devices are listed by
-  `mdnsctl`, but nothing is reflected.
-- An interface may appear in **several** segments. That is how `br0` can see
-  both `media` and `wifi` while those two stay isolated: reflection is never
-  transitive, because a device reflected onto `br0` is not reflected again.
-- Two segments may not share **two or more** interfaces (they would both
-  reflect between the same pair and fight over it). Sharing one is fine.
-- Names must be unique, and an interface may be listed only once per segment.
-  An interface need not exist when the daemon starts: it is waited for.
-
-### What gets reflected
-
-Devices are found by listening, and by probing: at startup, and whenever you
-run `mdnsctl probe` (or every [`ProbeInterval`](#probe-optional), if set), the daemon browses every interface for service types and
-instances, resolves each instance's hostname and port, and asks for the
-addresses of devices that have a name but no routable address yet. Many devices
-answer only when asked, and a device needs a hostname and a routable address to
-be reflected, so without probing they would stay invisible.
-
-Devices are also found by **asking on a client's behalf**. A query that is not
-about a name a device on that interface owns is asked again, by the daemon, on
-the other interfaces of its segments: those whose devices it is told about. The
-answer is reflected like any other, and the client, asking again a second later
-as clients do, is answered. Only the question crosses, in the daemon's own
-query: not the client's address, nor the known answers in its query, nor its
-wish for a unicast reply. The daemon's query carries what it already knows of
-the answer on that interface as known answers, each with the time it has left,
-so that only devices it has not heard of (or is about to forget) answer.
-A question is asked on an interface at most once a second.
-
-That is `ForwardQuestions=always`, the default, and it is what finds a device
-that only answers when asked, even when another device of its type is known: a
-browse has as many answers as devices of the type. `ForwardQuestions=unknown`
-asks only what nothing the daemon announces on the asking interface answers,
-which is less traffic but misses such a device once one of its type is
-reflected; `ForwardQuestions=never` asks nothing, leaving devices to be found by
-what they announce and by probing. An untrusted
-interface's questions are asked nowhere, since nothing could be reflected back
-to it, but questions are asked *on* untrusted interfaces, so they see the names
-the others look for (not who looks).
-
-- A device is identified by its **hostname**, and its addresses are the ones it
-  announces in its own A and AAAA records (plus the address it sent from, if it
-  announced none of its own). A packet may describe several devices (a
-  reflector's answer to a browse query does), so each record goes to the device
-  it names: an address to the host that owns the name, a service to the host its
-  SRV record points at. The address a packet came from is credited to a host
-  only if that host announced it, or announced none and is the only host
-  described, so a reflector is not mistaken for the devices it announces.
-  Its **routable** addresses (IPv4, and global and ULA IPv6: on a network with
-  both prefixes a device has one of each) are all kept, and so are its
-  **link-local** ones, up to eight of a family. Addresses announced with the
-  cache-flush bit, as most devices announce them, are all a device has of that
-  family and replace those it had; a goodbye drops just its address, so a
-  temporary IPv6 address giving way to the next is followed. A device leaves
-  when it says goodbye to the address it sends from without announcing another.
-- Only devices that announced **a hostname, a routable address and at least one
-  service** (with its SRV record, so a host and a port) are reflected. Chatty
-  clients that merely send queries (phones, laptops) are tracked but not
-  reflected.
-- **What no device could have announced is ignored**, as if it had not been
-  sent: records of a class other than IN; hostnames not under `.local`, or with
-  a dot, backslash, space, control character or invalid UTF-8 in a label;
-  service types other than `_name._tcp.local` or `_name._udp.local`; instance
-  names with control characters or invalid UTF-8; a PTR naming an instance of
-  another type; SRV port 0; and addresses no device can be reached at
-  (unspecified, loopback, multicast, broadcast, `0.0.0.0/8`, `240.0.0.0/4`, and
-  IPv4 addresses dressed as IPv6). A host that announced only such an address
-  is not given the address its packet came from instead.
-- **One sender cannot flood the others.** Each interface remembers at most
-  1024 devices, of which at most 64 hosts first described by any one sender (a
-  sleep proxy speaks for several hosts, but not for that many), and a device at
-  most 64 services. Beyond that, new ones are ignored until old ones expire.
-- **Link-local addresses are never reflected.** `fe80::/10` only means
-  something on the link the device is on; announced to another network it would
-  name nobody. A reflected device is announced with its routable address only,
-  so a device that has only a link-local IPv6 address is not reflected over
-  IPv6 (over IPv4 it still is, if it has an address there).
-- A reflected device is announced on the other interface with that **routable
-  address**. Your firewall must allow the actual connections between the
-  networks; mDNS only makes the device discoverable.
-- Along with its addresses and services, a reflected device carries:
-  - the **subtypes** its services announced (`_universal._sub._ipp._tcp.local`,
-    which is how an iPhone finds AirPrint printers). A device only sends these
-    when it announces itself or is asked for one by name, so a probe asks for the
-    well-known ones (`_universal` for IPP, `_printer` for HTTP, Matter's `_CM`)
-    of the types around, and for every one heard before.
-  - the **NSEC** record it announced for its hostname, which says what kinds of
-    address it has: asked for one it lacks (an IPv6 address of an IPv4-only
-    printer), the copy says so at once instead of leaving the asker to wait. The
-    copy only ever denies what the device denied itself.
-  - the **reverse mapping** (`9.1.0.10.in-addr.arpa PTR printer.local`) of its
-    routable address, if it announced one.
-- Names are compared **without regard to case**, as DNS does: `TV._http._tcp.local`
-  and `tv._HTTP._tcp.local` are the same service.
-- If devices on different interfaces announce the **same hostname**, the one
-  from the interface listed **first** in the segment wins; the other takes over
-  automatically if the winner goes away. When segments share an interface, the
-  **segment listed first in the config** wins there in the same way: with
-  `br0,media` above `br0,wifi`, a `tv.local` on `media` is the one `br0` sees,
-  and the one on `wifi` takes over only when it goes. The
-  [advertised name](#advertise-optional) always wins over a reflected device.
-- A device **on the network itself** comes first of all. While a device on
-  `br0` has a hostname, no reflected device of that name is announced on `br0`
-  (the device would take it for a conflict and rename itself), and a service
-  whose instance name (`Living Room._airplay._tcp.local`) a device on `br0`
-  offers is left out of what is reflected there. Each is announced once the
-  device on `br0` goes, and withdrawn again when it is back. Nor are devices
-  that are probing for a name answered with a reflected copy of it. Different hostnames never clash, even
-  on one address: a device with several names (a TV often has two) has each of
-  them reflected.
-- Reflected devices are kept alive with periodic re-announcements, answer
-  queries (including known-answer suppression), and are withdrawn with goodbye
-  packets when their source disappears.
-- A discovered device expires after it has been silent for at least
-  [`MinimumLifetime`](#devices-optional) (5 minutes by default), or for the TTL
-  of its records if that is longer. A goodbye packet removes it
-  immediately. A device that is about to expire is asked to answer again
-  ([`RefreshBefore`](#probe-optional)), which is what keeps quiet ones from
-  expiring.
-
-The daemon binds with `SO_REUSEPORT`, so it can run next to Avahi while you
-migrate, but don't run two reflectors (this and Avahi's) over the same
-interfaces.
-
-### Interfaces coming and going
-
-The daemon follows the kernel's link and address changes (rtnetlink), so
-interfaces may come and go while it runs:
-
-- One that is **not there** at startup is waited for, and used once it appears.
-- One that is **deleted** has its sockets closed, and the devices on it are
-  forgotten, so their copies on the other networks are withdrawn.
-- One that is **created again** (a VLAN reconfigured, hostapd restarted; it then
-  has a new index, and a socket bound to the old one would hear nothing) gets
-  new sockets. Once it is up, everything the daemon announces there is announced
-  again and the interface is probed; so too when it merely goes down and up.
-- One whose **addresses change** has the [advertised name](#advertise-optional)
-  announced with the new ones.
-
-## `mdnsctl`
-
-Queries a running daemon over its control socket.
-
-```
-usage: mdnsctl [-s PATH] [-v] [--json] <command>
-
-commands:
-  segments          list the configured segments
-  devices [--query TYPE]... <name>
-                    list the devices discovered in a segment
-  probe [<name>]    actively query for devices (all segments, or one)
-  watch [--query TYPE]... [--interval SPAN] <name>
-                    print the devices of a segment as they appear and go
-  timers            list the timers the daemon has scheduled
-
-options:
-  -s, --socket PATH  control socket (default /run/mdnsd/mdnsd.sock)
-  -v, --verbose      list devices with all details (addresses, services)
-      --json         print the daemon's reply unchanged
-  -h, --help         show this help
-```
-
-Options must come before the command (`devices` and `watch` have their own,
-after it). Segment names need no quoting: `mdnsctl devices IoT to br0` works.
-
-### `mdnsctl segments`
-
-Lists every configured segment once, with its interfaces and the address
-families it covers.
-
-```
-$ mdnsctl segments
-NAME         INTERFACES             FAMILIES
-media_stuff  br0, media             v4, v6
-IoT          wifi                   v4, v6
-IoT to br0   br0, wifi (untrusted)  v4, v6
-```
-
-An interface marked `(untrusted)` is announced nothing by the segment.
-
-### `mdnsctl devices <name>`
-
-Lists the devices **discovered on the segment's own interfaces** (both
-families). By default each device is one line: its DNS name, its pretty name
-(the name of its services, such as `OZAL Speakers`) and, last, all of its
-addresses, IPv4 first, whichever family it was heard over. Devices that have not
-announced a name yet have no DNS name to show, so they are only counted. Reflected copies from other segments are not
-included.
-
-```
-$ mdnsctl devices IoT to br0
-IoT to br0: 1 device
-  printer.local  Printer  10.0.0.10
-
-(1 device without a name not shown; use -v to list everything)
-```
-
-`-v` (`--verbose`) lists everything: interface, addresses of both families
-(routable first, then link-local) and hostname for every device, then `addr-ttl=`, the TTL
-its address records were announced with. Each device's services are underneath
-(instance, type, port, target, the `ttl=` their records were announced with,
-`sub=` and the subtypes it is of, and TXT records), including the devices without
-a name.
-
-```
-$ mdnsctl -v devices IoT to br0
-IoT to br0: 2 devices
-  br0   10.0.0.10, fd00::10  printer.local  addr-ttl=120
-      Printer  _http._tcp.local  :631 -> printer.local  ttl=4500  [rp=ipp, ty=hp]
-  wifi  10.0.1.7             -
-```
-
-`--query TYPE` (a service type such as `_shelly._tcp`; `.local` may be left
-off, and it may be given more than once) asks for that type by name on every
-interface of the segment first, resolving what answers, over about four
-seconds, and then lists only the devices of that type, with only their services
-of that type. Many devices, smart plugs among them, answer only when asked for
-their type: neither a probe (which asks what types there are) nor waiting finds
-them. The daemon remembers the type, so later probes ask for it too.
-
-```
-$ mdnsctl devices --query _shelly._tcp IoT
-IoT: 2 devices
-  shellyplug-a1b2.local  shellyplug-a1b2  10.0.1.21
-  shellyplug-c3d4.local  shellyplug-c3d4  10.0.1.22
-```
-
-A hostname of `-` means the device has been heard but has not announced a name
-yet. The TTLs are what a reflected copy is announced with (see
-[`ReflectTTL`](#devices-optional)); they are not shown for a device that has not
-announced any. `--json` always prints the full reply, regardless of `-v`, with
-them as `address_ttl` and, for each service, `ttl` (`null` when not known).
-
-### `mdnsctl probe [<name>]`
-
-Actively looks for devices on the interfaces of the named segment, or of every
-segment if no name is given. It asks which service types exist, browses each
-type for instances, resolves instances that have not yet said where they are,
-and asks for the addresses of named devices that have no routable one yet, in
-three rounds over about four seconds. It replies once the answers have
-been processed, with the number of queries sent on each interface:
-
-```
-$ mdnsctl probe IoT
-INTERFACE  RESULT
-wifi       18 queries sent
-
-List what answered with: mdnsctl devices <name>
-```
-
-The daemon already probes every interface at startup, and again every
-[`ProbeInterval`](#probe-optional) if you set one; run this to probe right now, for
-example to pick up a device you have just switched on.
-
-### `mdnsctl watch <name>`
-
-Follows a segment and prints each device as it appears, changes and goes, until
-you interrupt it. It prints only what happens from then on; `devices` shows what
-is there already.
-
-```
-$ mdnsctl watch IoT
-added    ttl=4500   plug.local  Plug S  10.0.1.9
-updated  ttl=4499   plug.local  Plug S  10.0.1.9
-removed  ttl=0      plug.local  Plug S  10.0.1.9
-```
-
-A line is what happened, the device's `ttl` (the seconds the daemon keeps it if
-it is not heard from again, or `0` once it is gone because it said goodbye or ran
-out), then the same columns as `devices`. The first time a device is shown with a
-name it is `added`, whatever the daemon first called it, and `updated` after
-that; devices that have not announced a name are not shown. `-v` prints each
-change as `devices -v` would list the device, services and their TTLs included,
-and shows unnamed ones too. It exits with status 2 if the daemon stops, and quietly with 0
-if its output is closed (`mdnsctl watch IoT | head`).
-
-`--query TYPE` narrows the watch to devices of that type, as for `devices`:
-it starts with a `present` line for each one already known, then asks for the
-type, and shows what answers and what changes from then on. One that loses its
-last service of the type is `removed`. `--interval SPAN` (`30s`, `5min`, at
-least ten seconds) asks again that often for as long as the watch runs, so a
-device that only answers when asked is found soon after it is switched on;
-without it, the watch asks once.
-
-With `--json` each change is one line of JSON as the daemon sent it, which is
-what to build on: react to a device the moment it is found, instead of polling.
-For example, configure each Shelly plug once as it appears, asking for them
-every minute:
-
-```sh
-mdnsctl --json watch --query _shelly._tcp --interval 1min IoT |
-jq -r --unbuffered 'select(.event != "removed" and .ttl > 0) | .device.addresses[0] // empty' |
-while read -r ip; do configure-plug "$ip"; done
-```
-
-A device usually produces several `updated` events as its records arrive, so a
-script like that should be idempotent, or remember the addresses it has done.
-
-### `mdnsctl timers`
-
-Lists what the daemon's timer has scheduled, soonest first, for finding out why
-something did or did not happen when you expected: each link has one `upkeep`
-timer, which expires devices, asks the ones about to expire to answer again, and
-re-announces reflected devices (`router.local` included), and it is set to the
-earliest of those that is due.
-
-```
-$ mdnsctl timers
-NAME                               STATE    DUE        RUNS  LAST RUN  TOOK
-upkeep br0                         waiting  in 1m 33s  4     3.5s ago  210us
-  re-announce router.local                  in 1m 33s
-  expire      10.0.0.10                     in 3m 02s
-  refresh     OZAL-Speakers.local           now
-upkeep wifi                        idle     never      1     8.0s ago  96us
-```
-
-Under each timer is everything it is waiting for, soonest first, which is what
-it is set to the first of: `expire` a device that has not been heard from (or,
-listed by its hostname and the address, one of its addresses that runs out on
-its own), `refresh` it (ask it to answer again, shortly before that), and
-`re-announce` a name this daemon announces. A device that has no name yet is
-listed by the address it was heard from.
-
-`STATE` is `running` while its callback runs, `waiting` until `DUE`, and `idle`
-when nothing is due (for example, no devices known yet). `DUE` says `now` for
-one that is overdue because another callback is still running. `TOOK` is how
-long the last run took.
-
-### Exit status
-
-| Code | Meaning                                                              |
-|------|----------------------------------------------------------------------|
-| `0`  | Success.                                                             |
-| `1`  | The daemon answered with an error (for example an unknown segment).  |
-| `2`  | Bad command line, or the daemon could not be reached.                |
-
-### Scripting
-
-`--json` prints the daemon's reply as a single line of JSON, ready for `jq`:
-
-```sh
-mdnsctl --json segments | jq -r '.segments[].name'
-mdnsctl --json devices media_stuff | jq -r '.devices[] | "\(.addr) \(.hostname)"'
-```
-
-The protocol behind it is one request per line over the Unix socket, one
-line of JSON back, any number of requests per connection:
-
-```sh
-printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
-```
-
-| Request           | Reply                                                                  |
-|-------------------|------------------------------------------------------------------------|
-| `segments`        | `{"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}` |
-| `devices [--query=<type>]... <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","hostname":"tv.local","addresses":["10.0.1.7","fd00::7","fe80::7"],"address_ttl":120,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
-| `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","queries":18,"error":null}]}` (replies after about 4 seconds) |
-| `watch [--query=<type>]... [--interval=<seconds>] <name>`    | `{"ok":true,"name":"IoT","watching":true}`, then until the client hangs up one line per change: `{"event":"added","segment":"IoT","ttl":4500,"device":{…as in devices…}}` (`added`, `updated` or `removed`, and with a query first `present` for each device of the type already known; `ttl` is 0 when removed) |
-| `timers`          | `{"ok":true,"timers":[{"id":1,"name":"upkeep wifi","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210}]}` |
-| anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
-
-`hostname`, `target`, `routable` and `link_local` are `null` when unknown. In
-`timers`, `due_in_ms` is `null` for a timer that is running or has nothing due,
-and `last_run_ago_ms` and `last_took_us` are `null` until it has run. Requests over 4 KiB are
-refused, and idle connections are closed after 60 seconds.
-
-## Shutdown
-
-On `SIGTERM` or `SIGINT` the daemon sends goodbye packets for every device it
-reflected, removes the control socket and exits with status 0, so clients drop
-the reflected devices immediately. If the daemon is killed with `SIGKILL` or
-crashes, no goodbyes are sent and clients keep the reflected devices until
-their records expire (up to 75 minutes).
+## Documentation
+
+The man pages are the reference, and are installed with the package:
+
+- **`mdns(8)`**: what the daemon does: how devices are tracked, probed and
+  refreshed, exactly what is reflected and what is not, the advertised name,
+  interfaces coming and going, signals and shutdown.
+- **`mdnsd.conf(5)`**: every setting, with its default and limits.
+- **`mdnsctl(1)`**: every command and option, what each prints (with
+  `--json` and without), its exit status, and talking to the control socket
+  directly.
+
+From a source checkout, read them with `man -l man/mdnsctl.1` and so on. The
+control protocol is also described at the top of `src/ipc.rs`.
 
 ## Fuzzing
 
