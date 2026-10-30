@@ -261,7 +261,11 @@ impl Entry {
 
     /// Its records that answer `q`, each with the time it has left here as
     /// its TTL, as known answers to a query asking `q` (RFC 6762 section 7.1).
+    /// None of one without a hostname, which has no records of its own.
     fn known_answers(&self, q: &Question, now: Instant) -> Vec<Record> {
+        if self.device.hostname.is_none() {
+            return Vec::new();
+        }
         let host_ttl = self.device.ttl.unwrap_or(HOST_TTL);
         let mut records = self.device.records_for(q, host_ttl, OTHER_TTL);
         for rec in &mut records {
@@ -1885,6 +1889,10 @@ mod tests {
         let (seg, rx) = wired();
         hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), srv("TV._http._tcp.local", 80, "tv.local")]);
         hear(&seg, "10.0.1.8", vec![a_record("nas.local", "10.0.1.8"), srv("NAS._http._tcp.local", 80, "nas.local")]);
+        // Known only by its address, and by a bare browse answer: no records
+        // of its own to give.
+        seg.observe(ip("10.0.1.9"));
+        hear(&seg, "10.0.1.10", vec![ptr("_http._tcp.local", "Bare._http._tcp.local")]);
         let now = Instant::now();
         {
             let mut state = seg.state.lock().unwrap();
