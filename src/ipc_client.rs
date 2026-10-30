@@ -10,31 +10,65 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use serde_json::Value;
+use systemd_unit_edit::parse_timespan;
 
 /// Keep in sync with `config::DEFAULT_SOCKET` in the daemon.
 const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A probe takes the daemon about four seconds to run before it replies.
+/// A probe takes the daemon about four seconds to run before it replies, and
+/// so does `devices --query`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Keep in sync with `ipc::MIN_QUERY_INTERVAL` in the daemon.
+const MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// (command, arguments, description): the whole IPC surface.
 const COMMANDS: &[(&str, &str, &str)] = &[
     ("segments", "", "list the configured segments"),
-    ("devices", "<name>", "list the devices discovered in a segment"),
+    ("devices", "[--query TYPE]... <name>", "list the devices discovered in a segment"),
     ("probe", "[<name>]", "actively query for devices (all segments, or one)"),
-    ("watch", "<name>", "print the devices of a segment as they appear and go"),
+    ("watch", "[--query TYPE]... [--interval SPAN] <name>", "print the devices of a segment as they appear and go"),
     ("timers", "", "list the timers the daemon has scheduled"),
 ];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Segments,
-    Devices(String),
+    Devices(Target),
     Probe(Option<String>),
-    Watch(String),
+    Watch(Target),
     Timers,
+}
+
+/// The segment of `devices` or `watch`, and the service types to ask for and
+/// show (`--query`), and how often a watch asks again (`--interval`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Target {
+    segment: String,
+    query: Vec<String>,
+    interval: Option<Duration>,
+}
+
+impl From<&str> for Target {
+    fn from(segment: &str) -> Target {
+        Target { segment: segment.into(), ..Target::default() }
+    }
+}
+
+impl Target {
+    /// The request line for `command` on this target.
+    fn request(&self, command: &str) -> String {
+        let mut line = command.to_string();
+        for kind in &self.query {
+            line.push_str(&format!(" --query={kind}"));
+        }
+        if let Some(every) = self.interval {
+            line.push_str(&format!(" --interval={}", every.as_secs()));
+        }
+        format!("{line} {}", self.segment)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,7 +98,14 @@ enum Failure {
 fn usage() -> String {
     let mut out = String::from("usage: mdnsctl [-s PATH] [-v] [--json] <command>\n\ncommands:\n");
     for (name, args, about) in COMMANDS {
-        out.push_str(&format!("  {:<18}{about}\n", format!("{name} {args}").trim_end()));
+        let synopsis = format!("{name} {args}");
+        let synopsis = synopsis.trim_end();
+        // One too long for the column has its description on a line of its own.
+        if synopsis.len() < 18 {
+            out.push_str(&format!("  {synopsis:<18}{about}\n"));
+        } else {
+            out.push_str(&format!("  {synopsis}\n  {:<18}{about}\n", ""));
+        }
     }
     out.push_str(&format!(
         "\noptions:\n  -s, --socket PATH  control socket (default {DEFAULT_SOCKET})\n  -v, --verbose      list devices with all details (addresses, services)\n      --json         print the daemon's reply unchanged\n  -h, --help         show this help\n"
@@ -107,18 +148,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
     let command = match name.as_str() {
         "segments" if rest.is_empty() => Command::Segments,
         "segments" => return Err(Failure::Usage("segments takes no arguments".into())),
-        "devices" => {
-            // Names may contain spaces, so `devices IoT to br0` needs no quoting.
-            let segment = rest.join(" ");
-            if segment.trim().is_empty() {
-                return Err(Failure::Usage("devices needs a segment name".into()));
-            }
-            // The protocol is one request per line.
-            if segment.contains(['\n', '\r']) {
-                return Err(Failure::Usage("segment name contains a line break".into()));
-            }
-            Command::Devices(segment)
-        }
+        "devices" => Command::Devices(target("devices", rest, false)?),
         "probe" => {
             let segment = rest.join(" ");
             if segment.contains(['\n', '\r']) {
@@ -126,16 +156,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
             }
             Command::Probe((!segment.trim().is_empty()).then_some(segment))
         }
-        "watch" => {
-            let segment = rest.join(" ");
-            if segment.trim().is_empty() {
-                return Err(Failure::Usage("watch needs a segment name".into()));
-            }
-            if segment.contains(['\n', '\r']) {
-                return Err(Failure::Usage("segment name contains a line break".into()));
-            }
-            Command::Watch(segment)
-        }
+        "watch" => Command::Watch(target("watch", rest, true)?),
         "timers" if rest.is_empty() => Command::Timers,
         "timers" => return Err(Failure::Usage("timers takes no arguments".into())),
         other => return Err(Failure::Usage(format!("unknown command {other:?}"))),
@@ -179,9 +200,63 @@ fn server_error(reply: &Value) -> Option<Failure> {
 
 /// Follow a segment: print each change the daemon reports until it stops (an
 /// error) or `out` is closed (success: `mdnsctl watch | head` is fine).
-fn watch(opts: &Options, name: &str, out: &mut impl Write) -> Result<(), Failure> {
+/// The target of `command` from the words after it: `--query` and (for a
+/// watch) `--interval` options, as `--query TYPE` or `--query=TYPE`, and the
+/// segment name of the rest. Names may contain spaces, so `devices IoT to
+/// br0` needs no quoting.
+fn target(command: &str, rest: &[String], watching: bool) -> Result<Target, Failure> {
+    let mut target = Target::default();
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let word = rest[i].as_str();
+        i += 1;
+        let (option, inline) = match word.split_once('=') {
+            Some((option, value)) => (option, Some(value)),
+            None => (word, None),
+        };
+        if option != "--query" && !(watching && option == "--interval") {
+            words.push(word);
+            continue;
+        }
+        let value = match inline {
+            Some(value) => value,
+            None => {
+                i += 1;
+                rest.get(i - 1).ok_or_else(|| Failure::Usage(format!("{option} needs a value")))?
+            }
+        };
+        if value.is_empty() || value.contains(char::is_whitespace) {
+            return Err(Failure::Usage(format!("invalid {option} {value:?}")));
+        }
+        if option == "--query" {
+            target.query.push(value.to_string());
+            continue;
+        }
+        let every = parse_timespan(value).map_err(|e| Failure::Usage(format!("invalid --interval {value:?}: {e}")))?;
+        if every < MIN_INTERVAL {
+            return Err(Failure::Usage(format!("--interval must be at least {}s", MIN_INTERVAL.as_secs())));
+        }
+        // The daemon takes whole seconds.
+        target.interval = Some(Duration::from_secs(every.as_secs() + u64::from(every.subsec_nanos() > 0)));
+    }
+    if target.interval.is_some() && target.query.is_empty() {
+        return Err(Failure::Usage("--interval needs a --query to ask again".into()));
+    }
+    target.segment = words.join(" ");
+    if target.segment.trim().is_empty() {
+        return Err(Failure::Usage(format!("{command} needs a segment name")));
+    }
+    // The protocol is one request per line.
+    if target.segment.contains(['\n', '\r']) {
+        return Err(Failure::Usage("segment name contains a line break".into()));
+    }
+    Ok(target)
+}
+
+fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
     let socket = &opts.socket;
-    let mut reader = BufReader::new(send(socket, &format!("watch {name}"), TIMEOUT)?);
+    let mut reader = BufReader::new(send(socket, &target.request("watch"), TIMEOUT)?);
     let mut line = String::new();
     let mut seen = HashSet::new();
     let mut acknowledged = false;
@@ -220,7 +295,8 @@ fn watch(opts: &Options, name: &str, out: &mut impl Write) -> Result<(), Failure
 fn execute(opts: &Options) -> Result<String, Failure> {
     let (line, timeout) = match &opts.command {
         Command::Segments => ("segments".to_string(), TIMEOUT),
-        Command::Devices(name) => (format!("devices {name}"), TIMEOUT),
+        Command::Devices(target) if target.query.is_empty() => (target.request("devices"), TIMEOUT),
+        Command::Devices(target) => (target.request("devices"), PROBE_TIMEOUT),
         Command::Probe(None) => ("probe".to_string(), PROBE_TIMEOUT),
         Command::Probe(Some(name)) => (format!("probe {name}"), PROBE_TIMEOUT),
         Command::Timers => ("timers".to_string(), TIMEOUT),
@@ -552,6 +628,11 @@ fn render_event(
             "removed"
         }
         ("removed", None) => "removed",
+        ("present", Some(key)) => {
+            seen.insert(key.clone());
+            "present"
+        }
+        ("present", None) => "present",
         ("added" | "updated", Some(key)) if seen.insert(key.clone()) => "added",
         ("added" | "updated", Some(_)) => "updated",
         // Nothing to track it by: say what the daemon said.
@@ -610,7 +691,7 @@ fn main() -> ExitCode {
     };
 
     let result = match &opts.command {
-        Command::Watch(name) => watch(&opts, name, &mut io::stdout().lock()),
+        Command::Watch(target) => watch(&opts, target, &mut io::stdout().lock()),
         _ => execute(&opts).map(|text| print!("{text}")),
     };
     match result {
@@ -674,6 +755,27 @@ mod tests {
         assert_eq!(parse(&["segments", "-h"]), Err(Failure::Usage("segments takes no arguments".into())));
     }
 
+    /// `--query` and `--interval` may come anywhere after the command, with
+    /// their value as the next word or after `=`; the other words are the
+    /// segment's name. They go to the daemon ahead of it.
+    #[test]
+    fn devices_and_watch_take_a_query() {
+        let o = opts(&["devices", "--query", "_shelly._tcp", "IoT", "--query=_hue._tcp", "to", "br0"]);
+        let target = Target { segment: "IoT to br0".into(), query: vec!["_shelly._tcp".into(), "_hue._tcp".into()], interval: None };
+        assert_eq!(target.request("devices"), "devices --query=_shelly._tcp --query=_hue._tcp IoT to br0");
+        assert_eq!(o.command, Command::Devices(target));
+
+        let o = opts(&["watch", "--interval", "1min", "--query=_shelly._tcp", "IoT"]);
+        let Command::Watch(target) = o.command else { panic!("{o:?}") };
+        assert_eq!(target.interval, Some(Duration::from_secs(60)));
+        assert_eq!(target.request("watch"), "watch --query=_shelly._tcp --interval=60 IoT");
+        // Part of a second more is a second more: never asked more often than said.
+        let Command::Watch(target) = opts(&["watch", "--interval=10500ms", "--query=_x._tcp", "IoT"]).command else { panic!() };
+        assert_eq!(target.interval, Some(Duration::from_secs(11)));
+        // devices asks once: --interval is part of the name there.
+        assert_eq!(opts(&["devices", "--interval=1min"]).command, Command::Devices("--interval=1min".into()));
+    }
+
     #[test]
     fn rejects_bad_command_lines() {
         for args in [
@@ -690,6 +792,13 @@ mod tests {
             &["-s"],
             &["devices", "a\nsegments"],
             &["probe", "a\nsegments"],
+            &["devices", "--query"],
+            &["devices", "--query", "_x._tcp"],
+            &["devices", "--query=", "IoT"],
+            &["devices", "--query=_x._tcp\nsegments", "IoT"],
+            &["watch", "--interval=1min", "IoT"],
+            &["watch", "--query=_x._tcp", "--interval=5s", "IoT"],
+            &["watch", "--query=_x._tcp", "--interval=soon", "IoT"],
         ] {
             assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
         }
@@ -946,6 +1055,13 @@ mod tests {
             Some("removed  ttl=0      plug.local  Plug S  10.0.1.9\n")
         );
         assert!(show(event("added", 300, Some("plug.local"), "10.0.1.9", PLUG), false).unwrap().starts_with("added  "));
+
+        // Already there when a watch for its type started: present, and then
+        // seen, so a change to it is an update.
+        let mut seen = HashSet::new();
+        let mut show = |e: Value| render_event(&e, false, &mut seen).unwrap();
+        assert!(show(event("present", 280, Some("hue.local"), "10.0.1.3", PLUG)).unwrap().starts_with("present  ttl=280 "));
+        assert!(show(event("updated", 300, Some("hue.local"), "10.0.1.3", PLUG)).unwrap().starts_with("updated  "));
     }
 
     #[test]
@@ -1006,7 +1122,7 @@ mod tests {
         let (path, daemon) = streaming_daemon("watch", vec![ACK.into(), added.clone(), removed.clone()]);
 
         let mut out = Vec::new();
-        let result = watch(&watch_options(&path, false), "IoT", &mut out);
+        let result = watch(&watch_options(&path, false), &"IoT".into(), &mut out);
         assert_eq!(daemon.join().unwrap(), "watch IoT\n");
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -1021,7 +1137,7 @@ mod tests {
         let added = event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG).to_string();
         let (path, daemon) = streaming_daemon("watch-json", vec![ACK.into(), added.clone()]);
         let mut out = Vec::new();
-        let _ = watch(&watch_options(&path, true), "IoT", &mut out);
+        let _ = watch(&watch_options(&path, true), &"IoT".into(), &mut out);
         daemon.join().unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), format!("{added}\n"));
     }
@@ -1030,14 +1146,14 @@ mod tests {
     fn watch_reports_refusals_and_failures_mid_stream() {
         let (path, daemon) = streaming_daemon("watch-refused", vec![r#"{"ok":false,"error":"no such segment: IoT"}"#.into()]);
         assert_eq!(
-            watch(&watch_options(&path, false), "IoT", &mut Vec::new()),
+            watch(&watch_options(&path, false), &"IoT".into(), &mut Vec::new()),
             Err(Failure::Server("no such segment: IoT".into()))
         );
         daemon.join().unwrap();
 
         let (path, daemon) = streaming_daemon("watch-stopped", vec![ACK.into(), r#"{"ok":false,"error":"shutting down"}"#.into()]);
         assert_eq!(
-            watch(&watch_options(&path, false), "IoT", &mut Vec::new()),
+            watch(&watch_options(&path, false), &"IoT".into(), &mut Vec::new()),
             Err(Failure::Server("shutting down".into()))
         );
         daemon.join().unwrap();
@@ -1057,7 +1173,7 @@ mod tests {
         }
         let added = event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG).to_string();
         let (path, daemon) = streaming_daemon("watch-closed", vec![ACK.into(), added]);
-        assert_eq!(watch(&watch_options(&path, false), "IoT", &mut Closed), Ok(()));
+        assert_eq!(watch(&watch_options(&path, false), &"IoT".into(), &mut Closed), Ok(()));
         daemon.join().unwrap();
     }
 

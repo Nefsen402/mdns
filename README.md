@@ -489,9 +489,11 @@ usage: mdnsctl [-s PATH] [-v] [--json] <command>
 
 commands:
   segments          list the configured segments
-  devices <name>    list the devices discovered in a segment
+  devices [--query TYPE]... <name>
+                    list the devices discovered in a segment
   probe [<name>]    actively query for devices (all segments, or one)
-  watch <name>      print the devices of a segment as they appear and go
+  watch [--query TYPE]... [--interval SPAN] <name>
+                    print the devices of a segment as they appear and go
   timers            list the timers the daemon has scheduled
 
 options:
@@ -501,8 +503,8 @@ options:
   -h, --help         show this help
 ```
 
-Options must come before the command. Segment names need no quoting:
-`mdnsctl devices IoT to br0` works.
+Options must come before the command (`devices` and `watch` have their own,
+after it). Segment names need no quoting: `mdnsctl devices IoT to br0` works.
 
 ### `mdnsctl segments`
 
@@ -549,6 +551,21 @@ IoT to br0: 2 devices
   br0   10.0.0.10, fd00::10  printer.local  addr-ttl=120
       Printer  _http._tcp.local  :631 -> printer.local  ttl=4500  [rp=ipp, ty=hp]
   wifi  10.0.1.7             -
+```
+
+`--query TYPE` (a service type such as `_shelly._tcp`; `.local` may be left
+off, and it may be given more than once) asks for that type by name on every
+interface of the segment first, resolving what answers, over about four
+seconds, and then lists only the devices of that type, with only their services
+of that type. Many devices, smart plugs among them, answer only when asked for
+their type: neither a probe (which asks what types there are) nor waiting finds
+them. The daemon remembers the type, so later probes ask for it too.
+
+```
+$ mdnsctl devices --query _shelly._tcp IoT
+IoT: 2 devices
+  shellyplug-a1b2.local  shellyplug-a1b2  10.0.1.21
+  shellyplug-c3d4.local  shellyplug-c3d4  10.0.1.22
 ```
 
 A hostname of `-` means the device has been heard but has not announced a name
@@ -600,15 +617,22 @@ change as `devices -v` would list the device, services and their TTLs included,
 and shows unnamed ones too. It exits with status 2 if the daemon stops, and quietly with 0
 if its output is closed (`mdnsctl watch IoT | head`).
 
+`--query TYPE` narrows the watch to devices of that type, as for `devices`:
+it starts with a `present` line for each one already known, then asks for the
+type, and shows what answers and what changes from then on. One that loses its
+last service of the type is `removed`. `--interval SPAN` (`30s`, `5min`, at
+least ten seconds) asks again that often for as long as the watch runs, so a
+device that only answers when asked is found soon after it is switched on;
+without it, the watch asks once.
+
 With `--json` each change is one line of JSON as the daemon sent it, which is
-what to build on: react to a device the moment it announces itself, instead of
-polling. For example, configure each Shelly plug once as it appears:
+what to build on: react to a device the moment it is found, instead of polling.
+For example, configure each Shelly plug once as it appears, asking for them
+every minute:
 
 ```sh
-mdnsctl --json watch IoT | jq -r --unbuffered '
-    select(.event != "removed" and .ttl > 0)
-    | select(any(.device.services[]?; .type == "_shelly._tcp.local"))
-    | .device.routable // empty' |
+mdnsctl --json watch --query _shelly._tcp --interval 1min IoT |
+jq -r --unbuffered 'select(.event != "removed" and .ttl > 0) | .device.addresses[0] // empty' |
 while read -r ip; do configure-plug "$ip"; done
 ```
 
@@ -672,9 +696,9 @@ printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
 | Request           | Reply                                                                  |
 |-------------------|------------------------------------------------------------------------|
 | `segments`        | `{"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}` |
-| `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","hostname":"tv.local","addresses":["10.0.1.7","fd00::7","fe80::7"],"address_ttl":120,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
+| `devices [--query=<type>]... <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","hostname":"tv.local","addresses":["10.0.1.7","fd00::7","fe80::7"],"address_ttl":120,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
 | `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","queries":18,"error":null}]}` (replies after about 4 seconds) |
-| `watch <name>`    | `{"ok":true,"name":"IoT","watching":true}`, then until the client hangs up one line per change: `{"event":"added","segment":"IoT","ttl":4500,"device":{…as in devices…}}` (`added`, `updated` or `removed`; `ttl` is 0 when removed) |
+| `watch [--query=<type>]... [--interval=<seconds>] <name>`    | `{"ok":true,"name":"IoT","watching":true}`, then until the client hangs up one line per change: `{"event":"added","segment":"IoT","ttl":4500,"device":{…as in devices…}}` (`added`, `updated` or `removed`, and with a query first `present` for each device of the type already known; `ttl` is 0 when removed) |
 | `timers`          | `{"ok":true,"timers":[{"id":1,"name":"upkeep wifi","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210}]}` |
 | anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
 

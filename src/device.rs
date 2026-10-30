@@ -739,21 +739,37 @@ impl Device {
         for q in questions {
             qs.ask(&q.name, q.qtype);
         }
-        let mut queries = qs.into_queries();
-        for msg in &mut queries {
-            let records: Vec<Record> = msg.questions.iter().flat_map(&known).collect();
-            for rec in records {
-                if msg.answers.contains(&rec) {
-                    continue;
-                }
-                msg.answers.push(rec);
-                if msg.encode().map_or(true, |b| b.len() > KNOWN_ANSWERS_SIZE) {
-                    msg.answers.pop();
-                    break;
-                }
-            }
+        with_known(qs.into_queries(), known)
+    }
+
+    /// Queries for the service types `kinds`, as asked for by name: each
+    /// type, and, of the devices that have one, the instances not yet
+    /// resolved and the hostnames without a routable address. Each packet
+    /// carries the `known` answers to its questions, as many as fit.
+    pub fn type_queries(devices: &[Device], kinds: &[String], known: impl Fn(&Question) -> Vec<Record>) -> Vec<Message> {
+        let mut qs = Questions::default();
+        for kind in kinds {
+            qs.ask(kind, rtype::PTR);
         }
-        queries
+        let of_kind = |s: &&Service| kinds.iter().any(|k| s.kind.eq_ignore_ascii_case(k));
+        for svc in devices.iter().flat_map(|d| &d.services).filter(of_kind).filter(|s| s.target.is_none()) {
+            qs.ask(&svc.instance, rtype::SRV);
+            qs.ask(&svc.instance, rtype::TXT);
+        }
+        let unreachable = devices.iter().filter(|d| d.services.iter().any(|s| of_kind(&s)) && d.routable().next().is_none());
+        for host in unreachable.filter_map(|d| d.hostname.as_deref()) {
+            qs.ask(host, rtype::A);
+            qs.ask(host, rtype::AAAA);
+        }
+        with_known(qs.into_queries(), known)
+    }
+
+    /// The device as far as the service types `kinds` go: its services of
+    /// one of them, or `None` if it has none.
+    pub fn only_kinds(&self, kinds: &[String]) -> Option<Device> {
+        let services: Vec<Service> =
+            self.services.iter().filter(|s| kinds.iter().any(|k| s.kind.eq_ignore_ascii_case(k))).cloned().collect();
+        (!services.is_empty()).then(|| Device { services, ..self.clone() })
     }
 
     /// Its records that answer `q`, with these TTLs, without the additional
@@ -990,6 +1006,25 @@ impl Questions {
     fn into_queries(self) -> Vec<Message> {
         self.list.chunks(QUESTIONS_PER_PACKET).map(query).collect()
     }
+}
+
+/// `queries` with the `known` answers to the questions of each, as many as
+/// fit in a frame, so that the devices already heard of need not answer.
+fn with_known(mut queries: Vec<Message>, known: impl Fn(&Question) -> Vec<Record>) -> Vec<Message> {
+    for msg in &mut queries {
+        let records: Vec<Record> = msg.questions.iter().flat_map(&known).collect();
+        for rec in records {
+            if msg.answers.contains(&rec) {
+                continue;
+            }
+            msg.answers.push(rec);
+            if msg.encode().map_or(true, |b| b.len() > KNOWN_ANSWERS_SIZE) {
+                msg.answers.pop();
+                break;
+            }
+        }
+    }
+    queries
 }
 
 /// A multicast query for `questions` (no known answers, so every device
@@ -1256,6 +1291,58 @@ mod tests {
         let queries = Device::probe_queries(&[], &types);
         assert_eq!(asked(&queries).len(), 41);
         assert_eq!(queries.len(), 3);
+    }
+
+    /// Asking for types by name browses each, and finishes what is missing
+    /// of their devices only: instances to resolve, hosts to find an address
+    /// for. What is known goes along as known answers.
+    #[test]
+    fn asking_for_types_browses_them_and_resolves_their_devices_only() {
+        // Of the type, unresolved, known only by a link-local address.
+        let mut plug = tv("169.254.1.5", &["Plug"]);
+        plug.hostname = Some("plug.local".into());
+        plug.services[0].kind = "_shelly._tcp.local".into();
+        plug.services[0].instance = "Plug._shelly._tcp.local".into();
+        // Of another type, as unfinished: none of its business.
+        let mut other = tv("169.254.1.6", &["TV"]);
+        other.hostname = Some("other.local".into());
+        let kinds = ["_Shelly._tcp.local".to_string()];
+        let ptr = Record {
+            name: "_shelly._tcp.local".into(),
+            class: 1,
+            cache_flush: false,
+            ttl: 60,
+            data: RData::Ptr("Plug._shelly._tcp.local".into()),
+        };
+        let known = |q: &Question| if q.qtype == rtype::PTR { vec![ptr.clone()] } else { Vec::new() };
+
+        let queries = Device::type_queries(&[plug.clone(), other], &kinds, known);
+        assert_eq!(asked(&queries), [
+            q("_Shelly._tcp.local", rtype::PTR),
+            q("Plug._shelly._tcp.local", rtype::SRV),
+            q("Plug._shelly._tcp.local", rtype::TXT),
+            q("plug.local", rtype::A),
+            q("plug.local", rtype::AAAA),
+        ]);
+        assert_eq!(queries[0].answers, [ptr]);
+
+        // Resolved and reachable, only the type is asked for.
+        plug.services[0].target = Some("plug.local".into());
+        plug.add_addrs(&[ip("10.0.1.5")]);
+        assert_eq!(asked(&Device::type_queries(&[plug], &kinds, |_| Vec::new())), [q("_Shelly._tcp.local", rtype::PTR)]);
+    }
+
+    /// Narrowed to some types, a device keeps only its services of them, and
+    /// is nothing without one.
+    #[test]
+    fn a_device_narrowed_to_types_keeps_only_those_services() {
+        let mut device = tv("10.0.1.9", &["TV", "Cast"]);
+        device.services[1].kind = "_googlecast._tcp.local".into();
+        let narrow = device.only_kinds(&["_GoogleCast._tcp.local".to_string()]).unwrap();
+        assert_eq!(narrow.services.len(), 1);
+        assert_eq!(narrow.services[0].kind, "_googlecast._tcp.local");
+        assert_eq!((narrow.hostname, narrow.addresses), (device.hostname.clone(), device.addresses.clone()));
+        assert!(device.only_kinds(&["_ipp._tcp.local".to_string()]).is_none());
     }
 
     #[test]

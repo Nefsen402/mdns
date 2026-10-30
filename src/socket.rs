@@ -1328,6 +1328,43 @@ impl Segment {
         ask(&state.outbound, &Device::probe_queries(&devices, &state.types))
     }
 
+    /// Ask for the service types `kinds` by name, in three rounds like a
+    /// [probe](Segment::probe): devices that only answer when asked for
+    /// their type, and do not say what types they have, are found this way.
+    /// The types are remembered, so that every later probe asks for them too.
+    /// What is known here already goes along as known answers, so only what
+    /// is new, or about to run out, answers. Returns how many questions were
+    /// sent; a no-op when the segment has no sender attached.
+    pub fn query_types(&self, kinds: &[String]) -> Result<usize> {
+        self.query_types_with(kinds, &PROBE_GAPS)
+    }
+
+    fn query_types_with(&self, kinds: &[String], gaps: &[Duration]) -> Result<usize> {
+        let mut sent = 0;
+        for gap in gaps {
+            sent += self.query_types_round(kinds)?;
+            thread::sleep(*gap);
+        }
+        Ok(sent)
+    }
+
+    fn query_types_round(&self, kinds: &[String]) -> Result<usize> {
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        if state.outbound.is_empty() {
+            return Ok(0);
+        }
+        for kind in kinds.iter().filter(|k| is_type(k)) {
+            if state.types.len() < MAX_TYPES {
+                state.types.insert(kind.to_ascii_lowercase());
+            }
+        }
+        let now = Instant::now();
+        let devices: Vec<Device> = state.discovered.values().map(|e| e.device.clone()).collect();
+        let known = |q: &Question| state.discovered.values().flat_map(|e| e.known_answers(q, now)).collect();
+        ask(&state.outbound, &Device::type_queries(&devices, kinds, known))
+    }
+
     /// Ask the devices that are about to expire to answer again, so that a
     /// quiet one (most speakers only answer when asked) is renewed just before
     /// it would be dropped, instead of being found again later.
@@ -1911,6 +1948,35 @@ mod tests {
         let ttl_of = |data: &RData| known.iter().find(|(d, _)| *d == data).map(|&(_, ttl)| ttl);
         assert!(ttl_of(&RData::Ptr("TV._http._tcp.local".into())).is_some_and(|t| (69..=70).contains(&t)), "{known:?}");
         assert!(ttl_of(&RData::A("10.0.1.7".parse().unwrap())).is_some_and(|t| (49..=50).contains(&t)), "{known:?}");
+    }
+
+    /// Types asked for by name are asked for in each round, with what is
+    /// known of them, and from then on in every probe; what is not a type is
+    /// asked for but not remembered.
+    #[test]
+    fn types_asked_for_by_name_are_asked_with_what_is_known_and_remembered() {
+        let (seg, rx) = wired();
+        hear(&seg, "10.0.1.5", vec![a_record("plug.local", "10.0.1.5"), srv("Plug._shelly._tcp.local", 80, "plug.local")]);
+        let kinds = ["_shelly._tcp.local".to_string(), "_Hue._tcp.local".to_string(), "bogus".to_string()];
+
+        assert_eq!(seg.query_types_with(&kinds, &[Duration::ZERO, Duration::ZERO]).unwrap(), 6);
+        for _ in 0..2 {
+            let m = recv(&rx).unwrap();
+            let questions: Vec<(String, u16)> = m.questions.iter().map(|q| (q.name.clone(), q.qtype)).collect();
+            assert_eq!(questions, [q("_shelly._tcp.local", rtype::PTR), q("_Hue._tcp.local", rtype::PTR), q("bogus", rtype::PTR)]);
+            assert_eq!(m.answers.len(), 1, "{:?}", m.answers);
+            assert_eq!(m.answers[0].data, RData::Ptr("Plug._shelly._tcp.local".into()));
+        }
+        assert!(recv(&rx).is_none());
+        let types = seg.state.lock().unwrap().types.clone();
+        assert!(types.contains("_hue._tcp.local") && types.contains("_shelly._tcp.local") && !types.contains("bogus"));
+
+        seg.probe_round().unwrap();
+        let probed: Vec<String> = std::iter::from_fn(|| recv(&rx)).flat_map(|m| m.questions).map(|q| q.name).collect();
+        assert!(probed.iter().any(|n| n == "_hue._tcp.local"), "{probed:?}");
+
+        // Without a sender, nothing.
+        assert_eq!(Segment::new("quiet", &[Family::V4]).query_types_with(&kinds, &[Duration::ZERO]).unwrap(), 0);
     }
 
     /// One sender may describe only so many hosts: a sleep proxy speaks for

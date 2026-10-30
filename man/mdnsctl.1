@@ -18,7 +18,14 @@ asks a running
 daemon what it knows, over the daemon's control socket.
 Each command of the control protocol has a subcommand here.
 Options must come before the command; everything after the command name
-belongs to the command.
+belongs to the command, which for
+.B devices
+and
+.B watch
+includes their own
+.B \-\-query
+and
+.BR \-\-interval .
 .SH COMMANDS
 .TP
 .B segments
@@ -26,7 +33,7 @@ List the configured segments, one line each, with the interfaces in the segment
 (an untrusted one marked, as it is announced nothing) and the address families
 (v4, v6) it covers.
 .TP
-\fBdevices\fR \fIname\fR
+\fBdevices\fR [\fB\-\-query\fR \fItype\fR]... \fIname\fR
 List the devices discovered on the interfaces of the segment called
 .IR name ,
 in both address families.
@@ -67,6 +74,25 @@ not.
 The name needs no quoting, even if it contains spaces:
 .B mdnsctl devices IoT to br0
 works.
+.IP
+With
+.B \-\-query
+.I type
+(a service type such as
+.BR _shelly._tcp ;
+.B .local
+may be left off, and the option may be given more than once, as
+.B \-\-query
+.I type
+or
+.BI \-\-query= type\fR),
+the daemon first asks for that type by name on every interface of the segment,
+resolving what answers, in three rounds over about four seconds, and then lists
+only the devices of that type, each with only its services of that type.
+Many devices, smart plugs among them, answer only when asked for their type: a
+probe, which asks what types there are, does not find them, and neither does
+waiting.
+The daemon remembers the type, so later probes ask for it too.
 .TP
 \fBprobe\fR [\fIname\fR]
 Actively look for devices instead of waiting for them to announce themselves:
@@ -92,11 +118,13 @@ in
 Run it to probe right now, for example to pick up a device you have just
 switched on.
 .TP
-\fBwatch\fR \fIname\fR
+\fBwatch\fR [\fB\-\-query\fR \fItype\fR]... [\fB\-\-interval\fR \fIspan\fR] \fIname\fR
 Follow the segment called
 .I name
 and print each device as it appears, changes and goes, until interrupted.
-Nothing is printed for what is already there: use
+Without
+.BR \-\-query ,
+nothing is printed for what is already there: use
 .B devices
 for that.
 Each line starts with what happened (\fBadded\fR, \fBupdated\fR or
@@ -120,6 +148,32 @@ lists it, services included, and unnamed devices too.
 With
 .B \-\-json
 each change is one line of JSON, unchanged from the daemon, for scripts.
+.IP
+With
+.B \-\-query
+.IR type ,
+as for
+.BR devices ,
+only devices of that type are shown, each with only its services of that type:
+first each one already known, as
+.BR present ,
+then the daemon asks for the type, and shows what answers and what changes from
+then on.
+A device that loses its last service of the type is shown as
+.BR removed .
+With
+.B \-\-interval
+.I span
+(such as
+.B 30s
+or
+.BR 5min ,
+at least ten seconds), the daemon asks again that often for as long as the
+watch runs, so that a device that only answers when asked is found soon after it
+is switched on.
+Without
+.BR \-\-interval ,
+it asks once.
 .IP
 It exits with status 2 if the daemon stops or the connection is lost, and
 quietly with status 0 if its output is closed, as with
@@ -330,6 +384,18 @@ Print every segment name, and every device address with its hostname:
 $ mdnsctl \-\-json segments | jq \-r '.segments[].name'
 $ mdnsctl \-\-json devices media_stuff \e
     | jq \-r '.devices[] | "\e(.addr) \e(.hostname)"'
+.fi
+.RE
+.PP
+Find the Shelly plugs on the IoT segment, asking for them by type, and print
+the address of each as it is found, asking again every minute:
+.PP
+.RS
+.nf
+$ mdnsctl \-\-json devices \-\-query _shelly._tcp IoT \e
+    | jq \-r '.devices[].addresses[0]'
+$ mdnsctl \-\-json watch \-\-query _shelly._tcp \-\-interval 1min IoT \e
+    | jq \-r \-\-unbuffered 'select(.event != "removed") | .device.addresses[0]'
 .fi
 .RE
 .PP
