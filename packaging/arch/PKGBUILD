@@ -6,7 +6,7 @@
 # directory, ./src, would otherwise be the project's own Rust sources.
 pkgname=mdns
 pkgver=0.1.0
-pkgrel=1
+pkgrel=4
 pkgdesc='mDNS discovery and per-segment reflection daemon, with the mdnsctl client'
 arch=('x86_64' 'aarch64')
 license=('GPL-3.0-only')
@@ -49,7 +49,4 @@ package() {
 
   install -Dm644 systemd/mdnsd.service "$pkgdir/usr/lib/systemd/system/mdnsd.service"
   install -Dm644 systemd/mdnsd.sysusers "$pkgdir/usr/lib/sysusers.d/mdnsd.conf"
-
-  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

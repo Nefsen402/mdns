@@ -262,10 +262,9 @@ sudo pacman -U mdns-*.pkg.tar.zst
 ```
 
 It installs `/usr/bin/mdns`, `/usr/bin/mdnsctl`, the `mdnsd.service` unit, a
-sysusers entry that creates the unprivileged `mdnsd` user, the man pages
-(`mdns(8)`, `mdnsd.conf(5)`, `mdnsctl(1)`), this README under
-`/usr/share/doc/mdns/`, and the license under `/usr/share/licenses/mdns/`. No
-`/etc/mdnsd.conf` is installed, since only you know your interfaces. Write one
+sysusers entry that creates the unprivileged `mdnsd` user, and the man pages
+(`mdns(8)`, `mdnsd.conf(5)`, `mdnsctl(1)`). No `/etc/mdnsd.conf` is installed,
+since only you know your interfaces. Write one
 (starting from [Reflecting between networks](#reflecting-between-networks) or
 [Tracking devices for scripts](#tracking-devices-for-scripts)), then start the
 service:
