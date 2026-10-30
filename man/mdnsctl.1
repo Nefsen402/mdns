@@ -179,6 +179,29 @@ It exits with status 2 if the daemon stops or the connection is lost, and
 quietly with status 0 if its output is closed, as with
 .BR "mdnsctl watch IoT | head" .
 .TP
+.B watchers
+List the watches open on the daemon, oldest first, one line each: its id, the
+segment it watches, its
+.B \-\-query
+types and
+.B \-\-interval
+.RB ( \-
+for none), how long it has been open, and the process holding it: its PID, its
+user and its command line.
+The daemon has the PID and user from the kernel, as the other end of the
+watch's connection, so a watcher cannot misreport them.
+The user name and command line are looked up by
+.B mdnsctl
+itself: a user that is not in
+.I /etc/passwd
+is shown by number, and the command line of a process this one may not see (as
+with
+.B hidepid
+on
+.IR /proc )
+as
+.BR \- .
+.TP
 .B timers
 List the timers the daemon has scheduled, soonest first, with their state,
 when each is due, how often it has run, when it last ran and how long that

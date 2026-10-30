@@ -17,6 +17,9 @@
 //!   {"event":"present","segment":"IoT","ttl":300,"device":{...}}   (--query only)
 //!   {"event":"added","segment":"IoT","ttl":4500,"device":{...as in devices...}}
 //!   {"event":"removed","segment":"IoT","ttl":0,"device":{...}}
+//! watchers
+//!   {"ok":true,"watchers":[{"id":3,"segment":"IoT","query":["_shelly._tcp.local"],
+//!    "interval_s":60,"pid":4242,"uid":1000,"age_ms":93000}]}
 //! timers
 //!   {"ok":true,"timers":[{"id":1,"name":"upkeep wifi","running":false,
 //!    "due_in_ms":93000,"runs":4,"last_run_ago_ms":3000,"last_took_us":210,
@@ -51,6 +54,12 @@
 //! service of the type is `removed` from the watch. The types asked for are
 //! remembered, so probes ask for them from then on.
 //!
+//! `watchers` lists the watches streaming now, oldest first: the segment,
+//! the `--query` types (empty for none) and `--interval` (`null` for none)
+//! each was asked with, how long it has been open, and the process and user
+//! holding it, as the kernel reports the other end of its connection (`null`
+//! if it cannot).
+//!
 //! `timers` lists what the daemon's timer has scheduled, soonest first, for
 //! debugging. `due_in_ms` is 0 for one that is overdue (its callback is queued
 //! behind another) and `null` for one that is running now or never due;
@@ -81,7 +90,8 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -118,6 +128,7 @@ const MIN_QUERY_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } els
 pub fn serve(path: &Path, groups: &Arc<Vec<Group>>, timers: Watcher) -> Result<JoinHandle<()>> {
     let listener = bind(path)?;
     let groups = Arc::downgrade(groups);
+    let watches = Arc::new(Watches::default());
     eprintln!("ipc: listening on {}", path.display());
     Ok(thread::spawn(move || {
         for conn in listener.incoming() {
@@ -125,7 +136,8 @@ pub fn serve(path: &Path, groups: &Arc<Vec<Group>>, timers: Watcher) -> Result<J
                 Ok(stream) => {
                     let groups = Weak::clone(&groups);
                     let timers = timers.clone();
-                    thread::spawn(move || match serve_connection(stream, &groups, &timers) {
+                    let watches = Arc::clone(&watches);
+                    thread::spawn(move || match serve_connection(stream, &groups, &timers, &watches) {
                         Err(e) if !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                             eprintln!("ipc: connection ended: {e}");
                         }
@@ -160,8 +172,9 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watcher) -> io::Result<()> {
+fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watcher, watches: &Watches) -> io::Result<()> {
     stream.set_read_timeout(Some(IDLE))?;
+    let peer = peer_of(&stream);
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut line = String::new();
@@ -184,16 +197,103 @@ fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watc
                 None => Err(error("shutting down")),
             };
             return match registered {
-                Ok(watch) => stream_events(&mut writer, groups, watch),
+                Ok(watch) => {
+                    let _listed = watches.add(&watch, peer);
+                    stream_events(&mut writer, groups, watch)
+                }
                 Err(reply) => writeln!(writer, "{reply}"),
             };
         }
         let reply = match groups.upgrade() {
-            Some(groups) => handle(&groups, timers, request),
+            Some(groups) => handle(&groups, timers, watches, request),
             None => error("shutting down").to_string(),
         };
         writeln!(writer, "{reply}")?;
     }
+}
+
+/// The watches streaming now, for `watchers`.
+#[derive(Default)]
+pub struct Watches {
+    next_id: AtomicU64,
+    open: Mutex<Vec<Open>>,
+}
+
+/// One watch, as `watchers` lists it.
+struct Open {
+    id: u64,
+    segment: String,
+    query: Query,
+    peer: Option<Peer>,
+    since: Instant,
+}
+
+/// The process at the other end of a connection, as the kernel has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Peer {
+    pid: i32,
+    uid: u32,
+}
+
+/// A watch listed in [`Watches`] for as long as this lives.
+struct Listed<'a> {
+    watches: &'a Watches,
+    id: u64,
+}
+
+impl Drop for Listed<'_> {
+    fn drop(&mut self) {
+        self.watches.open.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.id != self.id);
+    }
+}
+
+impl Watches {
+    /// List `watch`, held by `peer`, until the returned guard is dropped.
+    fn add(&self, watch: &Watch, peer: Option<Peer>) -> Listed<'_> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let query = Query { kinds: watch.query.kinds.clone(), interval: watch.query.interval };
+        let open = Open { id, segment: watch.name.clone(), query, peer, since: Instant::now() };
+        self.open.lock().unwrap_or_else(|e| e.into_inner()).push(open);
+        Listed { watches: self, id }
+    }
+
+    fn json(&self) -> Value {
+        let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let list: Vec<Value> = open
+            .iter()
+            .map(|w| {
+                json!({
+                    "id": w.id,
+                    "segment": w.segment,
+                    "query": w.query.kinds,
+                    "interval_s": w.query.interval.map(|d| d.as_secs()),
+                    "pid": w.peer.map(|p| p.pid),
+                    "uid": w.peer.map(|p| p.uid),
+                    "age_ms": u64::try_from(w.since.elapsed().as_millis()).unwrap_or(u64::MAX),
+                })
+            })
+            .collect();
+        json!({ "ok": true, "watchers": list })
+    }
+}
+
+/// Who is at the other end of `stream`, or `None` if the kernel will not say.
+fn peer_of(stream: &UnixStream) -> Option<Peer> {
+    // SAFETY: an all-zero ucred is valid, and `len` is its size.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the descriptor is open for the life of `stream`, and `cred` is
+    // writable for `len` bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some(Peer { pid: cred.pid, uid: cred.uid })
 }
 
 /// The arguments of a `watch` request, if it is one.
@@ -454,7 +554,7 @@ fn event_json(event: &str, segment: &str, notice: &Notice) -> Value {
 }
 
 /// Answer one request line with one line of JSON.
-pub fn handle(groups: &[Group], timers: &Watcher, request: &str) -> String {
+pub fn handle(groups: &[Group], timers: &Watcher, watches: &Watches, request: &str) -> String {
     let (command, arg) = match request.split_once(char::is_whitespace) {
         Some((command, arg)) => (command, arg.trim()),
         None => (request, ""),
@@ -464,10 +564,11 @@ pub fn handle(groups: &[Group], timers: &Watcher, request: &str) -> String {
         "devices" => devices(groups, arg),
         "probe" => probe(groups, arg),
         "timers" => timer_list(groups, timers),
+        "watchers" => watches.json(),
         "watch" => error("watch streams events: it needs a connection of its own"),
         "" => error("empty request"),
         other => error(&format!(
-            "unknown command {other:?}; try: segments, devices [--query=<type>] <name>, probe [name], watch <name>, timers"
+            "unknown command {other:?}; try: segments, devices [--query=<type>] <name>, probe [name], watch <name>, watchers, timers"
         )),
     }
     .to_string()
@@ -682,7 +783,7 @@ mod tests {
         let _sooner = timer.schedule("sooner", Duration::from_secs(60), || crate::timer::Next::Stop);
         let _never = timer.schedule("never", Duration::MAX, || crate::timer::Next::Stop);
 
-        let reply: Value = serde_json::from_str(&handle(&[], &timer.watcher(), "timers")).unwrap();
+        let reply: Value = serde_json::from_str(&handle(&[], &timer.watcher(), &Watches::default(), "timers")).unwrap();
         assert_eq!(reply["ok"], true);
         let list = reply["timers"].as_array().unwrap();
         let names: Vec<&str> = list.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -705,7 +806,7 @@ mod tests {
         segs[0].schedule(&timer, Some(Duration::from_secs(30)));
         segs[0].observe(ip("10.0.1.7"));
 
-        let reply: Value = serde_json::from_str(&handle(&[g, g2], &timer.watcher(), "timers")).unwrap();
+        let reply: Value = serde_json::from_str(&handle(&[g, g2], &timer.watcher(), &Watches::default(), "timers")).unwrap();
         let list = reply["timers"].as_array().unwrap();
         assert_eq!(list.len(), 1, "only wifi was scheduled");
         assert_eq!(list[0]["name"], "upkeep wifi");
@@ -720,7 +821,7 @@ mod tests {
 
     #[test]
     fn timers_reports_a_timer_that_is_gone() {
-        let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), "timers")).unwrap();
+        let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), &Watches::default(), "timers")).unwrap();
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("timer"));
     }
@@ -732,7 +833,7 @@ mod tests {
         let (iot, _) = group("iot", Family::V4, &["c"]);
         let groups = [m4, m6, iot];
         assert_eq!(
-            handle(&groups, &Watcher::default(), "segments"),
+            handle(&groups, &Watcher::default(), &Watches::default(), "segments"),
             r#"{"ok":true,"segments":[{"name":"media","interfaces":["a","b"],"untrusted":[],"families":["v4","v6"]},{"name":"iot","interfaces":["c"],"untrusted":[],"families":["v4"]}]}"#
         );
     }
@@ -743,7 +844,7 @@ mod tests {
         let reflector = Reflector::with_untrusted(0, segs, &["wifi".to_string()]).unwrap();
         let groups = [Group { name: "IoT to br0".into(), reflector }];
         assert_eq!(
-            handle(&groups, &Watcher::default(), "segments"),
+            handle(&groups, &Watcher::default(), &Watches::default(), "segments"),
             r#"{"ok":true,"segments":[{"name":"IoT to br0","interfaces":["br0","wifi"],"untrusted":["wifi"],"families":["v4"]}]}"#
         );
     }
@@ -753,7 +854,7 @@ mod tests {
         let (iot, segs) = group("IoT to br0", Family::V4, &["c"]);
         segs[0].observe(ip("10.0.3.9"));
         assert_eq!(
-            handle(&[iot], &Watcher::default(), r#"devices "IoT to br0""#),
+            handle(&[iot], &Watcher::default(), &Watches::default(), r#"devices "IoT to br0""#),
             r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","hostname":null,"addresses":["10.0.3.9"],"address_ttl":null,"services":[]}]}"#
         );
     }
@@ -763,7 +864,7 @@ mod tests {
         let (g, segs) = group("media", Family::V4, &["a", "b"]);
         announce(&segs[0], "10.0.1.5", "tv.local", r#"My "TV""#);
         segs[1].observe(ip("10.0.2.1"));
-        let out = handle(&[g], &Watcher::default(), "DEVICES media");
+        let out = handle(&[g], &Watcher::default(), &Watches::default(), "DEVICES media");
         assert!(
             out.contains(r#""interface":"a","hostname":"tv.local","addresses":["10.0.1.5"],"address_ttl":120"#),
             "{out}"
@@ -783,7 +884,7 @@ mod tests {
         announce(&segs[0], "10.0.1.5", "tv.local", "TV");
         std::thread::sleep(Duration::from_millis(150));
         assert!(!segs[1].manual_devices().is_empty(), "precondition: reflected onto b");
-        let out = handle(&[g], &Watcher::default(), "devices media");
+        let out = handle(&[g], &Watcher::default(), &Watches::default(), "devices media");
         assert_eq!(out.matches("\"addresses\"").count(), 1, "{out}");
     }
 
@@ -799,7 +900,7 @@ mod tests {
             Group { name: "y".into(), reflector: Reflector::new(1, vec![a, c]).unwrap() },
         ];
         let interfaces = |request: &str| -> Vec<String> {
-            let reply: Value = serde_json::from_str(&handle(&groups, &Watcher::default(), request)).unwrap();
+            let reply: Value = serde_json::from_str(&handle(&groups, &Watcher::default(), &Watches::default(), request)).unwrap();
             assert_eq!(reply["ok"], true, "{reply}");
             reply["probed"]
                 .as_array()
@@ -818,7 +919,7 @@ mod tests {
         let (g, _segs) = group("media", Family::V4, &["a"]);
         // No sender is attached in tests, so nothing is sent.
         assert_eq!(
-            handle(&[g], &Watcher::default(), "probe media"),
+            handle(&[g], &Watcher::default(), &Watches::default(), "probe media"),
             r#"{"ok":true,"probed":[{"interface":"a","queries":0,"error":null}]}"#
         );
     }
@@ -834,7 +935,7 @@ mod tests {
             ("", "empty request"),
             ("frobnicate", "unknown command"),
         ] {
-            let out = handle(&groups, &Watcher::default(), request);
+            let out = handle(&groups, &Watcher::default(), &Watches::default(), request);
             assert!(out.starts_with(r#"{"ok":false,"error":""#) && out.contains(expect), "{request}: {out}");
         }
     }
@@ -848,7 +949,7 @@ mod tests {
         // is quotes and backslashes.
         // A backslash in a label is `\\` in the escaped form names are kept in.
         announce(&segs[0], "10.0.1.5", "tv.local", "My \"TV\" \\\\ back");
-        let out = handle(&[g], &Watcher::default(), "devices media");
+        let out = handle(&[g], &Watcher::default(), &Watches::default(), "devices media");
         assert!(!out.contains('\n'), "{out}");
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
@@ -996,7 +1097,7 @@ mod tests {
         announce(&a, "10.0.1.7", "tv.local", "TV");
         a.observe(ip("10.0.1.8"));
         let reply: Value =
-            serde_json::from_str(&handle(&groups, &Watcher::default(), "devices --query=_http._tcp IoT")).unwrap();
+            serde_json::from_str(&handle(&groups, &Watcher::default(), &Watches::default(), "devices --query=_http._tcp IoT")).unwrap();
         assert_eq!(reply["ok"], true, "{reply}");
         let hosts: Vec<&str> = reply["devices"].as_array().unwrap().iter().filter_map(|d| d["hostname"].as_str()).collect();
         assert_eq!(hosts, ["tv.local"]);
@@ -1006,14 +1107,14 @@ mod tests {
         assert!(on_a.len() == 3 && on_a.iter().all(|&(_, known)| known == 1), "three rounds, with the TV known: {on_a:?}");
         assert_eq!(http(&b_rx).len(), 3);
 
-        let reply = handle(&groups, &Watcher::default(), "devices --query=_ipp._tcp IoT");
+        let reply = handle(&groups, &Watcher::default(), &Watches::default(), "devices --query=_ipp._tcp IoT");
         assert!(reply.contains(r#""devices":[]"#), "{reply}");
         for (request, why) in [
             ("devices --query=_http._tcp --interval=30 IoT", "--interval is for watch"),
             ("devices --query=http IoT", "not a service type"),
             ("devices --query=_http._tcp", "usage: devices"),
         ] {
-            assert!(handle(&groups, &Watcher::default(), request).contains(why), "{request}");
+            assert!(handle(&groups, &Watcher::default(), &Watches::default(), request).contains(why), "{request}");
         }
     }
 
@@ -1088,9 +1189,60 @@ mod tests {
         assert_eq!(show(Event::Removed(nameless)).as_deref(), Some("removed"));
     }
 
+    /// `watchers` lists the open watches, oldest first, with what each asked
+    /// for and who holds it, and one is gone from the list once its client
+    /// hangs up.
+    #[test]
+    fn watchers_lists_the_open_watches_and_who_holds_them() {
+        let (g, _segs) = group("IoT", Family::V4, &["wifi"]);
+        let path = temp_socket("watchers");
+        let groups = Arc::new(vec![g]);
+        serve(&path, &groups, Watcher::default()).unwrap();
+        let open = |request: &str| {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(ask(&mut stream, &mut reader, request).contains(r#""watching":true"#));
+            stream
+        };
+        let list = || {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let reply: Value = serde_json::from_str(&ask(&mut stream, &mut reader, "watchers")).unwrap();
+            assert_eq!(reply["ok"], true);
+            reply["watchers"].as_array().unwrap().clone()
+        };
+        assert!(list().is_empty());
+
+        let first = open("watch IoT");
+        let _second = open("watch --query=_shelly._tcp --interval=60 IoT");
+        let watchers = list();
+        assert_eq!(watchers.len(), 2, "{watchers:?}");
+        let me = (std::process::id() as i64, unsafe { libc::getuid() } as i64);
+        for w in &watchers {
+            assert_eq!(w["segment"], "IoT");
+            assert_eq!((w["pid"].as_i64().unwrap(), w["uid"].as_i64().unwrap()), me, "the kernel's word for who holds it");
+            assert!(w["age_ms"].as_u64().is_some());
+        }
+        assert!(watchers[0]["id"].as_u64() < watchers[1]["id"].as_u64(), "oldest first");
+        assert_eq!((watchers[0]["query"].as_array().unwrap().len(), &watchers[0]["interval_s"]), (0, &Value::Null));
+        assert_eq!(watchers[1]["query"][0], "_shelly._tcp.local");
+        assert_eq!(watchers[1]["interval_s"], 60);
+
+        // A watch whose client is gone leaves the list (within a check or two).
+        drop(first);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while list().len() != 1 {
+            assert!(Instant::now() < deadline, "the closed watch is still listed");
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(list()[0]["query"][0], "_shelly._tcp.local");
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn watch_is_refused_where_it_cannot_stream() {
-        let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), "watch IoT")).unwrap();
+        let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), &Watches::default(), "watch IoT")).unwrap();
         assert_eq!(reply["ok"], false);
     }
 

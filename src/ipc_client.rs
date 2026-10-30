@@ -32,6 +32,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("devices", "[--query TYPE]... <name>", "list the devices discovered in a segment"),
     ("probe", "[<name>]", "actively query for devices (all segments, or one)"),
     ("watch", "[--query TYPE]... [--interval SPAN] <name>", "print the devices of a segment as they appear and go"),
+    ("watchers", "", "list the watches open on the daemon, and who holds them"),
     ("timers", "", "list the timers the daemon has scheduled"),
 ];
 
@@ -41,6 +42,7 @@ enum Command {
     Devices(Target),
     Probe(Option<String>),
     Watch(Target),
+    Watchers,
     Timers,
 }
 
@@ -159,6 +161,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
             Command::Probe((!segment.trim().is_empty()).then_some(segment))
         }
         "watch" => Command::Watch(target("watch", rest, true)?),
+        "watchers" if rest.is_empty() => Command::Watchers,
+        "watchers" => return Err(Failure::Usage("watchers takes no arguments".into())),
         "timers" if rest.is_empty() => Command::Timers,
         "timers" => return Err(Failure::Usage("timers takes no arguments".into())),
         other => return Err(Failure::Usage(format!("unknown command {other:?}"))),
@@ -301,6 +305,7 @@ fn execute(opts: &Options) -> Result<String, Failure> {
         Command::Devices(target) => (target.request("devices"), PROBE_TIMEOUT),
         Command::Probe(None) => ("probe".to_string(), PROBE_TIMEOUT),
         Command::Probe(Some(name)) => (format!("probe {name}"), PROBE_TIMEOUT),
+        Command::Watchers => ("watchers".to_string(), TIMEOUT),
         Command::Timers => ("timers".to_string(), TIMEOUT),
         Command::Watch(_) => unreachable!("watch streams: see watch()"),
     };
@@ -319,6 +324,7 @@ fn execute(opts: &Options) -> Result<String, Failure> {
         Command::Devices(_) if opts.verbose => render_devices(&reply),
         Command::Devices(_) => render_devices_brief(&reply),
         Command::Probe(_) => render_probe(&reply),
+        Command::Watchers => render_watchers(&reply, user_name, command_line),
         Command::Timers => render_timers(&reply),
         Command::Watch(_) => unreachable!("watch streams: see watch()"),
     }
@@ -414,6 +420,65 @@ fn render_timers(reply: &Value) -> Result<String, Failure> {
         }
     }
     Ok(table(&rows))
+}
+
+/// One line per open watch, oldest first: what it watches, how often it asks
+/// again, how long it has been open, and the process holding it, named with
+/// `user` and `command`, which may not know (another user's process may be
+/// hidden).
+fn render_watchers(
+    reply: &Value,
+    user: impl Fn(u32) -> Option<String>,
+    command: impl Fn(i32) -> Option<String>,
+) -> Result<String, Failure> {
+    let list = reply["watchers"].as_array().ok_or_else(bad_reply)?;
+    if list.is_empty() {
+        return Ok("no watchers\n".into());
+    }
+    let mut rows = vec![
+        ["ID", "SEGMENT", "QUERY", "EVERY", "AGE", "PID", "USER", "COMMAND"].map(String::from).to_vec(),
+    ];
+    for w in list {
+        let query: Vec<&str> = w["query"]
+            .as_array()
+            .ok_or_else(bad_reply)?
+            .iter()
+            .map(|k| k.as_str().map(|k| k.strip_suffix(".local").unwrap_or(k)).ok_or_else(bad_reply))
+            .collect::<Result<_, _>>()?;
+        let query = if query.is_empty() { "-".to_string() } else { query.join(", ") };
+        let every = w["interval_s"].as_u64().map_or("-".to_string(), |s| span(s * 1000));
+        let pid = w["pid"].as_i64().and_then(|p| i32::try_from(p).ok());
+        let uid = w["uid"].as_u64().and_then(|u| u32::try_from(u).ok());
+        rows.push(vec![
+            w["id"].as_u64().ok_or_else(bad_reply)?.to_string(),
+            w["segment"].as_str().ok_or_else(bad_reply)?.to_string(),
+            query,
+            every,
+            span(w["age_ms"].as_u64().ok_or_else(bad_reply)?),
+            pid.map_or("-".to_string(), |p| p.to_string()),
+            uid.map_or("-".to_string(), |u| user(u).unwrap_or_else(|| u.to_string())),
+            pid.and_then(&command).unwrap_or_else(|| "-".to_string()),
+        ]);
+    }
+    Ok(table(&rows))
+}
+
+/// The name of the user with `uid`, from `/etc/passwd`.
+fn user_name(uid: u32) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        (fields.nth(1)?.parse::<u32>().ok()? == uid).then(|| name.to_string())
+    })
+}
+
+/// The command line of the process `pid`, if this one may see it.
+fn command_line(pid: i32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let words: Vec<String> =
+        raw.split(|&b| b == 0).filter(|w| !w.is_empty()).map(|w| String::from_utf8_lossy(w).into_owned()).collect();
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 /// One line per named device: its DNS name, its pretty name (the service
@@ -752,6 +817,7 @@ mod tests {
         assert_eq!(opts(&["probe", "  "]).command, Command::Probe(None));
         assert_eq!(opts(&["probe", "IoT", "to", "br0"]).command, Command::Probe(Some("IoT to br0".into())));
         assert_eq!(opts(&["timers"]).command, Command::Timers);
+        assert_eq!(opts(&["watchers"]).command, Command::Watchers);
         assert_eq!(opts(&["watch", "IoT", "to", "br0"]).command, Command::Watch("IoT to br0".into()));
         assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
         assert_eq!(parse(&["segments", "-h"]), Err(Failure::Usage("segments takes no arguments".into())));
@@ -787,6 +853,7 @@ mod tests {
             &["devices", "  "],
             &["segments", "extra"],
             &["timers", "extra"],
+            &["watchers", "IoT"],
             &["watch"],
             &["watch", "  "],
             &["watch", "a\nsegments"],
@@ -1000,6 +1067,39 @@ mod tests {
             render_probe(&reply).unwrap(),
             "INTERFACE  RESULT\nbr0        14 queries sent\nwifi       error: sending to ff02::fb: Network is unreachable\n\nList what answered with: mdnsctl devices <name>\n"
         );
+    }
+
+    /// A watcher is shown with what it watches and who holds it; what the
+    /// process or user cannot be named by is shown as the number, or `-`.
+    #[test]
+    fn renders_watchers() {
+        let reply: Value = serde_json::from_str(
+            r#"{"ok":true,"watchers":[
+                {"id":3,"segment":"IoT","query":[],"interval_s":null,"pid":4242,"uid":1000,"age_ms":93000},
+                {"id":7,"segment":"lan","query":["_shelly._tcp.local","_hue._tcp.local"],"interval_s":60,"pid":5151,"uid":0,"age_ms":2500},
+                {"id":9,"segment":"lan","query":[],"interval_s":null,"pid":null,"uid":null,"age_ms":10}]}"#,
+        )
+        .unwrap();
+        let user = |uid: u32| (uid == 1000).then(|| "alex".to_string());
+        let command = |pid: i32| (pid == 4242).then(|| "mdnsctl watch IoT".to_string());
+        assert_eq!(
+            render_watchers(&reply, user, command).unwrap(),
+            "ID  SEGMENT  QUERY                    EVERY   AGE     PID   USER  COMMAND\n\
+             3   IoT      -                        -       1m 33s  4242  alex  mdnsctl watch IoT\n\
+             7   lan      _shelly._tcp, _hue._tcp  1m 00s  2.5s    5151  0     -\n\
+             9   lan      -                        -       10ms    -     -     -\n"
+        );
+        let none: Value = serde_json::from_str(r#"{"ok":true,"watchers":[]}"#).unwrap();
+        assert_eq!(render_watchers(&none, user, command).unwrap(), "no watchers\n");
+        assert!(render_watchers(&serde_json::json!({"ok":true}), user, command).is_err());
+    }
+
+    #[test]
+    fn this_process_is_named_by_its_user_and_command_line() {
+        let me = std::process::id() as i32;
+        assert!(command_line(me).is_some_and(|c| !c.is_empty()));
+        assert_eq!(user_name(0).as_deref(), Some("root"));
+        assert!(command_line(-1).is_none());
     }
 
     #[test]
