@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 236" width="760" height="236" role="img" aria-labelledby="title desc">
+  <title id="title">The router keeps a model of the devices on each network</title>
+  <desc id="desc">The speaker on the media VLAN announces itself to the router, which keeps a model of it (Speakers.local, 10.0.2.73, _airplay on port 7000) and asks it questions as itself. The router announces that model on the LAN and answers the phone's questions from it; the phone never reaches the speaker over mDNS.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .box { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; }
+    .model { fill: #ddf4ff; stroke: #0969da; stroke-width: 1.5; }
+    .net { fill: #59636e; font: 600 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; letter-spacing: 0.04em; }
+    .name { fill: #1f2328; font: 600 15px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .label { fill: #1f2328; font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { fill: #1f2328; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace; }
+    .arrow { stroke: #59636e; stroke-width: 1.75; fill: none; }
+    .head { fill: #59636e; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .box { fill: #151b23; stroke: #656c76; }
+      .model { fill: #0c2d6b; stroke: #4493f8; }
+      .net { fill: #9198a1; }
+      .name, .label, .mono { fill: #f0f6fc; }
+      .arrow { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="760" height="236" rx="10"/>
+
+  <!-- Which network each is on. -->
+  <text class="net" x="90" y="30" text-anchor="middle">MEDIA VLAN</text>
+  <text class="net" x="370" y="30" text-anchor="middle">ROUTER</text>
+  <text class="net" x="660" y="30" text-anchor="middle">LAN</text>
+
+  <!-- The speaker. -->
+  <rect class="box" x="20" y="44" width="140" height="170" rx="8"/>
+  <text class="name" x="90" y="134" text-anchor="middle">speaker</text>
+
+  <!-- The router's model of it. -->
+  <rect class="model" x="280" y="44" width="180" height="170" rx="8"/>
+  <text class="name" x="370" y="78" text-anchor="middle">model of media</text>
+  <text class="mono" x="300" y="118">Speakers.local</text>
+  <text class="mono" x="300" y="142">10.0.2.73</text>
+  <text class="mono" x="300" y="166">_airplay :7000</text>
+
+  <!-- The phone. -->
+  <rect class="box" x="580" y="44" width="160" height="170" rx="8"/>
+  <text class="name" x="660" y="134" text-anchor="middle">phone</text>
+
+  <!-- Speaker and router. -->
+  <line class="arrow" x1="164" y1="104" x2="276" y2="104" marker-end="url(#head)"/>
+  <text class="label" x="220" y="94" text-anchor="middle">announces</text>
+  <line class="arrow" x1="276" y1="160" x2="164" y2="160" marker-end="url(#head)"/>
+  <text class="label" x="220" y="182" text-anchor="middle">asks, as itself</text>
+
+  <!-- Router and phone. -->
+  <line class="arrow" x1="464" y1="104" x2="576" y2="104" marker-end="url(#head)"/>
+  <text class="label" x="520" y="78" text-anchor="middle">announces,</text>
+  <text class="label" x="520" y="94" text-anchor="middle">answers</text>
+  <line class="arrow" x1="576" y1="160" x2="464" y2="160" marker-end="url(#head)"/>
+  <text class="label" x="520" y="182" text-anchor="middle">asks</text>
+</svg>

@@ -26,16 +26,7 @@ own address. It answers questions from the model too: a phone on the LAN asking
 for AirPlay speakers is answered by the router, with the speaker's details, and
 the speaker never hears the phone.
 
-```
- media VLAN                    router                      LAN
-┌──────────┐             ┌────────────────┐              ┌───────┐
-│ speaker  │  announces  │ model of media │  announces,  │ phone │
-│          │ ──────────▶ │ Speakers.local │  answers     │       │
-│          │             │ 10.0.2.73      │ ───────────▶ │       │
-│          │ ◀────────── │ _airplay :7000 │ ◀─────────── │       │
-│          │  asks, as   │                │  asks        │       │
-└──────────┘  itself     └────────────────┘              └───────┘
-```
+![The speaker on the media VLAN announces itself to the router, which keeps a model of it (Speakers.local, 10.0.2.73, _airplay on port 7000) and asks it questions as itself; the router announces that model on the LAN and answers the phone's questions from it.](docs/how-it-works.svg)
 
 ### What that makes possible
 
