@@ -33,8 +33,10 @@ sections of the configuration file; see
 A device is known by its hostname once it has announced one, and until then by
 the address it was heard from.
 Its addresses are those of its own address records (and the address it sent
-from, if it announced none of its own); per address family it has up to two, a
-link-local one and a routable one.
+from, if it announced none of its own): routable ones (IPv4, and global and ULA
+IPv6) and link-local ones, up to eight of a family.
+Addresses announced with the cache-flush bit are all a device has of their
+family and replace those it had; a goodbye drops just its address.
 Its DNS-SD services are taken from the records it announces.
 A packet may describe several devices, as a reflector's answer to a browse
 query does, so each record is attributed to the device it names: an address

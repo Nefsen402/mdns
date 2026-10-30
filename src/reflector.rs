@@ -336,9 +336,19 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
     use super::*;
-    use crate::device::Addrs;
     use crate::parser::{rtype, Header, Message, RData, Record};
     use crate::socket::Family;
+
+    /// Its first routable IPv4 or IPv6 address, and link-local one.
+    fn v4(d: &Device) -> Option<IpAddr> {
+        d.routable().find(|a| a.is_ipv4())
+    }
+    fn v6(d: &Device) -> Option<IpAddr> {
+        d.routable().find(|a| a.is_ipv6())
+    }
+    fn ll6(d: &Device) -> Option<IpAddr> {
+        d.addrs().find(|a| a.is_ipv6() && crate::device::is_link_local(a))
+    }
 
     /// A segment whose "multicast group" is a local socket we can read.
     fn wired(name: &str) -> (Segment, UdpSocket) {
@@ -579,13 +589,13 @@ mod tests {
         announce(&a, "10.0.1.5", "TV.local", &["TV"]);
         wait_for(|| {
             let d = c.manual_devices();
-            d.len() == 1 && d[0].ipv4.routable == Some(ip("10.0.1.5"))
+            d.len() == 1 && v4(&d[0]) == Some(ip("10.0.1.5"))
         });
 
         a.expire(Instant::now() + Duration::from_secs(36000));
         wait_for(|| {
             let d = c.manual_devices();
-            d.len() == 1 && d[0].ipv4.routable == Some(ip("10.0.2.5"))
+            d.len() == 1 && v4(&d[0]) == Some(ip("10.0.2.5"))
         });
     }
 
@@ -694,7 +704,7 @@ mod tests {
         let mut names: Vec<_> = b.manual_devices().iter().map(|d| d.hostname.clone().unwrap()).collect();
         names.sort();
         assert_eq!(names, ["tv-nsas-1.local", "tv.local"]);
-        assert!(b.manual_devices().iter().all(|d| d.ipv4.routable == Some(ip("10.0.1.5"))));
+        assert!(b.manual_devices().iter().all(|d| v4(d) == Some(ip("10.0.1.5"))));
     }
 
     /// The configured topology: a<->b and b<->c, but never a<->c, even
@@ -718,13 +728,13 @@ mod tests {
 
         announce(&b, "10.0.2.5", "tv-b.local", &["B"]);
         wait_for(|| a.manual_devices().len() == 1 && c.manual_devices().len() == 1);
-        assert_eq!(a.manual_devices()[0].ipv4.routable, Some(ip("10.0.2.5")));
-        assert_eq!(c.manual_devices()[0].ipv4.routable, Some(ip("10.0.2.5")));
+        assert_eq!(v4(&a.manual_devices()[0]), Some(ip("10.0.2.5")));
+        assert_eq!(v4(&c.manual_devices()[0]), Some(ip("10.0.2.5")));
 
         // Dropping one reflector withdraws only what it announced.
         drop(r_ab);
         assert!(a.manual_devices().is_empty());
-        let on_b: Vec<_> = b.manual_devices().iter().map(|d| d.ipv4.routable.unwrap()).collect();
+        let on_b: Vec<_> = b.manual_devices().iter().map(|d| v4(d).unwrap()).collect();
         assert_eq!(on_b, [ip("10.0.3.5")]);
         assert_eq!(c.manual_devices().len(), 1);
     }
@@ -739,7 +749,7 @@ mod tests {
         let (wifi, _wifi_rx) = wired("wifi");
         let _first = Reflector::new(0, vec![br0.clone(), media.clone()]).unwrap();
         let _second = Reflector::new(1, vec![br0.clone(), wifi.clone()]).unwrap();
-        let on_br0 = || br0.manual_devices().iter().map(|d| d.ipv4.routable).collect::<Vec<_>>();
+        let on_br0 = || br0.manual_devices().iter().map(v4).collect::<Vec<_>>();
         let gone = || Instant::now() + Duration::from_secs(3600);
 
         // Media's wins, and is not displaced by the one heard after it.
@@ -774,7 +784,7 @@ mod tests {
         let (br0, br0_rx) = wired("br0");
         let (media, _media_rx) = wired("media");
         let _r = Reflector::new(0, vec![br0.clone(), media.clone()]).unwrap();
-        let on_br0 = || br0.manual_devices().iter().map(|d| d.ipv4.routable).collect::<Vec<_>>();
+        let on_br0 = || br0.manual_devices().iter().map(v4).collect::<Vec<_>>();
         let tv_records = |msgs: Vec<Message>| -> Vec<Record> {
             msgs.into_iter().flat_map(|m| m.answers).filter(|r| r.name.eq_ignore_ascii_case("tv.local")).collect()
         };
@@ -806,7 +816,7 @@ mod tests {
     fn a_device_named_like_the_advertised_name_leaves_it_alone() {
         let (br0, br0_rx) = wired("br0");
         let (media, _media_rx) = wired("media");
-        let router = Device { hostname: Some("router.local".into()), ipv4: Addrs { routable: Some(ip("10.0.0.1")), ..Addrs::default() }, ..Device::default() };
+        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.0.1")], ..Device::default() };
         br0.add_manual_ttl(Owner::Own, router.clone(), Duration::from_secs(120)).unwrap();
         let _r = Reflector::new(0, vec![br0.clone(), media.clone()]).unwrap();
         drain(&br0_rx);
@@ -929,10 +939,35 @@ mod tests {
         wait_for(|| b.manual_devices().len() == 1);
 
         let there = b.manual_devices().remove(0);
-        assert_eq!(there.ipv4, Addrs { routable: Some(ip("10.0.1.5")), link_local: None });
-        assert_eq!(there.ipv6, Addrs { routable: Some(ip("fd00::5")), link_local: None });
+        assert_eq!(there.addresses, [ip("10.0.1.5"), ip("fd00::5")]);
         let sent: Vec<RData> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.name == "tv.local").map(|r| r.data).collect();
         assert_eq!(sent, [RData::A("10.0.1.5".parse().unwrap()), RData::Aaaa("fd00::5".parse().unwrap())]);
+    }
+
+    /// On a network with a global and a ULA prefix, a device's copy carries
+    /// both: which one a client can use depends on where it is.
+    #[test]
+    fn a_copy_carries_a_global_and_a_ula_address() {
+        let (a, _arx) = wired("a");
+        let (b, brx) = wired("b");
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
+        let msg = Message {
+            header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+            questions: vec![],
+            answers: vec![
+                rec("tv.local", RData::Aaaa("2001:db8::5".parse().unwrap())),
+                rec("tv.local", RData::Aaaa("fd00::5".parse().unwrap())),
+                rec("tv.local", RData::Aaaa("fe80::5".parse().unwrap())),
+                rec("TV._http._tcp.local", RData::Srv { priority: 0, weight: 0, port: 80, target: "tv.local".into() }),
+            ],
+            authorities: vec![],
+            additionals: vec![],
+        };
+        a.handle(SocketAddr::new(ip("fe80::5"), 5353), &msg.encode().unwrap()).unwrap();
+        wait_for(|| b.manual_devices().len() == 1);
+        assert_eq!(b.manual_devices()[0].addresses, [ip("2001:db8::5"), ip("fd00::5")]);
+        let sent: Vec<RData> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.name == "tv.local").map(|r| r.data).collect();
+        assert_eq!(sent, [RData::Aaaa("2001:db8::5".parse().unwrap()), RData::Aaaa("fd00::5".parse().unwrap())]);
     }
 
     /// The bug this guards against: a device on one network announced to
@@ -949,10 +984,10 @@ mod tests {
 
         // Where it lives, both addresses are known...
         let home = &a.devices()[0];
-        assert_eq!((home.ipv6.routable, home.ipv6.link_local), (Some(ip("fd00:0:1::5")), Some(ip("fe80::5"))));
+        assert_eq!((v6(home), ll6(home)), (Some(ip("fd00:0:1::5")), Some(ip("fe80::5"))));
         // ...but the other network is told only the routable one.
         let there = &b.manual_devices()[0];
-        assert_eq!((there.ipv6.routable, there.ipv6.link_local), (Some(ip("fd00:0:1::5")), None));
+        assert_eq!((v6(there), ll6(there)), (Some(ip("fd00:0:1::5")), None));
         let on_the_wire: Vec<Ipv6Addr> = drain(&brx)
             .iter()
             .flat_map(|m| &m.answers)
@@ -973,7 +1008,7 @@ mod tests {
         announce6(&a, "fe80::6", "mute.local", &["fe80::6"], "Mute");
         wait_for(|| !a.devices().is_empty());
         thread::sleep(Duration::from_millis(100));
-        assert_eq!(a.devices()[0].ipv4.routable, None);
+        assert_eq!(v4(&a.devices()[0]), None);
         assert!(b.manual_devices().is_empty());
         assert!(drain(&brx).is_empty());
     }

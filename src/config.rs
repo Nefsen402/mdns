@@ -110,6 +110,8 @@ pub struct Config {
     /// The least a device is kept after it was last heard from, whatever TTLs
     /// it announced. Zero keeps it for exactly its longest TTL.
     pub min_lifetime: Duration,
+    /// How many addresses of a family a device is kept with, at most.
+    pub max_addrs: usize,
 }
 
 impl Default for Config {
@@ -125,6 +127,7 @@ impl Default for Config {
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
             min_lifetime: crate::socket::DEFAULT_MIN_LIFETIME,
+            max_addrs: crate::device::DEFAULT_MAX_ADDRS,
         }
     }
 }
@@ -222,6 +225,7 @@ impl Config {
                     ("devices", "minimumlifetime") => {
                         config.min_lifetime = parse_lifetime(&value, lineno)?;
                     }
+                    ("devices", "maxaddresses") => config.max_addrs = parse_max_addrs(&value, lineno)?,
                     ("probe", "refreshbefore") => {
                         config.refresh_before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
                     }
@@ -376,6 +380,19 @@ fn timespan(value: &str, lineno: usize, key: &str) -> Result<Duration> {
         Err(TimespanParseError::Empty) if !value.trim().is_empty() => Ok(Duration::ZERO),
         Err(e) => bail!("line {lineno}: invalid {key} {value:?}: {e}"),
     }
+}
+
+/// How many addresses of a family a device is kept with: a number, at least
+/// one, or `infinity` for no limit at all.
+fn parse_max_addrs(value: &str, lineno: usize) -> Result<usize> {
+    if value.eq_ignore_ascii_case("infinity") {
+        return Ok(usize::MAX);
+    }
+    value
+        .parse()
+        .ok()
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| anyhow!("line {lineno}: MaxAddresses= must be a number of at least 1, or infinity, not {value:?}"))
 }
 
 /// The minimum lifetime of a device: a time span, where zero means no minimum.
@@ -549,7 +566,7 @@ interfaces=br0,wifi
         let man = include_str!("../man/mdnsd.conf.5");
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
-            "ReflectTTL=", "Name=", "Interfaces=", "Untrusted=",
+            "ReflectTTL=", "MaxAddresses=", "Name=", "Interfaces=", "Untrusted=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
@@ -754,6 +771,20 @@ ProbeInterval=off
         let err = |v: &str| error_of(&format!("[Probe]\nRefreshBefore={v}\n{EXAMPLE}"));
         assert!(err("20s").contains("RefreshBefore= must be at least 30 seconds"), "{}", err("20s"));
         assert!(err("soon").contains("line 2") && err("soon").contains("invalid RefreshBefore"));
+    }
+
+    #[test]
+    fn max_addresses_defaults_to_eight_and_has_no_upper_bound() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().max_addrs, crate::device::DEFAULT_MAX_ADDRS);
+        let with = |v: &str| Config::parse(&format!("[Devices]\nMaxAddresses={v}\n{EXAMPLE}"));
+        assert_eq!(with("2").unwrap().max_addrs, 2);
+        assert_eq!(with("100000").unwrap().max_addrs, 100_000);
+        assert_eq!(with("infinity").unwrap().max_addrs, usize::MAX, "no limit at all");
+        assert_eq!(with("Infinity").unwrap().max_addrs, usize::MAX);
+        for bad in ["0", "-1", "many", ""] {
+            let err = error_of(&format!("[Devices]\nMaxAddresses={bad}\n{EXAMPLE}"));
+            assert!(err.contains("line 2") && err.contains("MaxAddresses="), "{bad:?}: {err}");
+        }
     }
 
     #[test]

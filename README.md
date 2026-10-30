@@ -190,6 +190,7 @@ replaced; a live instance or a file that is not a socket is never overwritten.
 |-------------------|---------|-------------------------------------------------------------|
 | `MinimumLifetime` | `5min`  | The least a device is kept after it was last heard from.    |
 | `ReflectTTL`      | `auto`  | The TTL of the address of devices reflected to other networks. |
+| `MaxAddresses`    | `8`     | How many addresses of each family a device is kept with, at most. |
 
 A systemd time span (`5min`, `90s`, `1h`), at most 1 day. A device lives for the
 longest TTL it announced, but never for less than this, so a device that
@@ -217,6 +218,14 @@ minutes for its services. The TTL is the one last heard, not counted down: a
 copy of a device that went silent is withdrawn when the device expires, up to
 `MinimumLifetime` after it was last heard. `ReflectTTL` is independent of the
 [`TTL`](#advertise-optional) of the advertised name.
+
+**`MaxAddresses`** bounds how many addresses of each family a device is kept
+(and reflected) with. Eight covers a global and a ULA IPv6 address, a few
+temporary ones and a link-local one. Addresses announced with the cache-flush
+bit replace those of their family anyway, so this only bounds what one device
+can pile up; beyond it, more are ignored. It must be at least 1, has no upper
+bound, and `infinity` lifts the limit altogether, if you would rather let a
+device announce as many addresses as it likes.
 
 ### `[Probe]` (optional)
 
@@ -354,8 +363,14 @@ the others look for (not who looks).
   it names: an address to the host that owns the name, a service to the host its
   SRV record points at. The address a packet came from is credited to a host
   only if that host announced it, or announced none and is the only host
-  described, so a reflector is not mistaken for the devices it announces. Per address family it has up to two: a
-  **link-local** address, and a **routable** one (IPv4, or global/ULA IPv6).
+  described, so a reflector is not mistaken for the devices it announces.
+  Its **routable** addresses (IPv4, and global and ULA IPv6: on a network with
+  both prefixes a device has one of each) are all kept, and so are its
+  **link-local** ones, up to eight of a family. Addresses announced with the
+  cache-flush bit, as most devices announce them, are all a device has of that
+  family and replace those it had; a goodbye drops just its address, so a
+  temporary IPv6 address giving way to the next is followed. A device leaves
+  when it says goodbye to the address it sends from without announcing another.
 - Only devices that announced **a hostname, a routable address and at least one
   service** (with its SRV record, so a host and a port) are reflected. Chatty
   clients that merely send queries (phones, laptops) are tracked but not

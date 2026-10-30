@@ -49,15 +49,7 @@ fn main() -> Result<()> {
     // belong to the transport they come over.
     let mut links: HashMap<&str, Segment> = HashMap::new();
     for interface in config.interfaces() {
-        let link = start_link(
-            interface,
-            &families,
-            config.advertise.as_deref().map(|name| (name, config.advertise_ttl)),
-            config.refresh_before,
-            config.min_lifetime,
-            config.reflect_ttl,
-            &timer,
-        )?;
+        let link = start_link(interface, &families, &config, &timer)?;
         links.insert(interface, link);
     }
 
@@ -195,22 +187,16 @@ fn release(mut segments: Arc<Vec<Group>>) {
 /// devices, and an event logger, which run until the process exits. Expiry,
 /// refreshing and re-announcement run on `timer`.
 ///
-/// With `advertise`, the link also announces that name (say `router.local`)
-/// with this host's addresses on the interface, one of each family, as a
-/// reflected device with a hostname and addresses but no services, with its
-/// records valid for `ttl`. The addresses are read once, here.
-fn start_link(
-    interface: &str,
-    families: &[Family],
-    advertise: Option<(&str, Duration)>,
-    refresh_before: Option<Duration>,
-    min_lifetime: Duration,
-    reflect_ttl: Option<Duration>,
-    timer: &Timer,
-) -> Result<Segment> {
+/// With `[Advertise] Hostname=` in `config`, the link also announces that name
+/// (say `router.local`) with this host's addresses on the interface, one of
+/// each family, as a reflected device with a hostname and addresses but no
+/// services, with its records valid for `[Advertise] TTL=`. The addresses are
+/// read once, here.
+fn start_link(interface: &str, families: &[Family], config: &Config, timer: &Timer) -> Result<Segment> {
     let link = Segment::new(interface, families);
-    link.set_min_lifetime(min_lifetime);
-    link.set_reflect_ttl(reflect_ttl);
+    link.set_min_lifetime(config.min_lifetime);
+    link.set_max_addrs(config.max_addrs);
+    link.set_reflect_ttl(config.reflect_ttl);
     let mut sockets = Vec::new();
     for &family in families {
         let sock = socket::open(interface, family).with_context(|| format!("opening {family:?} socket on {interface}"))?;
@@ -220,7 +206,8 @@ fn start_link(
         sockets.push(sock);
     }
 
-    if let Some((name, ttl)) = advertise {
+    if let Some(name) = config.advertise.as_deref() {
+        let ttl = config.advertise_ttl;
         // On its own link, the router's link-local address is as good as any,
         // and for IPv6 it is the one the kernel picks. An interface without
         // an address of a family has none of it to advertise; that is not a
@@ -236,9 +223,7 @@ fn start_link(
             })
             .collect();
         let mut device = Device { hostname: Some(name.to_string()), ..Device::default() };
-        if let Some(&first) = addrs.first() {
-            device.set_addrs(&addrs, first);
-        }
+        device.add_addrs(&addrs);
         match link.add_manual_ttl(Owner::Own, device, ttl) {
             Ok(_) => {
                 let shown: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
@@ -258,7 +243,7 @@ fn start_link(
         }
     });
 
-    link.schedule(timer, refresh_before);
+    link.schedule(timer, config.refresh_before);
 
     for sock in sockets {
         let receiver = link.clone();

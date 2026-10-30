@@ -131,6 +131,20 @@ Independent of
 .B TTL=
 of
 .BR [Advertise] .
+.TP
+.B MaxAddresses=
+How many addresses of each family a device is kept with, and reflected with, at
+most.
+Default
+.BR 8 :
+enough for a global and a ULA IPv6 address, a few temporary ones and a
+link-local one.
+Addresses announced with the cache-flush bit replace those of their family, so
+this only bounds what one device can pile up; more are ignored.
+At least 1; there is no upper bound, and
+.B infinity
+lifts the limit altogether, at the cost of letting one device announce as many
+addresses as it likes.
 .SS [Probe]
 Optional.
 Both settings are systemd time spans, such as

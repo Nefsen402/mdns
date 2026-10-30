@@ -50,8 +50,8 @@
 //! A device is listed once, whichever family it was heard over, with its
 //! `addresses` of both: routable ones first (IPv4, then global or ULA IPv6),
 //! then link-local ones (`169.254/16`, `fe80::/10`), which only mean something
-//! on the device's own link. Up to one of each kind and family; empty when it
-//! announced none and was not heard from.
+//! on the device's own link. Up to eight of a family; empty when it announced
+//! none and was not heard from.
 //!
 //! The TTLs a device announced itself with are kept: `address_ttl` for its
 //! address records and `ttl` for each service (the SRV record's, else the PTR's
