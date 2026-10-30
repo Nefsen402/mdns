@@ -6,7 +6,8 @@
 //! one: unparseable packets, impossible names and addresses, floods. None of
 //! them may come out on the other. Among them go canaries, well-formed
 //! devices that must come out, within a few seconds, to show that the daemon
-//! is still alive and reflecting.
+//! is still alive and reflecting. Every other canary speaks only IPv6, and
+//! every canary has to come out over both families.
 //!
 //! It needs no privileges: it runs itself in a user namespace (`unshare -rn`)
 //! and the daemon in a network namespace within that.
@@ -228,7 +229,7 @@ fn drive(opts: &Options, run: &Path, socket: &Path, daemon: &mut Child) -> Resul
     for v6 in [false, true] {
         let listener = net::listener(net::FUZZ_B, v6).map_err(|e| format!("listening on {}: {e}", net::FUZZ_B))?;
         let (ledger, stop) = (ledger.clone(), stop.clone());
-        watchers.push(thread::spawn(move || watch::watch(listener, ledger, stop)));
+        watchers.push(thread::spawn(move || watch::watch(listener, v6, ledger, stop)));
     }
     let send4 = net::sender(net::FUZZ_A, false).map_err(|e| format!("sending on {}: {e}", net::FUZZ_A))?;
     let send6 = net::sender(net::FUZZ_A, true).map_err(|e| format!("sending on {}: {e}", net::FUZZ_A))?;
@@ -281,16 +282,23 @@ fn drive(opts: &Options, run: &Path, socket: &Path, daemon: &mut Child) -> Resul
             let mut stalled = Vec::new();
             for (&k, c) in &ledger.canaries {
                 let age = now.saturating_duration_since(c.sent);
-                if c.seen.is_none() && age > CANARY_RESEND && resent.insert(k) {
+                if c.seen().is_none() && age > CANARY_RESEND && resent.insert(k) {
                     send_canary(k);
                 }
-                if c.seen.is_none() && age > CANARY_TIMEOUT && late.insert(k) {
-                    stalled.push(k);
+                if c.seen().is_none() && age > CANARY_TIMEOUT && late.insert(k) {
+                    let missing = match (c.seen_v4, c.seen_v6) {
+                        (None, None) => "either family",
+                        (None, Some(_)) => "IPv4",
+                        _ => "IPv6",
+                    };
+                    stalled.push((k, missing));
                 }
             }
-            for k in stalled {
+            for (k, missing) in stalled {
                 let last = inputs.len().checked_sub(1).map(|i| i as u64);
-                ledger.stalled(last, format!("canary {k} was not reflected within {}s: the daemon has stalled", CANARY_TIMEOUT.as_secs()));
+                let kind = if bogus::canary_v6(k) { "IPv6-only" } else { "IPv4" };
+                let secs = CANARY_TIMEOUT.as_secs();
+                ledger.stalled(last, format!("{kind} canary {k} did not come out over {missing} within {secs}s"));
             }
         }
         if feeding {
@@ -330,12 +338,13 @@ fn report(opts: &Options, run: &Path, ledger: &Ledger, inputs: &[Input], rss: (O
     for input in inputs {
         *sent.entry(input.category.label()).or_default() += 1;
     }
-    let reflected = ledger.canaries.values().filter(|c| c.seen.is_some()).count();
-    let slowest = ledger.canaries.values().filter_map(|c| c.seen.map(|s| s - c.sent)).max().unwrap_or_default();
+    let reflected = ledger.canaries.values().filter(|c| c.seen().is_some()).count();
+    let slowest = ledger.canaries.values().filter_map(|c| c.seen().map(|s| s - c.sent)).max().unwrap_or_default();
+    let v6 = ledger.canaries.keys().filter(|&&k| bogus::canary_v6(k)).count();
     let sent: Vec<String> = sent.iter().map(|(c, n)| format!("{n} {c}")).collect();
     println!("seed {}: sent {} inputs ({})", opts.seed, inputs.len(), sent.join(", "));
     println!(
-        "canaries: {reflected} of {} reflected, the slowest in {:.1}s; {} packets judged on the far side",
+        "canaries: {reflected} of {} ({v6} IPv6-only) reflected over both families, the slowest in {:.1}s; {} packets judged on the far side",
         ledger.canaries.len(),
         slowest.as_secs_f64(),
         ledger.packets

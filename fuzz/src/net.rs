@@ -10,7 +10,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::process::Command;
 use std::time::Duration;
 
@@ -84,8 +84,11 @@ pub fn hand_over(pid: u32) -> io::Result<()> {
         ip(&["addr", "add", addr, "dev", iface])?;
         ip(&["link", "set", iface, "up"])?;
     }
-    // The canaries' own addresses, each sent from by its canary.
-    let canaries: String = (100..250).map(|i| format!("addr add 10.0.1.{i}/24 dev {FUZZ_A}\n")).collect();
+    // The canaries' own addresses, of both families, each sent from by its
+    // canary.
+    let canaries: String = (100..250)
+        .map(|i| format!("addr add 10.0.1.{i}/24 dev {FUZZ_A}\naddr add fd00:1::{i:x}/64 dev {FUZZ_A} nodad\n"))
+        .collect();
     let mut batch = Command::new("ip").args(["-batch", "-"]).stdin(std::process::Stdio::piped()).spawn()?;
     std::io::Write::write_all(batch.stdin.as_mut().expect("piped"), canaries.as_bytes())?;
     drop(batch.stdin.take());
@@ -150,14 +153,29 @@ pub fn sender(iface: &str, v6: bool) -> io::Result<(UdpSocket, SocketAddr)> {
 }
 
 /// A socket that sends to the mDNS group on `iface` from `addr`, port 5353,
-/// and where to send to: for a device that is its own sender.
-pub fn sender_from(iface: &str, addr: Ipv4Addr) -> io::Result<(UdpSocket, SocketAddr)> {
-    let socket = base(Domain::IPV4, iface)?;
-    socket.set_multicast_if_v4(&addr)?;
-    socket.set_multicast_ttl_v4(255)?;
-    socket.set_multicast_loop_v4(false)?;
-    socket.bind(&SocketAddr::V4(SocketAddrV4::new(addr, PORT)).into())?;
-    Ok((socket.into(), SocketAddr::V4(SocketAddrV4::new(GROUP_V4, PORT))))
+/// over `addr`'s family, and where to send to: for a device that is its own
+/// sender.
+pub fn sender_from(iface: &str, addr: IpAddr) -> io::Result<(UdpSocket, SocketAddr)> {
+    match addr {
+        IpAddr::V4(addr) => {
+            let socket = base(Domain::IPV4, iface)?;
+            socket.set_multicast_if_v4(&addr)?;
+            socket.set_multicast_ttl_v4(255)?;
+            socket.set_multicast_loop_v4(false)?;
+            socket.bind(&SocketAddr::V4(SocketAddrV4::new(addr, PORT)).into())?;
+            Ok((socket.into(), SocketAddr::V4(SocketAddrV4::new(GROUP_V4, PORT))))
+        }
+        IpAddr::V6(addr) => {
+            let idx = index(iface)?;
+            let socket = base(Domain::IPV6, iface)?;
+            socket.set_only_v6(true)?;
+            socket.set_multicast_if_v6(idx)?;
+            socket.set_multicast_hops_v6(255)?;
+            socket.set_multicast_loop_v6(false)?;
+            socket.bind(&SocketAddr::V6(SocketAddrV6::new(addr, PORT, 0, 0)).into())?;
+            Ok((socket.into(), SocketAddr::V6(SocketAddrV6::new(GROUP_V6, PORT, 0, idx))))
+        }
+    }
 }
 
 /// A socket that hears everything sent to the mDNS group on `iface`.

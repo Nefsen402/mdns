@@ -347,18 +347,34 @@ pub fn canary_instance(k: u64) -> String {
 
 /// Canary `k`'s address, from which it is also sent, as a device announces
 /// itself: one of its own, so that no one sender describes many devices.
-pub fn canary_addr(k: u64) -> Ipv4Addr {
-    Ipv4Addr::new(10, 0, 1, 100 + (k % 150) as u8)
+pub fn canary_addr(k: u64) -> IpAddr {
+    let i = 100 + (k % 150) as u16;
+    if canary_v6(k) {
+        IpAddr::V6(Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, i))
+    } else {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, i as u8))
+    }
 }
 
-/// Canary `k`: a well-formed device that must be reflected.
+/// Whether canary `k` is an IPv6 one: every other canary announces only an
+/// IPv6 address, and over IPv6, as a device that never speaks IPv4 does.
+pub fn canary_v6(k: u64) -> bool {
+    k.is_multiple_of(2)
+}
+
+/// Canary `k`: a well-formed device that must be reflected, over both
+/// families, whichever it announced itself over.
 pub fn canary(k: u64) -> Vec<u8> {
     let host = name(&canary_host(k));
     let instance = name(&canary_instance(k));
     let rr = |name: &Name, cache_flush, rdata| Rr { name: name.clone(), class: IN, cache_flush, ttl: 120, rdata };
+    let address = match canary_addr(k) {
+        IpAddr::V4(a) => Rdata::A(a),
+        IpAddr::V6(a) => Rdata::Aaaa(a),
+    };
     let packet = Packet {
         answers: vec![
-            rr(&host, true, Rdata::A(canary_addr(k))),
+            rr(&host, true, address),
             rr(&name("_http._tcp.local"), false, Rdata::Ptr(instance.clone())),
             rr(&instance, true, Rdata::Srv { port: 8000, target: host.clone() }),
             rr(&instance, true, Rdata::Txt(vec![format!("canary={k}").into_bytes()])),

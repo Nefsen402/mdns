@@ -31,7 +31,17 @@ pub struct Violation {
 
 pub struct Canary {
     pub sent: Instant,
-    pub seen: Option<Instant>,
+    /// When it first came out over IPv4, and over IPv6.
+    pub seen_v4: Option<Instant>,
+    pub seen_v6: Option<Instant>,
+}
+
+impl Canary {
+    /// When it had come out over both families, which it has to: the daemon
+    /// announces over every family, whichever the device spoke.
+    pub fn seen(&self) -> Option<Instant> {
+        Some(self.seen_v4?.max(self.seen_v6?))
+    }
 }
 
 #[derive(Default)]
@@ -54,7 +64,7 @@ impl Ledger {
     pub fn canary_sent(&mut self, k: u64) {
         self.canary_hosts.insert(canary_host(k).to_ascii_lowercase(), k);
         self.canary_instances.insert(canary_instance(k).to_ascii_lowercase());
-        self.canaries.entry(k).or_insert(Canary { sent: Instant::now(), seen: None });
+        self.canaries.entry(k).or_insert(Canary { sent: Instant::now(), seen_v4: None, seen_v6: None });
     }
 
     /// Remember the names in bogus input `id`, as the daemon read them: of
@@ -82,7 +92,8 @@ impl Ledger {
         self.violations.push(Violation { category: None, liveness: true, input: last, what });
     }
 
-    fn judge(&mut self, packet: &[u8]) {
+    /// Judge `packet`, which came over IPv6 if `v6`.
+    fn judge(&mut self, packet: &[u8], v6: bool) {
         self.packets += 1;
         let msg = match Message::parse(packet) {
             Ok(msg) => msg,
@@ -94,10 +105,11 @@ impl Ledger {
         for rec in msg.records() {
             if let Some(&k) = self.canary_hosts.get(&rec.name.to_ascii_lowercase()) {
                 if rec.ttl > 0
-                    && matches!(rec.data, RData::A(_))
+                    && matches!(rec.data, RData::A(_) | RData::Aaaa(_))
                     && let Some(c) = self.canaries.get_mut(&k)
                 {
-                    c.seen.get_or_insert(Instant::now());
+                    let seen = if v6 { &mut c.seen_v6 } else { &mut c.seen_v4 };
+                    seen.get_or_insert(Instant::now());
                 }
                 continue;
             }
@@ -150,11 +162,11 @@ fn names(rec: &Record) -> Vec<&str> {
 }
 
 /// Judge every packet `socket` hears, until the ledger says to stop.
-pub fn watch(socket: UdpSocket, ledger: Arc<Mutex<Ledger>>, stop: Arc<std::sync::atomic::AtomicBool>) {
+pub fn watch(socket: UdpSocket, v6: bool, ledger: Arc<Mutex<Ledger>>, stop: Arc<std::sync::atomic::AtomicBool>) {
     let mut buf = [0u8; 9000];
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         if let Ok((n, _)) = socket.recv_from(&mut buf) {
-            ledger.lock().unwrap().judge(&buf[..n]);
+            ledger.lock().unwrap().judge(&buf[..n], v6);
         }
     }
 }

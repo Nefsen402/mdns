@@ -689,7 +689,10 @@ an otherwise valid announcement with one thing wrong with it:
 
 None of them may come out on the other interface. Among them go canaries,
 well-formed devices that must come out within six seconds, to show that the
-daemon has neither stalled nor died.
+daemon has neither stalled nor died. Every other canary announces only an IPv6
+address, over IPv6, as a device that never speaks IPv4 does; every canary has
+to come out over both families, since the daemon announces a device over every
+family whichever it spoke.
 
 It needs no privileges: it runs itself under `unshare -rn`, which needs
 unprivileged user namespaces. Options: `--seed N` (a run is the same from the
