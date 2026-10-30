@@ -7,17 +7,17 @@
 //! segments
 //!   {"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"untrusted":[],"families":["v4","v6"]}]}
 //! devices <segment name>
-//!   {"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v6",
-//!    "hostname":"tv.local","routable":"fd00:0:1::7","link_local":"fe80::7",
+//!   {"ok":true,"name":"IoT","devices":[{"interface":"wifi","hostname":"tv.local",
+//!    "addresses":["10.0.1.7","fd00:0:1::7","fe80::7"],"address_ttl":120,
 //!    "services":[{"instance":...}]}]}
 //! probe [<segment name>]
-//!   {"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":14,"error":null}]}
+//!   {"ok":true,"probed":[{"interface":"wifi","queries":14,"error":null}]}
 //! watch <segment name>
 //!   {"ok":true,"name":"IoT","watching":true}
 //!   {"event":"added","segment":"IoT","ttl":4500,"device":{...as in devices...}}
 //!   {"event":"removed","segment":"IoT","ttl":0,"device":{...}}
 //! timers
-//!   {"ok":true,"timers":[{"id":1,"name":"upkeep wifi/V4","running":false,
+//!   {"ok":true,"timers":[{"id":1,"name":"upkeep wifi","running":false,
 //!    "due_in_ms":93000,"runs":4,"last_run_ago_ms":3000,"last_took_us":210,
 //!    "pending":[{"what":"re-announce","who":"router.local","due_in_ms":93000}]}]}
 //! ```
@@ -47,8 +47,11 @@
 //! none), and `due_in_ms` from now (0 if it is due).
 //! 
 //!
-//! A device has up to two addresses, of the entry's family: `routable` (IPv4,
-//! or global/ULA IPv6) and `link_local`; either is `null` when unknown.
+//! A device is listed once, whichever family it was heard over, with its
+//! `addresses` of both: routable ones first (IPv4, then global or ULA IPv6),
+//! then link-local ones (`169.254/16`, `fe80::/10`), which only mean something
+//! on the device's own link. Up to one of each kind and family; empty when it
+//! announced none and was not heard from.
 //!
 //! The TTLs a device announced itself with are kept: `address_ttl` for its
 //! address records and `ttl` for each service (the SRV record's, else the PTR's
@@ -250,17 +253,8 @@ fn notice_json(segment: &str, notice: &Notice) -> Option<Value> {
         "event": event,
         "segment": segment,
         "ttl": notice.ttl.as_secs(),
-        "device": device_json(&notice.interface, listed(&[], device)[0], device),
+        "device": device_json(&notice.interface, device),
     }))
-}
-
-/// The families a device is listed under, once each, with that family's
-/// addresses: those it has an address of, or else the first that `families`
-/// (its segment's) has, IPv4 if none.
-fn listed(families: &[Family], d: &Device) -> Vec<Family> {
-    let has = |f: Family| d.family(f).routable.is_some() || d.family(f).link_local.is_some();
-    let found: Vec<Family> = [Family::V4, Family::V6].into_iter().filter(|&f| has(f)).collect();
-    if found.is_empty() { vec![families.first().copied().unwrap_or(Family::V4)] } else { found }
 }
 
 /// Answer one request line with one line of JSON.
@@ -328,7 +322,7 @@ fn devices(groups: &[Group], name: &str) -> Value {
         for seg in g.reflector.segments() {
             let mut found = seg.devices();
             found.sort_by_key(|d| (d.key(), d.addrs().collect::<Vec<_>>()));
-            list.extend(found.iter().flat_map(|d| device(seg, d)));
+            list.extend(found.iter().map(|d| device_json(seg.interface(), d)));
         }
     }
     json!({ "ok": true, "name": name, "devices": list })
@@ -367,7 +361,6 @@ fn probe(groups: &[Group], name: &str) -> Value {
                 };
                 json!({
                     "interface": seg.interface(),
-                    "family": seg.families().iter().map(|&f| family_name(f)).collect::<Vec<_>>().join(","),
                     "queries": queries,
                     "error": err,
                 })
@@ -421,12 +414,7 @@ fn timer_list(groups: &[Group], timers: &Watcher) -> Value {
     json!({ "ok": true, "timers": list })
 }
 
-/// `d` as listed: once for each family it has addresses of.
-fn device(seg: &Segment, d: &Device) -> Vec<Value> {
-    listed(seg.families(), d).into_iter().map(|f| device_json(seg.interface(), f, d)).collect()
-}
-
-fn device_json(interface: &str, family: Family, d: &Device) -> Value {
+fn device_json(interface: &str, d: &Device) -> Value {
     let services: Vec<Value> = d
         .services
         .iter()
@@ -444,10 +432,8 @@ fn device_json(interface: &str, family: Family, d: &Device) -> Value {
         .collect();
     json!({
         "interface": interface,
-        "family": family_name(family),
         "hostname": d.hostname,
-        "routable": d.family(family).routable.map(|a| a.to_string()),
-        "link_local": d.family(family).link_local.map(|a| a.to_string()),
+        "addresses": d.addrs().map(|a| a.to_string()).collect::<Vec<_>>(),
         "address_ttl": d.ttl,
         "services": services,
     })
@@ -588,7 +574,7 @@ mod tests {
         segs[0].observe(ip("10.0.3.9"));
         assert_eq!(
             handle(&[iot], &Watcher::default(), r#"devices "IoT to br0""#),
-            r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","family":"v4","hostname":null,"routable":"10.0.3.9","link_local":null,"address_ttl":null,"services":[]}]}"#
+            r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","hostname":null,"addresses":["10.0.3.9"],"address_ttl":null,"services":[]}]}"#
         );
     }
 
@@ -599,14 +585,14 @@ mod tests {
         segs[1].observe(ip("10.0.2.1"));
         let out = handle(&[g], &Watcher::default(), "DEVICES media");
         assert!(
-            out.contains(r#""interface":"a","family":"v4","hostname":"tv.local","routable":"10.0.1.5","link_local":null,"address_ttl":120"#),
+            out.contains(r#""interface":"a","hostname":"tv.local","addresses":["10.0.1.5"],"address_ttl":120"#),
             "{out}"
         );
         assert!(
             out.contains(r#"{"instance":"My \"TV\"._http._tcp.local","type":"_http._tcp.local","port":80,"target":"tv.local","txt":["k=v"],"subtypes":[],"ttl":120}"#),
             "{out}"
         );
-        assert!(out.contains(r#""interface":"b","family":"v4","hostname":null,"routable":"10.0.2.1""#), "{out}");
+        assert!(out.contains(r#""interface":"b","hostname":null,"addresses":["10.0.2.1"]"#), "{out}");
         // Interface order is preserved.
         assert!(out.find(r#""interface":"a""#) < out.find(r#""interface":"b""#));
     }
@@ -618,7 +604,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert!(!segs[1].manual_devices().is_empty(), "precondition: reflected onto b");
         let out = handle(&[g], &Watcher::default(), "devices media");
-        assert_eq!(out.matches("\"routable\"").count(), 1, "{out}");
+        assert_eq!(out.matches("\"addresses\"").count(), 1, "{out}");
     }
 
     #[test]
@@ -653,7 +639,7 @@ mod tests {
         // No sender is attached in tests, so nothing is sent.
         assert_eq!(
             handle(&[g], &Watcher::default(), "probe media"),
-            r#"{"ok":true,"probed":[{"interface":"a","family":"v4","queries":0,"error":null}]}"#
+            r#"{"ok":true,"probed":[{"interface":"a","queries":0,"error":null}]}"#
         );
     }
 
@@ -721,7 +707,7 @@ mod tests {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         // Several requests on one connection.
         assert!(ask(&mut stream, &mut reader, "segments").contains(r#""name":"IoT""#));
-        assert!(ask(&mut stream, &mut reader, "devices IoT").contains(r#""routable":"10.0.1.7""#));
+        assert!(ask(&mut stream, &mut reader, "devices IoT").contains(r#""addresses":["10.0.1.7"]"#));
         assert!(ask(&mut stream, &mut reader, "bogus").contains(r#""ok":false"#));
 
         // Oversized requests are refused and the connection closed.
@@ -762,13 +748,13 @@ mod tests {
         assert_eq!((added["event"].as_str(), added["segment"].as_str()), (Some("added"), Some("IoT")));
         assert_eq!(added["ttl"], 300);
         assert_eq!(added["device"]["interface"], "wifi");
-        assert_eq!(added["device"]["routable"], "10.0.1.7");
+        assert_eq!(added["device"]["addresses"][0], "10.0.1.7");
 
         segs[0].expire(Instant::now() + Duration::from_secs(3600));
         let removed = next();
         assert_eq!(removed["event"], "removed");
         assert_eq!(removed["ttl"], 0);
-        assert_eq!(removed["device"]["routable"], "10.0.1.7");
+        assert_eq!(removed["device"]["addresses"][0], "10.0.1.7");
 
         // Failures are ordinary replies, and the connection can go on.
         let mut other = UnixStream::connect(&path).unwrap();

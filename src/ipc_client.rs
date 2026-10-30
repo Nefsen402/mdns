@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -274,17 +275,13 @@ fn render_segments(reply: &Value) -> Result<String, Failure> {
 
 fn render_probe(reply: &Value) -> Result<String, Failure> {
     let list = reply["probed"].as_array().ok_or_else(bad_reply)?;
-    let mut rows = vec![vec!["INTERFACE".to_string(), "FAMILY".into(), "RESULT".into()]];
+    let mut rows = vec![vec!["INTERFACE".to_string(), "RESULT".into()]];
     for link in list {
         let result = match link["error"].as_str() {
             Some(error) => format!("error: {error}"),
             None => format!("{} queries sent", link["queries"]),
         };
-        rows.push(vec![
-            link["interface"].as_str().ok_or_else(bad_reply)?.to_string(),
-            link["family"].as_str().ok_or_else(bad_reply)?.to_string(),
-            result,
-        ]);
+        rows.push(vec![link["interface"].as_str().ok_or_else(bad_reply)?.to_string(), result]);
     }
     let mut out = table(&rows);
     out.push_str("\nList what answered with: mdnsctl devices <name>\n");
@@ -343,9 +340,9 @@ fn render_timers(reply: &Value) -> Result<String, Failure> {
 
 /// One line per named device: its DNS name, its pretty name (the service
 /// instance name, such as "OZAL Speakers") and, last, all of its addresses,
-/// IPv4 before IPv6. The IPv4 and IPv6 entries of a device are merged. Devices
-/// that have not announced a hostname have no DNS name to show, so they are
-/// only counted.
+/// IPv4 before IPv6. A host heard on several interfaces of the segment is one
+/// line. Devices that have not announced a hostname have no DNS name to show,
+/// so they are only counted.
 fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
     struct Named {
         host: String,
@@ -375,12 +372,10 @@ fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
                 named.last_mut().unwrap()
             }
         };
-        for (link_local, field) in [(false, "routable"), (true, "link_local")] {
-            if let Some(addr) = device[field].as_str() {
-                let item = (link_local, addr.contains(':'), addr.to_string());
-                if !entry.addrs.contains(&item) {
-                    entry.addrs.push(item);
-                }
+        for addr in strings(&device["addresses"]) {
+            let item = (is_link_local(addr), addr.contains(':'), addr.to_string());
+            if !entry.addrs.contains(&item) {
+                entry.addrs.push(item);
             }
         }
         for p in pretty_names(device) {
@@ -452,10 +447,21 @@ fn unescape_label(label: &str) -> String {
     out
 }
 
-/// A device's addresses, the routable one first; `-` if it has none.
+/// A device's addresses, as the daemon lists them (routable ones first); `-`
+/// if it has none.
 fn device_addrs(device: &Value) -> String {
-    let addrs: Vec<&str> = ["routable", "link_local"].iter().filter_map(|f| device[*f].as_str()).collect();
+    let addrs = strings(&device["addresses"]);
     if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") }
+}
+
+/// Whether `addr` is link-local, `169.254/16` or `fe80::/10`: it only means
+/// something on the device's own link.
+fn is_link_local(addr: &str) -> bool {
+    match addr.parse::<IpAddr>() {
+        Ok(IpAddr::V4(a)) => a.is_link_local(),
+        Ok(IpAddr::V6(a)) => a.segments()[0] & 0xffc0 == 0xfe80,
+        Err(_) => false,
+    }
 }
 
 fn render_devices(reply: &Value) -> Result<String, Failure> {
@@ -466,29 +472,20 @@ fn render_devices(reply: &Value) -> Result<String, Failure> {
     }
 
     let rows = devices.iter().map(device_row).collect::<Result<Vec<_>, Failure>>()?;
-    let widths: Vec<usize> = (0..3).map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> = (0..2).map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0)).collect();
 
     let plural = if devices.len() == 1 { "" } else { "s" };
     let mut out = format!("{name}: {} device{plural}\n", devices.len());
     for (device, row) in devices.iter().zip(&rows) {
-        out.push_str(&format!(
-            "  {:<w0$}  {:<w1$}  {:<w2$}  {}\n",
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            w0 = widths[0],
-            w1 = widths[1],
-            w2 = widths[2]
-        ));
+        out.push_str(&format!("  {:<w0$}  {:<w1$}  {}\n", row[0], row[1], row[2], w0 = widths[0], w1 = widths[1]));
         out.push_str(&service_lines(device));
     }
     Ok(out)
 }
 
-/// The columns of a device in the verbose listing: interface, family,
-/// addresses, hostname.
-fn device_row(device: &Value) -> Result<[String; 4], Failure> {
+/// The columns of a device in the verbose listing: interface, addresses,
+/// hostname.
+fn device_row(device: &Value) -> Result<[String; 3], Failure> {
     // The hostname is the last column, so the TTL of its address records can
     // follow it.
     let mut hostname = device["hostname"].as_str().unwrap_or("-").to_string();
@@ -497,7 +494,6 @@ fn device_row(device: &Value) -> Result<[String; 4], Failure> {
     }
     Ok([
         device["interface"].as_str().ok_or_else(bad_reply)?.to_string(),
-        device["family"].as_str().ok_or_else(bad_reply)?.to_string(),
         device_addrs(device),
         hostname,
     ])
@@ -549,7 +545,7 @@ fn render_event(
     let kind = event["event"].as_str().ok_or_else(bad_reply)?;
     let row = device_row(device)?;
 
-    let key = device["hostname"].as_str().map(|h| (h.to_ascii_lowercase(), row[1].clone()));
+    let key = device["hostname"].as_str().map(|h| (h.to_ascii_lowercase(), row[0].clone()));
     let label = match (kind, &key) {
         ("removed", Some(key)) => {
             seen.remove(key);
@@ -566,7 +562,7 @@ fn render_event(
     let ttl = format!("{:<9}", format!("ttl={ttl}"));
 
     if verbose {
-        let mut out = format!("{label:<7}  {ttl}  {}  {}  {}  {}\n", row[0], row[1], row[2], row[3]);
+        let mut out = format!("{label:<7}  {ttl}  {}  {}  {}\n", row[0], row[1], row[2]);
         out.push_str(&service_lines(device));
         return Ok(Some(out));
     }
@@ -575,7 +571,7 @@ fn render_event(
     };
     let pretty = pretty_names(device);
     let pretty = if pretty.is_empty() { "-".to_string() } else { pretty.join(", ") };
-    Ok(Some(format!("{label:<7}  {ttl}  {host}  {pretty}  {}\n", row[2])))
+    Ok(Some(format!("{label:<7}  {ttl}  {host}  {pretty}  {}\n", row[1])))
 }
 
 /// Left-aligned columns; the last column is not padded.
@@ -721,16 +717,15 @@ mod tests {
     }
 
     const SEGMENTS: &str = r#"{"ok":true,"segments":[{"name":"media_stuff","interfaces":["br0","media"],"families":["v4","v6"]},{"name":"IoT","interfaces":["wifi"],"families":["v4"]}]}"#;
-    const DEVICES: &str = r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"br0","family":"v4","hostname":"printer.local","routable":"10.0.0.10","link_local":null,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp","ty=hp"]}]},{"interface":"wifi","family":"v4","hostname":null,"routable":"10.0.1.7","link_local":null,"services":[]}]}"#;
+    const DEVICES: &str = r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"br0","hostname":"printer.local","addresses":["10.0.0.10"],"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp","ty=hp"]}]},{"interface":"wifi","hostname":null,"addresses":["10.0.1.7"],"services":[]}]}"#;
 
     /// A device entry as the daemon sends it.
-    fn entry(interface: &str, family: &str, host: Option<&str>, routable: Option<&str>, link_local: Option<&str>, services: &str) -> String {
-        let q = |v: Option<&str>| v.map_or("null".to_string(), |v| format!("\"{v}\""));
+    fn entry(interface: &str, host: Option<&str>, addresses: &[&str], services: &str) -> String {
+        let host = host.map_or("null".to_string(), |h| format!("\"{h}\""));
+        let addresses: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
         format!(
-            r#"{{"interface":"{interface}","family":"{family}","hostname":{},"routable":{},"link_local":{},"services":[{services}]}}"#,
-            q(host),
-            q(routable),
-            q(link_local)
+            r#"{{"interface":"{interface}","hostname":{host},"addresses":[{}],"services":[{services}]}}"#,
+            addresses.join(",")
         )
     }
 
@@ -764,7 +759,7 @@ mod tests {
         let reply: Value = serde_json::from_str(DEVICES).unwrap();
         assert_eq!(
             render_devices(&reply).unwrap(),
-            "IoT to br0: 2 devices\n  br0   v4  10.0.0.10  printer.local\n      Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]\n  wifi  v4  10.0.1.7   -\n"
+            "IoT to br0: 2 devices\n  br0   10.0.0.10  printer.local\n      Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]\n  wifi  10.0.1.7   -\n"
         );
         let empty: Value = serde_json::from_str(r#"{"ok":true,"name":"IoT","devices":[]}"#).unwrap();
         assert_eq!(render_devices(&empty).unwrap(), "IoT: no devices\n");
@@ -775,14 +770,14 @@ mod tests {
         let json = reply(
             "x",
             &[
-                entry("a", "v6", Some("h.local"), Some("fd00::5"), Some("fe80::5"), ""),
-                entry("a", "v6", None, None, Some("fe80::9"), ""),
+                entry("a", Some("h.local"), &["fd00::5", "fe80::5"], ""),
+                entry("a", None, &["fe80::9"], ""),
             ],
         );
         let out = render_devices(&serde_json::from_str(&json).unwrap()).unwrap();
         assert_eq!(
             out,
-            format!("x: 2 devices\n  a  v6  fd00::5, fe80::5  h.local\n  a  v6  fe80::9{}-\n", " ".repeat(11))
+            format!("x: 2 devices\n  a  fd00::5, fe80::5  h.local\n  a  fe80::9{}-\n", " ".repeat(11))
         );
     }
 
@@ -813,8 +808,9 @@ mod tests {
     }
 
     #[test]
-    fn brief_listing_merges_families_and_cleans_names() {
-        // A speaker seen over v4 and v6, with an AirPlay-style "<MAC>@Name" instance.
+    fn brief_listing_cleans_names() {
+        // A speaker with addresses of both families, and an AirPlay-style
+        // "<MAC>@Name" instance.
         let svc = |instance: &str, kind: &str| {
             format!(r#"{{"instance":"{instance}","type":"{kind}","port":7000,"target":"x.local","txt":[]}}"#)
         };
@@ -826,16 +822,8 @@ mod tests {
         let json = reply(
             "media",
             &[
-                entry("media", "v4", Some("OZAL-Speakers.local"), Some("10.0.2.73"), None, &services),
-                entry("media", "v6", Some("OZAL-Speakers.local"), None, Some("fe80::1"), &services),
-                entry(
-                    "media",
-                    "v4",
-                    Some("tv.local"),
-                    Some("10.0.2.9"),
-                    None,
-                    &svc(r"Living Room\\. TV._http._tcp.local", "_http._tcp.local"),
-                ),
+                entry("media", Some("OZAL-Speakers.local"), &["10.0.2.73", "fe80::1"], &services),
+                entry("media", Some("tv.local"), &["10.0.2.9"], &svc(r"Living Room\\. TV._http._tcp.local", "_http._tcp.local")),
             ],
         );
         assert_eq!(
@@ -849,11 +837,10 @@ mod tests {
         let json = reply(
             "x",
             &[
-                entry("a", "v6", Some("dual.local"), Some("fd00::5"), Some("fe80::1"), ""),
-                entry("a", "v4", Some("dual.local"), Some("10.0.0.5"), None, ""),
-                entry("b", "v4", Some("dual.local"), Some("10.0.1.5"), None, ""),
-                entry("a", "v6", Some("v6only.local"), None, Some("fe80::2"), ""),
-                entry("b", "v6", Some("v6only.local"), None, Some("fe80::2"), ""),
+                entry("a", Some("dual.local"), &["10.0.0.5", "fd00::5", "fe80::1"], ""),
+                entry("b", Some("dual.local"), &["10.0.1.5"], ""),
+                entry("a", Some("v6only.local"), &["fe80::2"], ""),
+                entry("b", Some("v6only.local"), &["fe80::2"], ""),
             ],
         );
         // Routable IPv4, then routable IPv6, then link-local; each address once.
@@ -871,8 +858,8 @@ mod tests {
         let json = reply(
             "x",
             &[
-                entry("a", "v4", Some("b.local"), Some("1.1.1.1"), None, two),
-                entry("a", "v4", Some("A.local"), Some("1.1.1.2"), None, ""),
+                entry("a", Some("b.local"), &["1.1.1.1"], two),
+                entry("a", Some("A.local"), &["1.1.1.2"], ""),
             ],
         );
         assert_eq!(
@@ -883,7 +870,7 @@ mod tests {
         // Only unnamed devices, none at all.
         let only_unnamed = reply(
             "x",
-            &[entry("a", "v4", None, Some("1.1.1.1"), None, ""), entry("a", "v6", None, None, Some("fe80::1"), "")],
+            &[entry("a", None, &["1.1.1.1"], ""), entry("a", None, &["fe80::1"], "")],
         );
         assert_eq!(
             brief(&only_unnamed),
@@ -895,12 +882,12 @@ mod tests {
     #[test]
     fn renders_probe_results() {
         let reply: Value = serde_json::from_str(
-            r#"{"ok":true,"probed":[{"interface":"br0","family":"v4","queries":14,"error":null},{"interface":"wifi","family":"v6","queries":null,"error":"sending to ff02::fb: Network is unreachable"}]}"#,
+            r#"{"ok":true,"probed":[{"interface":"br0","queries":14,"error":null},{"interface":"wifi","queries":null,"error":"sending to ff02::fb: Network is unreachable"}]}"#,
         )
         .unwrap();
         assert_eq!(
             render_probe(&reply).unwrap(),
-            "INTERFACE  FAMILY  RESULT\nbr0        v4      14 queries sent\nwifi       v6      error: sending to ff02::fb: Network is unreachable\n\nList what answered with: mdnsctl devices <name>\n"
+            "INTERFACE  RESULT\nbr0        14 queries sent\nwifi       error: sending to ff02::fb: Network is unreachable\n\nList what answered with: mdnsctl devices <name>\n"
         );
     }
 
@@ -925,9 +912,9 @@ mod tests {
         assert!(render_timers(&serde_json::json!({"ok":true})).is_err());
     }
 
-    fn event(kind: &str, ttl: u64, host: Option<&str>, family: &str, addr: &str, services: &str) -> Value {
+    fn event(kind: &str, ttl: u64, host: Option<&str>, addr: &str, services: &str) -> Value {
         serde_json::from_str(&format!(
-            r#"{{"event":"{kind}","segment":"IoT","ttl":{ttl},"device":{{"interface":"wifi","family":"{family}","hostname":{},"routable":"{addr}","link_local":null,"services":{services}}}}}"#,
+            r#"{{"event":"{kind}","segment":"IoT","ttl":{ttl},"device":{{"interface":"wifi","hostname":{},"addresses":["{addr}"],"services":{services}}}}}"#,
             host.map_or("null".to_string(), |h| format!("\"{h}\""))
         ))
         .unwrap()
@@ -941,46 +928,46 @@ mod tests {
         let mut show = |e: Value, verbose| render_event(&e, verbose, &mut seen).unwrap();
 
         // Heard by address first: nothing to show until it has a name.
-        assert_eq!(show(event("added", 300, None, "v4", "10.0.1.9", "[]"), false), None);
+        assert_eq!(show(event("added", 300, None, "10.0.1.9", "[]"), false), None);
         // The first named sighting is "added", whatever the daemon called it.
         assert_eq!(
-            show(event("updated", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG), false).as_deref(),
+            show(event("updated", 4500, Some("plug.local"), "10.0.1.9", PLUG), false).as_deref(),
             Some("added    ttl=4500   plug.local  Plug S  10.0.1.9\n")
         );
         assert_eq!(
-            show(event("updated", 4400, Some("plug.local"), "v4", "10.0.1.9", PLUG), false).as_deref(),
+            show(event("updated", 4400, Some("plug.local"), "10.0.1.9", PLUG), false).as_deref(),
             Some("updated  ttl=4400   plug.local  Plug S  10.0.1.9\n")
         );
-        // Its IPv6 side is a device of its own.
-        assert!(show(event("added", 300, Some("plug.local"), "v6", "fd00::9", "[]"), false).unwrap().starts_with("added  "));
+        // Heard over IPv6 too, it is the same device: an update.
+        assert!(show(event("added", 300, Some("plug.local"), "fd00::9", "[]"), false).unwrap().starts_with("updated  "));
         // Gone: ttl 0, and a later return is "added" again.
         assert_eq!(
-            show(event("removed", 0, Some("plug.local"), "v4", "10.0.1.9", PLUG), false).as_deref(),
+            show(event("removed", 0, Some("plug.local"), "10.0.1.9", PLUG), false).as_deref(),
             Some("removed  ttl=0      plug.local  Plug S  10.0.1.9\n")
         );
-        assert!(show(event("added", 300, Some("plug.local"), "v4", "10.0.1.9", PLUG), false).unwrap().starts_with("added  "));
+        assert!(show(event("added", 300, Some("plug.local"), "10.0.1.9", PLUG), false).unwrap().starts_with("added  "));
     }
 
     #[test]
     fn verbose_watch_lines_are_a_device_with_its_services() {
         let mut seen = HashSet::new();
-        let shown = render_event(&event("added", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG), true, &mut seen)
+        let shown = render_event(&event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG), true, &mut seen)
             .unwrap()
             .unwrap();
         assert_eq!(
             shown,
-            "added    ttl=4500   wifi  v4  10.0.1.9  plug.local\n      Plug S  _shelly._tcp.local  :80 -> plug.local  [gen=2]\n"
+            "added    ttl=4500   wifi  10.0.1.9  plug.local\n      Plug S  _shelly._tcp.local  :80 -> plug.local  [gen=2]\n"
         );
         // Verbose shows devices that have no name too.
-        let unnamed = render_event(&event("added", 300, None, "v4", "10.0.1.9", "[]"), true, &mut seen).unwrap().unwrap();
-        assert_eq!(unnamed, "added    ttl=300    wifi  v4  10.0.1.9  -\n");
+        let unnamed = render_event(&event("added", 300, None, "10.0.1.9", "[]"), true, &mut seen).unwrap().unwrap();
+        assert_eq!(unnamed, "added    ttl=300    wifi  10.0.1.9  -\n");
     }
 
     #[test]
     fn a_malformed_event_is_an_error() {
         let mut seen = HashSet::new();
         assert!(render_event(&serde_json::json!({"event":"added"}), false, &mut seen).is_err());
-        let mut odd = event("exploded", 1, Some("x.local"), "v4", "10.0.0.1", "[]");
+        let mut odd = event("exploded", 1, Some("x.local"), "10.0.0.1", "[]");
         assert!(render_event(&odd, false, &mut seen).is_err());
         odd["event"] = "added".into();
         assert!(render_event(&odd, false, &mut seen).is_ok());
@@ -1014,8 +1001,8 @@ mod tests {
 
     #[test]
     fn watch_prints_changes_until_the_daemon_stops() {
-        let added = event("added", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG).to_string();
-        let removed = event("removed", 0, Some("plug.local"), "v4", "10.0.1.9", PLUG).to_string();
+        let added = event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG).to_string();
+        let removed = event("removed", 0, Some("plug.local"), "10.0.1.9", PLUG).to_string();
         let (path, daemon) = streaming_daemon("watch", vec![ACK.into(), added.clone(), removed.clone()]);
 
         let mut out = Vec::new();
@@ -1031,7 +1018,7 @@ mod tests {
 
     #[test]
     fn watch_json_prints_each_event_unchanged_and_not_the_acknowledgement() {
-        let added = event("added", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG).to_string();
+        let added = event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG).to_string();
         let (path, daemon) = streaming_daemon("watch-json", vec![ACK.into(), added.clone()]);
         let mut out = Vec::new();
         let _ = watch(&watch_options(&path, true), "IoT", &mut out);
@@ -1068,7 +1055,7 @@ mod tests {
                 Ok(())
             }
         }
-        let added = event("added", 4500, Some("plug.local"), "v4", "10.0.1.9", PLUG).to_string();
+        let added = event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG).to_string();
         let (path, daemon) = streaming_daemon("watch-closed", vec![ACK.into(), added]);
         assert_eq!(watch(&watch_options(&path, false), "IoT", &mut Closed), Ok(()));
         daemon.join().unwrap();
@@ -1102,16 +1089,16 @@ mod tests {
 
     #[test]
     fn verbose_listings_show_the_ttls_the_device_announced() {
-        let device = r#"{"interface":"wifi","family":"v4","hostname":"plug.local","routable":"10.0.1.9","link_local":null,"address_ttl":120,"services":[{"instance":"Plug S._shelly._tcp.local","type":"_shelly._tcp.local","port":80,"target":"plug.local","txt":["gen=2"],"ttl":4500},{"instance":"Plug S._http._tcp.local","type":"_http._tcp.local","port":80,"target":"plug.local","txt":[],"ttl":null}]}"#;
+        let device = r#"{"interface":"wifi","hostname":"plug.local","addresses":["10.0.1.9"],"address_ttl":120,"services":[{"instance":"Plug S._shelly._tcp.local","type":"_shelly._tcp.local","port":80,"target":"plug.local","txt":["gen=2"],"ttl":4500},{"instance":"Plug S._http._tcp.local","type":"_http._tcp.local","port":80,"target":"plug.local","txt":[],"ttl":null}]}"#;
         let reply: Value = serde_json::from_str(&format!(r#"{{"ok":true,"name":"IoT","devices":[{device}]}}"#)).unwrap();
         assert_eq!(
             render_devices(&reply).unwrap(),
-            "IoT: 1 device\n  wifi  v4  10.0.1.9  plug.local  addr-ttl=120\n      Plug S  _shelly._tcp.local  :80 -> plug.local  ttl=4500  [gen=2]\n      Plug S  _http._tcp.local  :80 -> plug.local\n"
+            "IoT: 1 device\n  wifi  10.0.1.9  plug.local  addr-ttl=120\n      Plug S  _shelly._tcp.local  :80 -> plug.local  ttl=4500  [gen=2]\n      Plug S  _http._tcp.local  :80 -> plug.local\n"
         );
         // A watch shows them too, after its own ttl: how long the daemon keeps the device.
         let event: Value = serde_json::from_str(&format!(r#"{{"event":"added","segment":"IoT","ttl":300,"device":{device}}}"#)).unwrap();
         let shown = render_event(&event, true, &mut HashSet::new()).unwrap().unwrap();
-        assert!(shown.starts_with("added    ttl=300    wifi  v4  10.0.1.9  plug.local  addr-ttl=120\n"), "{shown}");
+        assert!(shown.starts_with("added    ttl=300    wifi  10.0.1.9  plug.local  addr-ttl=120\n"), "{shown}");
         // The brief views stay as they were.
         let brief = render_event(&event, false, &mut HashSet::new()).unwrap().unwrap();
         assert_eq!(brief, "added    ttl=300    plug.local  Plug S  10.0.1.9\n");
@@ -1185,11 +1172,11 @@ mod tests {
 
     #[test]
     fn probe_asks_for_all_segments_or_one() {
-        const REPLY: &str = r#"{"ok":true,"probed":[{"interface":"br0","family":"v4","queries":3,"error":null}]}"#;
+        const REPLY: &str = r#"{"ok":true,"probed":[{"interface":"br0","queries":3,"error":null}]}"#;
         let (path, daemon) = fake_daemon("probe-all", REPLY);
         let out = run(&path, false, Command::Probe(None)).unwrap();
         assert_eq!(daemon.join().unwrap(), "probe\n");
-        assert!(out.contains("br0        v4      3 queries sent"), "{out}");
+        assert!(out.contains("br0        3 queries sent"), "{out}");
 
         let (path, daemon) = fake_daemon("probe-one", REPLY);
         run(&path, false, Command::Probe(Some("IoT to br0".into()))).unwrap();

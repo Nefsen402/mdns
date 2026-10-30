@@ -34,14 +34,14 @@ By default each device is one line: its DNS name (for example
 .BR OZAL\-Speakers.local ),
 its pretty name, which is the name of its services (for example
 .BR "OZAL Speakers" ),
-and, last, all of its addresses, IPv4 first.
-The IPv4 and IPv6 entries of one device are merged into one line, and devices
-that have not announced a name yet have no DNS name to show, so they are only
-counted.
+and, last, all of its addresses, IPv4 first, whichever family it was heard
+over.
+Devices that have not announced a name yet have no DNS name to show, so they
+are only counted.
 With
 .B \-v
-every device is listed with its interface, family, addresses (routable first,
-then link-local) and hostname (a
+every device is listed with its interface, addresses of both families (routable
+first, then link-local) and hostname (a
 hostname of
 .B \-
 means the device has been heard but has not announced a name), and
@@ -129,7 +129,7 @@ quietly with status 0 if its output is closed, as with
 List the timers the daemon has scheduled, soonest first, with their state,
 when each is due, how often it has run, when it last ran and how long that
 took.
-Each interface and address family has one
+Each interface has one
 .B upkeep
 timer, which drops devices as they expire, asks the ones about to expire to
 answer again, and re-announces reflected devices; it is set for the earliest of
@@ -163,8 +163,7 @@ instead of the default,
 is also accepted.
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
-List devices with everything the daemon knows: interface, address family,
-address, the TTLs they were announced with, and every service with its port,
+List devices with everything the daemon knows: interface, addresses, the TTLs they were announced with, and every service with its port,
 target and TXT records, including devices that have not announced a name.
 Only
 .B devices
@@ -211,9 +210,9 @@ it lists everything, including addresses and service details:
 .nf
 .RS
 IoT to br0: 2 devices
-  br0   v4  10.0.0.10  printer.local  addr-ttl=120
+  br0   10.0.0.10, fd00::10  printer.local  addr-ttl=120
       Printer  _http._tcp.local  :631 -> printer.local  ttl=4500  [rp=ipp, ty=hp]
-  wifi  v4  10.0.1.7   \-
+  wifi  10.0.1.7             \-
 .RE
 .fi
 .PP
@@ -223,9 +222,9 @@ prints what it sent where:
 .PP
 .nf
 .RS
-INTERFACE  FAMILY  RESULT
-br0        v4      14 queries sent
-wifi       v4      9 queries sent
+INTERFACE  RESULT
+br0        14 queries sent
+wifi       9 queries sent
 .RE
 .fi
 .PP

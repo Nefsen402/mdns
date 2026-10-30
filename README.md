@@ -469,9 +469,8 @@ An interface marked `(untrusted)` is announced nothing by the segment.
 Lists the devices **discovered on the segment's own interfaces** (both
 families). By default each device is one line: its DNS name, its pretty name
 (the name of its services, such as `OZAL Speakers`) and, last, all of its
-addresses, IPv4 first. The IPv4 and IPv6 entries of one device are merged into
-one line, and devices that have not announced a name yet have no DNS name to
-show, so they are only counted. Reflected copies from other segments are not
+addresses, IPv4 first, whichever family it was heard over. Devices that have not
+announced a name yet have no DNS name to show, so they are only counted. Reflected copies from other segments are not
 included.
 
 ```
@@ -482,8 +481,8 @@ IoT to br0: 1 device
 (1 device without a name not shown; use -v to list everything)
 ```
 
-`-v` (`--verbose`) lists everything: interface, family, addresses (routable
-first, then link-local) and hostname for every entry, then `addr-ttl=`, the TTL
+`-v` (`--verbose`) lists everything: interface, addresses of both families
+(routable first, then link-local) and hostname for every device, then `addr-ttl=`, the TTL
 its address records were announced with. Each device's services are underneath
 (instance, type, port, target, the `ttl=` their records were announced with,
 `sub=` and the subtypes it is of, and TXT records), including the devices without
@@ -492,9 +491,9 @@ a name.
 ```
 $ mdnsctl -v devices IoT to br0
 IoT to br0: 2 devices
-  br0   v4  10.0.0.10  printer.local  addr-ttl=120
+  br0   10.0.0.10, fd00::10  printer.local  addr-ttl=120
       Printer  _http._tcp.local  :631 -> printer.local  ttl=4500  [rp=ipp, ty=hp]
-  wifi  v4  10.0.1.7   -
+  wifi  10.0.1.7             -
 ```
 
 A hostname of `-` means the device has been heard but has not announced a name
@@ -514,9 +513,8 @@ been processed, with the number of queries sent on each interface:
 
 ```
 $ mdnsctl probe IoT
-INTERFACE  FAMILY  RESULT
-wifi       v4      9 queries sent
-wifi       v6      9 queries sent
+INTERFACE  RESULT
+wifi       18 queries sent
 
 List what answered with: mdnsctl devices <name>
 ```
@@ -618,8 +616,8 @@ printf 'segments\ndevices IoT\n' | ncat -U /run/mdnsd/mdnsd.sock
 | Request           | Reply                                                                  |
 |-------------------|------------------------------------------------------------------------|
 | `segments`        | `{"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"families":["v4","v6"]}]}` |
-| `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","family":"v4","hostname":"tv.local","routable":"10.0.1.7","link_local":null,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
-| `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","family":"v4","queries":9,"error":null}]}` (replies after about 4 seconds) |
+| `devices <name>`  | `{"ok":true,"name":"IoT","devices":[{"interface":"wifi","hostname":"tv.local","addresses":["10.0.1.7","fd00::7","fe80::7"],"address_ttl":120,"services":[{"instance":"Printer._http._tcp.local","type":"_http._tcp.local","port":631,"target":"printer.local","txt":["rp=ipp"]}]}]}` |
+| `probe [<name>]`  | `{"ok":true,"probed":[{"interface":"wifi","queries":18,"error":null}]}` (replies after about 4 seconds) |
 | `watch <name>`    | `{"ok":true,"name":"IoT","watching":true}`, then until the client hangs up one line per change: `{"event":"added","segment":"IoT","ttl":4500,"device":{…as in devices…}}` (`added`, `updated` or `removed`; `ttl` is 0 when removed) |
 | `timers`          | `{"ok":true,"timers":[{"id":1,"name":"upkeep wifi","running":false,"due_in_ms":93000,"runs":4,"last_run_ago_ms":3500,"last_took_us":210}]}` |
 | anything wrong    | `{"ok":false,"error":"no such segment: nope"}`                          |
