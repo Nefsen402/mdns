@@ -239,13 +239,45 @@ struct Entry {
     /// The address of the packet it was first heard of in.
     from: IpAddr,
     expires: Instant,
+    /// When each of its addresses runs out if it is not heard of again: its
+    /// own TTL after it was last heard, but not before the minimum lifetime,
+    /// as for the device. One that stops being announced, without a goodbye,
+    /// is so dropped on its own.
+    addr_expires: HashMap<IpAddr, Instant>,
     /// When it was last asked to answer again because it was about to expire.
     refreshed: Option<Instant>,
 }
 
 impl Entry {
     fn new(now: Instant, from: IpAddr) -> Entry {
-        Entry { device: Device::default(), from, expires: now, refreshed: None }
+        Entry { device: Device::default(), from, expires: now, addr_expires: HashMap::new(), refreshed: None }
+    }
+
+    /// The soonest it, or one of its addresses, runs out.
+    fn soonest(&self) -> Instant {
+        self.addr_expires.values().copied().fold(self.expires, Instant::min)
+    }
+
+    /// Renew those of `addrs` it has, each for its TTL in `ttls` (none if it
+    /// did not say) but at least `floor` from `now`, and forget when the
+    /// addresses it no longer has run out.
+    fn renew_addrs(&mut self, addrs: &[IpAddr], ttls: &HashMap<IpAddr, u32>, now: Instant, floor: Duration) {
+        for addr in addrs.iter().filter(|a| self.device.addresses.contains(a)) {
+            let ttl = Duration::from_secs(ttls.get(addr).copied().unwrap_or(0).into());
+            self.addr_expires.insert(*addr, now + ttl.max(floor));
+        }
+        let have = &self.device.addresses;
+        self.addr_expires.retain(|addr, _| have.contains(addr));
+    }
+
+    /// Drop the addresses that have run out by `now`. Returns whether any had.
+    fn expire_addrs(&mut self, now: Instant) -> bool {
+        let gone: Vec<IpAddr> = self.addr_expires.iter().filter(|&(_, at)| *at <= now).map(|(a, _)| *a).collect();
+        for addr in &gone {
+            self.addr_expires.remove(addr);
+        }
+        self.device.addresses.retain(|a| !gone.contains(a));
+        !gone.is_empty()
     }
 
     /// Whether there is anything to ask it about: a name or a service.
@@ -257,6 +289,10 @@ impl Entry {
     fn absorb(&mut self, earlier: Entry) {
         self.device.absorb(earlier.device);
         self.expires = self.expires.max(earlier.expires);
+        for (addr, at) in earlier.addr_expires {
+            let mine = self.addr_expires.entry(addr).or_insert(at);
+            *mine = (*mine).max(at);
+        }
     }
 }
 
@@ -438,19 +474,24 @@ impl State {
                 (None, Key::Source(addr)) => addr,
             };
             f("expire", who, e.expires);
+            // Its addresses that run out before it does, each on its own.
+            for (addr, &at) in e.addr_expires.iter().filter(|&(_, at)| *at < e.expires) {
+                f("expire", &format!("{who} {addr}"), at);
+            }
             let Some(before) = before.filter(|_| !self.outbound.is_empty() && e.askable()) else {
                 continue;
             };
-            // Due `before` ahead of expiry, and not again until the gap has
-            // passed since it was last asked.
-            let mut at = e.expires.checked_sub(before).unwrap_or(now);
+            // Due `before` ahead of it or one of its addresses running out,
+            // and not again until the gap has passed since it was last asked.
+            let soonest = e.soonest();
+            let mut at = soonest.checked_sub(before).unwrap_or(now);
             match e.refreshed.map(|t| t.checked_add(refresh_gap(before))) {
                 Some(Some(again)) => at = at.max(again),
                 Some(None) => continue, // never again
                 None => {}
             }
-            // A device that runs out first is dropped, not asked.
-            if at < e.expires {
+            // What runs out first is dropped, not asked about.
+            if at < soonest {
                 f("refresh", who, at);
             }
         }
@@ -1116,9 +1157,10 @@ impl Segment {
             if let Some(earlier) = earlier {
                 entry.absorb(earlier);
             }
-            let ttl = Duration::from_secs(report.max_ttl as u64);
+            let ttl = Duration::from_secs(report.longest_ttl().into());
             entry.expires = entry.expires.max(now + ttl.max(floor));
             entry.device.learn(report, &addrs, max_addrs);
+            entry.renew_addrs(&addrs, &report.ttls, now, floor);
 
             for addr in addrs {
                 state.by_addr.insert(addr, key.clone());
@@ -1142,6 +1184,7 @@ impl Segment {
             let ttl = Duration::from_secs(ttl as u64);
             entry.expires = entry.expires.max(now + ttl.max(floor));
             entry.device.take_addrs(&[src], &[], &[], max_addrs);
+            entry.renew_addrs(&[src], &HashMap::new(), now, floor);
             entry.device.learn_records(rest.iter().copied());
             state.by_addr.insert(src, key);
         }
@@ -1230,9 +1273,11 @@ impl Segment {
 
         let mut asking = Vec::new();
         for entry in discovered.values_mut() {
-            // Not one that has already run out: it is about to be dropped. A
-            // margin too long to add to a time reaches past every expiry.
-            let due = entry.expires > now && now.checked_add(before).is_none_or(|limit| entry.expires <= limit);
+            // Due when it, or one of its addresses, is about to run out. Not
+            // what has already run out: it is about to be dropped. A margin
+            // too long to add to a time reaches past every expiry.
+            let soonest = entry.soonest();
+            let due = soonest > now && now.checked_add(before).is_none_or(|limit| soonest <= limit);
             let recent = entry.refreshed.is_some_and(|t| now.saturating_duration_since(t) < gap);
             if !entry.askable() || !due || recent {
                 continue;
@@ -1245,19 +1290,34 @@ impl Segment {
 
     /// Drop devices whose lifetime has run out as of `now`.
     pub fn expire(&self, now: Instant) {
-        let mut state = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
         let stale: Vec<Key> = state
             .discovered
             .iter()
             .filter(|&(_, e)| e.expires <= now)
             .map(|(key, _)| key.clone())
             .collect();
-        if stale.is_empty() {
+        // Of the others, the addresses that ran out on their own.
+        let mut lost = Vec::new();
+        for (key, entry) in state.discovered.iter_mut().filter(|(key, _)| !stale.contains(key)) {
+            if entry.expire_addrs(now) {
+                lost.push(key.clone());
+            }
+        }
+        if stale.is_empty() && lost.is_empty() {
             return;
         }
         for key in stale {
             if let Some(entry) = state.forget(&key) {
                 state.notify(Event::Removed(entry.device));
+            }
+        }
+        let discovered = &state.discovered;
+        state.by_addr.retain(|addr, key| matches!(key, Key::Source(_)) || discovered.get(key).is_some_and(|e| e.device.addresses.contains(addr)));
+        for key in lost {
+            if let Some(device) = state.discovered.get(&key).map(|e| e.device.clone()) {
+                state.notify(Event::Updated(device));
             }
         }
         // What they had here may be shown again. `now` may be ahead of the
@@ -1750,6 +1810,53 @@ mod tests {
         hear(&seg, "fe80::5", many);
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         assert_eq!(tv.addresses, [ip("2001:db8::1"), ip("2001:db8::2")]);
+    }
+
+    /// An address that is not heard of again runs out on its own, its TTL
+    /// (at least the minimum lifetime) after it was last heard, while the
+    /// device, with services that live longer, stays.
+    #[test]
+    fn an_address_not_heard_of_again_runs_out_on_its_own() {
+        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let events = seg.subscribe();
+        let t0 = Instant::now();
+        hear(&seg, "10.0.1.7", vec![
+            a_record("tv.local", "10.0.1.7"),
+            Record { ttl: 4500, ..aaaa("tv.local", "fd00::7") },
+            Record { ttl: 4500, ..srv("TV._http._tcp.local", 80, "tv.local") },
+        ]);
+        events.try_iter().count();
+
+        // The timer is set for it.
+        let pending = seg.pending();
+        let address = pending.iter().find(|p| p.who == "tv.local 10.0.1.7").expect("pending");
+        assert_eq!(address.what, "expire");
+        assert!(address.at > t0 + Duration::from_secs(299) && address.at < t0 + Duration::from_secs(302));
+
+        seg.expire(t0 + Duration::from_secs(200));
+        assert!(events.try_recv().is_err(), "not yet");
+
+        seg.expire(t0 + Duration::from_secs(400));
+        let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still there");
+        assert_eq!(tv.addresses, [ip("fd00::7")]);
+        assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.addresses == [ip("fd00::7")]));
+        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("10.0.1.7")), "nor found by it");
+    }
+
+    /// A device whose services live long is still asked again before its
+    /// address runs out, as a cache renews a record before its TTL is up.
+    #[test]
+    fn a_device_is_asked_again_before_its_address_runs_out() {
+        let (seg, rx) = wired();
+        let t0 = Instant::now();
+        hear(&seg, "10.0.1.7", vec![
+            a_record("tv.local", "10.0.1.7"),
+            Record { ttl: 4500, ..srv("TV._http._tcp.local", 80, "tv.local") },
+        ]);
+        let before = Duration::from_secs(60);
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(100), before).unwrap(), 0);
+        assert!(seg.refresh(t0 + Duration::from_secs(250), before).unwrap() > 0);
+        assert!(asked(&recv(&rx).unwrap()).contains(&q("tv.local", rtype::A)));
     }
 
     #[test]
@@ -2505,17 +2612,24 @@ mod tests {
     }
 
     /// Pretend the device called `host` was heard from so that it now expires at `at`.
+    /// Pretend `host` and its addresses run out at `at`, as hearing from it
+    /// would make them.
     fn set_expiry(seg: &Segment, host: &str, at: Instant) {
         let mut state = seg.state.lock().unwrap();
-        state.discovered.get_mut(&host_key(host)).expect("no such device").expires = at;
+        let entry = state.discovered.get_mut(&host_key(host)).expect("no such device");
+        entry.expires = at;
+        for expiry in entry.addr_expires.values_mut() {
+            *expiry = at;
+        }
     }
 
     /// printer.local lives only for the 5 minute floor (all its TTLs are 120);
-    /// other.local announces a 4500 second PTR, so it lives 75 minutes.
+    /// other.local announces its address and a PTR for 4500 seconds, so it and
+    /// its address live 75 minutes.
     fn hear_a_short_and_a_long_lived_device(seg: &Segment) {
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         hear(seg, "10.0.1.8", vec![
-            a_record("other.local", "10.0.1.8"),
+            Record { ttl: 4500, ..a_record("other.local", "10.0.1.8") },
             ptr("_x._tcp.local", "O._x._tcp.local"),
             srv("O._x._tcp.local", 1, "other.local"),
         ]);

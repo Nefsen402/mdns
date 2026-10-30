@@ -44,7 +44,8 @@
 //! `upkeep` timer is set for the first of its `pending` list: everything it is
 //! waiting to do, soonest first, as `what` (`expire`, `refresh` or
 //! `re-announce`), to `who` (a hostname, or the address of a device that has
-//! none), and `due_in_ms` from now (0 if it is due).
+//! none, or a hostname and one of its addresses, for that address running out
+//! on its own), and `due_in_ms` from now (0 if it is due).
 //! 
 //!
 //! A device is listed once, whichever family it was heard over, with its

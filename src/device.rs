@@ -126,15 +126,12 @@ pub fn is_link_local(addr: &IpAddr) -> bool {
 /// and the records that are about it.
 pub struct Report<'a> {
     pub host: String,
-    /// Its usable addresses of the segment's family, as announced.
+    /// Its usable addresses, of either family, as announced.
     pub addrs: Vec<IpAddr>,
     /// The records about it other than its addresses: those of the services
-    /// whose SRV points at it, its NSEC, and its reverse mappings.
+    /// whose SRV points at it, its NSEC, and its reverse mappings, each with its
+    /// own TTL.
     pub records: Vec<&'a Record>,
-    /// The longest TTL of its addresses and services.
-    pub max_ttl: u32,
-    /// The TTL its address records announced, if it has any of this family.
-    pub addr_ttl: Option<u32>,
     /// The addresses it announced that no device can be reached at. Having
     /// announced addresses of a family, it is not one to credit with the
     /// address of that family the packet came from instead.
@@ -144,6 +141,10 @@ pub struct Report<'a> {
     pub flushed: Vec<Family>,
     /// The addresses it said goodbye to (TTL 0).
     pub gone: Vec<IpAddr>,
+    /// The TTL each of its usable addresses was announced with: each runs
+    /// out on its own. The only record of its addresses' TTLs; the others
+    /// are worked out from it.
+    pub ttls: HashMap<IpAddr, u32>,
 }
 
 impl<'a> Report<'a> {
@@ -187,8 +188,7 @@ impl<'a> Report<'a> {
         for &rec in &records {
             let instance = match &rec.data {
                 RData::A(_) | RData::Aaaa(_) => {
-                    let i = report_index(&mut reports, &rec.name);
-                    reports[i].max_ttl = reports[i].max_ttl.max(rec.ttl);
+                    report_index(&mut reports, &rec.name);
                     continue;
                 }
                 // What types a host has; those of service instances are not kept.
@@ -208,16 +208,13 @@ impl<'a> Report<'a> {
                 _ => continue,
             };
             match instance_host.get(&instance.to_ascii_lowercase()) {
-                Some(&i) => {
-                    reports[i].records.push(rec);
-                    reports[i].max_ttl = reports[i].max_ttl.max(rec.ttl);
-                }
+                Some(&i) => reports[i].records.push(rec),
                 None => rest.push(rec),
             }
         }
 
         for r in &mut reports {
-            (r.addrs, r.refused) = announced_addrs(&records, &r.host);
+            (r.addrs, r.refused, r.ttls) = announced_addrs(&records, &r.host);
             for rec in records.iter().filter(|rec| rec.name.eq_ignore_ascii_case(&r.host)) {
                 let Some(addr) = addr_of(&rec.data) else { continue };
                 if rec.ttl == 0 {
@@ -226,14 +223,20 @@ impl<'a> Report<'a> {
                     r.flushed.push(family_of(addr));
                 }
             }
-            r.addr_ttl = records
-                .iter()
-                .filter(|rec| rec.name.eq_ignore_ascii_case(&r.host))
-                .filter(|rec| addr_of(&rec.data).is_some_and(|a| r.addrs.contains(&a)))
-                .map(|rec| rec.ttl)
-                .max();
         }
         (reports, rest)
+    }
+
+    /// The longest TTL its addresses were announced with, if it announced
+    /// any.
+    pub fn addr_ttl(&self) -> Option<u32> {
+        self.ttls.values().copied().max()
+    }
+
+    /// The longest TTL of anything it says about the host, its addresses and
+    /// its other records: how long, at least, the host is to be kept.
+    pub fn longest_ttl(&self) -> u32 {
+        self.records.iter().map(|r| r.ttl).chain(self.addr_ttl()).max().unwrap_or(0)
     }
 
     /// The service instances it says where they are, by an SRV record.
@@ -250,27 +253,31 @@ fn report_index(reports: &mut Vec<Report<'_>>, host: &str) -> usize {
         host: host.to_string(),
         addrs: Vec::new(),
         records: Vec::new(),
-        max_ttl: 0,
-        addr_ttl: None,
         refused: Vec::new(),
         flushed: Vec::new(),
         gone: Vec::new(),
+        ttls: HashMap::new(),
     });
     reports.len() - 1
 }
 
 /// The usable addresses that `records` announce for `host`, of either
-/// family, and those they announced that are not.
-fn announced_addrs(records: &[&Record], host: &str) -> (Vec<IpAddr>, Vec<IpAddr>) {
-    let (mut found, mut refused) = (Vec::new(), Vec::new());
+/// family, those they announced that are not, and the TTL each usable one
+/// was announced with.
+fn announced_addrs(records: &[&Record], host: &str) -> (Vec<IpAddr>, Vec<IpAddr>, HashMap<IpAddr, u32>) {
+    let (mut found, mut refused, mut ttls) = (Vec::new(), Vec::new(), HashMap::new());
     for rec in records.iter().filter(|r| r.ttl > 0 && r.name.eq_ignore_ascii_case(host)) {
         let Some(addr) = addr_of(&rec.data) else { continue };
+        if is_usable(addr) {
+            let ttl = ttls.entry(addr).or_insert(0);
+            *ttl = (*ttl).max(rec.ttl);
+        }
         let list = if is_usable(addr) { &mut found } else { &mut refused };
         if !list.contains(&addr) {
             list.push(addr);
         }
     }
-    (found, refused)
+    (found, refused, ttls)
 }
 
 /// Whether a device could be reached at `addr`. Not at an unspecified,
@@ -433,7 +440,7 @@ impl Device {
     pub fn learn(&mut self, report: &Report<'_>, addrs: &[IpAddr], max_addrs: usize) {
         self.hostname = Some(report.host.clone());
         self.take_addrs(addrs, &report.flushed, &report.gone, max_addrs);
-        self.ttl = report.addr_ttl.or(self.ttl);
+        self.ttl = report.addr_ttl().or(self.ttl);
         self.learn_records(report.records.iter().copied());
     }
 
@@ -1354,6 +1361,28 @@ mod tests {
         let kept: Vec<&str> = report.records.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(kept, ["TV._http._tcp.local"]);
         assert!(rest.is_empty(), "{rest:?}");
+    }
+
+    /// What a report says of TTLs comes from each address's, and each other
+    /// record's, own: the longest address TTL, and the longest of all, which
+    /// the host is kept for at least.
+    #[test]
+    fn a_reports_ttls_come_from_each_records_own() {
+        let msg = response(vec![
+            Record { ttl: 120, ..a_record("tv.local", "10.0.1.7") },
+            Record { ttl: 300, ..aaaa("tv.local", "fd00::7") },
+            Record { ttl: 86400, ..a_record("tv.local", "0.0.0.0") },
+            Record { ttl: 4500, ..srv("TV._http._tcp.local", 80, "tv.local") },
+        ]);
+        let (reports, _) = Report::all(&msg);
+        let r = &reports[0];
+        assert_eq!(r.ttls, HashMap::from([(ip("10.0.1.7"), 120), (ip("fd00::7"), 300)]));
+        assert_eq!(r.addr_ttl(), Some(300), "an unusable address's does not count");
+        assert_eq!(r.longest_ttl(), 4500);
+
+        let only_service = response(vec![Record { ttl: 4500, ..srv("TV._http._tcp.local", 80, "tv.local") }]);
+        let (reports, _) = Report::all(&only_service);
+        assert_eq!((reports[0].addr_ttl(), reports[0].longest_ttl()), (None, 4500));
     }
 
     #[test]

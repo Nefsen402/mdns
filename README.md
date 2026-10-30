@@ -253,6 +253,17 @@ from regularly are never asked, and a device known only by the address it was
 heard from (a phone that merely sends queries) has nothing to ask and is left
 alone. The minimum is 30 seconds.
 
+*Addresses run out on their own.* Each address of a device lives for the TTL it
+was announced with, at least `MinimumLifetime`, so one the device stops
+announcing (a temporary IPv6 address that lapsed without a goodbye) is dropped
+by itself, and withdrawn from the other networks. A device is also asked again
+`RefreshBefore` before one of its addresses would run out: a host's addresses
+conventionally live two minutes while its services live 75, so it is asked
+about every five minutes, as an mDNS cache renews a record before it runs out.
+With `RefreshBefore` off, a quiet device's addresses lapse after
+`MinimumLifetime` even while its services live on, and it is no longer
+reflected until it is heard from again.
+
 *Short TTLs.* The minimum lifetime is why a TTL shorter than the margin (10
 seconds, say) is not a problem: the device is not due the moment it is heard, it
 lives `MinimumLifetime` after it was last heard (5 minutes by default) and is
@@ -594,10 +605,11 @@ upkeep wifi                        idle     never      1     8.0s ago  96us
 ```
 
 Under each timer is everything it is waiting for, soonest first, which is what
-it is set to the first of: `expire` a device that has not been heard from,
-`refresh` it (ask it to answer again, shortly before that), and `re-announce` a
-name this daemon announces. A device that has no name yet is listed by the
-address it was heard from.
+it is set to the first of: `expire` a device that has not been heard from (or,
+listed by its hostname and the address, one of its addresses that runs out on
+its own), `refresh` it (ask it to answer again, shortly before that), and
+`re-announce` a name this daemon announces. A device that has no name yet is
+listed by the address it was heard from.
 
 `STATE` is `running` while its callback runs, `waiting` until `DUE`, and `idle`
 when nothing is due (for example, no devices known yet). `DUE` says `now` for

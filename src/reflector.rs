@@ -970,6 +970,35 @@ mod tests {
         assert_eq!(sent, [RData::Aaaa("2001:db8::5".parse().unwrap()), RData::Aaaa("fd00::5".parse().unwrap())]);
     }
 
+    /// An address the device stops announcing runs out on its own, and the
+    /// copy is told to drop just that one.
+    #[test]
+    fn a_copy_drops_an_address_that_ran_out() {
+        let (a, _arx) = wired("a");
+        let (b, brx) = wired("b");
+        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
+        let msg = Message {
+            header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+            questions: vec![],
+            answers: vec![
+                rec_ttl("tv.local", RData::A("10.0.1.5".parse().unwrap()), 120),
+                rec_ttl("tv.local", RData::Aaaa("fd00::5".parse().unwrap()), 4500),
+                rec_ttl("TV._http._tcp.local", RData::Srv { priority: 0, weight: 0, port: 80, target: "tv.local".into() }, 4500),
+            ],
+            authorities: vec![],
+            additionals: vec![],
+        };
+        a.handle(SocketAddr::new(ip("10.0.1.5"), 5353), &msg.encode().unwrap()).unwrap();
+        wait_for(|| b.manual_devices().len() == 1);
+        drain(&brx);
+
+        a.expire(Instant::now() + Duration::from_secs(400));
+        wait_for(|| b.manual_devices().first().is_some_and(|d| d.addresses == [ip("fd00::5")]));
+        let bye: Vec<Record> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.ttl == 0).collect();
+        assert_eq!(bye.len(), 1, "{bye:?}");
+        assert_eq!(bye[0].data, RData::A("10.0.1.5".parse().unwrap()));
+    }
+
     /// The bug this guards against: a device on one network announced to
     /// another with its link-local address, which only exists on its own link.
     #[test]

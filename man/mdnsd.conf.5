@@ -155,7 +155,8 @@ or
 or a bare number of seconds.
 .TP
 .B RefreshBefore=
-Ask a device to answer again this long before it would expire.
+Ask a device to answer again this long before it would expire, or one of its
+addresses would.
 Default
 .BR 30s ;
 .B 0
@@ -168,6 +169,16 @@ A device lives for as long as the longest TTL it announced, and at least
 This long before that runs out, the daemon asks that device, and only it, for
 the records it announced, and asks again about every quarter of this margin
 until it answers or expires.
+.IP
+Each address of a device lives for the TTL it was announced with, at least the
+minimum lifetime, so one the device stops announcing is dropped on its own, and
+withdrawn from the other networks; a device is asked again this long before one
+of its addresses would run out, too.
+With
+.B RefreshBefore=
+off, a quiet device's addresses lapse after
+.B MinimumLifetime=
+even while its services live on.
 A speaker whose records live seventy-five minutes is asked at about seventy-four
 minutes; a device with short records just before its minimum lifetime is up.
 Devices that are heard from regularly are never asked, and a device known only by
