@@ -9,8 +9,35 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 
-use crate::parser::{self, rtype, Message, RData, Record};
+use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
 use crate::socket::Family;
+
+/// TTLs for announced records (RFC 6762 section 10): host records are short
+/// lived, everything else long lived. They are what a device that did not say
+/// is announced with.
+pub const HOST_TTL: u32 = 120;
+pub const OTHER_TTL: u32 = 4500;
+
+/// TTL cap for replies to legacy unicast resolvers (RFC 6762 section 6.7).
+pub const LEGACY_TTL_CAP: u32 = 10;
+
+/// DNS-SD service type enumeration (RFC 6763 section 9).
+pub const META_QUERY: &str = "_services._dns-sd._udp.local";
+
+/// Questions per query packet, to stay well inside one Ethernet frame.
+pub const QUESTIONS_PER_PACKET: usize = 16;
+
+/// Subtypes a probe asks for when their type is around. A device sends its
+/// subtypes only when it announces itself and when asked for one by name,
+/// not when its type is browsed, yet some clients browse by subtype alone:
+/// iOS finds AirPrint printers by `_universal`, and Matter controllers find
+/// devices that are ready to be added by `_CM`.
+const KNOWN_SUBTYPES: [&str; 4] = [
+    "_universal._sub._ipp._tcp.local",
+    "_universal._sub._ipps._tcp.local",
+    "_printer._sub._http._tcp.local",
+    "_CM._sub._matterc._udp.local",
+];
 
 /// A reflected device is never announced for less than this, however short a
 /// TTL it announced itself with: it is announced again at 80% of its TTL, and
@@ -453,6 +480,137 @@ impl Device {
         records
     }
 
+    /// The queries that look for devices on a segment of `family` where
+    /// `devices` are known and `types` were said to be offered: what types
+    /// there are, the instances of each, the subtypes clients browse by (they
+    /// are not sent when their type is browsed), where each instance not yet
+    /// resolved is, and the addresses of a device known by name but without a
+    /// routable address (it only ever showed a link-local one).
+    pub fn probe_queries(devices: &[Device], types: &BTreeSet<String>, family: Family) -> Vec<Message> {
+        let mut qs = Questions::default();
+        qs.ask(META_QUERY, rtype::PTR);
+
+        let services = || devices.iter().flat_map(|d| &d.services);
+        let mut kinds: BTreeSet<&str> = types.iter().map(String::as_str).collect();
+        kinds.extend(services().map(|s| s.kind.as_str()).filter(|k| !k.is_empty()));
+        let known: HashSet<String> = kinds.iter().map(|k| k.to_ascii_lowercase()).collect();
+        for kind in kinds {
+            qs.ask(kind, rtype::PTR);
+        }
+        // The subtypes clients browse by, and the ones heard of, to keep them up.
+        let wanted = KNOWN_SUBTYPES.into_iter().filter(|sub| {
+            sub.split_once("._sub.").is_some_and(|(_, kind)| known.contains(&kind.to_ascii_lowercase()))
+        });
+        for sub in wanted.chain(services().flat_map(|s| &s.subtypes).map(String::as_str)) {
+            qs.ask(sub, rtype::PTR);
+        }
+        for svc in services().filter(|s| s.target.is_none()) {
+            qs.ask(&svc.instance, rtype::SRV);
+            qs.ask(&svc.instance, rtype::TXT);
+        }
+        for host in devices.iter().filter(|d| d.routable.is_none()).filter_map(|d| d.hostname.as_deref()) {
+            qs.ask(host, address_type(family));
+        }
+        qs.into_queries()
+    }
+
+    /// The queries that ask `devices`, on a segment of `family`, to answer
+    /// again: each for what it announced (its address, and the service and
+    /// text records of each of its instances), and not for whole service
+    /// types, so that only they answer.
+    pub fn refresh_queries(devices: &[Device], family: Family) -> Vec<Message> {
+        let mut qs = Questions::default();
+        for device in devices {
+            if let Some(host) = &device.hostname {
+                qs.ask(host, address_type(family));
+            }
+            for svc in &device.services {
+                qs.ask(&svc.instance, rtype::SRV);
+                qs.ask(&svc.instance, rtype::TXT);
+            }
+        }
+        qs.into_queries()
+    }
+
+    /// The records that take a segment from announcing `old` to announcing
+    /// `new` under one hostname, either of them nothing, each announced with
+    /// the TTL of its address in its `ttl`: all of `new`, and goodbyes for
+    /// what of `old` it does not have.
+    ///
+    /// What devices on the segment have themselves is theirs. No goodbye is
+    /// sent for a service whose instance name one has (`local`, lowercase),
+    /// nor, if one has the hostname (`host_here`), for the NSEC, which may say
+    /// just what theirs does. And no goodbye carries the cache-flush bit,
+    /// which would flush their records of the name too.
+    pub fn transition(old: Option<&Device>, new: Option<&Device>, local: &HashSet<String>, host_here: bool) -> Vec<Record> {
+        let ttl = |d: &Device| d.ttl.unwrap_or(HOST_TTL);
+        let mut records = match (old, new) {
+            (Some(old), Some(new)) if old == new => Vec::new(),
+            (None, None) => Vec::new(),
+            (None, Some(new)) => new.announcement(ttl(new), OTHER_TTL),
+            (Some(old), Some(new)) => old.without(local).replacement(new, ttl(new), OTHER_TTL),
+            (Some(old), None) => old.without(local).announcement(0, 0),
+        };
+        for r in records.iter_mut().filter(|r| r.ttl == 0) {
+            r.cache_flush = false;
+        }
+        if host_here {
+            records.retain(|r| r.ttl != 0 || !matches!(r.data, RData::Nsec { .. }));
+        }
+        records
+    }
+
+    /// The reply to `query` from a responder that has `devices`: what each of
+    /// them answers, once each, in one message, each with the TTL of its
+    /// address ([`HOST_TTL`] if it has none) and of its services. Returns it
+    /// with the indices of the devices that answered, or `None` if none did.
+    ///
+    /// A `legacy` resolver, asking from a port other than 5353, gets a reply
+    /// it can take (RFC 6762 section 6.7): its question and id echoed, no TTL
+    /// over ten seconds, and no cache-flush bits.
+    pub fn query_response(devices: &[Device], query: &Message, legacy: bool) -> Option<(Message, Vec<usize>)> {
+        let mut answers: Vec<Record> = Vec::new();
+        let mut additionals: Vec<Record> = Vec::new();
+        let mut answered = Vec::new();
+        for (i, device) in devices.iter().enumerate() {
+            let (a, x) = device.answers(query, device.ttl.unwrap_or(HOST_TTL), OTHER_TTL);
+            if a.is_empty() {
+                continue;
+            }
+            for r in a {
+                if !answers.contains(&r) {
+                    answers.push(r);
+                }
+            }
+            for r in x {
+                if !additionals.contains(&r) {
+                    additionals.push(r);
+                }
+            }
+            answered.push(i);
+        }
+        if answers.is_empty() {
+            return None;
+        }
+
+        let mut msg = Message {
+            header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+            questions: Vec::new(),
+            answers,
+            authorities: Vec::new(),
+            additionals,
+        };
+        if legacy {
+            msg.header.id = query.header.id;
+            msg.questions = query.questions.clone();
+            for r in msg.answers.iter_mut().chain(&mut msg.additionals) {
+                r.ttl = r.ttl.min(LEGACY_TTL_CAP);
+                r.cache_flush = false;
+            }
+        }
+        Some((msg, answered))
+    }
+
     /// Its records that match `query`, with known-answer suppression
     /// applied, plus the additional records a client will want next (RFC 6763
     /// section 12): a PTR brings its SRV and TXT, and an SRV brings its address.
@@ -546,6 +704,53 @@ impl Device {
     }
 }
 
+/// The address record type of `family`.
+fn address_type(family: Family) -> u16 {
+    match family {
+        Family::V4 => rtype::A,
+        Family::V6 => rtype::AAAA,
+    }
+}
+
+/// Questions for queries, each asked once however many devices want it.
+#[derive(Default)]
+struct Questions {
+    list: Vec<Question>,
+    seen: BTreeSet<(String, u16)>,
+}
+
+impl Questions {
+    fn ask(&mut self, name: &str, qtype: u16) {
+        if !self.seen.insert((name.to_ascii_lowercase(), qtype)) {
+            return;
+        }
+        let q = Question { name: name.into(), qtype, class: 1, unicast_response: false };
+        // Names come off the network; one that cannot be re-encoded (lossy
+        // UTF-8 can stretch a label past 63 bytes) is skipped rather than
+        // failing the whole query.
+        if query(std::slice::from_ref(&q)).encode().is_ok() {
+            self.list.push(q);
+        }
+    }
+
+    /// The questions as multicast queries, a few to a packet.
+    fn into_queries(self) -> Vec<Message> {
+        self.list.chunks(QUESTIONS_PER_PACKET).map(query).collect()
+    }
+}
+
+/// A multicast query for `questions` (no known answers, so every device
+/// that has a match replies).
+fn query(questions: &[Question]) -> Message {
+    Message {
+        header: Header { id: 0, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 },
+        questions: questions.to_vec(),
+        answers: Vec::new(),
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+    }
+}
+
 /// The TTL to announce `svc` with: the one it announced itself with (at least
 /// [`MIN_REFLECT_TTL`]) or, if that is not known, `other_ttl`. Zero stays zero:
 /// that is a goodbye.
@@ -601,7 +806,7 @@ fn ends_with_ci(name: &str, suffix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{Header, Question};
+    use crate::parser::Question;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -684,6 +889,161 @@ mod tests {
                 .collect(),
             ..Device::default()
         }
+    }
+
+    /// Two devices with a service of one type, and one with another type.
+    fn three_devices() -> Vec<Device> {
+        let mut television = tv("10.0.1.9", &["TV"]);
+        television.ttl = Some(300);
+        let nas = Device { hostname: Some("nas.local".into()), ..tv("10.0.1.20", &["NAS"]) };
+        let mut printer = Device { hostname: Some("printer.local".into()), ..tv("10.0.1.30", &["Printer"]) };
+        printer.services[0].kind = "_ipp._tcp.local".into();
+        printer.services[0].instance = "Printer._ipp._tcp.local".into();
+        vec![television, nas, printer]
+    }
+
+    #[test]
+    fn a_query_response_has_what_each_device_answers_once() {
+        let devices = three_devices();
+        let (msg, answered) = Device::query_response(&devices, &query("_http._tcp.local", rtype::PTR), false).unwrap();
+        assert_eq!(answered, [0, 1], "the printer has nothing of that type");
+        let browsed: Vec<&RData> = msg.answers.iter().map(|r| &r.data).collect();
+        assert_eq!(browsed, [
+            &RData::Ptr("TV._http._tcp.local".into()),
+            &RData::Ptr("NAS._http._tcp.local".into()),
+        ]);
+        // Each comes with what it takes to resolve it, its address with the
+        // TTL it is announced with, or the usual one.
+        let addr_ttl = |host: &str| msg.additionals.iter().find(|r| r.name == host && matches!(r.data, RData::A(_))).map(|r| r.ttl);
+        assert_eq!((addr_ttl("tv.local"), addr_ttl("nas.local")), (Some(300), Some(HOST_TTL)));
+        assert_eq!(msg.additionals.iter().filter(|r| matches!(r.data, RData::Srv { .. })).count(), 2);
+        assert!(msg.header.response && msg.header.authoritative && msg.questions.is_empty());
+
+        // A record two of them have is given once.
+        let (msg, answered) =
+            Device::query_response(&devices, &query("_services._dns-sd._udp.local", rtype::PTR), false).unwrap();
+        assert_eq!(answered, [0, 1, 2]);
+        assert_eq!(msg.answers.len(), 2, "_http and _ipp: {:?}", msg.answers);
+
+        // Nothing to say is no reply at all.
+        assert!(Device::query_response(&devices, &query("_airplay._tcp.local", rtype::PTR), false).is_none());
+        assert!(Device::query_response(&[], &query("_http._tcp.local", rtype::PTR), false).is_none());
+    }
+
+    #[test]
+    fn a_legacy_resolver_gets_its_question_back_and_short_ttls_without_cache_flush() {
+        let devices = three_devices();
+        let mut asked = query("tv.local", rtype::ANY);
+        asked.header.id = 0x4242;
+
+        let (msg, _) = Device::query_response(&devices, &asked, true).unwrap();
+        assert_eq!((msg.header.id, msg.questions.clone()), (0x4242, asked.questions.clone()));
+        assert!(msg.answers.iter().chain(&msg.additionals).all(|r| r.ttl <= LEGACY_TTL_CAP && !r.cache_flush));
+
+        // To the group, none of that.
+        let (msg, _) = Device::query_response(&devices, &asked, false).unwrap();
+        assert_eq!(msg.header.id, 0);
+        assert!(msg.questions.is_empty());
+        assert!(msg.answers.iter().any(|r| r.ttl == 300 && r.cache_flush));
+    }
+
+    /// Every question the `queries` ask, as (name, type), in order.
+    fn asked(queries: &[Message]) -> Vec<(String, u16)> {
+        assert!(queries.iter().all(|q| !q.header.response && q.questions.len() <= QUESTIONS_PER_PACKET));
+        queries.iter().flat_map(|q| &q.questions).map(|q| (q.name.clone(), q.qtype)).collect()
+    }
+
+    fn q(name: &str, qtype: u16) -> (String, u16) {
+        (name.to_string(), qtype)
+    }
+
+    #[test]
+    fn a_probe_asks_for_types_instances_subtypes_and_whatever_is_missing() {
+        // Resolved and with a routable address: only its type is browsed.
+        let mut resolved = tv("10.0.1.9", &["TV"]);
+        resolved.services[0].target = Some("tv.local".into());
+        // Of the same type, with a subtype heard of, but not yet resolved.
+        let mut unresolved = tv("10.0.1.10", &["Den"]);
+        unresolved.hostname = None;
+        unresolved.services[0].subtypes = vec!["_scanner._sub._http._tcp.local".into()];
+        // Known by name, but only by a link-local address.
+        let named = Device { hostname: Some("nas.local".into()), link_local: Some(ip("169.254.1.1")), ..Device::default() };
+        let types = BTreeSet::from(["_ipp._tcp.local".to_string()]);
+
+        let questions = asked(&Device::probe_queries(&[resolved, unresolved, named], &types, Family::V4));
+        for wanted in [
+            q(META_QUERY, rtype::PTR),
+            q("_http._tcp.local", rtype::PTR),
+            q("_ipp._tcp.local", rtype::PTR),
+            q("_printer._sub._http._tcp.local", rtype::PTR),
+            q("_universal._sub._ipp._tcp.local", rtype::PTR),
+            q("_scanner._sub._http._tcp.local", rtype::PTR),
+            q("Den._http._tcp.local", rtype::SRV),
+            q("Den._http._tcp.local", rtype::TXT),
+            q("nas.local", rtype::A),
+        ] {
+            assert!(questions.contains(&wanted), "{wanted:?} in {questions:?}");
+        }
+        assert_eq!(questions.iter().filter(|w| **w == q("_http._tcp.local", rtype::PTR)).count(), 1, "asked once");
+        assert!(!questions.contains(&q("TV._http._tcp.local", rtype::SRV)), "already resolved");
+        assert!(!questions.contains(&q("tv.local", rtype::A)), "already has a routable address");
+        assert!(!questions.contains(&q("_universal._sub._ipps._tcp.local", rtype::PTR)), "no _ipps around");
+
+        // However many types there are, a packet has only so many questions.
+        let types: BTreeSet<String> = (0..40).map(|i| format!("_t{i}._tcp.local")).collect();
+        let queries = Device::probe_queries(&[], &types, Family::V4);
+        assert_eq!(asked(&queries).len(), 41);
+        assert_eq!(queries.len(), 3);
+    }
+
+    #[test]
+    fn a_refresh_asks_each_device_for_what_it_announced_and_no_more() {
+        let devices = [tv("fd00::9", &["TV", "Cast"]), tv("fd00::9", &["TV"])];
+        let questions = asked(&Device::refresh_queries(&devices, Family::V6));
+        assert_eq!(questions, [
+            q("tv.local", rtype::AAAA),
+            q("TV._http._tcp.local", rtype::SRV),
+            q("TV._http._tcp.local", rtype::TXT),
+            q("Cast._http._tcp.local", rtype::SRV),
+            q("Cast._http._tcp.local", rtype::TXT),
+        ]);
+        assert!(Device::refresh_queries(&[], Family::V6).is_empty());
+    }
+
+    #[test]
+    fn a_transition_announces_the_new_and_takes_back_only_what_is_ours() {
+        let none = HashSet::new();
+        let mut old = tv("10.0.1.9", &["Kitchen", "Den"]);
+        old.ttl = Some(300);
+        old.nsec = Some(vec![rtype::A]);
+        let goodbyes = |records: &[Record]| records.iter().filter(|r| r.ttl == 0).cloned().collect::<Vec<_>>();
+
+        assert!(Device::transition(Some(&old), Some(&old), &none, false).is_empty(), "nothing changed");
+        assert!(Device::transition(None, None, &none, false).is_empty());
+
+        let shown = Device::transition(None, Some(&old), &none, false);
+        assert!(shown.iter().any(|r| r.data == RData::A("10.0.1.9".parse().unwrap()) && r.ttl == 300 && r.cache_flush));
+        assert!(goodbyes(&shown).is_empty());
+
+        // Moved: the new address, and a goodbye for the old one that does not
+        // flush the new.
+        let moved = Device { routable: Some(ip("10.0.1.10")), ..old.clone() };
+        let bye = goodbyes(&Device::transition(Some(&old), Some(&moved), &none, false));
+        assert_eq!(bye.len(), 1);
+        assert_eq!((&bye[0].data, bye[0].cache_flush), (&RData::A("10.0.1.9".parse().unwrap()), false));
+
+        // Withdrawn: everything, none of it flushing.
+        let bye = goodbyes(&Device::transition(Some(&old), None, &none, false));
+        assert_eq!(bye.len(), old.announcement(0, 0).len());
+        assert!(bye.iter().all(|r| !r.cache_flush));
+
+        // But not what a device on the segment has: a service of the same
+        // instance name, or, if one has the hostname, the NSEC.
+        let local = HashSet::from(["kitchen._http._tcp.local".to_string()]);
+        let bye = goodbyes(&Device::transition(Some(&old), None, &local, true));
+        assert!(!bye.iter().any(|r| r.name.starts_with("Kitchen.") || r.data == RData::Ptr("Kitchen._http._tcp.local".into())));
+        assert!(!bye.iter().any(|r| matches!(r.data, RData::Nsec { .. })));
+        assert!(bye.iter().any(|r| r.name.starts_with("Den.")), "{bye:?}");
     }
 
     #[test]

@@ -17,8 +17,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 
-use crate::device::{addr_of, is_service_type, service_ttl, Device, Report, MIN_REFLECT_TTL};
-use crate::parser::{rtype, Header, Message, Question, RData, Record};
+use crate::device::{
+    addr_of, is_service_type, service_ttl, Device, Report, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
+};
+use crate::parser::{Header, Message, RData, Record};
 use crate::timer::{self, Next, Timer};
 
 pub const MDNS_PORT: u16 = 5353;
@@ -28,23 +30,12 @@ pub const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 // Not exported by the libc crate on all versions (Linux >= 4.20).
 const IPV6_MULTICAST_ALL: libc::c_int = 29;
 
-/// Minimum time a discovered device may stay silent before it is dropped.
-/// Record TTLs can extend this but never shorten it: without actively
-/// querying, a quiet device is indistinguishable from a departed one.
-/// TTLs for announced records (RFC 6762 section 10): host records are short
-/// lived, everything else long lived.
-const HOST_TTL: u32 = 120;
-const OTHER_TTL: u32 = 4500;
-
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises.
 fn reannounce_after(host_ttl: u32) -> Duration {
     Duration::from_secs(u64::from(host_ttl) * 4 / 5)
 }
 /// How long to wait before trying again after a re-announcement failed to send.
 const ANNOUNCE_RETRY: Duration = Duration::from_secs(10);
-
-/// DNS-SD service type enumeration (RFC 6763 section 9).
-const META_QUERY: &str = "_services._dns-sd._udp.local";
 
 /// Pause after each round of a probe. A probe is three rounds, because the
 /// answers to one round (service types, then instances) decide what the next
@@ -55,30 +46,12 @@ const PROBE_GAPS: [Duration; 3] = if cfg!(test) {
     [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(1)]
 };
 
-/// Questions per query packet, to stay well inside one Ethernet frame.
-const QUESTIONS_PER_PACKET: usize = 16;
-
 /// Service types remembered per segment, so a hostile device cannot grow it
 /// without bound by announcing endless made-up types.
 const MAX_TYPES: usize = 256;
 
-/// Subtypes a probe asks for when their type is around. A device sends its
-/// subtypes only when it announces itself and when asked for one by name,
-/// not when its type is browsed, yet some clients browse by subtype alone:
-/// iOS finds AirPrint printers by `_universal`, and Matter controllers find
-/// devices that are ready to be added by `_CM`.
-const KNOWN_SUBTYPES: [&str; 4] = [
-    "_universal._sub._ipp._tcp.local",
-    "_universal._sub._ipps._tcp.local",
-    "_printer._sub._http._tcp.local",
-    "_CM._sub._matterc._udp.local",
-];
-
 /// A record may not be multicast more than once a second (RFC 6762 section 6).
 const MIN_MULTICAST_GAP: Duration = Duration::from_secs(1);
-
-/// TTL cap for replies to legacy unicast resolvers (RFC 6762 section 6.7).
-const LEGACY_TTL_CAP: u32 = 10;
 
 /// The default for how long a device is kept at least after it was last heard
 /// from, whatever TTLs it announced. See [`Segment::set_min_lifetime`].
@@ -474,24 +447,11 @@ impl State {
             return Ok(false);
         };
         let want = self.wanted(key, m, local);
-        // What a device here has is its own: no goodbye takes it back.
-        let mut records = match (&m.shown, &want) {
-            (Some(old), Some(new)) if *old == new.device && m.host_ttl == new.host_ttl => Vec::new(),
-            (None, None) => Vec::new(),
-            (None, Some(new)) => new.device.announcement(new.host_ttl, m.other_ttl),
-            (Some(old), Some(new)) => old.without(local).replacement(&new.device, new.host_ttl, m.other_ttl),
-            (Some(old), None) => old.without(local).announcement(0, 0),
-        };
-        // A goodbye with the cache-flush bit would also flush the records a
-        // device here has under the same name.
-        for r in records.iter_mut().filter(|r| r.ttl == 0) {
-            r.cache_flush = false;
-        }
-        // Nor is the NSEC taken back from under a device here of that name:
-        // its own may say just the same.
-        if self.discovered.contains_key(&Key::Host(key.to_string())) {
-            records.retain(|r| r.ttl != 0 || !matches!(r.data, RData::Nsec { .. }));
-        }
+        // Each with the TTL its address is announced with.
+        let old = m.shown.as_ref().map(|d| Device { ttl: Some(m.host_ttl), ..d.clone() });
+        let new = want.as_ref().map(|c| Device { ttl: Some(c.host_ttl), ..c.device.clone() });
+        let host_here = self.discovered.contains_key(&Key::Host(key.to_string()));
+        let records = Device::transition(old.as_ref(), new.as_ref(), local, host_here);
         let sent = !records.is_empty();
         if sent {
             send(&self.outbound, &records)?;
@@ -514,6 +474,27 @@ impl State {
             self.manual.remove(key);
         }
         Ok(sent)
+    }
+
+    /// The devices this segment answers queries for, by hostname: what is
+    /// shown of each, with the TTL its address is announced with. Left out
+    /// are those multicast less than a second ago (RFC 6762 section 6), unless
+    /// the reply is to go to a `legacy` resolver alone, and, for a device
+    /// `probing` for names it is about to take, the reflected copies: it would
+    /// take them for a conflict, and once it announces, the copy gives way.
+    fn answering(&self, now: Instant, legacy: bool, probing: bool) -> Vec<(String, Device)> {
+        let mut out = Vec::new();
+        for (key, m) in &self.manual {
+            let Some(device) = &m.shown else { continue };
+            if probing && m.claims.keys().next() != Some(&Owner::Own) {
+                continue;
+            }
+            if !legacy && now.saturating_duration_since(m.last_sent) < MIN_MULTICAST_GAP {
+                continue;
+            }
+            out.push((key.clone(), Device { ttl: Some(m.host_ttl), ..device.clone() }));
+        }
+        out
     }
 
     /// [Settle](State::settle) every announced hostname, after the devices
@@ -853,72 +834,20 @@ impl Segment {
             return Ok(());
         }
         let legacy = from.port() != MDNS_PORT;
-        let probing = !query.authorities.is_empty();
         let now = Instant::now();
 
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        let mut answers: Vec<Record> = Vec::new();
-        let mut additionals: Vec<Record> = Vec::new();
-        let mut used = Vec::new();
-        for (key, m) in &state.manual {
-            let Some(device) = &m.shown else { continue };
-            if probing && m.claims.keys().next() != Some(&Owner::Own) {
-                continue;
-            }
-            let (a, x) = device.answers(query, m.host_ttl, m.other_ttl);
-            if a.is_empty() {
-                continue;
-            }
-            if !legacy && now.saturating_duration_since(m.last_sent) < MIN_MULTICAST_GAP {
-                continue;
-            }
-            for r in a {
-                if !answers.contains(&r) {
-                    answers.push(r);
-                }
-            }
-            for r in x {
-                if !additionals.contains(&r) {
-                    additionals.push(r);
-                }
-            }
-            used.push(key.clone());
-        }
-        if answers.is_empty() {
+        let probing = !query.authorities.is_empty();
+        let (keys, devices): (Vec<String>, Vec<Device>) = state.answering(now, legacy, probing).into_iter().unzip();
+        let Some((msg, answered)) = Device::query_response(&devices, query, legacy) else {
             return Ok(());
-        }
-
-        let mut msg = Message {
-            header: Header {
-                id: 0,
-                response: true,
-                opcode: 0,
-                authoritative: true,
-                truncated: false,
-                rcode: 0,
-            },
-            questions: Vec::new(),
-            answers,
-            authorities: Vec::new(),
-            additionals,
         };
-        let dest = if legacy {
-            msg.header.id = h.id;
-            msg.questions = query.questions.clone();
-            for r in msg.answers.iter_mut().chain(&mut msg.additionals) {
-                r.ttl = r.ttl.min(LEGACY_TTL_CAP);
-                r.cache_flush = false;
-            }
-            Some(from)
-        } else {
-            None
-        };
-        transmit(&state.outbound, &msg, dest)?;
+        transmit(&state.outbound, &msg, legacy.then_some(from))?;
 
         if !legacy {
-            for key in used {
-                if let Some(m) = state.manual.get_mut(&key) {
+            for i in answered {
+                if let Some(m) = state.manual.get_mut(&keys[i]) {
                     m.last_sent = now;
                 }
             }
@@ -1116,36 +1045,8 @@ impl Segment {
             return Ok(0);
         }
 
-        let mut qs = Questions::default();
-        qs.ask(META_QUERY, rtype::PTR);
-
-        let mut kinds: BTreeSet<&str> = state.types.iter().map(String::as_str).collect();
-        let services = || state.discovered.values().flat_map(|e| &e.device.services);
-        kinds.extend(services().map(|s| s.kind.as_str()).filter(|k| !k.is_empty()));
-        let known: HashSet<String> = kinds.iter().map(|k| k.to_ascii_lowercase()).collect();
-        for kind in kinds {
-            qs.ask(kind, rtype::PTR);
-        }
-        // Subtypes are not sent when their type is browsed: ask for the ones
-        // clients browse by, and to keep up the ones heard of here.
-        let wanted = KNOWN_SUBTYPES.into_iter().filter(|sub| {
-            sub.split_once("._sub.").is_some_and(|(_, kind)| known.contains(&kind.to_ascii_lowercase()))
-        });
-        for sub in wanted.chain(services().flat_map(|s| &s.subtypes).map(String::as_str)) {
-            qs.ask(sub, rtype::PTR);
-        }
-        for svc in services().filter(|s| s.target.is_none()) {
-            qs.ask(&svc.instance, rtype::SRV);
-            qs.ask(&svc.instance, rtype::TXT);
-        }
-        // A device known by name but without a routable address (it only ever
-        // showed a link-local one) is asked for all of its addresses.
-        let address_type = if self.family == Family::V4 { rtype::A } else { rtype::AAAA };
-        for host in state.discovered.values().filter(|e| e.device.routable.is_none()).filter_map(|e| e.device.hostname.as_deref()) {
-            qs.ask(host, address_type);
-        }
-
-        qs.send(&state.outbound)
+        let devices: Vec<Device> = state.discovered.values().map(|e| e.device.clone()).collect();
+        ask(&state.outbound, &Device::probe_queries(&devices, &state.types, self.family))
     }
 
     /// Ask the devices that are about to expire to answer again, so that a
@@ -1170,9 +1071,8 @@ impl Segment {
             return Ok(0);
         }
         let gap = refresh_gap(before);
-        let address_type = if self.family == Family::V4 { rtype::A } else { rtype::AAAA };
 
-        let mut qs = Questions::default();
+        let mut asking = Vec::new();
         for entry in discovered.values_mut() {
             // Not one that has already run out: it is about to be dropped. A
             // margin too long to add to a time reaches past every expiry.
@@ -1182,15 +1082,9 @@ impl Segment {
                 continue;
             }
             entry.refreshed = Some(now);
-            if let Some(host) = &entry.device.hostname {
-                qs.ask(host, address_type);
-            }
-            for svc in &entry.device.services {
-                qs.ask(&svc.instance, rtype::SRV);
-                qs.ask(&svc.instance, rtype::TXT);
-            }
+            asking.push(entry.device.clone());
         }
-        qs.send(outbound)
+        ask(outbound, &Device::refresh_queries(&asking, self.family))
     }
 
     /// Drop devices whose lifetime has run out as of `now`.
@@ -1253,53 +1147,12 @@ impl Touched {
     }
 }
 
-/// Questions for one query, each asked once however many devices want it.
-#[derive(Default)]
-struct Questions {
-    list: Vec<Question>,
-    seen: BTreeSet<(String, u16)>,
-}
-
-impl Questions {
-    fn ask(&mut self, name: &str, qtype: u16) {
-        if !self.seen.insert((name.to_ascii_lowercase(), qtype)) {
-            return;
-        }
-        let q = Question { name: name.into(), qtype, class: 1, unicast_response: false };
-        // Names come off the network; one that cannot be re-encoded (lossy
-        // UTF-8 can stretch a label past 63 bytes) is skipped rather than
-        // failing the whole query.
-        if query(std::slice::from_ref(&q)).encode().is_ok() {
-            self.list.push(q);
-        }
+/// Multicast `queries`. Returns how many questions they asked.
+fn ask(outbound: &Option<Outbound>, queries: &[Message]) -> Result<usize> {
+    for q in queries {
+        transmit(outbound, q, None)?;
     }
-
-    /// Multicast the questions, a few to a packet. Returns how many there were.
-    fn send(&self, outbound: &Option<Outbound>) -> Result<usize> {
-        for chunk in self.list.chunks(QUESTIONS_PER_PACKET) {
-            transmit(outbound, &query(chunk), None)?;
-        }
-        Ok(self.list.len())
-    }
-}
-
-/// A multicast query for `questions` (no known answers, so every device
-/// that has a match replies).
-fn query(questions: &[Question]) -> Message {
-    Message {
-        header: Header {
-            id: 0,
-            response: false,
-            opcode: 0,
-            authoritative: false,
-            truncated: false,
-            rcode: 0,
-        },
-        questions: questions.to_vec(),
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-    }
+    Ok(queries.iter().map(|q| q.questions.len()).sum())
 }
 
 fn send(outbound: &Option<Outbound>, records: &[Record]) -> Result<()> {
@@ -1336,8 +1189,8 @@ fn transmit(outbound: &Option<Outbound>, msg: &Message, dest: Option<SocketAddr>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{is_link_local, record, Service};
-    use crate::parser;
+    use crate::device::{is_link_local, record, Service, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
+    use crate::parser::{self, rtype};
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
