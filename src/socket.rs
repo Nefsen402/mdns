@@ -1978,23 +1978,6 @@ mod tests {
     }
 
     #[test]
-    fn an_ipv6_device_has_a_link_local_and_a_routable_address() {
-        let seg = Segment::new("test", Family::V6);
-        // It sends from its link-local address and announces that, a ULA, and
-        // (wrongly for this segment) an IPv4 address, which is ignored.
-        hear(&seg, "fe80::7", vec![
-            aaaa("tv.local", "fd00:0:1::7"),
-            aaaa("tv.local", "fe80::7"),
-            a_record("tv.local", "10.0.1.7"),
-        ]);
-        let devices = seg.devices();
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].hostname.as_deref(), Some("tv.local"));
-        assert_eq!(devices[0].routable, Some(ip("fd00:0:1::7")));
-        assert_eq!(devices[0].link_local, Some(ip("fe80::7")));
-    }
-
-    #[test]
     fn a_device_first_heard_by_address_becomes_the_named_device() {
         let seg = Segment::new("test", Family::V4);
         let rx = seg.subscribe();
@@ -2633,21 +2616,10 @@ mod tests {
     }
 
     #[test]
-    fn the_ttls_a_device_announces_are_kept_and_the_address_ones_do_not_get_the_services() {
-        let (seg, _rx) = wired();
-        hear(&seg, "10.0.1.30", vec![
-            record("d.local".into(), true, 120, RData::A("10.0.1.30".parse().unwrap())),
-            record("D._x._tcp.local".into(), true, 4500, RData::Srv { priority: 0, weight: 0, port: 1, target: "d.local".into() }),
-            record("_x._tcp.local".into(), false, 100, RData::Ptr("D._x._tcp.local".into())),
-        ]);
-        let device = seg.devices().remove(0);
-        assert_eq!(device.ttl, Some(120));
-        // The SRV record's TTL counts, not the PTR's.
-        assert_eq!(device.services[0].ttl, 4500);
-
-        // A device known only by address has announced nothing.
+    fn a_device_known_only_by_address_has_announced_no_ttls() {
+        let seg = Segment::new("test", Family::V4);
         seg.observe(ip("10.0.1.99"));
-        let bare = seg.devices().into_iter().find(|d| d.hostname.is_none()).unwrap();
+        let bare = seg.devices().remove(0);
         assert_eq!((bare.ttl, bare.services.len()), (None, 0));
     }
 
@@ -2756,88 +2728,14 @@ mod tests {
         assert!(seg.state.lock().unwrap().subscribers.is_empty());
     }
 
-    /// DNS compares names without regard to case, and devices are not
-    /// consistent about it, not even within one packet.
+    /// Service types learned from the enumeration are one per type, whatever
+    /// their case.
     #[test]
-    fn names_that_differ_only_in_case_are_one_and_the_same() {
+    fn service_types_are_learned_once_whatever_their_case() {
         let seg = Segment::new("test", Family::V4);
-        hear(&seg, "10.0.1.7", vec![
-            a_record("tv.local", "10.0.1.7"),
-            ptr("_HTTP._TCP.LOCAL", "TV._http._tcp.local"),
-            srv("tv._HTTP._tcp.local", 80, "tv.local"),
-        ]);
-        let services = seg.devices()[0].services.clone();
-        assert_eq!(services.len(), 1, "{services:?}");
-        let svc = &services[0];
-        assert_eq!((svc.instance.as_str(), svc.kind.as_str(), svc.port), ("TV._http._tcp.local", "_HTTP._TCP.LOCAL", 80));
-
-        // A goodbye in yet another spelling still says goodbye to it.
-        let bye = Record { ttl: 0, ..srv("Tv._Http._Tcp.Local", 80, "tv.local") };
-        hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), bye]);
-        assert!(seg.devices()[0].services.is_empty());
-
-        // Service types learned from the enumeration are one per type, too.
         let meta = |kind: &str| ptr("_services._dns-sd._udp.local", kind);
         hear(&seg, "10.0.1.7", vec![meta("_http._tcp.local"), meta("_HTTP._tcp.LOCAL")]);
         assert_eq!(seg.state.lock().unwrap().types.len(), 1);
-    }
-
-    /// A printer says it is an AirPrint one with a subtype PTR next to its
-    /// usual one. That is kept with the service, and a goodbye for it drops
-    /// the subtype, not the service.
-    #[test]
-    fn subtypes_are_kept_with_their_service() {
-        let seg = Segment::new("test", Family::V4);
-        let printer = |sub_ttl| {
-            vec![
-                a_record("printer.local", "10.0.1.8"),
-                ptr("_ipp._tcp.local", "Office._ipp._tcp.local"),
-                Record { ttl: sub_ttl, ..ptr("_universal._sub._ipp._tcp.local", "Office._ipp._tcp.local") },
-                srv("Office._ipp._tcp.local", 631, "printer.local"),
-            ]
-        };
-        let services = |seg: &Segment| seg.devices()[0].services.clone();
-
-        hear(&seg, "10.0.1.8", printer(4500));
-        assert_eq!(services(&seg).len(), 1);
-        assert_eq!(services(&seg)[0].subtypes, ["_universal._sub._ipp._tcp.local"]);
-        assert_eq!(services(&seg)[0].kind, "_ipp._tcp.local", "the type is not the subtype's");
-
-        // Heard again, in another case and on its own: still one.
-        hear(&seg, "10.0.1.8", vec![ptr("_UNIVERSAL._sub._ipp._tcp.local", "Office._ipp._tcp.local")]);
-        assert_eq!(services(&seg)[0].subtypes.len(), 1);
-
-        hear(&seg, "10.0.1.8", printer(0));
-        assert!(services(&seg)[0].subtypes.is_empty());
-        assert_eq!(services(&seg)[0].port, 631);
-    }
-
-    #[test]
-    fn subtypes_are_announced_answered_and_withdrawn() {
-        let (seg, rx) = wired();
-        let mut printer = tv("10.0.1.9", &["Office"]);
-        printer.services[0].subtypes = vec!["_printer._sub._http._tcp.local".into()];
-        let subtype = |m: &Message| m.answers.iter().find(|r| r.name == "_printer._sub._http._tcp.local").cloned();
-
-        seg.add_manual(Owner::Reflector(0), printer.clone()).unwrap();
-        let r = subtype(&recv(&rx).unwrap()).expect("announced");
-        assert_eq!((r.data, r.cache_flush), (RData::Ptr("Office._http._tcp.local".into()), false));
-
-        // Browsing by the subtype finds it, with what it takes to resolve it.
-        age(&seg, 2);
-        seg.handle(sa("10.0.1.50"), &query("_printer._sub._http._tcp.local", rtype::PTR, vec![])).unwrap();
-        let m = recv(&rx).unwrap();
-        assert_eq!(m.answers.len(), 1);
-        assert!(subtype(&m).is_some());
-        assert!(m.additionals.iter().any(|r| matches!(r.data, RData::Srv { .. })));
-        assert!(m.additionals.iter().any(|r| matches!(r.data, RData::A(_))));
-
-        // No longer of the subtype: that alone is withdrawn.
-        printer.services[0].subtypes.clear();
-        seg.add_manual(Owner::Reflector(0), printer).unwrap();
-        let m = recv(&rx).unwrap();
-        assert_eq!(subtype(&m).map(|r| r.ttl), Some(0));
-        assert_eq!(m.answers.iter().filter(|r| r.ttl == 0).count(), 1);
     }
 
     /// Subtypes are not sent in answers to a browse of their type, so a probe
@@ -2868,79 +2766,6 @@ mod tests {
         record(name.into(), true, 120, RData::Nsec { next: name.into(), types: types.to_vec() })
     }
 
-    /// A device says which types its hostname has with an NSEC record, in
-    /// its announcements or on its own as a negative answer. That of its
-    /// service instances is not kept, nor taken for a host.
-    #[test]
-    fn what_a_device_says_its_hostname_has_is_kept() {
-        let seg = Segment::new("test", Family::V4);
-        hear(&seg, "10.0.1.7", vec![
-            a_record("tv.local", "10.0.1.7"),
-            nsec("tv.local", &[rtype::A]),
-            srv("TV._http._tcp.local", 80, "tv.local"),
-            nsec("TV._http._tcp.local", &[rtype::TXT, rtype::SRV]),
-        ]);
-        let devices = seg.devices();
-        assert_eq!(devices.len(), 1, "{devices:?}");
-        assert_eq!(devices[0].nsec, Some(vec![rtype::A]));
-
-        // On its own, from the device, it is still the device's.
-        hear(&seg, "10.0.1.7", vec![nsec("TV.local", &[rtype::A, rtype::AAAA])]);
-        assert_eq!(seg.devices()[0].nsec, Some(vec![rtype::A, rtype::AAAA]));
-        hear(&seg, "10.0.1.7", vec![Record { ttl: 0, ..nsec("tv.local", &[rtype::A]) }]);
-        assert_eq!(seg.devices()[0].nsec, None);
-    }
-
-    #[test]
-    fn a_reflected_device_denies_only_what_it_denied_itself() {
-        let (seg, rx) = wired();
-        let mut v4_only = tv("10.0.1.9", &["TV"]);
-        v4_only.nsec = Some(vec![rtype::A]);
-        seg.add_manual(Owner::Reflector(0), v4_only.clone()).unwrap();
-        let nsec_of = |records: &[Record]| records.iter().find(|r| matches!(r.data, RData::Nsec { .. })).cloned();
-        let r = nsec_of(&recv(&rx).unwrap().answers).expect("announced");
-        assert_eq!((r.name.as_str(), r.cache_flush, r.ttl), ("tv.local", true, HOST_TTL));
-        assert_eq!(r.data, RData::Nsec { next: "tv.local".into(), types: vec![rtype::A] });
-
-        // Asked for an address it has not got, it says so...
-        age(&seg, 2);
-        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::AAAA, vec![])).unwrap();
-        let m = recv(&rx).unwrap();
-        assert_eq!(m.answers.len(), 1);
-        assert!(nsec_of(&m.answers).is_some());
-
-        // ...and its address comes with it.
-        age(&seg, 2);
-        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::A, vec![])).unwrap();
-        let m = recv(&rx).unwrap();
-        assert!(matches!(m.answers[..], [Record { data: RData::A(_), .. }]));
-        assert!(nsec_of(&m.additionals).is_some());
-
-        // It is not among what the name has.
-        age(&seg, 2);
-        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::ANY, vec![])).unwrap();
-        assert!(nsec_of(&recv(&rx).unwrap().answers).is_none());
-
-        // What it announces is never denied, and NSEC itself is not listed.
-        let mut said_less = v4_only.clone();
-        said_less.nsec = Some(vec![rtype::AAAA, rtype::NSEC, 300]);
-        let types = |d: &Device| match d.nsec_record(120).map(|r| r.data) {
-            Some(RData::Nsec { types, .. }) => types,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(types(&said_less), [rtype::A, rtype::AAAA]);
-
-        // A device that said nothing is denied nothing.
-        let mut silent = v4_only;
-        silent.nsec = None;
-        assert!(silent.nsec_record(120).is_none());
-        seg.add_manual(Owner::Reflector(0), silent).unwrap();
-        recv(&rx).unwrap();
-        age(&seg, 2);
-        seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::AAAA, vec![])).unwrap();
-        assert!(recv(&rx).is_none());
-    }
-
     /// A copy giving way to a device here of the same name takes back its
     /// address, but not its NSEC, which may be just what the device's says.
     #[test]
@@ -2955,75 +2780,6 @@ mod tests {
         let bye = recv(&rx).unwrap();
         assert_eq!(bye.answers.len(), 1, "{:?}", bye.answers);
         assert_eq!((&bye.answers[0].data, bye.answers[0].ttl), (&RData::A("10.0.2.9".parse().unwrap()), 0));
-    }
-
-    fn reverse(addr: &str, host: &str) -> Record {
-        record(parser::reverse_name(ip(addr)), true, 120, RData::Ptr(host.into()))
-    }
-
-    /// A device announces a reverse-mapping PTR for its address. That is kept
-    /// with the host it names, not taken for a service or a device of its own.
-    #[test]
-    fn reverse_mappings_are_kept_with_the_host_they_name() {
-        let seg = Segment::new("test", Family::V4);
-        hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), reverse("10.0.1.7", "tv.local")]);
-        let devices = seg.devices();
-        assert_eq!(devices.len(), 1, "{devices:?}");
-        assert_eq!(devices[0].reverse, [ip("10.0.1.7")]);
-        assert!(devices[0].services.is_empty());
-
-        // On its own, as an answer to a reverse lookup: still the same.
-        hear(&seg, "10.0.1.7", vec![reverse("10.0.1.7", "TV.local")]);
-        assert_eq!(seg.devices()[0].reverse, [ip("10.0.1.7")]);
-        hear(&seg, "10.0.1.7", vec![Record { ttl: 0, ..reverse("10.0.1.7", "tv.local") }]);
-        assert!(seg.devices()[0].reverse.is_empty());
-    }
-
-    /// A sleep proxy or Thread border router announces a host's records from
-    /// its own address. Its NSEC and reverse mapping go to that host, as its
-    /// address does, not to the proxy.
-    #[test]
-    fn what_a_proxy_says_of_a_host_goes_to_that_host() {
-        let seg = Segment::new("test", Family::V4);
-        hear(&seg, "10.0.1.1", vec![
-            a_record("tv.local", "10.0.1.7"),
-            nsec("tv.local", &[rtype::A]),
-            reverse("10.0.1.7", "tv.local"),
-        ]);
-        let devices = seg.devices();
-        assert_eq!(devices.len(), 1, "nothing is put down to the proxy: {devices:?}");
-        assert_eq!(devices[0].hostname.as_deref(), Some("tv.local"));
-        assert_eq!((devices[0].nsec.clone(), devices[0].reverse.clone()), (Some(vec![rtype::A]), vec![ip("10.0.1.7")]));
-    }
-
-    #[test]
-    fn reverse_mappings_are_announced_answered_and_withdrawn() {
-        let (seg, rx) = wired();
-        let name = "9.1.0.10.in-addr.arpa";
-        let mut mapped = tv("10.0.1.9", &["TV"]);
-        mapped.reverse = vec![ip("10.0.1.9")];
-        let of = |records: &[Record]| records.iter().find(|r| r.name == name).cloned();
-
-        // Only for an address the device announced one for.
-        seg.add_manual(Owner::Reflector(0), tv("10.0.1.9", &["TV"])).unwrap();
-        assert!(of(&recv(&rx).unwrap().answers).is_none());
-        seg.add_manual(Owner::Reflector(0), mapped.clone()).unwrap();
-        let r = of(&recv(&rx).unwrap().answers).expect("announced");
-        assert_eq!((r.data, r.cache_flush), (RData::Ptr("tv.local".into()), true));
-
-        age(&seg, 2);
-        seg.handle(sa("10.0.1.50"), &query(name, rtype::PTR, vec![])).unwrap();
-        let m = recv(&rx).unwrap();
-        assert_eq!(m.answers.len(), 1);
-        assert!(of(&m.answers).is_some());
-
-        // Moved: the old mapping is withdrawn along with the old address.
-        let mut moved = tv("10.0.1.10", &["TV"]);
-        moved.reverse = vec![ip("10.0.1.10")];
-        seg.add_manual(Owner::Reflector(0), moved).unwrap();
-        let m = recv(&rx).unwrap();
-        assert_eq!(of(&m.answers).map(|r| r.ttl), Some(0));
-        assert!(m.answers.iter().any(|r| r.name == "10.1.0.10.in-addr.arpa" && r.ttl > 0));
     }
 
     #[test]
