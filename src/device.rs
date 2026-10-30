@@ -514,6 +514,23 @@ impl Device {
         qs.into_queries()
     }
 
+    /// Queries that ask `questions`, put on another segment, as this
+    /// daemon's own: each once, a few to a packet, and for a multicast answer
+    /// whatever the asker wanted, so that it is heard and can be reflected.
+    pub fn forward_queries<'a>(questions: impl IntoIterator<Item = &'a Question>) -> Vec<Message> {
+        let mut qs = Questions::default();
+        for q in questions {
+            qs.ask(&q.name, q.qtype);
+        }
+        qs.into_queries()
+    }
+
+    /// Whether it has an answer to `q`: a record, or, by its NSEC, the word
+    /// that there is none.
+    pub fn knows(&self, q: &Question) -> bool {
+        !self.answers(&query(std::slice::from_ref(q)), 1, 1).0.is_empty()
+    }
+
     /// The queries that ask `devices`, on a segment of `family`, to answer
     /// again: each for what it announced (its address, and the service and
     /// text records of each of its instances), and not for whole service
@@ -1044,6 +1061,32 @@ mod tests {
         assert!(!bye.iter().any(|r| r.name.starts_with("Kitchen.") || r.data == RData::Ptr("Kitchen._http._tcp.local".into())));
         assert!(!bye.iter().any(|r| matches!(r.data, RData::Nsec { .. })));
         assert!(bye.iter().any(|r| r.name.starts_with("Den.")), "{bye:?}");
+    }
+
+    #[test]
+    fn a_device_knows_what_it_has_and_what_its_nsec_says_it_has_not() {
+        let mut device = tv("10.0.1.9", &["TV"]);
+        let knows = |d: &Device, name: &str, qtype: u16| {
+            d.knows(&Question { name: name.into(), qtype, class: 1, unicast_response: false })
+        };
+        assert!(knows(&device, "TV.local", rtype::A));
+        assert!(knows(&device, "tv.local", rtype::ANY));
+        assert!(knows(&device, "_http._tcp.local", rtype::PTR));
+        assert!(knows(&device, "TV._http._tcp.local", rtype::SRV));
+        assert!(!knows(&device, "tv.local", rtype::AAAA), "it has not said");
+        assert!(!knows(&device, "printer.local", rtype::A));
+        device.nsec = Some(vec![rtype::A]);
+        assert!(knows(&device, "tv.local", rtype::AAAA), "it said it has none");
+    }
+
+    #[test]
+    fn forwarded_queries_ask_each_question_once_for_a_multicast_answer() {
+        let ask = |name: &str, qtype: u16, unicast_response: bool| Question { name: name.into(), qtype, class: 255, unicast_response };
+        let questions = [ask("printer.local", rtype::A, true), ask("Printer.local", rtype::A, false), ask("_ipp._tcp.local", rtype::PTR, false)];
+        let queries = Device::forward_queries(&questions);
+        assert_eq!(asked(&queries), [q("printer.local", rtype::A), q("_ipp._tcp.local", rtype::PTR)]);
+        assert!(queries.iter().flat_map(|m| &m.questions).all(|q| !q.unicast_response && q.class == 1));
+        assert!(Device::forward_queries(&[]).is_empty());
     }
 
     #[test]

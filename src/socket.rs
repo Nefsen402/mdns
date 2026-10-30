@@ -20,7 +20,7 @@ use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 use crate::device::{
     addr_of, is_service_type, service_ttl, Device, Report, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
 };
-use crate::parser::{Header, Message, RData, Record};
+use crate::parser::{Header, Message, Question, RData, Record};
 use crate::timer::{self, Next, Timer};
 
 pub const MDNS_PORT: u16 = 5353;
@@ -52,6 +52,14 @@ const MAX_TYPES: usize = 256;
 
 /// A record may not be multicast more than once a second (RFC 6762 section 6).
 const MIN_MULTICAST_GAP: Duration = Duration::from_secs(1);
+
+/// A question put to a segment on another's behalf is not put to it again
+/// within this long: clients ask again after a second, and several ask alike.
+const FORWARD_GAP: Duration = Duration::from_secs(1);
+
+/// Questions remembered per segment as just put to it, so that a client
+/// asking endless made-up names cannot grow the list without bound.
+const MAX_FORWARDED: usize = 1024;
 
 /// The default for how long a device is kept at least after it was last heard
 /// from, whatever TTLs it announced. See [`Segment::set_min_lifetime`].
@@ -183,13 +191,19 @@ fn set_int(socket: &Socket, level: libc::c_int, name: libc::c_int, value: libc::
     Ok(())
 }
 
-/// A change to the *discovered* list. Manual devices never produce events.
+/// A change to the *discovered* list (manual devices never produce events),
+/// or questions asked on the segment that it could not answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Added(Device),
     /// Hostname or services changed.
     Updated(Device),
     Removed(Device),
+    /// The questions of a query that nothing announced here has an answer
+    /// to, and that no device here owns the name of: for the reflector to
+    /// put to the segments whose devices it announces here
+    /// ([`Segment::query_question`]).
+    Question(Vec<Question>),
 }
 
 /// Something a segment's timer is waiting to do: see [`Segment::pending`].
@@ -344,6 +358,9 @@ struct State {
     /// [`Segment::add_manual`] announces; `None` follows each device's own.
     reflect_ttl: Option<u32>,
     wake: Option<Wake>,
+    /// The questions put to this segment on another's behalf, in lowercase,
+    /// and when, for [`FORWARD_GAP`].
+    forwarded: HashMap<(String, u16), Instant>,
 }
 
 impl State {
@@ -474,6 +491,28 @@ impl State {
             self.manual.remove(key);
         }
         Ok(sent)
+    }
+
+    /// The questions of `query` that nothing announced here has an answer to,
+    /// and that are not about a name a device here owns (it answers for
+    /// itself): those to put to the other segments. None from a device
+    /// probing for names it is about to take: they are its own.
+    fn unknown(&self, query: &Message) -> Vec<Question> {
+        if !query.authorities.is_empty() {
+            return Vec::new();
+        }
+        let local = self.local_instances();
+        let shown: Vec<&Device> = self.manual.values().filter_map(|m| m.shown.as_ref()).collect();
+        query
+            .questions
+            .iter()
+            .filter(|q| {
+                let name = q.name.to_ascii_lowercase();
+                let here = local.contains(&name) || self.discovered.contains_key(&Key::Host(name));
+                !here && !shown.iter().any(|d| d.knows(q))
+            })
+            .cloned()
+            .collect()
     }
 
     /// The devices this segment answers queries for, by hostname: what is
@@ -828,6 +867,9 @@ impl Segment {
     /// not multicast more than once a second. A device probing for names it
     /// is about to take is not answered with reflected copies: it would take
     /// them for a conflict, and once it announces, the copy gives way.
+    ///
+    /// What it has no answer to is passed on to the subscribers as an
+    /// [`Event::Question`], for the reflector to ask elsewhere.
     fn respond(&self, from: SocketAddr, query: &Message) -> Result<()> {
         let h = &query.header;
         if h.response || h.opcode != 0 || h.rcode != 0 || query.questions.is_empty() {
@@ -838,6 +880,10 @@ impl Segment {
 
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
+        let unknown = state.unknown(query);
+        if !unknown.is_empty() {
+            state.notify(Event::Question(unknown));
+        }
         let probing = !query.authorities.is_empty();
         let (keys, devices): (Vec<String>, Vec<Device>) = state.answering(now, legacy, probing).into_iter().unzip();
         let Some((msg, answered)) = Device::query_response(&devices, query, legacy) else {
@@ -853,6 +899,34 @@ impl Segment {
             }
         }
         Ok(())
+    }
+
+    /// Ask the devices on this segment `questions` that another segment had
+    /// no answer to, in a query of the daemon's own: nothing of the asker's
+    /// packet comes here, not its address, not its known answers, not its
+    /// wish for a unicast reply. Their answers are heard like any, and so
+    /// reflected; the asker, asking again, is answered from that.
+    ///
+    /// A question asked here within [`FORWARD_GAP`] is not asked again, nor
+    /// any once [`MAX_FORWARDED`] are waiting it out. Returns how many were
+    /// asked. A no-op when the segment has no sender attached.
+    pub fn query_question(&self, questions: &[Question]) -> Result<usize> {
+        let now = Instant::now();
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        if state.outbound.is_none() {
+            return Ok(0);
+        }
+        state.forwarded.retain(|_, at| now.saturating_duration_since(*at) < FORWARD_GAP);
+        let mut fresh = Vec::new();
+        for q in questions {
+            let key = (q.name.to_ascii_lowercase(), q.qtype);
+            if !state.forwarded.contains_key(&key) && state.forwarded.len() < MAX_FORWARDED {
+                state.forwarded.insert(key, now);
+                fresh.push(q);
+            }
+        }
+        ask(&state.outbound, &Device::forward_queries(fresh))
     }
 
     // Fed by the receive loops and the timer.
@@ -1478,6 +1552,79 @@ mod tests {
         assert!(recv(&rx).is_some());
     }
 
+    /// A question nothing announced here answers is passed on for the
+    /// reflector to ask elsewhere; one something does, or that a device here
+    /// owns the name of, or that a device asks while probing, is not.
+    #[test]
+    fn a_question_nothing_here_answers_is_passed_on() {
+        let (seg, rx) = wired();
+        let events = seg.subscribe();
+        let mut copy = tv("10.0.2.9", &["TV"]);
+        copy.nsec = Some(vec![rtype::A]);
+        seg.add_manual(Owner::Reflector(0), copy).unwrap();
+        recv(&rx).unwrap();
+        hear(&seg, "10.0.1.20", vec![
+            a_record("nas.local", "10.0.1.20"),
+            srv("Files._smb._tcp.local", 445, "nas.local"),
+        ]);
+        let client = sa("10.0.1.50");
+
+        seg.handle(client, &asking(&[question("printer.local", rtype::A)], vec![])).unwrap();
+        assert_eq!(passed_on(&events), [vec![question("printer.local", rtype::A)]]);
+
+        // Only what is not known: the copy's address, and even what its NSEC
+        // says it has not got, are answered here.
+        let mixed = [question("tv.local", rtype::A), question("tv.local", rtype::AAAA), question("_ipp._tcp.local", rtype::PTR)];
+        seg.handle(client, &asking(&mixed, vec![])).unwrap();
+        assert_eq!(passed_on(&events), [vec![question("_ipp._tcp.local", rtype::PTR)]]);
+
+        // A copy that may not answer again just yet still knows the answer.
+        seg.handle(client, &asking(&[question("tv.local", rtype::A)], vec![])).unwrap();
+        assert!(passed_on(&events).is_empty());
+
+        // Names a device here owns, it answers for itself, whatever the case.
+        let owned = [question("NAS.local", rtype::A), question("files._smb._tcp.local", rtype::TXT)];
+        seg.handle(client, &asking(&owned, vec![])).unwrap();
+        assert!(passed_on(&events).is_empty());
+
+        // A probe is the prober's own business, and a response asks nothing.
+        seg.handle(client, &asking(&[question("printer.local", rtype::ANY)], vec![a_record("printer.local", "10.0.1.50")])).unwrap();
+        hear(&seg, "10.0.1.20", vec![a_record("nas.local", "10.0.1.20")]);
+        assert!(passed_on(&events).is_empty());
+    }
+
+    #[test]
+    fn a_question_from_elsewhere_is_asked_once_a_second_without_the_askers_wishes() {
+        let (seg, rx) = wired();
+        let wants_unicast = Question { unicast_response: true, ..question("printer.local", rtype::A) };
+        let questions = [wants_unicast, question("_ipp._tcp.local", rtype::PTR)];
+
+        assert_eq!(seg.query_question(&questions).unwrap(), 2);
+        let m = recv(&rx).unwrap();
+        assert_eq!(asked(&m), BTreeSet::from([q("printer.local", rtype::A), q("_ipp._tcp.local", rtype::PTR)]));
+        assert!(m.answers.is_empty() && m.authorities.is_empty());
+
+        // Again right away, in another case: not asked again.
+        assert_eq!(seg.query_question(&[question("PRINTER.local", rtype::A)]).unwrap(), 0);
+        assert!(recv(&rx).is_none());
+
+        // A second on, it is.
+        for at in seg.state.lock().unwrap().forwarded.values_mut() {
+            *at -= FORWARD_GAP;
+        }
+        assert_eq!(seg.query_question(&questions[..1]).unwrap(), 1);
+        recv(&rx).unwrap();
+
+        // However many made-up names are asked, only so many are waited out.
+        let flood: Vec<Question> = (0..MAX_FORWARDED + 10).map(|i| question(&format!("x{i}.local"), rtype::A)).collect();
+        assert_eq!(seg.query_question(&flood).unwrap(), MAX_FORWARDED - 1);
+        assert!(seg.state.lock().unwrap().forwarded.len() <= MAX_FORWARDED);
+        while recv(&rx).is_some() {}
+
+        // Without a sender, nothing.
+        assert_eq!(Segment::new("quiet", Family::V4).query_question(&questions).unwrap(), 0);
+    }
+
     #[test]
     fn add_rejects_unannounceable_devices() {
         let (seg, rx) = wired();
@@ -1500,6 +1647,34 @@ mod tests {
         }
         .encode()
         .unwrap()
+    }
+
+    fn question(name: &str, qtype: u16) -> Question {
+        Question { name: name.into(), qtype, class: 1, unicast_response: false }
+    }
+
+    /// A query asking `questions`, with `proposed` records if it is a probe.
+    fn asking(questions: &[Question], proposed: Vec<Record>) -> Vec<u8> {
+        Message {
+            header: Header { id: 0, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 },
+            questions: questions.to_vec(),
+            answers: vec![],
+            authorities: proposed,
+            additionals: vec![],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// The questions passed on so far, one list per query.
+    fn passed_on(events: &Receiver<Event>) -> Vec<Vec<Question>> {
+        events
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Question(qs) => Some(qs),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Pretend the last multicast of every reflected device was `secs` ago.

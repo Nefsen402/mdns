@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 
 use crate::device::Device;
+use crate::parser::Question;
 use crate::socket::{Event, Family, Owner, Segment};
 
 /// How often a worker checks for shutdown while waiting for events.
@@ -208,7 +209,7 @@ impl Inner {
         }
         let seg = &self.segments[src];
         let ttl = match event {
-            Event::Removed(_) => Duration::ZERO,
+            Event::Removed(_) | Event::Question(_) => Duration::ZERO,
             Event::Added(device) | Event::Updated(device) => seg.lifetime_left(device),
         };
         let notice = Notice { interface: seg.interface().to_string(), family: seg.family(), event: event.clone(), ttl };
@@ -216,6 +217,9 @@ impl Inner {
     }
 
     fn apply(&self, src: usize, event: Event) {
+        if let Event::Question(questions) = &event {
+            return self.forward(src, questions);
+        }
         self.notify(src, &event);
         let mut book = self.book();
         match event {
@@ -226,8 +230,28 @@ impl Inner {
                     book.sources.remove(&(src, key));
                 }
             }
+            // Forwarded above.
+            Event::Question(_) => {}
         }
         self.reconcile(&mut book);
+    }
+
+    /// Put the questions asked on `src` that it had no answer to, to the
+    /// other segments: those whose devices are announced on it, so whose
+    /// answers will be. An untrusted segment is announced nothing, so its
+    /// questions are put nowhere.
+    fn forward(&self, src: usize, questions: &[Question]) {
+        if self.untrusted[src] {
+            return;
+        }
+        for (target, seg) in self.segments.iter().enumerate() {
+            if target == src {
+                continue;
+            }
+            if let Err(e) = seg.query_question(questions) {
+                eprintln!("{}/{:?}: asking on behalf of {} failed: {e:#}", seg.interface(), seg.family(), self.segments[src].interface());
+            }
+        }
     }
 
     /// What `target` should be announcing: every reflectable device from the
@@ -314,7 +338,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
     use super::*;
-    use crate::parser::{Header, Message, RData, Record};
+    use crate::parser::{rtype, Header, Message, RData, Record};
     use crate::socket::Family;
 
     /// A segment whose "multicast group" is a local socket we can read.
@@ -798,6 +822,58 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert_eq!(br0.manual_devices(), [router]);
         assert!(drain(&br0_rx).is_empty(), "nothing about it was sent, or withdrawn");
+    }
+
+    /// A client on `seg` asks `name` (type A), from port 5353.
+    fn ask(seg: &Segment, client: &str, name: &str) {
+        let msg = Message {
+            header: Header { id: 0, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 },
+            questions: vec![Question { name: name.into(), qtype: rtype::A, class: 1, unicast_response: false }],
+            answers: vec![],
+            authorities: vec![],
+            additionals: vec![],
+        };
+        seg.handle(SocketAddr::new(ip(client), 5353), &msg.encode().unwrap()).unwrap();
+    }
+
+    /// What `msgs` ask, by name.
+    fn asked_names(msgs: &[Message]) -> Vec<String> {
+        msgs.iter().filter(|m| !m.header.response).flat_map(|m| &m.questions).map(|q| q.name.clone()).collect()
+    }
+
+    /// A question br0 has no answer to is asked, by the daemon, on the
+    /// segments whose devices br0 is told about, untrusted ones included.
+    /// Their answer is reflected, and the client asking again is answered.
+    /// An untrusted segment's questions go nowhere: nothing would come back.
+    #[test]
+    fn a_question_nothing_answers_is_asked_where_the_answer_could_come_from() {
+        let (br0, br0_rx) = wired("br0");
+        let (media, media_rx) = wired("media");
+        let (wifi, wifi_rx) = wired("wifi");
+        let _r = Reflector::with_untrusted(0, vec![br0.clone(), media.clone(), wifi.clone()], &["wifi".to_string()]).unwrap();
+
+        ask(&br0, "10.0.0.50", "printer.local");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(asked_names(&drain(&media_rx)), ["printer.local"]);
+        assert_eq!(asked_names(&drain(&wifi_rx)), ["printer.local"]);
+        assert!(drain(&br0_rx).is_empty(), "nothing to answer, and nothing asked there");
+
+        // The printer on media answers the daemon, and br0 is told of it.
+        announce(&media, "10.0.2.7", "printer.local", &["Printer"]);
+        wait_for(|| br0.manual_devices().len() == 1);
+        let told: Vec<Record> = drain(&br0_rx).into_iter().flat_map(|m| m.answers).collect();
+        assert!(told.iter().any(|r| r.data == RData::A("10.0.2.7".parse().unwrap())), "{told:?}");
+
+        // The client asking again is answered on br0 (once the copy may be
+        // multicast again), and nothing more is asked elsewhere.
+        ask(&br0, "10.0.0.50", "printer.local");
+        thread::sleep(Duration::from_millis(100));
+        assert!(asked_names(&drain(&media_rx)).is_empty() && asked_names(&drain(&wifi_rx)).is_empty());
+
+        // The untrusted one asks: nothing is asked on its behalf.
+        ask(&wifi, "10.0.3.50", "nas.local");
+        thread::sleep(Duration::from_millis(100));
+        assert!(asked_names(&drain(&br0_rx)).is_empty() && asked_names(&drain(&media_rx)).is_empty());
     }
 
     /// The bug this guards against: a device on one network announced to

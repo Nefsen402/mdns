@@ -74,6 +74,14 @@ section of
 .BR mdnsd.conf (5)
 (it is not by default).
 .PP
+A query that nothing the daemon announces on an interface can answer, and that
+is not about a name a device there owns, is also asked by the daemon on the
+other interfaces of that interface's segments, in a query of its own: the answer
+is reflected, and the client asking again is answered.
+Only the question crosses, not the client's address or known answers.
+A question is asked on an interface at most once a second; an untrusted
+interface's questions are asked nowhere.
+.PP
 Most devices only answer when asked, and one that is not heard from expires, so
 a device that is about to expire is asked to answer again, on its own: this long
 before the end of its lifetime, which is the longest TTL it announced and at

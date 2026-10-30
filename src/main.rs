@@ -253,7 +253,8 @@ fn start_link(
     thread::spawn({
         let name = name.clone();
         move || {
-            for event in events {
+            // Questions passed on for the reflector are not worth a line each.
+            for event in events.iter().filter(|e| !matches!(e, socket::Event::Question(_))) {
                 eprintln!("{name}: {event:?}");
             }
         }

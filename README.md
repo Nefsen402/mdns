@@ -330,6 +330,18 @@ addresses of devices that have a name but no routable address yet. Many devices
 answer only when asked, and a device needs a hostname and a routable address to
 be reflected, so without probing they would stay invisible.
 
+Devices are also found by **asking on a client's behalf**. A query that nothing
+the daemon announces on that interface can answer (and that is not about a name
+a device there owns) is asked again, by the daemon, on the other interfaces of
+its segments: those whose devices it is told about. The answer is reflected like
+any other, and the client, asking again a second later as clients do, is
+answered. Only the question crosses, in the daemon's own query: not the client's
+address, nor the known answers in its query, nor its wish for a unicast reply.
+A question is asked on an interface at most once a second. An untrusted
+interface's questions are asked nowhere, since nothing could be reflected back
+to it, but questions are asked *on* untrusted interfaces, so they see the names
+the others look for (not who looks).
+
 - A device is identified by its **hostname**, and its addresses are the ones it
   announces in its own A and AAAA records (plus the address it sent from, if it
   announced none of its own). A packet may describe several devices (a

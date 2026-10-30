@@ -205,7 +205,11 @@ fn stream_events(writer: &mut UnixStream, name: &str, events: &Receiver<Notice>)
     writeln!(writer, "{}", json!({ "ok": true, "name": name, "watching": true }))?;
     loop {
         match events.recv_timeout(STREAM_CHECK) {
-            Ok(notice) => writeln!(writer, "{}", notice_json(name, &notice))?,
+            Ok(notice) => {
+                if let Some(json) = notice_json(name, &notice) {
+                    writeln!(writer, "{json}")?;
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if client_gone(writer)? {
                     return Ok(());
@@ -234,18 +238,20 @@ fn client_gone(stream: &UnixStream) -> io::Result<bool> {
     }
 }
 
-fn notice_json(segment: &str, notice: &Notice) -> Value {
+/// A device's change as `watch` shows it; `None` for what is not one.
+fn notice_json(segment: &str, notice: &Notice) -> Option<Value> {
     let (event, device) = match &notice.event {
         Event::Added(d) => ("added", d),
         Event::Updated(d) => ("updated", d),
         Event::Removed(d) => ("removed", d),
+        Event::Question(_) => return None,
     };
-    json!({
+    Some(json!({
         "event": event,
         "segment": segment,
         "ttl": notice.ttl.as_secs(),
         "device": device_json(&notice.interface, notice.family, device),
-    })
+    }))
 }
 
 /// Answer one request line with one line of JSON.
