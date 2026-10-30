@@ -1,2 +1,2 @@
-# System user for the mdns daemon (mdnsctl access = membership of this group).
+# System user for mdnsd (mdnsctl access = membership of this group).
 u mdnsd - "mDNS discovery daemon" -

@@ -1,6 +1,6 @@
-.TH MDNSCTL 1 "October 2026" "mdns 0.1.0" "User Commands"
+.TH MDNSCTL 1 "October 2026" "mdnsd 0.1.0" "User Commands"
 .SH NAME
-mdnsctl \- query the mdns daemon
+mdnsctl \- query the mdnsd daemon
 .SH SYNOPSIS
 .B mdnsctl
 [\fB\-s\fR \fIPATH\fR]
@@ -14,7 +14,7 @@ mdnsctl \- query the mdns daemon
 .SH DESCRIPTION
 .B mdnsctl
 asks a running
-.BR mdns (8)
+.BR mdnsd (8)
 daemon what it knows, over the daemon's control socket.
 Each command of the control protocol has a subcommand here.
 Options must come before the command; everything after the command name
@@ -498,5 +498,5 @@ $ printf 'segments\endevices IoT\en' | ncat \-U /run/mdnsd/mdnsd.sock
 .fi
 .RE
 .SH SEE ALSO
-.BR mdns (8),
+.BR mdnsd (8),
 .BR mdnsd.conf (5)

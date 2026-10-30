@@ -4,9 +4,9 @@
 # tarball): run `makepkg -f` from this directory (packaging/arch). The build
 # happens here and not at the project root, because makepkg's default source
 # directory, ./src, would otherwise be the project's own Rust sources.
-pkgname=mdns
+pkgname=mdnsd
 pkgver=0.1.0
-pkgrel=4
+pkgrel=1
 pkgdesc='mDNS discovery and per-segment reflection daemon, with the mdnsctl client'
 arch=('x86_64' 'aarch64')
 license=('GPL-3.0-only')
@@ -40,12 +40,12 @@ package() {
   cd "$startdir/../.."
   _cargo_target
 
-  install -Dm755 "$CARGO_TARGET_DIR/release/mdns" "$pkgdir/usr/bin/mdns"
+  install -Dm755 "$CARGO_TARGET_DIR/release/mdnsd" "$pkgdir/usr/bin/mdnsd"
   install -Dm755 "$CARGO_TARGET_DIR/release/mdnsctl" "$pkgdir/usr/bin/mdnsctl"
 
   install -Dm644 man/mdnsctl.1 "$pkgdir/usr/share/man/man1/mdnsctl.1"
   install -Dm644 man/mdnsd.conf.5 "$pkgdir/usr/share/man/man5/mdnsd.conf.5"
-  install -Dm644 man/mdns.8 "$pkgdir/usr/share/man/man8/mdns.8"
+  install -Dm644 man/mdnsd.8 "$pkgdir/usr/share/man/man8/mdnsd.8"
 
   install -Dm644 systemd/mdnsd.service "$pkgdir/usr/lib/systemd/system/mdnsd.service"
   install -Dm644 systemd/mdnsd.sysusers "$pkgdir/usr/lib/sysusers.d/mdnsd.conf"

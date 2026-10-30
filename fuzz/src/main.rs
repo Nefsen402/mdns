@@ -81,9 +81,9 @@ fn main() -> ExitCode {
     let opts = match options(std::env::args().skip(1)) {
         Ok(opts) => opts,
         Err(e) => {
-            eprintln!("mdns-fuzz: {e}");
+            eprintln!("mdnsd-fuzz: {e}");
             eprintln!(
-                "usage: mdns-fuzz [--seed N] [--duration SECS] [--rate PACKETS_PER_SEC]\n                 \
+                "usage: mdnsd-fuzz [--seed N] [--duration SECS] [--rate PACKETS_PER_SEC]\n                 \
                  [--only unparseable,names,addresses,floods] [--stop-on-first] [--daemon PATH]"
             );
             return ExitCode::from(2);
@@ -91,7 +91,7 @@ fn main() -> ExitCode {
     };
     let result = if stage == "fuzzer" { fuzz(&opts) } else { outside(&opts) };
     result.unwrap_or_else(|e| {
-        eprintln!("mdns-fuzz: {e}");
+        eprintln!("mdnsd-fuzz: {e}");
         ExitCode::FAILURE
     })
 }
@@ -138,9 +138,9 @@ fn outside(opts: &Options) -> Result<ExitCode, String> {
         Some(path) => path.clone(),
         None => {
             let target = repo().join("target/fuzz-daemon");
-            eprintln!("mdns-fuzz: building the daemon (debug, with overflow checks) in {}", target.display());
+            eprintln!("mdnsd-fuzz: building the daemon (debug, with overflow checks) in {}", target.display());
             let status = Command::new(env!("CARGO"))
-                .args(["build", "--bin", "mdns", "--manifest-path"])
+                .args(["build", "--bin", "mdnsd", "--manifest-path"])
                 .arg(repo().join("Cargo.toml"))
                 .arg("--target-dir")
                 .arg(&target)
@@ -149,7 +149,7 @@ fn outside(opts: &Options) -> Result<ExitCode, String> {
             if !status.success() {
                 return Err("building the daemon failed".into());
             }
-            target.join("debug/mdns")
+            target.join("debug/mdnsd")
         }
     };
     let daemon = daemon.canonicalize().map_err(|e| format!("{}: {e}", daemon.display()))?;
@@ -161,12 +161,12 @@ fn outside(opts: &Options) -> Result<ExitCode, String> {
 /// In the daemon's namespace: take over its interfaces, and become it.
 fn router() -> ExitCode {
     if let Err(e) = net::take_over() {
-        eprintln!("mdns-fuzz router: {e}");
+        eprintln!("mdnsd-fuzz router: {e}");
         return ExitCode::FAILURE;
     }
     let daemon = std::env::var_os(DAEMON).unwrap_or_default();
     let e = Command::new(daemon).arg(std::env::var_os(CONFIG).unwrap_or_default()).exec();
-    eprintln!("mdns-fuzz router: running the daemon: {e}");
+    eprintln!("mdnsd-fuzz router: running the daemon: {e}");
     ExitCode::FAILURE
 }
 
@@ -253,7 +253,7 @@ fn drive(opts: &Options, run: &Path, socket: &Path, daemon: &mut Child) -> Resul
     let steady: Vec<Category> = opts.only.iter().copied().filter(|c| *c != Category::Flood).collect();
     let per_tick = (opts.rate as u128 * TICK.as_millis() / 1000).max(1) as usize;
 
-    eprintln!("mdns-fuzz: seed {}, {}s, {} inputs/s, logging to {}", opts.seed, opts.duration.as_secs(), opts.rate, run.display());
+    eprintln!("mdnsd-fuzz: seed {}, {}s, {} inputs/s, logging to {}", opts.seed, opts.duration.as_secs(), opts.rate, run.display());
     let start = Instant::now();
     let (mut next_canary, mut next_flood) = (start, start + FLOOD_EVERY);
     let mut canary = 0u64;

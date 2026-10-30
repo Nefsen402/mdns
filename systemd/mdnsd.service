@@ -1,13 +1,13 @@
 [Unit]
 Description=mDNS discovery and reflection daemon
-Documentation=file:///usr/share/doc/mdns/README.md
+Documentation=man:mdnsd(8) man:mdnsd.conf(5) man:mdnsctl(1)
 After=network.target
 # Nothing to do until the segments have been configured.
 ConditionPathExists=/etc/mdnsd.conf
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/mdns /etc/mdnsd.conf
+ExecStart=/usr/bin/mdnsd /etc/mdnsd.conf
 # The config is read once at startup; SIGTERM makes the daemon send goodbyes
 # for everything it reflected, then exit. It is not restarted if it fails:
 # interfaces that appear late are waited for, so a failure is a fault to look

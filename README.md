@@ -1,4 +1,4 @@
-# mdns
+# mdnsd
 
 An mDNS (Bonjour/Avahi-style) daemon for Linux routers and hosts. It keeps track
 of the devices on each network it is told to watch, makes chosen ones visible on
@@ -117,7 +117,7 @@ Untrusted=wifi
   from every network, with its own address on each.
 - Interfaces may come and go: a VLAN that is created after the daemon starts, or
   recreated, is picked up without a restart
-  (see `mdns(8)`).
+  (see `mdnsd(8)`).
 
 mDNS only makes devices **discoverable**. Your firewall must still allow the
 connections between the networks (the phone on the LAN connecting to the
@@ -133,7 +133,7 @@ media_stuff: 3 devices
   desktop.local         -               10.0.0.10, fd00::10
 ```
 
-The rules for what is reflected, and when, are in `mdns(8)`. Don't run another
+The rules for what is reflected, and when, are in `mdnsd(8)`. Don't run another
 reflector (Avahi's `enable-reflector`) over the same interfaces.
 
 ## Tracking devices for scripts
@@ -237,10 +237,10 @@ Things to know when using it this way:
 
 ```sh
 cargo build --release
-# produces target/release/mdns (the daemon) and target/release/mdnsctl (the client)
+# produces target/release/mdnsd (the daemon) and target/release/mdnsctl (the client)
 
-mdns                     # reads /etc/mdnsd.conf
-mdns /path/to/other.conf # or a config file you name
+mdnsd                     # reads /etc/mdnsd.conf
+mdnsd /path/to/other.conf # or a config file you name
 ```
 
 To run it as a service, see [Installing (Arch Linux)](#installing-arch-linux).
@@ -249,7 +249,7 @@ The configuration is read once at startup; restart the daemon to apply changes.
 Startup fails, naming the problem, if the config is invalid or an interface
 that is there cannot be opened. One that is not there yet is waited for. The
 daemon stops cleanly on `SIGTERM` or `SIGINT`, withdrawing what it reflected
-with goodbyes (see `mdns(8)`).
+with goodbyes (see `mdnsd(8)`).
 
 ## Installing (Arch Linux)
 
@@ -257,13 +257,13 @@ The `PKGBUILD` in `packaging/arch/` builds a package from the working tree:
 
 ```sh
 cd packaging/arch
-makepkg -f          # builds, runs the test suite, and creates mdns-*.pkg.tar.zst
-sudo pacman -U mdns-*.pkg.tar.zst
+makepkg -f          # builds, runs the test suite, and creates mdnsd-*.pkg.tar.zst
+sudo pacman -U mdnsd-*.pkg.tar.zst
 ```
 
-It installs `/usr/bin/mdns`, `/usr/bin/mdnsctl`, the `mdnsd.service` unit, a
+It installs `/usr/bin/mdnsd`, `/usr/bin/mdnsctl`, the `mdnsd.service` unit, a
 sysusers entry that creates the unprivileged `mdnsd` user, and the man pages
-(`mdns(8)`, `mdnsd.conf(5)`, `mdnsctl(1)`). No `/etc/mdnsd.conf` is installed,
+(`mdnsd(8)`, `mdnsd.conf(5)`, `mdnsctl(1)`). No `/etc/mdnsd.conf` is installed,
 since only you know your interfaces. Write one
 (starting from [Reflecting between networks](#reflecting-between-networks) or
 [Tracking devices for scripts](#tracking-devices-for-scripts)), then start the
@@ -284,7 +284,7 @@ Notes on the service:
   if it fails, so a crash shows in `systemctl status mdnsd` and the journal
   instead of being retried past. Interfaces that appear after boot (VLANs,
   Wi-Fi) need no restart: the daemon follows interfaces as they come and go
-  (see `mdns(8)`). Configuration is read at start, so apply changes with
+  (see `mdnsd(8)`). Configuration is read at start, so apply changes with
   `systemctl restart mdnsd`.
 - `systemctl stop` sends `SIGTERM`, so reflected devices are withdrawn cleanly.
 - The control socket lives in `/run/mdnsd/`, readable only by the `mdnsd`
@@ -292,14 +292,14 @@ Notes on the service:
   `sudo usermod -aG mdnsd $USER` (then log in again).
 
 To run it by hand instead, point `Socket=` at a directory you can write to:
-`mdns /path/to/mdnsd.conf` as root, or as a normal user with a config whose
+`mdnsd /path/to/mdnsd.conf` as root, or as a normal user with a config whose
 `[Ipc] Socket=` is somewhere under your home or `/tmp`.
 
 ## Documentation
 
 The man pages are the reference, and are installed with the package:
 
-- **`mdns(8)`**: what the daemon does: how devices are tracked, probed and
+- **`mdnsd(8)`**: what the daemon does: how devices are tracked, probed and
   refreshed, exactly what is reflected and what is not, the advertised name,
   interfaces coming and going, signals and shutdown.
 - **`mdnsd.conf(5)`**: every setting, with its default and limits.

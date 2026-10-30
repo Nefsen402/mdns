@@ -1,11 +1,11 @@
 [package]
-name = "mdns"
+name = "mdnsd"
 version = "0.1.0"
 edition = "2024"
 description = "mDNS discovery and per-segment reflection daemon, with the mdnsctl client"
 license = "GPL-3.0-only"
 
-default-run = "mdns"
+default-run = "mdnsd"
 
 [[bin]]
 name = "mdnsctl"

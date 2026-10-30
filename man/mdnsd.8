@@ -1,11 +1,11 @@
-.TH MDNS 8 "October 2026" "mdns 0.1.0" "System Administration"
+.TH MDNSD 8 "October 2026" "mdnsd 0.1.0" "System Administration"
 .SH NAME
-mdns \- mDNS discovery and reflection daemon
+mdnsd \- mDNS discovery and reflection daemon
 .SH SYNOPSIS
-.B mdns
+.B mdnsd
 [\fIconfig-file\fR]
 .SH DESCRIPTION
-.B mdns
+.B mdnsd
 tracks the devices announcing themselves with multicast DNS (Bonjour, Avahi)
 on a set of network interfaces, and reflects them between the interfaces you
 choose, and only those.
@@ -263,7 +263,7 @@ Run in the foreground with a configuration file of your own:
 .PP
 .RS
 .nf
-$ mdns ./mdnsd.conf
+$ mdnsd ./mdnsd.conf
 .fi
 .RE
 .PP

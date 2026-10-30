@@ -1,5 +1,5 @@
 [package]
-name = "mdns-fuzz"
+name = "mdnsd-fuzz"
 version = "0.1.0"
 edition = "2024"
 description = "Feeds bogus mDNS devices to the reflector in a network namespace, and checks none come out the other side"
