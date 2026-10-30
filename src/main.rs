@@ -1,6 +1,8 @@
 mod config;
 mod device;
 mod ipc;
+mod links;
+mod netlink;
 mod parser;
 mod reflector;
 mod signal;
@@ -8,7 +10,6 @@ mod socket;
 mod timer;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -17,9 +18,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use config::Config;
+use links::Link;
+use netlink::Netlink;
 use reflector::Reflector;
-use device::Device;
-use socket::{Family, MdnsSocket, Owner, Segment};
+use socket::{Family, Owner, Segment};
 use timer::Timer;
 
 /// One configured segment, over every family the daemon listens on.
@@ -44,14 +46,25 @@ fn main() -> Result<()> {
         .filter_map(|(enabled, family)| enabled.then_some(family))
         .collect();
 
+    // Hear of interfaces coming and going from before the sockets are opened,
+    // so that no change in between is missed.
+    let netlink = Netlink::open().context("listening for interface changes (netlink)")?;
+
     // One link per interface, however many segments use it, with a socket
     // for each family and one list of devices for both: mDNS records do not
-    // belong to the transport they come over.
+    // belong to the transport they come over. One that is not there yet is
+    // waited for.
+    let mut tracked = Vec::new();
     let mut links: HashMap<&str, Segment> = HashMap::new();
     for interface in config.interfaces() {
-        let link = start_link(interface, &families, &config, &timer)?;
-        links.insert(interface, link);
+        let mut link = Link::new(interface, &families, &config, &timer);
+        if !link.open()? {
+            eprintln!("{interface}: not there yet; waiting for it");
+        }
+        links.insert(interface, link.segment().clone());
+        tracked.push(link);
     }
+    thread::spawn(move || links::track(netlink, tracked));
 
     // One reflector per configured segment, over the shared links. Where
     // segments share an interface and both want a hostname announced there,
@@ -176,94 +189,6 @@ fn release(mut segments: Arc<Vec<Group>>) {
             }
             Err(_) => {
                 eprintln!("segments still in use after 5s; exiting without goodbyes");
-                return;
-            }
-        }
-    }
-}
-
-/// Open a socket for each of `families` on one interface, and start the
-/// link's threads: a receive loop per socket, both feeding the one list of
-/// devices, and an event logger, which run until the process exits. Expiry,
-/// refreshing and re-announcement run on `timer`.
-///
-/// With `[Advertise] Hostname=` in `config`, the link also announces that name
-/// (say `router.local`) with this host's addresses on the interface, one of
-/// each family, as a reflected device with a hostname and addresses but no
-/// services, with its records valid for `[Advertise] TTL=`. The addresses are
-/// read once, here.
-fn start_link(interface: &str, families: &[Family], config: &Config, timer: &Timer) -> Result<Segment> {
-    let link = Segment::new(interface, families);
-    link.set_min_lifetime(config.min_lifetime);
-    link.set_max_addrs(config.max_addrs);
-    link.set_reflect_ttl(config.reflect_ttl);
-    let mut sockets = Vec::new();
-    for &family in families {
-        let sock = socket::open(interface, family).with_context(|| format!("opening {family:?} socket on {interface}"))?;
-        eprintln!("listening on {interface} ({family:?})");
-        let (tx, dest) = sock.sender()?;
-        link.attach(family, tx, dest);
-        sockets.push(sock);
-    }
-
-    if let Some(name) = config.advertise.as_deref() {
-        let ttl = config.advertise_ttl;
-        // On its own link, the router's link-local address is as good as any,
-        // and for IPv6 it is the one the kernel picks. An interface without
-        // an address of a family has none of it to advertise; that is not a
-        // reason to refuse to start.
-        let addrs: Vec<IpAddr> = sockets
-            .iter()
-            .filter_map(|sock| match sock.local_addr() {
-                Ok(addr) => Some(addr),
-                Err(e) => {
-                    eprintln!("{interface}/{:?}: no address to advertise {name} with: {e:#}", sock.family);
-                    None
-                }
-            })
-            .collect();
-        let mut device = Device { hostname: Some(name.to_string()), ..Device::default() };
-        device.add_addrs(&addrs);
-        match link.add_manual_ttl(Owner::Own, device, ttl) {
-            Ok(_) => {
-                let shown: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
-                eprintln!("{interface}: advertising {name} as {} (TTL {}s)", shown.join(", "), ttl.as_secs());
-            }
-            Err(e) => eprintln!("{interface}: not advertising {name}: {e:#}"),
-        }
-    }
-
-    // Placeholder consumer: log changes to the discovered list.
-    let events = link.subscribe();
-    let name = interface.to_string();
-    thread::spawn(move || {
-        // Questions passed on for the reflector are not worth a line each.
-        for event in events.iter().filter(|e| !matches!(e, socket::Event::Question(_))) {
-            eprintln!("{name}: {event:?}");
-        }
-    });
-
-    link.schedule(timer, config.refresh_before);
-
-    for sock in sockets {
-        let receiver = link.clone();
-        thread::spawn(move || recv_loop(sock, receiver));
-    }
-    Ok(link)
-}
-
-fn recv_loop(sock: MdnsSocket, segment: Segment) {
-    let udp: UdpSocket = sock.socket.into();
-    let mut buf = [0u8; 9000];
-    loop {
-        match udp.recv_from(&mut buf) {
-            Ok((len, from)) => {
-                if let Err(e) = segment.handle(from, &buf[..len]) {
-                    eprintln!("{} {:?}: reply failed: {e:#}", sock.interface, sock.family);
-                }
-            }
-            Err(e) => {
-                eprintln!("{} {:?}: recv failed: {e}", sock.interface, sock.family);
                 return;
             }
         }

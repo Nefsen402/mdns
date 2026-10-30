@@ -236,8 +236,7 @@ which is what the kernel uses as the source address towards the mDNS group
 there.
 An interface that has no address of a family is skipped, with a message in
 the log.
-The addresses are read once, at startup: restart the daemon after changing
-them.
+The addresses are read again whenever they change.
 .IP
 The name is announced and kept alive like a reflected device, answers queries
 (a reflected device without services), and is withdrawn with a goodbye on
@@ -265,7 +264,8 @@ Quote it if it contains spaces.
 .B Interfaces=
 Required.
 The interfaces of the segment, separated by commas and/or whitespace.
-Every interface must exist when the daemon starts.
+An interface need not exist when the daemon starts: it is waited for, and the
+daemon follows it as it comes and goes.
 .TP
 .B Untrusted=
 Optional.

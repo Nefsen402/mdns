@@ -169,6 +169,15 @@ A device on the interface itself comes first of all: while it has a hostname,
 or a service instance name, no reflected copy of it is announced there.
 Different hostnames never clash, even on one address: a device with several
 names has each of them reflected.
+.SS Interfaces coming and going
+The daemon follows the kernel's link and address changes over rtnetlink.
+An interface that is not there at startup is waited for.
+One that is deleted has its sockets closed and its devices forgotten, so their
+copies elsewhere are withdrawn.
+One created again, under a new index, gets new sockets; once it is up, what the
+daemon announces there is announced again and it is probed, as also when it
+merely goes down and up.
+One whose addresses change has the advertised name announced with the new ones.
 .SS Control socket
 The daemon serves a local control socket, described under
 .B [Ipc]
@@ -202,8 +211,9 @@ or
 .BR SIGINT .
 .TP
 .B 1
-Startup failed: the configuration is invalid, an interface cannot be opened, or
-the control socket cannot be created.
+Startup failed: the configuration is invalid, an interface that is there
+cannot be opened (one that is not is waited for), interface changes cannot be
+followed (netlink), or the control socket cannot be created.
 The reason is printed on standard error.
 .SH FILES
 .TP
@@ -219,8 +229,10 @@ It runs the daemon as the unprivileged
 .B mdnsd
 user, starts it only once
 .I /etc/mdnsd.conf
-exists, and restarts it every five seconds if it exits, which covers interfaces
-that appear after boot.
+exists.
+It is not restarted if it fails, so that a failure shows in
+.BR "systemctl status mdnsd" ;
+interfaces that appear after boot are waited for, and need no restart.
 .SH NOTES
 Binding a socket to a single interface needs no privilege on Linux 5.7 and
 newer.

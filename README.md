@@ -33,7 +33,7 @@ To run it as a service, see [Installing (Arch Linux)](#installing-arch-linux).
 
 The configuration is read once at startup; restart the daemon to apply changes.
 Startup fails, naming the problem, if the config is invalid or an interface
-cannot be opened. The daemon stops cleanly on `SIGTERM` or `SIGINT` (see
+that is there cannot be opened. One that is not there yet is waited for. The daemon stops cleanly on `SIGTERM` or `SIGINT` (see
 [Shutdown](#shutdown)).
 
 ## Installing (Arch Linux)
@@ -66,9 +66,12 @@ Notes on the service:
 - It runs as `mdnsd`, not root, with a locked-down sandbox (no capabilities,
   read-only filesystem, a syscall allow-list). Binding a socket to one
   interface needs no privilege on **Linux 5.7 or newer**.
-- It does not start until `/etc/mdnsd.conf` exists, and it is restarted every
-  5 seconds if it exits, which covers VLAN or Wi-Fi interfaces that appear
-  after boot. Configuration is read at start, so apply changes with
+- It does not start until `/etc/mdnsd.conf` exists. It is **not** restarted
+  if it fails, so a crash shows in `systemctl status mdnsd` and the journal
+  instead of being retried past. Interfaces that appear after boot (VLANs,
+  Wi-Fi) need no restart: the daemon follows interfaces as they come and go
+  (see [Interfaces coming and going](#interfaces-coming-and-going)).
+  Configuration is read at start, so apply changes with
   `systemctl restart mdnsd`.
 - `systemctl stop` sends `SIGTERM`, so reflected devices are withdrawn cleanly.
 - The control socket lives in `/run/mdnsd/`, readable only by the `mdnsd`
@@ -301,7 +304,7 @@ router. The IPv4 socket publishes an A record with the interface's primary
 IPv4 address and the IPv6 socket an AAAA record with its link-local IPv6
 address (the source address the kernel uses towards the mDNS group there). An
 interface with no address of a family is skipped, with a message in the log.
-Addresses are read once, at startup; restart the daemon after changing them.
+The addresses are read again whenever they change.
 
 Internally the name is just a reflected device that has a hostname and an
 address but no services, so it is announced, kept alive, answered for and
@@ -343,8 +346,8 @@ devices on an untrusted interface are still tracked and listed by `mdnsctl`.
   transitive, because a device reflected onto `br0` is not reflected again.
 - Two segments may not share **two or more** interfaces (they would both
   reflect between the same pair and fight over it). Sharing one is fine.
-- Names must be unique, an interface may be listed only once per segment, and
-  every interface must exist when the daemon starts.
+- Names must be unique, and an interface may be listed only once per segment.
+  An interface need not exist when the daemon starts: it is waited for.
 
 ### What gets reflected
 
@@ -450,6 +453,21 @@ the others look for (not who looks).
 The daemon binds with `SO_REUSEPORT`, so it can run next to Avahi while you
 migrate, but don't run two reflectors (this and Avahi's) over the same
 interfaces.
+
+### Interfaces coming and going
+
+The daemon follows the kernel's link and address changes (rtnetlink), so
+interfaces may come and go while it runs:
+
+- One that is **not there** at startup is waited for, and used once it appears.
+- One that is **deleted** has its sockets closed, and the devices on it are
+  forgotten, so their copies on the other networks are withdrawn.
+- One that is **created again** (a VLAN reconfigured, hostapd restarted; it then
+  has a new index, and a socket bound to the old one would hear nothing) gets
+  new sockets. Once it is up, everything the daemon announces there is announced
+  again and the interface is probed; so too when it merely goes down and up.
+- One whose **addresses change** has the [advertised name](#advertise-optional)
+  announced with the new ones.
 
 ## `mdnsctl`
 

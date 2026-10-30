@@ -9,11 +9,9 @@ ConditionPathExists=/etc/mdnsd.conf
 Type=exec
 ExecStart=/usr/bin/mdns /etc/mdnsd.conf
 # The config is read once at startup; SIGTERM makes the daemon send goodbyes
-# for everything it reflected, then exit.
-Restart=on-failure
-# The daemon exits if a configured interface cannot be opened yet (VLANs and
-# Wi-Fi often appear after the network target), so keep retrying.
-RestartSec=5s
+# for everything it reflected, then exit. It is not restarted if it fails:
+# interfaces that appear late are waited for, so a failure is a fault to look
+# into (systemctl status mdnsd), not something to retry past.
 
 # Unprivileged: port 5353 is unprivileged and binding a socket to one
 # interface needs no capability on Linux 5.7 or newer.
@@ -40,7 +38,9 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK: to follow interfaces as they come and go (VLANs and Wi-Fi often
+# appear after the network target, or are recreated).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

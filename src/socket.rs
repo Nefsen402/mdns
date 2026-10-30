@@ -99,30 +99,28 @@ impl MdnsSocket {
         Ok((self.socket.try_clone()?.into(), dest))
     }
 
-    /// The address this host uses on this interface: the source address the
-    /// kernel picks for traffic to the mDNS group there, which is the primary
-    /// IPv4 address and, for IPv6, the link-local address. Nothing is sent.
-    pub fn local_addr(&self) -> Result<IpAddr> {
-        let (domain, group) = match self.family {
-            Family::V4 => (Domain::IPV4, SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT))),
-            Family::V6 => (
-                Domain::IPV6,
-                SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, self.index)),
-            ),
-        };
-        // A throwaway socket: connecting UDP only makes the kernel choose a
-        // source address, which `local_addr` then reveals.
-        let probe = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        probe.bind_device(Some(self.interface.as_bytes()))?;
-        probe
-            .connect(&group.into())
-            .with_context(|| format!("finding the address used on {}", self.interface))?;
-        probe
-            .local_addr()?
-            .as_socket()
-            .map(|a| a.ip())
-            .ok_or_else(|| anyhow!("no local address on {}", self.interface))
-    }
+}
+
+/// The address this host uses on `interface` for `family`: the source
+/// address the kernel picks for traffic to the mDNS group there, which is the
+/// primary IPv4 address and, for IPv6, the link-local address. Nothing is
+/// sent.
+pub fn local_addr(interface: &str, family: Family) -> Result<IpAddr> {
+    let index = ifindex(interface)?;
+    let (domain, group) = match family {
+        Family::V4 => (Domain::IPV4, SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT))),
+        Family::V6 => (Domain::IPV6, SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, index))),
+    };
+    // A throwaway socket: connecting UDP only makes the kernel choose a
+    // source address, which `local_addr` then reveals.
+    let probe = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    probe.bind_device(Some(interface.as_bytes()))?;
+    probe.connect(&group.into()).with_context(|| format!("finding the address used on {interface}"))?;
+    probe
+        .local_addr()?
+        .as_socket()
+        .map(|a| a.ip())
+        .ok_or_else(|| anyhow!("no local address on {interface}"))
 }
 
 pub fn ifindex(name: &str) -> Result<u32> {
@@ -919,6 +917,53 @@ impl Segment {
         drop(guard);
         self.rearm();
         Ok(true)
+    }
+
+    /// Let go of every way to send, as when the interface is gone: what is
+    /// announced here is kept, to announce again once it is back.
+    pub fn detach_all(&self) {
+        self.state.lock().unwrap().outbound.clear();
+    }
+
+    /// Announce again everything announced here, as when the interface has
+    /// come back: whoever is on it now may never have heard it. A failed send
+    /// is retried by [`Segment::reannounce`].
+    pub fn announce_all(&self) -> Result<()> {
+        let now = Instant::now();
+        let mut guard = self.state.lock().unwrap();
+        let State { manual, outbound, .. } = &mut *guard;
+        let mut first_err = None;
+        for m in manual.values_mut() {
+            let Some(device) = &m.shown else { continue };
+            match send(outbound, &device.announcement(m.host_ttl, m.other_ttl)) {
+                Ok(()) => {
+                    m.announced = now;
+                    m.last_sent = Sent::both(now);
+                    m.retry = None;
+                }
+                Err(e) => {
+                    m.retry = Some(now + ANNOUNCE_RETRY);
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        drop(guard);
+        self.rearm();
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// Forget every device discovered here, as when the interface is gone:
+    /// they cannot be reached through it, and their copies elsewhere are
+    /// withdrawn. They are found again once it is back.
+    pub fn forget_discovered(&self) {
+        let mut state = self.state.lock().unwrap();
+        let keys: Vec<Key> = state.discovered.keys().cloned().collect();
+        for key in keys {
+            if let Some(entry) = state.forget(&key) {
+                state.notify(Event::Removed(entry.device));
+            }
+        }
+        state.settle_all(Instant::now());
     }
 
     /// The devices announced on this segment: for each hostname, what is
@@ -1939,6 +1984,35 @@ mod tests {
         assert!(seg.devices().iter().all(|d| d.hostname.is_none()), "gone");
     }
 
+    /// When the interface goes, the segment lets go of its sockets and of the
+    /// devices on it, and keeps what it announces; when it is back, that is
+    /// announced again.
+    #[test]
+    fn an_interface_that_goes_and_comes_back() {
+        let (seg, rx) = wired();
+        let events = seg.subscribe();
+        hear(&seg, "10.0.1.7", vec![a_record("nas.local", "10.0.1.7"), srv("NAS._smb._tcp.local", 445, "nas.local")]);
+        seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+        recv(&rx).unwrap();
+        events.try_iter().count();
+
+        // Gone: the devices heard on it are forgotten, what it announces kept.
+        seg.detach_all();
+        seg.forget_discovered();
+        assert!(seg.devices().is_empty());
+        assert!(matches!(events.try_recv(), Ok(Event::Removed(d)) if d.hostname.as_deref() == Some("nas.local")));
+        assert_eq!(seg.manual_devices().len(), 1);
+        seg.announce_all().unwrap();
+        assert!(recv(&rx).is_none(), "nothing goes out without a socket");
+
+        // Back: a new socket, and everything announced again.
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        seg.attach(Family::V4, tx, rx.local_addr().unwrap());
+        seg.announce_all().unwrap();
+        let m = recv(&rx).expect("announced again");
+        assert!(m.answers.iter().any(|r| r.name == "tv.local" && r.ttl > 0));
+    }
+
     #[test]
     fn add_rejects_unannounceable_devices() {
         let (seg, rx) = wired();
@@ -2285,7 +2359,7 @@ mod tests {
     fn live_local_addr() {
         let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
         for family in [Family::V4, Family::V6] {
-            let addr = open(&iface, family).unwrap().local_addr().unwrap();
+            let addr = local_addr(&iface, family).unwrap();
             println!("{iface} {family:?}: {addr}");
             assert!(!addr.is_loopback() && !addr.is_unspecified());
             assert_eq!(addr.is_ipv4(), family == Family::V4);
