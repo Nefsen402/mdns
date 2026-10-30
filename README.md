@@ -164,9 +164,12 @@ Untrusted=wifi
 | `IPv4` | `yes`   | Listen and announce on IPv4 (`224.0.0.251`).   |
 | `IPv6` | `yes`   | Listen and announce on IPv6 (`ff02::fb`).      |
 
-At least one must be enabled. The two families are completely independent: each
-has its own sockets, device lists and reflectors, and a device reachable over
-both appears once per family.
+At least one must be enabled. Each family has its own sockets, device lists and
+reflectors, so a device reachable over both appears once per family. But mDNS
+records do not belong to the transport they come over: a device's addresses of
+both families are kept, whichever family it was heard over, and passed on to
+the other networks, so a client asking over IPv4 is told of IPv6 addresses
+too.
 
 ### `[Ipc]` (optional)
 

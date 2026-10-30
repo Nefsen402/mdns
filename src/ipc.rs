@@ -313,7 +313,7 @@ fn devices(groups: &[Group], name: &str) -> Value {
     for g in members {
         for seg in g.reflector.segments() {
             let mut found = seg.devices();
-            found.sort_by_key(|d| (d.key(), d.routable, d.link_local));
+            found.sort_by_key(|d| (d.key(), d.addrs().collect::<Vec<_>>()));
             list.extend(found.iter().map(|d| device(seg, d)));
         }
     }
@@ -431,8 +431,8 @@ fn device_json(interface: &str, family: Family, d: &Device) -> Value {
         "interface": interface,
         "family": family_name(family),
         "hostname": d.hostname,
-        "routable": d.routable.map(|a| a.to_string()),
-        "link_local": d.link_local.map(|a| a.to_string()),
+        "routable": d.family(family).routable.map(|a| a.to_string()),
+        "link_local": d.family(family).link_local.map(|a| a.to_string()),
         "address_ttl": d.ttl,
         "services": services,
     })

@@ -234,9 +234,8 @@ fn start_link(
         // On its own link, the router's link-local address is as good as any,
         // and for IPv6 it is the one the kernel picks.
         let router = sock.local_addr().and_then(|addr| {
-            let (link_local, routable) =
-                if device::is_link_local(&addr) { (Some(addr), None) } else { (None, Some(addr)) };
-            let device = Device { hostname: Some(name.to_string()), link_local, routable, ..Device::default() };
+            let mut device = Device { hostname: Some(name.to_string()), ..Device::default() };
+            device.set_addrs(&[addr], addr);
             link.add_manual_ttl(Owner::Own, device, ttl).map(|_| addr)
         });
         match router {

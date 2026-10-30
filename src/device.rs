@@ -69,17 +69,26 @@ pub struct Service {
     pub ttl: u32,
 }
 
+/// A device's addresses of one family: a routable one, that other networks
+/// can reach it at (IPv4, or global/ULA IPv6), and a link-local one, which
+/// only means something on the link it was heard on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Addrs {
+    pub routable: Option<IpAddr>,
+    pub link_local: Option<IpAddr>,
+}
+
 /// A device on a segment. Once it has announced a hostname it is known by
 /// that; until then only by the address it was heard from.
 ///
-/// It has up to two addresses, of the segment's family: a link-local one,
-/// which only means something on the link it was heard on, and a routable one
-/// that other networks can reach it at (IPv4, or global/ULA IPv6).
+/// Its addresses are of both families, whichever it was heard over: mDNS
+/// records do not belong to the transport they came in, and an IPv4 packet
+/// may well carry a device's IPv6 addresses.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Device {
     pub hostname: Option<String>,
-    pub link_local: Option<IpAddr>,
-    pub routable: Option<IpAddr>,
+    pub ipv4: Addrs,
+    pub ipv6: Addrs,
     /// Those it learned of are in order of their instance names, ignoring
     /// case: names that differ only in case are one and the same.
     pub services: Vec<Service>,
@@ -116,10 +125,10 @@ pub struct Report<'a> {
     pub max_ttl: u32,
     /// The TTL its address records announced, if it has any of this family.
     pub addr_ttl: Option<u32>,
-    /// It announced addresses of this family that no device can be reached
-    /// at. Having announced addresses, it is not one to credit with the
-    /// address the packet came from instead.
-    pub refused: bool,
+    /// The addresses it announced that no device can be reached at. Having
+    /// announced addresses of a family, it is not one to credit with the
+    /// address of that family the packet came from instead.
+    pub refused: Vec<IpAddr>,
 }
 
 impl<'a> Report<'a> {
@@ -136,7 +145,7 @@ impl<'a> Report<'a> {
     ///
     /// A record that is not [well formed](well_formed) is left out, as if it
     /// were not there.
-    pub fn all(msg: &'a Message, family: Family) -> (Vec<Report<'a>>, Vec<&'a Record>) {
+    pub fn all(msg: &'a Message) -> (Vec<Report<'a>>, Vec<&'a Record>) {
         let records: Vec<&'a Record> = msg.records().filter(|r| well_formed(r)).collect();
         let mut reports: Vec<Report<'a>> = Vec::new();
         let mut instance_host: HashMap<String, usize> = HashMap::new();
@@ -193,7 +202,7 @@ impl<'a> Report<'a> {
         }
 
         for r in &mut reports {
-            (r.addrs, r.refused) = announced_addrs(&records, &r.host, family);
+            (r.addrs, r.refused) = announced_addrs(&records, &r.host);
             r.addr_ttl = records
                 .iter()
                 .filter(|rec| rec.name.eq_ignore_ascii_case(&r.host))
@@ -220,25 +229,20 @@ fn report_index(reports: &mut Vec<Report<'_>>, host: &str) -> usize {
         records: Vec::new(),
         max_ttl: 0,
         addr_ttl: None,
-        refused: false,
+        refused: Vec::new(),
     });
     reports.len() - 1
 }
 
-/// The usable addresses of `family` that `records` announce for `host`, and
-/// whether they announced any of that family that are not.
-fn announced_addrs(records: &[&Record], host: &str, family: Family) -> (Vec<IpAddr>, bool) {
-    let mut found: Vec<IpAddr> = Vec::new();
-    let mut refused = false;
+/// The usable addresses that `records` announce for `host`, of either
+/// family, and those they announced that are not.
+fn announced_addrs(records: &[&Record], host: &str) -> (Vec<IpAddr>, Vec<IpAddr>) {
+    let (mut found, mut refused) = (Vec::new(), Vec::new());
     for rec in records.iter().filter(|r| r.ttl > 0 && r.name.eq_ignore_ascii_case(host)) {
         let Some(addr) = addr_of(&rec.data) else { continue };
-        if !matches!((family, addr), (Family::V4, IpAddr::V4(_)) | (Family::V6, IpAddr::V6(_))) {
-            continue;
-        }
-        if !is_usable(addr) {
-            refused = true;
-        } else if !found.contains(&addr) {
-            found.push(addr);
+        let list = if is_usable(addr) { &mut found } else { &mut refused };
+        if !list.contains(&addr) {
+            list.push(addr);
         }
     }
     (found, refused)
@@ -354,9 +358,31 @@ fn unescape(label: &str) -> String {
 }
 
 impl Device {
-    /// Its addresses, the routable one first.
+    /// Its addresses, the routable ones first, IPv4 before IPv6.
     pub fn addrs(&self) -> impl Iterator<Item = IpAddr> {
-        self.routable.into_iter().chain(self.link_local)
+        self.routable().chain(self.ipv4.link_local).chain(self.ipv6.link_local)
+    }
+
+    /// Its routable addresses, IPv4 before IPv6.
+    pub fn routable(&self) -> impl Iterator<Item = IpAddr> {
+        self.ipv4.routable.into_iter().chain(self.ipv6.routable)
+    }
+
+    /// Its addresses of `family`.
+    pub fn family(&self, family: Family) -> &Addrs {
+        match family {
+            Family::V4 => &self.ipv4,
+            Family::V6 => &self.ipv6,
+        }
+    }
+
+    /// This device without its link-local addresses, which mean nothing off
+    /// its own link.
+    pub fn without_link_local(&self) -> Device {
+        let mut device = self.clone();
+        device.ipv4.link_local = None;
+        device.ipv6.link_local = None;
+        device
     }
 
     /// What identifies it in the manual list and to the reflector: its
@@ -384,18 +410,23 @@ impl Device {
         self.learn_records(report.records.iter().copied());
     }
 
-    /// Record the addresses a packet vouches for. When there are several of a
-    /// kind, the one the packet came from wins, else the lowest.
+    /// Record the addresses a packet vouches for, of either family. When
+    /// there are several of a kind, the one the packet came from wins, else
+    /// the lowest.
     pub fn set_addrs(&mut self, addrs: &[IpAddr], src: IpAddr) {
-        let pick = |wanted: bool| {
-            let found: Vec<IpAddr> = addrs.iter().copied().filter(|a| is_link_local(a) == wanted).collect();
-            found.contains(&src).then_some(src).or_else(|| found.iter().min().copied())
-        };
-        if let Some(a) = pick(false) {
-            self.routable = Some(a);
-        }
-        if let Some(a) = pick(true) {
-            self.link_local = Some(a);
+        for v4 in [true, false] {
+            let pick = |link_local: bool| {
+                let found: Vec<IpAddr> =
+                    addrs.iter().copied().filter(|a| a.is_ipv4() == v4 && is_link_local(a) == link_local).collect();
+                found.contains(&src).then_some(src).or_else(|| found.iter().min().copied())
+            };
+            let family = if v4 { &mut self.ipv4 } else { &mut self.ipv6 };
+            if let Some(a) = pick(false) {
+                family.routable = Some(a);
+            }
+            if let Some(a) = pick(true) {
+                family.link_local = Some(a);
+            }
         }
     }
 
@@ -645,7 +676,7 @@ impl Device {
             qs.ask(&svc.instance, rtype::SRV);
             qs.ask(&svc.instance, rtype::TXT);
         }
-        for host in devices.iter().filter(|d| d.routable.is_none()).filter_map(|d| d.hostname.as_deref()) {
+        for host in devices.iter().filter(|d| d.routable().next().is_none()).filter_map(|d| d.hostname.as_deref()) {
             qs.ask(host, address_type(family));
         }
         qs.into_queries()
@@ -839,8 +870,9 @@ impl Device {
                 extra.push(rec.clone());
             }
         }
-        // An address comes with the NSEC that says which kinds of address
-        // there are (RFC 6762 section 6.2).
+        // An address comes with the name's addresses of the other family, and
+        // the NSEC that says which kinds of address there are (RFC 6762
+        // section 6.2): so a client asking over IPv4 learns of IPv6 too.
         let hosts: Vec<String> = answers
             .iter()
             .chain(&extra)
@@ -848,8 +880,8 @@ impl Device {
             .map(|r| r.name.clone())
             .collect();
         for rec in &all {
-            let wanted =
-                matches!(rec.data, RData::Nsec { .. }) && hosts.iter().any(|h| rec.name.eq_ignore_ascii_case(h));
+            let wanted = matches!(rec.data, RData::A(_) | RData::Aaaa(_) | RData::Nsec { .. })
+                && hosts.iter().any(|h| rec.name.eq_ignore_ascii_case(h));
             if wanted && !answers.contains(rec) && !extra.contains(rec) {
                 extra.push(rec.clone());
             }
@@ -1012,25 +1044,24 @@ mod tests {
 
     /// Make `device` hear `records` from `src`, as a segment puts them to the
     /// one device they are about: the report on it, and what ties to no host.
-    fn hear(device: &mut Device, family: Family, src: &str, records: Vec<Record>) {
+    fn hear(device: &mut Device, src: &str, records: Vec<Record>) {
         let msg = response(records);
-        let (reports, rest) = Report::all(&msg, family);
+        let (reports, rest) = Report::all(&msg);
         for report in &reports {
             device.learn(report, &report.addrs, ip(src));
         }
         device.learn_records(rest.into_iter());
     }
 
-    fn heard(family: Family, src: &str, records: Vec<Record>) -> Device {
+    fn heard(src: &str, records: Vec<Record>) -> Device {
         let mut device = Device::default();
-        hear(&mut device, family, src, records);
+        hear(&mut device, src, records);
         device
     }
 
     fn tv(addr: &str, instances: &[&str]) -> Device {
-        Device {
+        let mut device = Device {
             hostname: Some("tv.local".into()),
-            routable: Some(ip(addr)),
             services: instances
                 .iter()
                 .map(|i| Service {
@@ -1042,7 +1073,9 @@ mod tests {
                 })
                 .collect(),
             ..Device::default()
-        }
+        };
+        device.set_addrs(&[ip(addr)], ip(addr));
+        device
     }
 
     /// Two devices with a service of one type, and one with another type.
@@ -1121,7 +1154,7 @@ mod tests {
         unresolved.hostname = None;
         unresolved.services[0].subtypes = vec!["_scanner._sub._http._tcp.local".into()];
         // Known by name, but only by a link-local address.
-        let named = Device { hostname: Some("nas.local".into()), link_local: Some(ip("169.254.1.1")), ..Device::default() };
+        let named = Device { hostname: Some("nas.local".into()), ipv4: Addrs { link_local: Some(ip("169.254.1.1")), ..Addrs::default() }, ..Device::default() };
         let types = BTreeSet::from(["_ipp._tcp.local".to_string()]);
 
         let questions = asked(&Device::probe_queries(&[resolved, unresolved, named], &types, Family::V4));
@@ -1181,7 +1214,7 @@ mod tests {
 
         // Moved: the new address, and a goodbye for the old one that does not
         // flush the new.
-        let moved = Device { routable: Some(ip("10.0.1.10")), ..old.clone() };
+        let moved = Device { ipv4: Addrs { routable: Some(ip("10.0.1.10")), ..Addrs::default() }, ..old.clone() };
         let bye = goodbyes(&Device::transition(Some(&old), Some(&moved), &none, false));
         assert_eq!(bye.len(), 1);
         assert_eq!((&bye[0].data, bye[0].cache_flush), (&RData::A("10.0.1.9".parse().unwrap()), false));
@@ -1279,7 +1312,7 @@ mod tests {
             ptr("_http._tcp.local", "Other Type._ipp._tcp.local"),
             srv("TV._http._tcp.local", 80, "tv.local"),
         ]);
-        let (reports, rest) = Report::all(&msg, Family::V4);
+        let (reports, rest) = Report::all(&msg);
         let [report] = &reports[..] else { panic!("{} reports", reports.len()) };
         assert_eq!((report.host.as_str(), report.addrs.clone()), ("tv.local", vec![ip("10.0.1.7")]));
         let kept: Vec<&str> = report.records.iter().map(|r| r.name.as_str()).collect();
@@ -1291,19 +1324,25 @@ mod tests {
     fn a_host_that_announced_only_unusable_addresses_is_refused() {
         let refused = |records| {
             let msg = response(records);
-            let (reports, _) = Report::all(&msg, Family::V4);
-            (reports[0].addrs.clone(), reports[0].refused)
+            let (reports, _) = Report::all(&msg);
+            (reports[0].addrs.clone(), reports[0].refused.clone())
         };
-        assert_eq!(refused(vec![a_record("tv.local", "0.0.0.0")]), (vec![], true));
-        assert_eq!(refused(vec![a_record("tv.local", "0.0.0.0"), a_record("tv.local", "10.0.1.7")]), (vec![ip("10.0.1.7")], true));
-        assert_eq!(refused(vec![srv("TV._http._tcp.local", 80, "tv.local")]), (vec![], false), "it said nothing");
-        // Another family's address is neither.
-        assert_eq!(refused(vec![aaaa("tv.local", "::1")]), (vec![], false));
+        assert_eq!(refused(vec![a_record("tv.local", "0.0.0.0")]), (vec![], vec![ip("0.0.0.0")]));
+        assert_eq!(
+            refused(vec![a_record("tv.local", "0.0.0.0"), a_record("tv.local", "10.0.1.7")]),
+            (vec![ip("10.0.1.7")], vec![ip("0.0.0.0")])
+        );
+        assert_eq!(refused(vec![srv("TV._http._tcp.local", 80, "tv.local")]), (vec![], vec![]), "it said nothing");
+        // Of either family, whatever the packet came over.
+        assert_eq!(
+            refused(vec![aaaa("tv.local", "::1"), aaaa("tv.local", "fd00::7")]),
+            (vec![ip("fd00::7")], vec![ip("::1")])
+        );
     }
 
     #[test]
     fn a_device_holds_only_so_much() {
-        let mut device = Device { hostname: Some("tv.local".into()), routable: Some(ip("10.0.1.7")), ..Device::default() };
+        let mut device = Device { hostname: Some("tv.local".into()), ipv4: Addrs { routable: Some(ip("10.0.1.7")), ..Addrs::default() }, ..Device::default() };
         let services: Vec<Record> = (0..MAX_SERVICES + 10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
         device.learn_records(services.iter());
         assert_eq!(device.services.len(), MAX_SERVICES);
@@ -1319,24 +1358,43 @@ mod tests {
     }
 
     #[test]
-    fn an_ipv6_device_has_a_link_local_and_a_routable_address() {
-        // It sends from its link-local address and announces that, a ULA, and
-        // (wrongly for an IPv6 segment) an IPv4 address, which is ignored.
-        let device = heard(Family::V6, "fe80::7", vec![
+    fn a_device_has_the_addresses_of_both_families_whatever_it_was_heard_over() {
+        // It sends from its IPv6 link-local address and announces that, a
+        // ULA, and its IPv4 address, all in one packet.
+        let device = heard("fe80::7", vec![
             aaaa("tv.local", "fd00:0:1::7"),
             aaaa("tv.local", "fe80::7"),
             a_record("tv.local", "10.0.1.7"),
         ]);
         assert_eq!(device.hostname.as_deref(), Some("tv.local"));
-        assert_eq!(device.routable, Some(ip("fd00:0:1::7")));
-        assert_eq!(device.link_local, Some(ip("fe80::7")));
+        assert_eq!(device.ipv6, Addrs { routable: Some(ip("fd00:0:1::7")), link_local: Some(ip("fe80::7")) });
+        assert_eq!(device.ipv4, Addrs { routable: Some(ip("10.0.1.7")), link_local: None });
+
+        // One family heard later leaves the other as it was.
+        let mut device = heard("10.0.1.8", vec![a_record("nas.local", "10.0.1.8")]);
+        hear(&mut device, "10.0.1.8", vec![aaaa("nas.local", "fd00::8")]);
+        assert_eq!((device.ipv4.routable, device.ipv6.routable), (Some(ip("10.0.1.8")), Some(ip("fd00::8"))));
     }
+
+    /// Asked for one family's address, a device answers with the other's too
+    /// (RFC 6762 section 6.2): a client asking over IPv4 learns of IPv6.
+    #[test]
+    fn an_address_answer_brings_the_other_familys() {
+        let mut device = tv("10.0.1.9", &["TV"]);
+        device.set_addrs(&[ip("fd00::9")], ip("fd00::9"));
+        for (asked, other) in [(rtype::A, RData::Aaaa("fd00::9".parse().unwrap())), (rtype::AAAA, RData::A("10.0.1.9".parse().unwrap()))] {
+            let (answers, extra) = device.answers(&query("tv.local", asked), 120, 4500);
+            assert_eq!(answers.len(), 1);
+            assert!(extra.iter().any(|r| r.data == other), "{other:?} in {extra:?}");
+        }
+    }
+
 
     /// DNS compares names without regard to case, and devices are not
     /// consistent about it, not even within one packet.
     #[test]
     fn names_that_differ_only_in_case_are_one_and_the_same() {
-        let mut device = heard(Family::V4, "10.0.1.7", vec![
+        let mut device = heard("10.0.1.7", vec![
             a_record("tv.local", "10.0.1.7"),
             ptr("_HTTP._TCP.LOCAL", "TV._http._tcp.local"),
             srv("tv._HTTP._tcp.local", 80, "tv.local"),
@@ -1347,13 +1405,13 @@ mod tests {
 
         // A goodbye in yet another spelling still says goodbye to it.
         let bye = Record { ttl: 0, ..srv("Tv._Http._Tcp.Local", 80, "tv.local") };
-        hear(&mut device, Family::V4, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), bye]);
+        hear(&mut device, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), bye]);
         assert!(device.services.is_empty());
     }
 
     #[test]
     fn the_ttls_a_device_announces_are_kept_and_the_address_ones_do_not_get_the_services() {
-        let device = heard(Family::V4, "10.0.1.30", vec![
+        let device = heard("10.0.1.30", vec![
             a_record("d.local", "10.0.1.30"),
             record("D._x._tcp.local".into(), true, 4500, RData::Srv { priority: 0, weight: 0, port: 1, target: "d.local".into() }),
             record("_x._tcp.local".into(), false, 100, RData::Ptr("D._x._tcp.local".into())),
@@ -1377,16 +1435,16 @@ mod tests {
             ]
         };
 
-        let mut device = heard(Family::V4, "10.0.1.8", printer(4500));
+        let mut device = heard("10.0.1.8", printer(4500));
         assert_eq!(device.services.len(), 1);
         assert_eq!(device.services[0].subtypes, ["_universal._sub._ipp._tcp.local"]);
         assert_eq!(device.services[0].kind, "_ipp._tcp.local", "the type is not the subtype's");
 
         // Heard again, in another case and on its own: still one.
-        hear(&mut device, Family::V4, "10.0.1.8", vec![ptr("_UNIVERSAL._sub._ipp._tcp.local", "Office._ipp._tcp.local")]);
+        hear(&mut device, "10.0.1.8", vec![ptr("_UNIVERSAL._sub._ipp._tcp.local", "Office._ipp._tcp.local")]);
         assert_eq!(device.services[0].subtypes.len(), 1);
 
-        hear(&mut device, Family::V4, "10.0.1.8", printer(0));
+        hear(&mut device, "10.0.1.8", printer(0));
         assert!(device.services[0].subtypes.is_empty());
         assert_eq!(device.services[0].port, 631);
     }
@@ -1427,14 +1485,14 @@ mod tests {
             srv("TV._http._tcp.local", 80, "tv.local"),
             nsec("TV._http._tcp.local", &[rtype::TXT, rtype::SRV]),
         ];
-        assert_eq!(Report::all(&response(records.clone()), Family::V4).0.len(), 1);
-        let mut device = heard(Family::V4, "10.0.1.7", records);
+        assert_eq!(Report::all(&response(records.clone())).0.len(), 1);
+        let mut device = heard("10.0.1.7", records);
         assert_eq!(device.nsec, Some(vec![rtype::A]));
 
         // On its own, it is still about the host it names.
-        hear(&mut device, Family::V4, "10.0.1.7", vec![nsec("TV.local", &[rtype::A, rtype::AAAA])]);
+        hear(&mut device, "10.0.1.7", vec![nsec("TV.local", &[rtype::A, rtype::AAAA])]);
         assert_eq!(device.nsec, Some(vec![rtype::A, rtype::AAAA]));
-        hear(&mut device, Family::V4, "10.0.1.7", vec![Record { ttl: 0, ..nsec("tv.local", &[rtype::A]) }]);
+        hear(&mut device, "10.0.1.7", vec![Record { ttl: 0, ..nsec("tv.local", &[rtype::A]) }]);
         assert_eq!(device.nsec, None);
     }
 
@@ -1481,15 +1539,15 @@ mod tests {
     #[test]
     fn reverse_mappings_are_kept_with_the_host_they_name() {
         let records = vec![a_record("tv.local", "10.0.1.7"), reverse("10.0.1.7", "tv.local")];
-        assert_eq!(Report::all(&response(records.clone()), Family::V4).0.len(), 1);
-        let mut device = heard(Family::V4, "10.0.1.7", records);
+        assert_eq!(Report::all(&response(records.clone())).0.len(), 1);
+        let mut device = heard("10.0.1.7", records);
         assert_eq!(device.reverse, [ip("10.0.1.7")]);
         assert!(device.services.is_empty());
 
         // On its own, as an answer to a reverse lookup: still the same.
-        hear(&mut device, Family::V4, "10.0.1.7", vec![reverse("10.0.1.7", "TV.local")]);
+        hear(&mut device, "10.0.1.7", vec![reverse("10.0.1.7", "TV.local")]);
         assert_eq!(device.reverse, [ip("10.0.1.7")]);
-        hear(&mut device, Family::V4, "10.0.1.7", vec![Record { ttl: 0, ..reverse("10.0.1.7", "tv.local") }]);
+        hear(&mut device, "10.0.1.7", vec![Record { ttl: 0, ..reverse("10.0.1.7", "tv.local") }]);
         assert!(device.reverse.is_empty());
     }
 
@@ -1503,14 +1561,14 @@ mod tests {
             nsec("tv.local", &[rtype::A]),
             reverse("10.0.1.7", "tv.local"),
         ]);
-        let (reports, rest) = Report::all(&msg, Family::V4);
+        let (reports, rest) = Report::all(&msg);
         assert!(rest.is_empty());
         let [report] = &reports[..] else { panic!("{} reports", reports.len()) };
         assert_eq!(report.host, "tv.local");
 
         let mut device = Device::default();
         device.learn(report, &report.addrs, ip("10.0.1.1"));
-        assert_eq!(device.routable, Some(ip("10.0.1.7")), "the proxy's address is not the host's");
+        assert_eq!(device.ipv4.routable, Some(ip("10.0.1.7")), "the proxy's address is not the host's");
         assert_eq!((device.nsec, device.reverse), (Some(vec![rtype::A]), vec![ip("10.0.1.7")]));
     }
 
