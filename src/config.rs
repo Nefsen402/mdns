@@ -677,6 +677,37 @@ interfaces=br0,wifi
         assert!(bad.contains("line 4") && bad.contains("ForwardQuestions"), "{bad}");
     }
 
+    /// A config is read from its file, and an error says which file, and,
+    /// for what is in it, which line.
+    #[test]
+    fn a_config_is_loaded_from_its_file() {
+        std::fs::create_dir_all("target").unwrap();
+        let path = PathBuf::from(format!("target/config-test-{}.conf", std::process::id()));
+        std::fs::write(&path, "[Segment]\nName=lan\nInterfaces=eth0\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().segments[0].interfaces, ["eth0"]);
+
+        std::fs::write(&path, "[Segment]\nName=lan\nInterfaces=eth0\nBogus=1\n").unwrap();
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(err.contains(&format!("parsing {}", path.display())) && err.contains("line 4"), "{err}");
+        std::fs::remove_file(&path).unwrap();
+
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(err.contains(&format!("reading {}", path.display())), "{err}");
+    }
+
+    /// A hostname to advertise is at most 253 bytes, as a DNS name is, even
+    /// with every label short enough.
+    #[test]
+    fn an_advertised_hostname_is_not_too_long() {
+        let label = "a".repeat(63);
+        let long = format!("{label}.{label}.{label}.{label}.local");
+        let err = error_of(&format!("[Advertise]\nHostname={long}\n{EXAMPLE}"));
+        assert!(err.contains("line 2") && err.contains("is too long"), "{err}");
+        let fits = format!("{label}.{label}.{label}.{}.local", "a".repeat(52));
+        assert_eq!(fits.len(), 250);
+        assert!(Config::parse(&format!("[Advertise]\nHostname={fits}\n{EXAMPLE}")).is_ok());
+    }
+
     #[test]
     fn the_probe_interval_is_off_by_default_and_takes_systemd_time_spans() {
         assert_eq!(Config::parse(EXAMPLE).unwrap().probe_interval, None);

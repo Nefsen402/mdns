@@ -718,6 +718,28 @@ mod tests {
         assert_eq!(Message::parse(&p), Err(ParseError::BadRdata("A")));
     }
 
+    /// An AAAA record of any length but 16, or an NSEC whose type bitmap is
+    /// empty, too long or runs over its record, is malformed.
+    #[test]
+    fn rejects_malformed_aaaa_and_nsec_data() {
+        let parse = |rtype: u16, rdata: &[u8]| {
+            let mut p = header(0x8400, 0, 1);
+            rr(&mut p, &labels(&["x", "local"]), rtype, 1, 10, rdata);
+            Message::parse(&p)
+        };
+        assert_eq!(parse(rtype::AAAA, &[0; 4]), Err(ParseError::BadRdata("AAAA")));
+        assert_eq!(parse(rtype::AAAA, &[0; 17]), Err(ParseError::BadRdata("AAAA")));
+        assert!(parse(rtype::AAAA, &[0; 16]).is_ok());
+
+        let next = labels(&["x", "local"]);
+        let nsec = |bitmap: &[u8]| [next.as_slice(), bitmap].concat();
+        assert!(parse(rtype::NSEC, &nsec(&[0, 1, 0x40])).is_ok(), "block 0, one byte: A");
+        assert_eq!(parse(rtype::NSEC, &nsec(&[0, 0])), Err(ParseError::BadRdata("NSEC")), "empty bitmap");
+        let long = [[0u8, 33].as_slice(), &[0; 33]].concat();
+        assert_eq!(parse(rtype::NSEC, &nsec(&long)), Err(ParseError::BadRdata("NSEC")), "over 32 bytes");
+        assert_eq!(parse(rtype::NSEC, &nsec(&[0, 4, 0x40])), Err(ParseError::BadRdata("NSEC")), "runs over");
+    }
+
     #[test]
     fn huge_counts_do_not_allocate_or_panic() {
         let mut p = header(0x8400, 0xffff, 0xffff);
@@ -800,6 +822,15 @@ mod tests {
             assert_eq!(reverse_addr(&reverse_name(addr).to_ascii_uppercase()), Some(addr), "case does not matter");
         }
         for not in ["tv.local", "1.0.10.in-addr.arpa", "256.1.0.10.in-addr.arpa", "x.ip6.arpa", "10.in-addr.arpa.local"] {
+            assert_eq!(reverse_addr(not), None, "{not}");
+        }
+        // An IPv6 name of other than 32 single hex digits.
+        let v6_name = reverse_name(v6);
+        let short = v6_name.strip_prefix("5.").unwrap();
+        let long = format!("0.{v6_name}");
+        // 32 labels still, but one of two digits.
+        let wide = v6_name.replacen("5.", "05.", 1);
+        for not in [short, &long, &wide, "ip6.arpa"] {
             assert_eq!(reverse_addr(not), None, "{not}");
         }
     }

@@ -1662,6 +1662,56 @@ mod tests {
         assert!(bye.iter().any(|r| r.name.starts_with("Den.")), "{bye:?}");
     }
 
+    /// A device is asked again for the address records of the families it
+    /// has, or of both if it has none yet.
+    #[test]
+    fn a_device_is_asked_for_the_addresses_of_its_families() {
+        let named = |addrs: &[&str]| {
+            let mut d = Device { hostname: Some("tv.local".into()), ..Device::default() };
+            d.add_addrs(&addrs.iter().map(|a| ip(a)).collect::<Vec<_>>());
+            d
+        };
+        assert_eq!(named(&["10.0.1.9"]).address_types(), [rtype::A]);
+        assert_eq!(named(&["fd00::9"]).address_types(), [rtype::AAAA]);
+        assert_eq!(named(&["10.0.1.9", "fd00::9"]).address_types(), [rtype::A, rtype::AAAA]);
+        assert_eq!(named(&[]).address_types(), [rtype::A, rtype::AAAA]);
+        assert_eq!(asked(&Device::refresh_queries(&[named(&[])], DEFAULT_MAX_PACKET)), [
+            q("tv.local", rtype::A),
+            q("tv.local", rtype::AAAA),
+        ]);
+    }
+
+    /// A copy's NSEC names the address types it is announced with, IPv6 as
+    /// well as IPv4, along with what the device said it has.
+    #[test]
+    fn a_copys_nsec_names_its_ipv6_addresses_too() {
+        let mut d = tv("fd00::9", &[]);
+        d.nsec = Some(vec![]);
+        let types = |d: &Device| match d.nsec_record(120).map(|r| r.data) {
+            Some(RData::Nsec { types, .. }) => types,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(types(&d), [rtype::AAAA]);
+        d.add_addrs(&[ip("10.0.1.9")]);
+        assert_eq!(types(&d), [rtype::A, rtype::AAAA]);
+    }
+
+    /// Only questions of class IN, or any class, are answered: mDNS records
+    /// are of IN alone.
+    #[test]
+    fn only_questions_of_class_in_or_any_are_answered() {
+        let d = tv("10.0.1.9", &["TV"]);
+        let of_class = |class: u16| {
+            let mut msg = query("tv.local", rtype::A);
+            msg.questions[0].class = class;
+            d.answers(&msg, 120, 4500).0
+        };
+        assert_eq!(of_class(1).len(), 1);
+        assert_eq!(of_class(255).len(), 1);
+        assert!(of_class(3).is_empty(), "CHAOS");
+        assert!(of_class(4).is_empty(), "Hesiod");
+    }
+
     #[test]
     fn a_device_knows_what_it_has_and_what_its_nsec_says_it_has_not() {
         let mut device = tv("10.0.1.9", &["TV"]);

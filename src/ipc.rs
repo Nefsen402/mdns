@@ -1247,6 +1247,26 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// A watch says what happened to a device as the daemon says it: added,
+    /// updated or removed. Questions are not changes, and are not shown.
+    #[test]
+    fn a_watch_line_says_what_happened() {
+        let seg = Segment::new("wifi", &[Family::V4]);
+        announce(&seg, "10.0.1.7", "tv.local", "TV");
+        let tv = seg.devices().remove(0);
+        let line = |event| notice_json("IoT", &Notice { interface: "wifi".into(), event, ttl: Duration::from_secs(120) });
+        for (event, said) in [
+            (Event::Added(tv.clone()), "added"),
+            (Event::Updated(tv.clone()), "updated"),
+            (Event::Removed(tv.clone()), "removed"),
+        ] {
+            let json = line(event).unwrap();
+            assert_eq!((json["event"].as_str(), json["segment"].as_str()), (Some(said), Some("IoT")));
+            assert_eq!((json["ttl"].as_u64(), json["device"]["hostname"].as_str()), (Some(120), Some("tv.local")));
+        }
+        assert!(line(Event::Question(vec![])).is_none());
+    }
+
     #[test]
     fn watch_is_refused_where_it_cannot_stream() {
         let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), &Watches::default(), "watch IoT")).unwrap();
