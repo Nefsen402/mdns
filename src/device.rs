@@ -24,13 +24,23 @@ pub const LEGACY_TTL_CAP: u32 = 10;
 /// DNS-SD service type enumeration (RFC 6763 section 9).
 pub const META_QUERY: &str = "_services._dns-sd._udp.local";
 
-/// Questions per query packet, to stay well inside one Ethernet frame.
+/// Questions per query packet, at most; fewer if they are long and would
+/// not fit in one packet.
 pub const QUESTIONS_PER_PACKET: usize = 16;
 
-/// The most a query with known answers is let grow to, to stay inside one
-/// Ethernet frame. Known answers that do not fit are left out: those devices
-/// answer, which is only more traffic.
-const KNOWN_ANSWERS_SIZE: usize = 1400;
+/// The most a packet may hold until the interface's MTU is known: a 1500-byte
+/// Ethernet frame less the IPv6 and UDP headers. Every packet the daemon
+/// sends is kept within its interface's limit, as one that is not goes out in
+/// IP fragments, which many devices and access points drop.
+pub const DEFAULT_MAX_PACKET: usize = 1452;
+
+/// What a legacy resolver takes unless its query says it takes more, with
+/// EDNS0 (RFC 1035 section 4.2.1, RFC 6891).
+const LEGACY_PACKET: usize = 512;
+
+/// The type of the EDNS0 pseudo-record, whose class is the size of reply
+/// the asker takes.
+const OPT: u16 = 41;
 
 /// Subtypes a probe asks for when their type is around. A device sends its
 /// subtypes only when it announces itself and when asked for one by name,
@@ -697,7 +707,7 @@ impl Device {
     /// when their type is browsed), where each instance not yet resolved is,
     /// and the addresses of a device known by name but without a routable
     /// address (it only ever showed a link-local one), of both families.
-    pub fn probe_queries(devices: &[Device], types: &BTreeSet<String>) -> Vec<Message> {
+    pub fn probe_queries(devices: &[Device], types: &BTreeSet<String>, limit: usize) -> Vec<Message> {
         let mut qs = Questions::default();
         qs.ask(META_QUERY, rtype::PTR);
 
@@ -723,30 +733,37 @@ impl Device {
             qs.ask(host, rtype::A);
             qs.ask(host, rtype::AAAA);
         }
-        qs.into_queries()
+        qs.into_queries(limit)
     }
 
     /// Queries that ask `questions`, put on another segment, as this
     /// daemon's own: each once, a few to a packet, and for a multicast answer
     /// whatever the asker wanted, so that it is heard and can be reflected.
     /// Each packet carries the `known` answers to its questions, as many as
-    /// fit, so that devices already heard of need not answer.
+    /// fit, so that devices already heard of need not answer. No packet is
+    /// bigger than `limit`.
     pub fn forward_queries<'a>(
         questions: impl IntoIterator<Item = &'a Question>,
         known: impl Fn(&Question) -> Vec<Record>,
+        limit: usize,
     ) -> Vec<Message> {
         let mut qs = Questions::default();
         for q in questions {
             qs.ask(&q.name, q.qtype);
         }
-        with_known(qs.into_queries(), known)
+        with_known(qs.into_queries(limit), known, limit)
     }
 
     /// Queries for the service types `kinds`, as asked for by name: each
     /// type, and, of the devices that have one, the instances not yet
     /// resolved and the hostnames without a routable address. Each packet
     /// carries the `known` answers to its questions, as many as fit.
-    pub fn type_queries(devices: &[Device], kinds: &[String], known: impl Fn(&Question) -> Vec<Record>) -> Vec<Message> {
+    pub fn type_queries(
+        devices: &[Device],
+        kinds: &[String],
+        known: impl Fn(&Question) -> Vec<Record>,
+        limit: usize,
+    ) -> Vec<Message> {
         let mut qs = Questions::default();
         for kind in kinds {
             qs.ask(kind, rtype::PTR);
@@ -761,7 +778,7 @@ impl Device {
             qs.ask(host, rtype::A);
             qs.ask(host, rtype::AAAA);
         }
-        with_known(qs.into_queries(), known)
+        with_known(qs.into_queries(limit), known, limit)
     }
 
     /// The device as far as the service types `kinds` go: its services of
@@ -790,7 +807,7 @@ impl Device {
     /// announced (its addresses, of the families it has, or both if it has
     /// none yet, and the service and text records of each of its instances),
     /// and not for whole service types, so that only they answer.
-    pub fn refresh_queries(devices: &[Device]) -> Vec<Message> {
+    pub fn refresh_queries(devices: &[Device], limit: usize) -> Vec<Message> {
         let mut qs = Questions::default();
         for device in devices {
             if let Some(host) = &device.hostname {
@@ -803,7 +820,7 @@ impl Device {
                 qs.ask(&svc.instance, rtype::TXT);
             }
         }
-        qs.into_queries()
+        qs.into_queries(limit)
     }
 
     /// The records that take a segment from announcing `old` to announcing
@@ -835,14 +852,24 @@ impl Device {
     }
 
     /// The reply to `query` from a responder that has `devices`: what each of
-    /// them answers, once each, in one message, each with the TTL of its
-    /// address ([`HOST_TTL`] if it has none) and of its services. Returns it
-    /// with the indices of the devices that answered, or `None` if none did.
+    /// them answers, once each, each with the TTL of its address
+    /// ([`HOST_TTL`] if it has none) and of its services, in as many packets
+    /// of at most `limit` bytes as it takes ([`responses`]). Returns them with
+    /// the indices of the devices that answered, or `None` if none did.
     ///
-    /// A `legacy` resolver, asking from a port other than 5353, gets a reply
+    /// A `legacy` resolver, asking from a port other than 5353, gets one reply
     /// it can take (RFC 6762 section 6.7): its question and id echoed, no TTL
-    /// over ten seconds, and no cache-flush bits.
-    pub fn query_response(devices: &[Device], query: &Message, legacy: bool) -> Option<(Message, Vec<usize>)> {
+    /// over ten seconds, no cache-flush bits, and no bigger than it says it
+    /// takes (512 bytes, unless its query says more with EDNS0), nor than
+    /// `limit`. Answers that
+    /// do not fit are left out and the reply marked truncated; additional
+    /// records that do not fit are only left out.
+    pub fn query_response(
+        devices: &[Device],
+        query: &Message,
+        legacy: bool,
+        limit: usize,
+    ) -> Option<(Vec<Message>, Vec<usize>)> {
         let mut answers: Vec<Record> = Vec::new();
         let mut additionals: Vec<Record> = Vec::new();
         let mut answered = Vec::new();
@@ -867,22 +894,31 @@ impl Device {
             return None;
         }
 
-        let mut msg = Message {
-            header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
-            questions: Vec::new(),
-            answers,
-            authorities: Vec::new(),
-            additionals,
-        };
-        if legacy {
-            msg.header.id = query.header.id;
-            msg.questions = query.questions.clone();
-            for r in msg.answers.iter_mut().chain(&mut msg.additionals) {
-                r.ttl = r.ttl.min(LEGACY_TTL_CAP);
-                r.cache_flush = false;
+        if !legacy {
+            return Some((responses(&answers, &additionals, limit), answered));
+        }
+
+        let limit = query
+            .additionals
+            .iter()
+            .find(|r| r.rtype() == OPT)
+            .map_or(LEGACY_PACKET, |opt| usize::from(opt.class | u16::from(opt.cache_flush) << 15))
+            .max(LEGACY_PACKET)
+            .min(limit);
+        let legacy = |r: &Record| Record { ttl: r.ttl.min(LEGACY_TTL_CAP), cache_flush: false, ..r.clone() };
+        let mut msg = response();
+        msg.header.id = query.header.id;
+        msg.questions = query.questions.clone();
+        for (additional, records) in [(false, &answers), (true, &additionals)] {
+            for rec in records {
+                section(&mut msg, additional).push(legacy(rec));
+                if size(&msg) > limit {
+                    section(&mut msg, additional).pop();
+                    msg.header.truncated |= !additional;
+                }
             }
         }
-        Some((msg, answered))
+        Some((vec![msg], answered))
     }
 
     /// Its records that match `query`, with known-answer suppression
@@ -1002,15 +1038,31 @@ impl Questions {
         }
     }
 
-    /// The questions as multicast queries, a few to a packet.
-    fn into_queries(self) -> Vec<Message> {
-        self.list.chunks(QUESTIONS_PER_PACKET).map(query).collect()
+    /// The questions as multicast queries: up to [`QUESTIONS_PER_PACKET`] to
+    /// a packet, and fewer if they would make it bigger than `limit`.
+    fn into_queries(self, limit: usize) -> Vec<Message> {
+        let mut out: Vec<Message> = Vec::new();
+        for q in self.list {
+            match out.last_mut() {
+                Some(msg) if msg.questions.len() < QUESTIONS_PER_PACKET => {
+                    msg.questions.push(q);
+                    if size(msg) > limit {
+                        let q = msg.questions.pop().expect("just pushed");
+                        out.push(query(&[q]));
+                    }
+                }
+                _ => out.push(query(&[q])),
+            }
+        }
+        out
     }
 }
 
 /// `queries` with the `known` answers to the questions of each, as many as
-/// fit in a frame, so that the devices already heard of need not answer.
-fn with_known(mut queries: Vec<Message>, known: impl Fn(&Question) -> Vec<Record>) -> Vec<Message> {
+/// keep it within `limit`, so that the devices already heard of need not
+/// answer. Those that do not fit are left out: those devices answer, which is
+/// only more traffic.
+fn with_known(mut queries: Vec<Message>, known: impl Fn(&Question) -> Vec<Record>, limit: usize) -> Vec<Message> {
     for msg in &mut queries {
         let records: Vec<Record> = msg.questions.iter().flat_map(&known).collect();
         for rec in records {
@@ -1018,13 +1070,97 @@ fn with_known(mut queries: Vec<Message>, known: impl Fn(&Question) -> Vec<Record
                 continue;
             }
             msg.answers.push(rec);
-            if msg.encode().map_or(true, |b| b.len() > KNOWN_ANSWERS_SIZE) {
+            if size(msg) > limit {
                 msg.answers.pop();
                 break;
             }
         }
     }
     queries
+}
+
+/// `answers`, then `additionals`, as responses of at most `limit` bytes each,
+/// in as many as it takes. The records of a name and type go in one packet
+/// where they fit, so that its cache-flush bit replaces the set whole; a set
+/// too big for one is split, and a record too big for any goes alone.
+/// Additional records fill what room the answers leave, then packets of
+/// their own.
+pub fn responses(answers: &[Record], additionals: &[Record], limit: usize) -> Vec<Message> {
+    let mut out = vec![response()];
+    for (additional, records) in [(false, answers), (true, additionals)] {
+        for set in rrsets(records) {
+            if !place(&mut out, additional, &set, limit) {
+                for rec in set {
+                    place(&mut out, additional, &[rec], limit);
+                }
+            }
+        }
+    }
+    out.retain(|m| !m.answers.is_empty() || !m.additionals.is_empty());
+    out
+}
+
+/// `records` grouped by name and type, in the order each set first appears.
+fn rrsets(records: &[Record]) -> Vec<Vec<&Record>> {
+    let mut sets: Vec<Vec<&Record>> = Vec::new();
+    for rec in records {
+        let same = |set: &&mut Vec<&Record>| set[0].rtype() == rec.rtype() && set[0].name.eq_ignore_ascii_case(&rec.name);
+        match sets.iter_mut().find(same) {
+            Some(set) => set.push(rec),
+            None => sets.push(vec![rec]),
+        }
+    }
+    sets
+}
+
+/// Put `records` together in the last of `out`, or in a new one if they do
+/// not fit there, keeping each within `limit`. A single record too big even
+/// for a packet of its own goes in one anyway. Returns whether they were
+/// put; if not, they are too many to go together.
+fn place(out: &mut Vec<Message>, additional: bool, records: &[&Record], limit: usize) -> bool {
+    let is_empty = |msg: &Message| msg.answers.is_empty() && msg.additionals.is_empty();
+    for fresh in [false, true] {
+        if fresh {
+            if out.last().is_some_and(is_empty) {
+                break;
+            }
+            out.push(response());
+        }
+        let msg = out.last_mut().expect("never empty");
+        section(msg, additional).extend(records.iter().map(|&r| r.clone()));
+        if size(msg) <= limit {
+            return true;
+        }
+        let keep = section(msg, additional).len() - records.len();
+        section(msg, additional).truncate(keep);
+    }
+    let [record] = records else { return false };
+    let msg = out.last_mut().expect("never empty");
+    section(msg, additional).push((*record).clone());
+    out.push(response());
+    true
+}
+
+/// The answer or additional section of `msg`.
+fn section(msg: &mut Message, additional: bool) -> &mut Vec<Record> {
+    if additional { &mut msg.additionals } else { &mut msg.answers }
+}
+
+/// The size of `msg` on the wire; one that cannot be encoded is too big for
+/// anything.
+fn size(msg: &Message) -> usize {
+    msg.encode().map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// An empty multicast response.
+fn response() -> Message {
+    Message {
+        header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+        questions: Vec::new(),
+        answers: Vec::new(),
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+    }
 }
 
 /// A multicast query for `questions` (no known answers, so every device
@@ -1199,10 +1335,17 @@ mod tests {
         vec![television, nas, printer]
     }
 
+    /// The one packet of a reply that fits in one.
+    fn only(mut msgs: Vec<Message>) -> Message {
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        msgs.remove(0)
+    }
+
     #[test]
     fn a_query_response_has_what_each_device_answers_once() {
         let devices = three_devices();
-        let (msg, answered) = Device::query_response(&devices, &query("_http._tcp.local", rtype::PTR), false).unwrap();
+        let (msgs, answered) = Device::query_response(&devices, &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
+        let msg = only(msgs);
         assert_eq!(answered, [0, 1], "the printer has nothing of that type");
         let browsed: Vec<&RData> = msg.answers.iter().map(|r| &r.data).collect();
         assert_eq!(browsed, [
@@ -1217,14 +1360,136 @@ mod tests {
         assert!(msg.header.response && msg.header.authoritative && msg.questions.is_empty());
 
         // A record two of them have is given once.
-        let (msg, answered) =
-            Device::query_response(&devices, &query("_services._dns-sd._udp.local", rtype::PTR), false).unwrap();
+        let (msgs, answered) =
+            Device::query_response(&devices, &query("_services._dns-sd._udp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
+        let msg = only(msgs);
         assert_eq!(answered, [0, 1, 2]);
         assert_eq!(msg.answers.len(), 2, "_http and _ipp: {:?}", msg.answers);
 
         // Nothing to say is no reply at all.
-        assert!(Device::query_response(&devices, &query("_airplay._tcp.local", rtype::PTR), false).is_none());
-        assert!(Device::query_response(&[], &query("_http._tcp.local", rtype::PTR), false).is_none());
+        assert!(Device::query_response(&devices, &query("_airplay._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
+        assert!(Device::query_response(&[], &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
+    }
+
+    /// `n` devices `dev0.local`, `dev1.local`, ... each with a service of
+    /// `_http._tcp` with a TXT record of `txt` bytes.
+    fn many(n: usize, txt: usize) -> Vec<Device> {
+        (0..n)
+            .map(|i| {
+                let mut d = tv(&format!("10.0.1.{}", i + 1), &[&format!("Device {i}")]);
+                d.hostname = Some(format!("dev{i}.local"));
+                d.services[0].target = d.hostname.clone();
+                d.services[0].txt = vec!["k=".to_string() + &"v".repeat(txt)];
+                d
+            })
+            .collect()
+    }
+
+    fn sizes(msgs: &[Message]) -> Vec<usize> {
+        msgs.iter().map(|m| m.encode().unwrap().len()).collect()
+    }
+
+    /// Records are put in as few packets as keep within the limit, in order,
+    /// answers before additional ones, each name and type's records together.
+    #[test]
+    fn records_are_split_into_packets_that_fit() {
+        let records: Vec<Record> = many(30, 40).iter().flat_map(|d| d.announcement(120, 4500)).collect();
+        let packets = responses(&records, &[], 600);
+        assert!(packets.len() > 1, "they do not fit in one");
+        assert!(sizes(&packets).iter().all(|&s| s <= 600), "{:?}", sizes(&packets));
+        let sent: Vec<Record> = packets.iter().flat_map(|m| m.answers.clone()).collect();
+        assert_eq!(sent.len(), records.len(), "no record lost or doubled");
+        // Each name and type in one packet: here, every device's addresses.
+        for host in (0..30).map(|i| format!("dev{i}.local")) {
+            let with = packets.iter().filter(|m| m.answers.iter().any(|r| r.name == host && r.rtype() == rtype::A)).count();
+            assert_eq!(with, 1, "{host}");
+        }
+        // What fits in one stays in one.
+        assert_eq!(responses(&records[..3], &[], 600).len(), 1);
+        assert!(responses(&[], &[], 600).is_empty());
+
+        // Additional records fill the room the answers leave, then packets of
+        // their own, after the answers.
+        let (answers, additionals) = records.split_at(10);
+        let packets = responses(answers, additionals, 600);
+        assert!(sizes(&packets).iter().all(|&s| s <= 600));
+        assert_eq!(packets.iter().map(|m| m.answers.len()).sum::<usize>(), 10);
+        assert_eq!(packets.iter().map(|m| m.additionals.len()).sum::<usize>(), additionals.len());
+        let first_additional = packets.iter().position(|m| !m.additionals.is_empty()).unwrap();
+        assert!(packets[first_additional + 1..].iter().all(|m| m.answers.is_empty()));
+    }
+
+    /// A record too big for any packet still goes out, alone; what comes
+    /// after it does not share its packet.
+    #[test]
+    fn a_record_too_big_for_a_packet_goes_alone() {
+        let big = record("big._http._tcp.local".into(), true, 4500, RData::Txt(vec![vec![b'x'; 250]; 4]));
+        let small = |i: u8| record(format!("dev{i}.local"), true, 120, RData::A([10, 0, 0, i].into()));
+        let packets = responses(&[small(1), big.clone(), small(2)], &[], 512);
+        assert_eq!(packets.len(), 3, "{packets:?}");
+        assert_eq!(packets[1].answers, [big]);
+        assert!(sizes(&packets)[1] > 512);
+        assert!(sizes(&[packets[0].clone(), packets[2].clone()]).iter().all(|&s| s <= 512));
+    }
+
+    /// A browse many devices answer is split over as many packets as it
+    /// takes, none bigger than the limit, with every device's answer in one.
+    #[test]
+    fn a_large_reply_is_split_over_packets() {
+        let devices = many(40, 100);
+        let (packets, answered) = Device::query_response(&devices, &query("_http._tcp.local", rtype::PTR), false, 1452).unwrap();
+        assert_eq!(answered.len(), 40);
+        assert!(packets.len() > 1);
+        assert!(sizes(&packets).iter().all(|&s| s <= 1452), "{:?}", sizes(&packets));
+        let browsed = packets.iter().flat_map(|m| &m.answers).filter(|r| r.rtype() == rtype::PTR).count();
+        assert_eq!(browsed, 40);
+        assert!(packets.iter().all(|m| m.header.response && m.questions.is_empty()));
+    }
+
+    /// A legacy resolver gets one reply of at most 512 bytes, or of what its
+    /// query says it takes (and the interface allows). Answers left out mark
+    /// it truncated; additional records left out do not.
+    #[test]
+    fn a_legacy_reply_fits_what_the_resolver_takes() {
+        let devices = many(40, 100);
+        let browse = query("_http._tcp.local", rtype::PTR);
+        let (packets, _) = Device::query_response(&devices, &browse, true, 1452).unwrap();
+        let reply = only(packets);
+        assert!(reply.encode().unwrap().len() <= 512);
+        assert!(reply.header.truncated, "not every answer fits");
+        assert!(!reply.answers.is_empty());
+
+        // With EDNS0 saying 4096, as much as the interface allows.
+        let mut edns = browse.clone();
+        edns.additionals.push(Record { name: String::new(), class: 4096, cache_flush: false, ttl: 0, data: RData::Other { rtype: OPT, data: vec![] } });
+        let reply = only(Device::query_response(&devices, &edns, true, 1452).unwrap().0);
+        let size = reply.encode().unwrap().len();
+        assert!(size > 512 && size <= 1452, "{size}");
+
+        // One device: its answer fits, but not all its additional records
+        // (its TXT record is too big), and leaving those out is no truncation.
+        let mut one = many(1, 0);
+        one[0].services[0].txt = vec!["a=".to_string() + &"x".repeat(240), "b=".to_string() + &"x".repeat(240)];
+        let whole = only(Device::query_response(&one, &browse, false, 1452).unwrap().0);
+        let reply = only(Device::query_response(&one, &browse, true, 1452).unwrap().0);
+        assert_eq!(reply.answers.len(), 1);
+        assert!(reply.additionals.len() < whole.additionals.len(), "the TXT record does not fit");
+        assert!(!reply.header.truncated);
+        assert!(reply.encode().unwrap().len() <= 512);
+    }
+
+    /// Questions are put fewer to a packet when they are long.
+    #[test]
+    fn long_questions_are_put_fewer_to_a_packet() {
+        let mut devices = many(16, 1);
+        for (i, d) in devices.iter_mut().enumerate() {
+            d.services[0].instance = format!("{}{i}._http._tcp.local", "n".repeat(60));
+            d.services[0].target = None;
+        }
+        let queries = Device::refresh_queries(&devices, 512);
+        assert!(queries.len() > 2, "{}", queries.len());
+        assert!(sizes(&queries).iter().all(|&s| s <= 512), "{:?}", sizes(&queries));
+        assert_eq!(queries.iter().map(|q| q.questions.len()).sum::<usize>(), 16 * 2 + 16, "SRV, TXT and the address of each");
     }
 
     #[test]
@@ -1233,12 +1498,14 @@ mod tests {
         let mut asked = query("tv.local", rtype::ANY);
         asked.header.id = 0x4242;
 
-        let (msg, _) = Device::query_response(&devices, &asked, true).unwrap();
+        let (msgs, _) = Device::query_response(&devices, &asked, true, DEFAULT_MAX_PACKET).unwrap();
+        let msg = only(msgs);
         assert_eq!((msg.header.id, msg.questions.clone()), (0x4242, asked.questions.clone()));
         assert!(msg.answers.iter().chain(&msg.additionals).all(|r| r.ttl <= LEGACY_TTL_CAP && !r.cache_flush));
 
         // To the group, none of that.
-        let (msg, _) = Device::query_response(&devices, &asked, false).unwrap();
+        let (msgs, _) = Device::query_response(&devices, &asked, false, DEFAULT_MAX_PACKET).unwrap();
+        let msg = only(msgs);
         assert_eq!(msg.header.id, 0);
         assert!(msg.questions.is_empty());
         assert!(msg.answers.iter().any(|r| r.ttl == 300 && r.cache_flush));
@@ -1267,7 +1534,7 @@ mod tests {
         let named = Device { hostname: Some("nas.local".into()), addresses: vec![ip("169.254.1.1")], ..Device::default() };
         let types = BTreeSet::from(["_ipp._tcp.local".to_string()]);
 
-        let questions = asked(&Device::probe_queries(&[resolved, unresolved, named], &types));
+        let questions = asked(&Device::probe_queries(&[resolved, unresolved, named], &types, DEFAULT_MAX_PACKET));
         for wanted in [
             q(META_QUERY, rtype::PTR),
             q("_http._tcp.local", rtype::PTR),
@@ -1288,7 +1555,7 @@ mod tests {
 
         // However many types there are, a packet has only so many questions.
         let types: BTreeSet<String> = (0..40).map(|i| format!("_t{i}._tcp.local")).collect();
-        let queries = Device::probe_queries(&[], &types);
+        let queries = Device::probe_queries(&[], &types, DEFAULT_MAX_PACKET);
         assert_eq!(asked(&queries).len(), 41);
         assert_eq!(queries.len(), 3);
     }
@@ -1316,7 +1583,7 @@ mod tests {
         };
         let known = |q: &Question| if q.qtype == rtype::PTR { vec![ptr.clone()] } else { Vec::new() };
 
-        let queries = Device::type_queries(&[plug.clone(), other], &kinds, known);
+        let queries = Device::type_queries(&[plug.clone(), other], &kinds, known, DEFAULT_MAX_PACKET);
         assert_eq!(asked(&queries), [
             q("_Shelly._tcp.local", rtype::PTR),
             q("Plug._shelly._tcp.local", rtype::SRV),
@@ -1329,7 +1596,7 @@ mod tests {
         // Resolved and reachable, only the type is asked for.
         plug.services[0].target = Some("plug.local".into());
         plug.add_addrs(&[ip("10.0.1.5")]);
-        assert_eq!(asked(&Device::type_queries(&[plug], &kinds, |_| Vec::new())), [q("_Shelly._tcp.local", rtype::PTR)]);
+        assert_eq!(asked(&Device::type_queries(&[plug], &kinds, |_| Vec::new(), DEFAULT_MAX_PACKET)), [q("_Shelly._tcp.local", rtype::PTR)]);
     }
 
     /// Narrowed to some types, a device keeps only its services of them, and
@@ -1348,7 +1615,7 @@ mod tests {
     #[test]
     fn a_refresh_asks_each_device_for_what_it_announced_and_no_more() {
         let devices = [tv("fd00::9", &["TV", "Cast"]), tv("fd00::9", &["TV"])];
-        let questions = asked(&Device::refresh_queries(&devices));
+        let questions = asked(&Device::refresh_queries(&devices, DEFAULT_MAX_PACKET));
         assert_eq!(questions, [
             q("tv.local", rtype::AAAA),
             q("TV._http._tcp.local", rtype::SRV),
@@ -1356,7 +1623,7 @@ mod tests {
             q("Cast._http._tcp.local", rtype::SRV),
             q("Cast._http._tcp.local", rtype::TXT),
         ]);
-        assert!(Device::refresh_queries(&[]).is_empty());
+        assert!(Device::refresh_queries(&[], DEFAULT_MAX_PACKET).is_empty());
     }
 
     #[test]
@@ -1416,16 +1683,16 @@ mod tests {
         let ask = |name: &str, qtype: u16, unicast_response: bool| Question { name: name.into(), qtype, class: 255, unicast_response };
         let questions = [ask("printer.local", rtype::A, true), ask("Printer.local", rtype::A, false), ask("_ipp._tcp.local", rtype::PTR, false)];
         let none = |_: &Question| Vec::new();
-        let queries = Device::forward_queries(&questions, none);
+        let queries = Device::forward_queries(&questions, none, DEFAULT_MAX_PACKET);
         assert_eq!(asked(&queries), [q("printer.local", rtype::A), q("_ipp._tcp.local", rtype::PTR)]);
         assert!(queries.iter().flat_map(|m| &m.questions).all(|q| !q.unicast_response && q.class == 1));
         assert!(queries.iter().all(|m| m.answers.is_empty()));
-        assert!(Device::forward_queries(&[], none).is_empty());
+        assert!(Device::forward_queries(&[], none, DEFAULT_MAX_PACKET).is_empty());
 
         // A name that cannot be encoded again (a label past 63 bytes) is
         // skipped, not the whole query failed.
         let long = format!("{}.local", "x".repeat(64));
-        let queries = Device::forward_queries(&[ask(&long, rtype::A, false), ask("ok.local", rtype::A, false)], none);
+        let queries = Device::forward_queries(&[ask(&long, rtype::A, false), ask("ok.local", rtype::A, false)], none, DEFAULT_MAX_PACKET);
         assert_eq!(asked(&queries), [q("ok.local", rtype::A)]);
     }
 
@@ -1457,16 +1724,16 @@ mod tests {
         };
         let known = |q: &Question| (0..3).map(|i| ptr(&q.name, i)).collect::<Vec<_>>();
         let questions = [browse("_http._tcp.local"), browse("_ipp._tcp.local"), browse("_http._tcp.local")];
-        let queries = Device::forward_queries(&questions, known);
+        let queries = Device::forward_queries(&questions, known, DEFAULT_MAX_PACKET);
         assert_eq!(queries.len(), 1);
         let mut expected = known(&questions[0]);
         expected.extend(known(&questions[1]));
         assert_eq!(queries[0].answers, expected);
 
         let many = |q: &Question| (0..200).map(|i| ptr(&q.name, i)).collect::<Vec<_>>();
-        let queries = Device::forward_queries(&questions[..1], many);
+        let queries = Device::forward_queries(&questions[..1], many, DEFAULT_MAX_PACKET);
         let size = queries[0].encode().unwrap().len();
-        assert!(size <= KNOWN_ANSWERS_SIZE && size > KNOWN_ANSWERS_SIZE - 100, "{size}");
+        assert!(size <= DEFAULT_MAX_PACKET && size > DEFAULT_MAX_PACKET - 100, "{size}");
         assert!(queries[0].answers.len() < 200 && !queries[0].answers.is_empty());
     }
 

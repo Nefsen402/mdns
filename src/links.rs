@@ -45,6 +45,8 @@ pub struct Link {
     up: bool,
     /// Whether it has had sockets before: one that comes again is back.
     was_here: bool,
+    /// Its MTU, once known: what a packet sent on it may hold follows it.
+    mtu: Option<u32>,
     /// Tells the receive loops of the current sockets to stop.
     stop: Arc<AtomicBool>,
 }
@@ -78,6 +80,7 @@ impl Link {
             index: None,
             up: true,
             was_here: false,
+            mtu: None,
             stop: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -93,6 +96,7 @@ impl Link {
         let Ok(index) = socket::ifindex(&self.interface) else {
             return Ok(false);
         };
+        self.take_mtu(socket::mtu(&self.interface).ok());
         let mut sockets = Vec::new();
         for &family in &self.families {
             let sock = socket::open(&self.interface, family)
@@ -153,7 +157,8 @@ impl Link {
     /// Act on `change`, if it is about this interface.
     pub fn changed(&mut self, change: &Change) {
         match change {
-            Change::Link { index, name, up } if *name == self.interface => {
+            Change::Link { index, name, up, mtu } if *name == self.interface => {
+                self.take_mtu(*mtu);
                 let came_up = *up && !self.up;
                 self.up = *up;
                 if self.index != Some(*index) {
@@ -202,12 +207,25 @@ impl Link {
         match socket::ifindex(&self.interface) {
             Ok(index) if self.index != Some(index) => {
                 let name = self.interface.clone();
-                self.changed(&Change::Link { index, name, up: true });
+                self.changed(&Change::Link { index, name, up: true, mtu: None });
             }
-            Ok(_) => self.advertise(),
+            Ok(_) => {
+                self.take_mtu(socket::mtu(&self.interface).ok());
+                self.advertise();
+            }
             Err(_) if self.index.is_some() => self.gone(),
             Err(_) => {}
         }
+    }
+
+    /// Take the interface's MTU, if it is known and new: packets sent on it
+    /// are kept within what it leaves.
+    fn take_mtu(&mut self, mtu: Option<u32>) {
+        let Some(mtu) = mtu.filter(|&m| Some(m) != self.mtu) else { return };
+        let max_packet = self.segment.set_mtu(mtu);
+        let how = if self.mtu.is_some() { "now" } else { "is" };
+        eprintln!("{}: MTU {how} {mtu}: packets of at most {max_packet} bytes", self.interface);
+        self.mtu = Some(mtu);
     }
 
     /// The interface is back, or up again: whoever is on it now may never

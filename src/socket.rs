@@ -18,10 +18,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 
 use crate::device::{
-    addr_of, family_of, is_type, service_ttl, Device, Report, DEFAULT_MAX_ADDRS, HOST_TTL, META_QUERY, MIN_REFLECT_TTL,
-    OTHER_TTL,
+    addr_of, family_of, is_type, responses, service_ttl, Device, Report, DEFAULT_MAX_ADDRS, DEFAULT_MAX_PACKET,
+    HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
 };
-use crate::parser::{Header, Message, Question, RData, Record};
+use crate::parser::{Message, Question, RData, Record};
 use crate::timer::{self, Next, Timer};
 
 pub const MDNS_PORT: u16 = 5353;
@@ -121,6 +121,41 @@ pub fn local_addr(interface: &str, family: Family) -> Result<IpAddr> {
         .as_socket()
         .map(|a| a.ip())
         .ok_or_else(|| anyhow!("no local address on {interface}"))
+}
+
+/// The headers around an mDNS packet: those of IPv6, the larger of the two
+/// families, and of UDP. What an interface's MTU leaves for the packet is its
+/// MTU less these.
+const IP_UDP_HEADERS: u32 = 40 + 8;
+
+/// The least a packet may be let grow to, whatever an interface says: what
+/// any DNS resolver takes (RFC 1035 section 4.2.1).
+const MIN_MAX_PACKET: usize = 512;
+
+/// The most a packet may be let grow to, however large an interface's MTU:
+/// mDNS's own limit (RFC 6762 section 17).
+const MAX_MAX_PACKET: usize = 9000;
+
+/// The MTU of the interface called `name`, as its network namespace has it.
+pub fn mtu(name: &str) -> Result<u32> {
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    let bytes = name.as_bytes();
+    if bytes.len() >= req.ifr_name.len() || bytes.contains(&0) {
+        bail!("not an interface name: {name:?}");
+    }
+    for (dst, &b) in req.ifr_name.iter_mut().zip(bytes) {
+        *dst = b as libc::c_char;
+    }
+    // SAFETY: a plain socket for the ioctl, closed when `sock` drops.
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
+    // SAFETY: `req` is a valid ifreq naming the interface; SIOCGIFMTU fills
+    // in its MTU.
+    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut req) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("reading the MTU of {name}"));
+    }
+    // SAFETY: SIOCGIFMTU set the MTU member of the union.
+    let mtu = unsafe { req.ifr_ifru.ifru_mtu };
+    u32::try_from(mtu).with_context(|| format!("{name} says its MTU is {mtu}"))
 }
 
 pub fn ifindex(name: &str) -> Result<u32> {
@@ -465,6 +500,8 @@ struct State {
     reflect_ttl: Option<u32>,
     /// How many addresses of a family a discovered device is kept with.
     max_addrs: usize,
+    /// The most a packet sent here may hold: what the interface's MTU leaves.
+    max_packet: usize,
     wake: Option<Wake>,
     /// The questions put to this segment on another's behalf, in lowercase,
     /// and when, for [`FORWARD_GAP`].
@@ -592,7 +629,7 @@ impl State {
         let records = Device::transition(old.as_ref(), new.as_ref(), local, host_here);
         let sent = !records.is_empty();
         if sent {
-            send(&self.outbound, &records)?;
+            send(&self.outbound, self.max_packet, &records)?;
         }
 
         let m = self.manual.get_mut(key).expect("looked up above");
@@ -694,6 +731,7 @@ impl Segment {
             state: Arc::new(Mutex::new(State {
                 min_lifetime: DEFAULT_MIN_LIFETIME,
                 max_addrs: DEFAULT_MAX_ADDRS,
+                max_packet: DEFAULT_MAX_PACKET,
                 ..State::default()
             })),
         }
@@ -713,6 +751,17 @@ impl Segment {
     /// Applies to what is heard from now on.
     pub fn set_max_addrs(&self, max_addrs: usize) {
         self.state.lock().unwrap().max_addrs = max_addrs.max(1);
+    }
+
+    /// Take the interface's MTU: no packet sent here is bigger than it leaves
+    /// once the IP and UDP headers are added, so that none has to go out in
+    /// fragments. Until it is told, a segment assumes a standard Ethernet
+    /// frame ([`DEFAULT_MAX_PACKET`]). Returns what a packet may now hold.
+    pub fn set_mtu(&self, mtu: u32) -> usize {
+        let room = usize::try_from(mtu.saturating_sub(IP_UDP_HEADERS)).unwrap_or(usize::MAX);
+        let max_packet = room.clamp(MIN_MAX_PACKET, MAX_MAX_PACKET);
+        self.state.lock().unwrap().max_packet = max_packet;
+        max_packet
     }
 
     /// The TTL, to the second, of the address records of the devices
@@ -956,11 +1005,11 @@ impl Segment {
     pub fn announce_all(&self) -> Result<()> {
         let now = Instant::now();
         let mut guard = self.state.lock().unwrap();
-        let State { manual, outbound, .. } = &mut *guard;
+        let State { manual, outbound, max_packet, .. } = &mut *guard;
         let mut first_err = None;
         for m in manual.values_mut() {
             let Some(device) = &m.shown else { continue };
-            match send(outbound, &device.announcement(m.host_ttl, m.other_ttl)) {
+            match send(outbound, *max_packet, &device.announcement(m.host_ttl, m.other_ttl)) {
                 Ok(()) => {
                     m.announced = now;
                     m.last_sent = Sent::both(now);
@@ -1020,7 +1069,7 @@ impl Segment {
                     return Ok(());
                 };
                 if let Some(device) = &m.shown {
-                    send(&state.outbound, &device.announcement(m.host_ttl, m.other_ttl))?;
+                    send(&state.outbound, state.max_packet, &device.announcement(m.host_ttl, m.other_ttl))?;
                     m.announced = now;
                     m.last_sent = Sent::both(now);
                 }
@@ -1067,10 +1116,12 @@ impl Segment {
         }
         let probing = !query.authorities.is_empty();
         let (keys, devices): (Vec<String>, Vec<Device>) = state.answering(now, legacy, probing, family).into_iter().unzip();
-        let Some((msg, answered)) = Device::query_response(&devices, query, legacy) else {
+        let Some((msgs, answered)) = Device::query_response(&devices, query, legacy, state.max_packet) else {
             return Ok(());
         };
-        transmit(&state.outbound, family, &msg, legacy.then_some(from))?;
+        for msg in &msgs {
+            transmit(&state.outbound, family, msg, legacy.then_some(from))?;
+        }
 
         if !legacy {
             for i in answered {
@@ -1110,7 +1161,7 @@ impl Segment {
             }
         }
         let known = |q: &Question| state.discovered.values().flat_map(|e| e.known_answers(q, now)).collect();
-        ask(&state.outbound, &Device::forward_queries(fresh, known))
+        ask(&state.outbound, &Device::forward_queries(fresh, known, state.max_packet))
     }
 
     // Fed by the receive loops and the timer.
@@ -1325,7 +1376,7 @@ impl Segment {
         }
 
         let devices: Vec<Device> = state.discovered.values().map(|e| e.device.clone()).collect();
-        ask(&state.outbound, &Device::probe_queries(&devices, &state.types))
+        ask(&state.outbound, &Device::probe_queries(&devices, &state.types, state.max_packet))
     }
 
     /// Ask for the service types `kinds` by name, in three rounds like a
@@ -1362,7 +1413,7 @@ impl Segment {
         let now = Instant::now();
         let devices: Vec<Device> = state.discovered.values().map(|e| e.device.clone()).collect();
         let known = |q: &Question| state.discovered.values().flat_map(|e| e.known_answers(q, now)).collect();
-        ask(&state.outbound, &Device::type_queries(&devices, kinds, known))
+        ask(&state.outbound, &Device::type_queries(&devices, kinds, known, state.max_packet))
     }
 
     /// Ask the devices that are about to expire to answer again, so that a
@@ -1382,7 +1433,7 @@ impl Segment {
     /// many questions were sent.
     pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
         let mut guard = self.state.lock().unwrap();
-        let State { discovered, outbound, .. } = &mut *guard;
+        let State { discovered, outbound, max_packet, .. } = &mut *guard;
         if outbound.is_empty() {
             return Ok(0);
         }
@@ -1402,7 +1453,7 @@ impl Segment {
             entry.refreshed = Some(now);
             asking.push(entry.device.clone());
         }
-        ask(outbound, &Device::refresh_queries(&asking))
+        ask(outbound, &Device::refresh_queries(&asking, *max_packet))
     }
 
     /// Drop devices whose lifetime has run out as of `now`.
@@ -1489,23 +1540,17 @@ fn ask(outbound: &[Outbound], queries: &[Message]) -> Result<usize> {
     Ok(queries.iter().map(|q| q.questions.len()).sum())
 }
 
-/// Announce `records`, over every family.
-fn send(outbound: &[Outbound], records: &[Record]) -> Result<()> {
-    let msg = Message {
-        header: Header {
-            id: 0,
-            response: true,
-            opcode: 0,
-            authoritative: true,
-            truncated: false,
-            rcode: 0,
-        },
-        questions: Vec::new(),
-        answers: records.to_vec(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-    };
-    multicast(outbound, &msg)
+/// Announce `records`, over every family, in as many packets as it takes to
+/// keep each within `limit`. Every packet is tried; the first error is
+/// returned.
+fn send(outbound: &[Outbound], limit: usize, records: &[Record]) -> Result<()> {
+    let mut first_err = None;
+    for msg in responses(records, &[], limit) {
+        if let Err(e) = multicast(outbound, &msg) {
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Send `msg` to the group of every family. Every family is tried; the
@@ -1538,7 +1583,7 @@ fn transmit(outbound: &[Outbound], family: Family, msg: &Message, dest: Option<S
 mod tests {
     use super::*;
     use crate::device::{record, Service, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
-    use crate::parser::{self, rtype};
+    use crate::parser::{self, rtype, Header};
 
     /// Its first routable IPv4 or IPv6 address, and link-local one.
     fn v4(d: &Device) -> Option<IpAddr> {
@@ -2109,6 +2154,111 @@ mod tests {
         assert!(format!("{err:#}").contains("[::1]:5353"), "{err:#}");
         let sent = recv(&rx).expect("sent over the other family all the same");
         assert!(sent.answers.iter().any(|r| r.data == RData::A("10.0.2.9".parse().unwrap())));
+    }
+
+    /// A packet may hold what the MTU leaves once the IPv6 and UDP headers
+    /// are added, but never less than plain DNS takes, nor more than mDNS
+    /// allows.
+    #[test]
+    fn the_mtu_sets_what_a_packet_may_hold() {
+        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        assert_eq!(seg.state.lock().unwrap().max_packet, DEFAULT_MAX_PACKET, "a standard frame until told");
+        assert_eq!(seg.set_mtu(1500), 1452);
+        assert_eq!(seg.set_mtu(1492), 1444, "PPPoE");
+        assert_eq!(seg.set_mtu(9000), 8952, "jumbo frames");
+        assert_eq!(seg.set_mtu(65536), 9000, "loopback: mDNS's own limit");
+        assert_eq!(seg.set_mtu(300), 512);
+        assert_eq!(seg.set_mtu(0), 512);
+        assert_eq!(seg.state.lock().unwrap().max_packet, 512);
+    }
+
+    #[test]
+    fn an_interfaces_mtu_is_read() {
+        assert!(mtu("lo").unwrap() >= 1280, "every network namespace has a loopback");
+        assert!(mtu("no-such-if0").is_err());
+        assert!(mtu("a-name-far-too-long-for-one").is_err());
+        assert!(mtu("nul\0").is_err());
+    }
+
+    /// An announcement bigger than the interface allows goes out in packets
+    /// that each fit, together all of it.
+    #[test]
+    fn an_announcement_too_big_for_the_mtu_goes_in_packets_that_fit() {
+        let (seg, rx) = wired();
+        let max_packet = seg.set_mtu(576);
+        let instances: Vec<String> = (0..20).map(|i| format!("Service {i}")).collect();
+        let names: Vec<&str> = instances.iter().map(String::as_str).collect();
+        let mut device = tv("10.0.2.9", &names);
+        for svc in &mut device.services {
+            svc.txt = vec!["k=".to_string() + &"v".repeat(60)];
+        }
+        let expected = device.announcement(HOST_TTL, OTHER_TTL).len();
+        seg.add_manual_ttl(Owner::Reflector(0), device, Duration::from_secs(HOST_TTL.into())).unwrap();
+
+        let mut buf = [0u8; 9000];
+        let mut records = 0;
+        let mut packets = 0;
+        while let Ok(n) = rx.recv(&mut buf) {
+            assert!(n <= max_packet, "a packet of {n} bytes, over {max_packet}");
+            records += Message::parse(&buf[..n]).unwrap().answers.len();
+            packets += 1;
+        }
+        assert!(packets > 1, "{packets}");
+        assert_eq!(records, expected, "all of it, once");
+    }
+
+    /// Whatever the segment sends, it keeps within its interface's MTU:
+    /// replies, probes, refreshes and questions asked on another's behalf.
+    #[test]
+    fn everything_sent_keeps_within_the_mtu() {
+        let (seg, rx) = wired();
+        let max_packet = seg.set_mtu(576);
+        let packets = || {
+            let mut buf = [0u8; 9000];
+            let mut sizes = Vec::new();
+            while let Ok(n) = rx.recv(&mut buf) {
+                sizes.push(n);
+            }
+            sizes
+        };
+        let within = |what: &str, sizes: Vec<usize>| {
+            assert!(sizes.len() > 1, "{what}: {sizes:?}");
+            assert!(sizes.iter().all(|&n| n <= max_packet), "{what}: {sizes:?}");
+        };
+        // Twenty devices of one type, heard here, with names long enough to
+        // need several packets for anything about all of them.
+        for i in 0..20 {
+            let host = format!("a-device-with-a-rather-long-name-{i}.local");
+            let addr = format!("10.0.1.{}", i + 1);
+            hear(&seg, &addr, vec![
+                a_record(&host, &addr),
+                srv(&format!("A service with a long name {i}._http._tcp.local"), 80, &host),
+            ]);
+        }
+        // Copies of as many, to answer for.
+        for i in 0..20 {
+            let mut copy = tv(&format!("10.0.2.{}", i + 1), &[&format!("A copied service with a long name {i}")]);
+            copy.hostname = Some(format!("a-copy-with-a-rather-long-name-{i}.local"));
+            seg.add_manual(Owner::Reflector(0), copy).unwrap();
+        }
+        packets();
+        age(&seg, 2);
+
+        seg.handle(sa("10.0.1.200"), &query("_http._tcp.local", rtype::PTR, vec![])).unwrap();
+        within("a reply", packets());
+        // Types with long names, so that size, not the count, splits a probe.
+        seg.state.lock().unwrap().types.extend((0..20).map(|i| format!("_{}{i}._tcp.local", "t".repeat(40))));
+        seg.probe_round().unwrap();
+        within("a probe", packets());
+        // Every device due: a margin longer than any lifetime.
+        seg.refresh(Instant::now(), Duration::from_secs(1_000_000)).unwrap();
+        within("a refresh", packets());
+        let questions: Vec<Question> = (0..16).map(|i| question(&format!("{}{i}._http._tcp.local", "q".repeat(50)), rtype::SRV)).collect();
+        seg.query_question(&questions).unwrap();
+        within("questions asked on another's behalf", packets());
+        seg.query_question(&[question("_http._tcp.local", rtype::PTR)]).unwrap();
+        let known = packets();
+        assert!(known.len() == 1 && known[0] <= max_packet, "known answers left out to fit: {known:?}");
     }
 
     /// One sender may describe only so many hosts: a sleep proxy speaks for

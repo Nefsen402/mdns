@@ -185,6 +185,16 @@ One created again, under a new index, gets new sockets; once it is up, what the
 daemon announces there is announced again and it is probed, as also when it
 merely goes down and up.
 One whose addresses change has the advertised name announced with the new ones.
+.PP
+No packet is bigger than its interface's MTU leaves room for, once the IP and
+UDP headers are added (but at least 512 bytes, and at most mDNS's 9000), so none
+goes out in IP fragments, which many devices and access points drop.
+The MTU is read when the interface opens and followed as it changes.
+What does not fit in one packet is sent in several, the records of a name and
+type kept together; a single record too big for any still goes, alone.
+A legacy resolver, asking from a port other than 5353, gets one reply of at
+most 512 bytes, or of the size its query asks for with EDNS0, with what does not
+fit left out: if that is an answer, the reply is marked truncated.
 .SS Control socket
 The daemon serves a local control socket, described under
 .B [Ipc]

@@ -13,8 +13,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     /// The interface called `name` is there, with `index`, and is up (and
-    /// running) or not. Sent when it appears and whenever it changes.
-    Link { index: u32, name: String, up: bool },
+    /// running) or not, with its MTU if the kernel said. Sent when it appears
+    /// and whenever it changes.
+    Link { index: u32, name: String, up: bool, mtu: Option<u32> },
     /// The interface with `index` is gone.
     Gone { index: u32 },
     /// An address of the interface with `index` was added or removed.
@@ -33,6 +34,7 @@ const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const IFLA_IFNAME: u16 = 3;
+const IFLA_MTU: u16 = 4;
 const IFF_UP: u32 = 0x1;
 const IFF_RUNNING: u32 = 0x40;
 
@@ -110,9 +112,10 @@ pub fn parse(buf: &[u8]) -> Vec<Change> {
                 let index = u32_at(body, 4);
                 if kind == RTM_DELLINK {
                     out.push(Change::Gone { index });
-                } else if let Some(name) = link_name(&body[IFINFOMSG_LEN..]) {
+                } else if let (Some(name), mtu) = link_attrs(&body[IFINFOMSG_LEN..]) {
                     let flags = u32_at(body, 8);
-                    out.push(Change::Link { index, name, up: flags & (IFF_UP | IFF_RUNNING) == IFF_UP | IFF_RUNNING });
+                    let up = flags & (IFF_UP | IFF_RUNNING) == IFF_UP | IFF_RUNNING;
+                    out.push(Change::Link { index, name, up, mtu });
                 }
             }
             RTM_NEWADDR | RTM_DELADDR if body.len() >= IFADDRMSG_LEN => {
@@ -125,21 +128,27 @@ pub fn parse(buf: &[u8]) -> Vec<Change> {
     out
 }
 
-/// The interface name among a link message's attributes.
-fn link_name(mut attrs: &[u8]) -> Option<String> {
+/// The interface name and MTU among a link message's attributes. No name if
+/// an attribute runs over the end, as nothing after it can be trusted.
+fn link_attrs(mut attrs: &[u8]) -> (Option<String>, Option<u32>) {
+    let (mut name, mut mtu) = (None, None);
     while attrs.len() >= RTA_HDRLEN {
         let len = u16_at(attrs, 0) as usize;
         if len < RTA_HDRLEN || len > attrs.len() {
-            return None;
+            return (None, None);
         }
-        if u16_at(attrs, 2) == IFLA_IFNAME {
-            let name = &attrs[RTA_HDRLEN..len];
-            let name = name.split(|&b| b == 0).next().unwrap_or_default();
-            return String::from_utf8(name.to_vec()).ok();
+        let data = &attrs[RTA_HDRLEN..len];
+        match u16_at(attrs, 2) {
+            IFLA_IFNAME => {
+                let bytes = data.split(|&b| b == 0).next().unwrap_or_default();
+                name = String::from_utf8(bytes.to_vec()).ok();
+            }
+            IFLA_MTU if data.len() >= 4 => mtu = Some(u32_at(data, 0)),
+            _ => {}
         }
         attrs = attrs.get(align(len)..).unwrap_or_default();
     }
-    None
+    (name, mtu)
 }
 
 /// Netlink lengths are padded to four bytes.
@@ -185,8 +194,8 @@ mod tests {
         body.extend(index.to_ne_bytes());
         body.extend(flags.to_ne_bytes());
         body.extend(0u32.to_ne_bytes());
-        // Another attribute first, as the kernel sends many.
-        body.extend(attr(4, &1500u32.to_ne_bytes()));
+        // The MTU first, as the kernel sends many before the name.
+        body.extend(attr(IFLA_MTU, &1500u32.to_ne_bytes()));
         body.extend(attr(IFLA_IFNAME, format!("{name}\0").as_bytes()));
         message(kind, &body)
     }
@@ -205,12 +214,30 @@ mod tests {
         buf.extend(address(RTM_DELADDR, 8));
         buf.extend(link(RTM_DELLINK, 7, 0, "mdns-a"));
         assert_eq!(parse(&buf), [
-            Change::Link { index: 7, name: "mdns-a".into(), up: true },
-            Change::Link { index: 8, name: "wifi".into(), up: false },
+            Change::Link { index: 7, name: "mdns-a".into(), up: true, mtu: Some(1500) },
+            Change::Link { index: 8, name: "wifi".into(), up: false, mtu: Some(1500) },
             Change::Address { index: 7 },
             Change::Address { index: 8 },
             Change::Gone { index: 7 },
         ]);
+    }
+
+    /// A link message without an MTU, or with one too short to read, says
+    /// nothing of it.
+    #[test]
+    fn a_link_without_an_mtu_says_none() {
+        let named = |extra: Vec<u8>| {
+            let mut body = vec![0u8; 4];
+            body.extend(9u32.to_ne_bytes());
+            body.extend((IFF_UP | IFF_RUNNING).to_ne_bytes());
+            body.extend(0u32.to_ne_bytes());
+            body.extend(extra);
+            body.extend(attr(IFLA_IFNAME, b"wifi\0"));
+            parse(&message(RTM_NEWLINK, &body))
+        };
+        assert_eq!(named(vec![]), [Change::Link { index: 9, name: "wifi".into(), up: true, mtu: None }]);
+        assert_eq!(named(attr(IFLA_MTU, &[1, 2])), [Change::Link { index: 9, name: "wifi".into(), up: true, mtu: None }]);
+        assert_eq!(named(attr(IFLA_MTU, &9000u32.to_ne_bytes())), [Change::Link { index: 9, name: "wifi".into(), up: true, mtu: Some(9000) }]);
     }
 
     #[test]
