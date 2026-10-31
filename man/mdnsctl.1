@@ -17,15 +17,13 @@ asks a running
 .BR mdnsd (8)
 daemon what it knows, over the daemon's control socket.
 Each command of the control protocol has a subcommand here.
-Options must come before the command; everything after the command name
-belongs to the command, which for
-.B devices
-and
-.B watch
-includes their own
-.B \-\-query
-and
-.BR \-\-interval .
+Options may come anywhere: before the command, after it, or among the words of
+a segment's name, which need no quoting even with spaces in it
+.RB ( "mdnsctl devices IoT to br0 \-v" ).
+The words left over are the name.
+Every command takes
+.BR \-h ,
+which shows what it takes.
 .SH COMMANDS
 .TP
 .B segments
@@ -356,7 +354,10 @@ It cannot be given with
 .BR \-\-json .
 .TP
 \fB\-h\fR, \fB\-\-help\fR
-Show usage and exit.
+Show usage and exit; after a command, that command's.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Show the version and exit.
 .SH OUTPUT
 Without
 .BR \-\-json ,

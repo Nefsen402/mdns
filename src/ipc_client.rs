@@ -15,6 +15,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::Value;
 
 #[path = "timespan.rs"]
@@ -49,21 +51,6 @@ const STOP_CHECK: Duration = Duration::from_millis(50);
 
 /// Set by SIGTERM or SIGINT: a subscriber stops its script and exits.
 static STOP: AtomicBool = AtomicBool::new(false);
-
-/// (command, arguments, description): the whole IPC surface.
-const COMMANDS: &[(&str, &str, &str)] = &[
-    ("segments", "", "list the configured segments"),
-    ("devices", "[--query TYPE]... [--wait SPAN] <name>", "list the devices discovered in a segment"),
-    ("probe", "[<name>]", "actively query for devices (all segments, or one)"),
-    ("watch", "[--query TYPE]... [--interval SPAN] <name>", "print the devices of a segment as they appear and go"),
-    (
-        "subscribe",
-        "[--query TYPE]... [--interval SPAN] [--foreground] [--log FILE] <name> -- SCRIPT [ARG]...",
-        "run SCRIPT for each change in a segment, in the background",
-    ),
-    ("watchers", "", "list the watches open on the daemon, and who holds them"),
-    ("timers", "", "list the timers the daemon has scheduled"),
-];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -130,10 +117,156 @@ struct Options {
     command: Command,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Parsed {
-    Run(Options),
-    Help,
+/// The command line, as clap reads it. Options may come anywhere, before
+/// the command or after it; a segment's name is the words left over, so it
+/// needs no quoting even with spaces in it. [`parse_args`] turns it into
+/// [`Options`].
+#[derive(Debug, Parser)]
+#[command(name = "mdnsctl", version, about = "Query the mdnsd daemon over its control socket", disable_help_subcommand = true)]
+struct Cli {
+    /// The control socket
+    #[arg(short, long, value_name = "PATH", default_value = DEFAULT_SOCKET, global = true)]
+    socket: PathBuf,
+    /// List devices with all details (addresses, services)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+    /// Print the daemon's reply unchanged
+    #[arg(long, global = true)]
+    json: bool,
+    /// With devices: print each device as a line of JSON of its own
+    #[arg(long, global = true, conflicts_with = "json")]
+    segmented_json: bool,
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// List the configured segments
+    Segments,
+    /// List the devices discovered in a segment
+    Devices {
+        /// Ask for this service type by name, and list only devices of it
+        #[arg(long = "query", value_name = "TYPE", value_parser = service_type)]
+        query: Vec<String>,
+        /// How long to take what answers a --query [default: 4s]
+        #[arg(long, value_name = "SPAN", value_parser = wait_span, requires = "query")]
+        wait: Option<Duration>,
+        /// The segment
+        #[arg(value_name = "NAME", required = true)]
+        name: Vec<String>,
+    },
+    /// Actively query for devices (all segments, or one)
+    Probe {
+        /// The segment; all of them if left out
+        #[arg(value_name = "NAME")]
+        name: Vec<String>,
+    },
+    /// Print the devices of a segment as they appear and go
+    Watch {
+        /// Ask for this service type by name, and show only devices of it
+        #[arg(long = "query", value_name = "TYPE", value_parser = service_type)]
+        query: Vec<String>,
+        /// Ask for the --query types again this often (at least 10s)
+        #[arg(long, value_name = "SPAN", value_parser = interval_span, requires = "query")]
+        interval: Option<Duration>,
+        /// The segment
+        #[arg(value_name = "NAME", required = true)]
+        name: Vec<String>,
+    },
+    /// Run SCRIPT for each change in a segment, in the background
+    Subscribe {
+        /// Ask for this service type by name, and run SCRIPT only for devices of it
+        #[arg(long = "query", value_name = "TYPE", value_parser = service_type)]
+        query: Vec<String>,
+        /// Ask for the --query types again this often (at least 10s)
+        #[arg(long, value_name = "SPAN", value_parser = interval_span, requires = "query")]
+        interval: Option<Duration>,
+        /// Stay attached instead of going into the background
+        #[arg(long)]
+        foreground: bool,
+        /// Append what the subscriber has to say, and SCRIPT's output, to FILE
+        #[arg(long, value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        log: Option<String>,
+        /// The segment
+        #[arg(value_name = "NAME", required = true)]
+        name: Vec<String>,
+        /// The script to run for each change, and its arguments, after --
+        #[arg(last = true, required = true, value_name = "SCRIPT")]
+        script: Vec<String>,
+    },
+    /// List the watches open on the daemon, and who holds them
+    Watchers,
+    /// List the timers the daemon has scheduled
+    Timers,
+}
+
+/// A `--query` service type, as given: the daemon checks it is one.
+fn service_type(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        return Err("not a service type (like _http._tcp)".into());
+    }
+    Ok(value.to_string())
+}
+
+/// A `--wait`: a time span longer than nothing.
+fn wait_span(value: &str) -> Result<Duration, String> {
+    let span = timespan::parse(value).map_err(|e| e.to_string())?;
+    if span.is_zero() {
+        return Err("it must be longer than nothing".into());
+    }
+    Ok(span)
+}
+
+/// An `--interval`: a time span of at least [`MIN_INTERVAL`], in whole
+/// seconds as the daemon takes it, part of a second more being a second
+/// more, so it is never asked more often than said.
+fn interval_span(value: &str) -> Result<Duration, String> {
+    let span = timespan::parse(value).map_err(|e| e.to_string())?;
+    if span < MIN_INTERVAL {
+        return Err(format!("it must be at least {}s", MIN_INTERVAL.as_secs()));
+    }
+    Ok(Duration::from_secs(span.as_secs() + u64::from(span.subsec_nanos() > 0)))
+}
+
+/// Read the command line into [`Options`]. A usage error, `--help` and
+/// `--version` come back as clap's error, which prints itself and exits.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, clap::Error> {
+    let cli = Cli::try_parse_from(std::iter::once("mdnsctl".to_string()).chain(args))?;
+    let usage = |kind, message: &str| Cli::command().error(kind, message);
+    // The protocol is one request per line.
+    let segment = |words: Vec<String>| {
+        let name = words.join(" ");
+        match name.contains(['\n', '\r']) {
+            true => Err(usage(ErrorKind::InvalidValue, "a segment's name cannot hold a line break")),
+            false => Ok(name),
+        }
+    };
+    let target = |query, interval, wait, name| {
+        let segment = segment(name)?;
+        if segment.trim().is_empty() {
+            return Err(usage(ErrorKind::MissingRequiredArgument, "the segment's name is blank"));
+        }
+        Ok(Target { segment, query, interval, wait })
+    };
+    let command = match cli.command {
+        Cmd::Segments => Command::Segments,
+        Cmd::Devices { query, wait, name } => Command::Devices(target(query, None, wait, name)?),
+        Cmd::Probe { name } => Command::Probe(Some(segment(name)?).filter(|n| !n.trim().is_empty())),
+        Cmd::Watch { query, interval, name } => Command::Watch(target(query, interval, None, name)?),
+        Cmd::Subscribe { query, interval, foreground, log, name, script } => Command::Subscribe(Subscription {
+            target: target(query, interval, None, name)?,
+            script,
+            foreground,
+            log: log.map(PathBuf::from),
+        }),
+        Cmd::Watchers => Command::Watchers,
+        Cmd::Timers => Command::Timers,
+    };
+    if cli.segmented_json && !matches!(command, Command::Devices(_)) {
+        return Err(usage(ErrorKind::ArgumentConflict, "--segmented-json is for devices"));
+    }
+    Ok(Options { socket: cli.socket, json: cli.json, segmented: cli.segmented_json, verbose: cli.verbose, command })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -144,86 +277,6 @@ enum Failure {
     Connect(String),
     /// The daemon answered with an error.
     Server(String),
-}
-
-fn usage() -> String {
-    let mut out = String::from("usage: mdnsctl [-s PATH] [-v] [--json | --segmented-json] <command>\n\ncommands:\n");
-    for (name, args, about) in COMMANDS {
-        let synopsis = format!("{name} {args}");
-        let synopsis = synopsis.trim_end();
-        // One too long for the column has its description on a line of its own.
-        if synopsis.len() < 18 {
-            out.push_str(&format!("  {synopsis:<18}{about}\n"));
-        } else {
-            out.push_str(&format!("  {synopsis}\n  {:<18}{about}\n", ""));
-        }
-    }
-    out.push_str(&format!(
-        "\noptions:\n  -s, --socket PATH  control socket (default {DEFAULT_SOCKET})\n  -v, --verbose      list devices with all details (addresses, services)\n      --json         print the daemon's reply unchanged\n      --segmented-json\n                     with devices: print each device as a line of JSON of its own\n  -h, --help         show this help\n"
-    ));
-    out
-}
-
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure> {
-    let mut args = args.into_iter();
-    let mut socket = PathBuf::from(DEFAULT_SOCKET);
-    let mut json = false;
-    let mut segmented = false;
-    let mut verbose = false;
-    let mut words: Vec<String> = Vec::new();
-
-    while let Some(arg) = args.next() {
-        // Once the command starts, everything left belongs to it.
-        if !words.is_empty() {
-            words.push(arg);
-            continue;
-        }
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(Parsed::Help),
-            "--json" => json = true,
-            "--segmented-json" => segmented = true,
-            "-v" | "--verbose" => verbose = true,
-            "-s" | "--socket" => {
-                let path = args.next().ok_or_else(|| Failure::Usage(format!("{arg} needs a path")))?;
-                socket = PathBuf::from(path);
-            }
-            _ if arg.starts_with("--socket=") => socket = PathBuf::from(&arg["--socket=".len()..]),
-            _ if arg.starts_with('-') && arg.len() > 1 => {
-                return Err(Failure::Usage(format!("unknown option {arg}")));
-            }
-            _ => words.push(arg),
-        }
-    }
-
-    let Some((name, rest)) = words.split_first() else {
-        return Err(Failure::Usage("missing command".into()));
-    };
-    let command = match name.as_str() {
-        "segments" if rest.is_empty() => Command::Segments,
-        "segments" => return Err(Failure::Usage("segments takes no arguments".into())),
-        "devices" => Command::Devices(target("devices", rest)?),
-        "probe" => {
-            let segment = rest.join(" ");
-            if segment.contains(['\n', '\r']) {
-                return Err(Failure::Usage("segment name contains a line break".into()));
-            }
-            Command::Probe((!segment.trim().is_empty()).then_some(segment))
-        }
-        "watch" => Command::Watch(target("watch", rest)?),
-        "subscribe" => Command::Subscribe(subscription(rest)?),
-        "watchers" if rest.is_empty() => Command::Watchers,
-        "watchers" => return Err(Failure::Usage("watchers takes no arguments".into())),
-        "timers" if rest.is_empty() => Command::Timers,
-        "timers" => return Err(Failure::Usage("timers takes no arguments".into())),
-        other => return Err(Failure::Usage(format!("unknown command {other:?}"))),
-    };
-    if segmented && json {
-        return Err(Failure::Usage("--json and --segmented-json are two ways of printing; pick one".into()));
-    }
-    if segmented && !matches!(command, Command::Devices(_)) {
-        return Err(Failure::Usage("--segmented-json is for devices".into()));
-    }
-    Ok(Parsed::Run(Options { socket, json, segmented, verbose, command }))
 }
 
 fn connect_err(socket: &Path, e: io::Error) -> Failure {
@@ -260,74 +313,6 @@ fn server_error(reply: &Value) -> Option<Failure> {
         .then(|| Failure::Server(reply["error"].as_str().unwrap_or("request failed").to_string()))
 }
 
-/// Follow a segment: print each change the daemon reports until it stops (an
-/// error) or `out` is closed (success: `mdnsctl watch | head` is fine).
-/// The target of `command` from the words after it: `--query`, and
-/// `--interval` (for `watch` and `subscribe`) or `--wait` (for `devices`),
-/// as `--query TYPE` or `--query=TYPE`, and the segment name of the rest.
-/// Names may contain spaces, so `devices IoT to br0` needs no quoting.
-fn target(command: &str, rest: &[String]) -> Result<Target, Failure> {
-    let timed = if command == "devices" { "--wait" } else { "--interval" };
-    let mut target = Target::default();
-    let mut words: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < rest.len() {
-        let word = rest[i].as_str();
-        i += 1;
-        let (option, inline) = match word.split_once('=') {
-            Some((option, value)) => (option, Some(value)),
-            None => (word, None),
-        };
-        if option != "--query" && option != timed {
-            words.push(word);
-            continue;
-        }
-        let value = match inline {
-            Some(value) => value,
-            None => {
-                i += 1;
-                rest.get(i - 1).ok_or_else(|| Failure::Usage(format!("{option} needs a value")))?
-            }
-        };
-        if value.is_empty() || value.contains(char::is_whitespace) {
-            return Err(Failure::Usage(format!("invalid {option} {value:?}")));
-        }
-        if option == "--query" {
-            target.query.push(value.to_string());
-            continue;
-        }
-        let span = timespan::parse(value).map_err(|e| Failure::Usage(format!("invalid {option} {value:?}: {e}")))?;
-        if option == "--wait" {
-            if span.is_zero() {
-                return Err(Failure::Usage("--wait must be longer than nothing".into()));
-            }
-            target.wait = Some(span);
-            continue;
-        }
-        let every = span;
-        if every < MIN_INTERVAL {
-            return Err(Failure::Usage(format!("--interval must be at least {}s", MIN_INTERVAL.as_secs())));
-        }
-        // The daemon takes whole seconds.
-        target.interval = Some(Duration::from_secs(every.as_secs() + u64::from(every.subsec_nanos() > 0)));
-    }
-    if target.interval.is_some() && target.query.is_empty() {
-        return Err(Failure::Usage("--interval needs a --query to ask again".into()));
-    }
-    if target.wait.is_some() && target.query.is_empty() {
-        return Err(Failure::Usage("--wait needs a --query to wait for answers to".into()));
-    }
-    target.segment = words.join(" ");
-    if target.segment.trim().is_empty() {
-        return Err(Failure::Usage(format!("{command} needs a segment name")));
-    }
-    // The protocol is one request per line.
-    if target.segment.contains(['\n', '\r']) {
-        return Err(Failure::Usage("segment name contains a line break".into()));
-    }
-    Ok(target)
-}
-
 /// Send the watch request `line` and wait for the daemon to accept it: the
 /// stream its events will come on, with no time limit from then on.
 fn open_watch(socket: &Path, line: &str) -> Result<BufReader<UnixStream>, Failure> {
@@ -346,6 +331,8 @@ fn open_watch(socket: &Path, line: &str) -> Result<BufReader<UnixStream>, Failur
     Ok(reader)
 }
 
+/// Follow a segment: print each change the daemon reports until it stops (an
+/// error) or `out` is closed (success: `mdnsctl watch | head` is fine).
 fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
     let socket = &opts.socket;
     let mut reader = open_watch(socket, &target.request("watch"))?;
@@ -463,50 +450,6 @@ fn device_key(device: &Value) -> String {
         None => device["addresses"][0].as_str().unwrap_or_default().to_string(),
     };
     format!("{}\0{who}", device["interface"].as_str().unwrap_or_default())
-}
-
-/// The subscription the words after `subscribe` describe: options and the
-/// segment name as for `watch`, then `--` and the script, with its
-/// arguments.
-fn subscription(rest: &[String]) -> Result<Subscription, Failure> {
-    let split = rest
-        .iter()
-        .position(|w| w == "--")
-        .ok_or_else(|| Failure::Usage("subscribe needs `-- SCRIPT` to run for each change".into()))?;
-    let (before, script) = (&rest[..split], &rest[split + 1..]);
-    if script.is_empty() {
-        return Err(Failure::Usage("subscribe needs a script after --".into()));
-    }
-    let mut foreground = false;
-    let mut log = None;
-    let mut words = Vec::new();
-    let mut i = 0;
-    while i < before.len() {
-        let word = before[i].as_str();
-        i += 1;
-        let file = match word {
-            "--foreground" => {
-                foreground = true;
-                continue;
-            }
-            "--log" => {
-                i += 1;
-                before.get(i - 1).map(String::as_str)
-            }
-            _ => match word.strip_prefix("--log=") {
-                Some(file) => Some(file),
-                None => {
-                    words.push(before[i - 1].clone());
-                    continue;
-                }
-            },
-        };
-        match file {
-            Some(file) if !file.is_empty() => log = Some(PathBuf::from(file)),
-            _ => return Err(Failure::Usage("--log needs a file".into())),
-        }
-    }
-    Ok(Subscription { target: target("subscribe", &words)?, script: script.to_vec(), foreground, log })
 }
 
 /// Subscribe: open the watch, then (unless in the foreground) go into the
@@ -1268,16 +1211,9 @@ fn table(rows: &[Vec<String>]) -> String {
 
 fn main() -> ExitCode {
     let opts = match parse_args(std::env::args().skip(1)) {
-        Ok(Parsed::Run(opts)) => opts,
-        Ok(Parsed::Help) => {
-            print!("{}", usage());
-            return ExitCode::SUCCESS;
-        }
-        Err(Failure::Usage(message)) => {
-            eprintln!("mdnsctl: {message}\n\n{}", usage());
-            return ExitCode::from(2);
-        }
-        Err(_) => unreachable!("parse_args only reports usage errors"),
+        Ok(opts) => opts,
+        // Help and version to stdout with 0, usage errors to stderr with 2.
+        Err(e) => e.exit(),
     };
 
     let result = match &opts.command {
@@ -1306,15 +1242,12 @@ mod tests {
 
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<Parsed, Failure> {
+    fn parse(args: &[&str]) -> Result<Options, clap::Error> {
         parse_args(args.iter().map(|s| s.to_string()))
     }
 
     fn opts(args: &[&str]) -> Options {
-        match parse(args).unwrap() {
-            Parsed::Run(o) => o,
-            Parsed::Help => panic!("unexpected help"),
-        }
+        parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
     }
 
     #[test]
@@ -1329,28 +1262,31 @@ mod tests {
         assert_eq!(o.socket, PathBuf::from("/x.sock"));
         assert!(o.json);
         assert_eq!(o.command, Command::Devices("IoT to br0".into()));
-
         assert_eq!(opts(&["--socket=/y.sock", "segments"]).socket, PathBuf::from("/y.sock"));
-        // Options after the command belong to the command.
-        assert_eq!(opts(&["devices", "--json"]).command, Command::Devices("--json".into()));
+
+        // Options may come anywhere, before the command or after it, and
+        // among the words of a segment's name.
+        let o = opts(&["devices", "IoT", "-v", "to", "br0", "--json", "--socket", "/z.sock"]);
+        assert!(o.verbose && o.json);
+        assert_eq!((o.socket, o.command), (PathBuf::from("/z.sock"), Command::Devices("IoT to br0".into())));
         assert!(!opts(&["devices", "IoT"]).verbose);
         assert!(opts(&["-v", "devices", "IoT"]).verbose);
         assert!(opts(&["--verbose", "--json", "devices", "IoT"]).verbose);
-        // After the command, "-v" is part of the segment name, not a flag.
-        assert_eq!(opts(&["devices", "-v"]).command, Command::Devices("-v".into()));
+
         assert_eq!(opts(&["probe"]).command, Command::Probe(None));
-        assert_eq!(opts(&["probe", "  "]).command, Command::Probe(None));
         assert_eq!(opts(&["probe", "IoT", "to", "br0"]).command, Command::Probe(Some("IoT to br0".into())));
         assert_eq!(opts(&["timers"]).command, Command::Timers);
         assert_eq!(opts(&["watchers"]).command, Command::Watchers);
         assert_eq!(opts(&["watch", "IoT", "to", "br0"]).command, Command::Watch("IoT to br0".into()));
-        assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
-        assert_eq!(parse(&["segments", "-h"]), Err(Failure::Usage("segments takes no arguments".into())));
+        for help in [&["--help"][..], &["segments", "-h"], &["devices", "--help"]] {
+            assert_eq!(parse(help).unwrap_err().kind(), ErrorKind::DisplayHelp, "{help:?}");
+        }
+        assert_eq!(parse(&["--version"]).unwrap_err().kind(), ErrorKind::DisplayVersion);
     }
 
-    /// `--query` and `--interval` may come anywhere after the command, with
-    /// their value as the next word or after `=`; the other words are the
-    /// segment's name. They go to the daemon ahead of it.
+    /// `--query` and `--interval` may come anywhere, with their value as the
+    /// next word or after `=`; the other words are the segment's name. They
+    /// go to the daemon ahead of it.
     #[test]
     fn devices_and_watch_take_a_query() {
         let o = opts(&["devices", "--query", "_shelly._tcp", "IoT", "--query=_hue._tcp", "to", "br0"]);
@@ -1365,8 +1301,8 @@ mod tests {
         // Part of a second more is a second more: never asked more often than said.
         let Command::Watch(target) = opts(&["watch", "--interval=10.5s", "--query=_x._tcp", "IoT"]).command else { panic!() };
         assert_eq!(target.interval, Some(Duration::from_secs(11)));
-        // devices asks once: --interval is part of the name there.
-        assert_eq!(opts(&["devices", "--interval=1min"]).command, Command::Devices("--interval=1min".into()));
+        // devices takes no --interval: it waits, it does not ask again.
+        assert!(parse(&["devices", "--query=_x._tcp", "--interval=1min", "IoT"]).is_err());
     }
 
     #[test]
@@ -1394,7 +1330,7 @@ mod tests {
             &["watch", "--query=_x._tcp", "--interval=5s", "IoT"],
             &["watch", "--query=_x._tcp", "--interval=soon", "IoT"],
         ] {
-            assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
+            assert!(parse(args).is_err(), "{args:?}");
         }
     }
 
@@ -1402,7 +1338,8 @@ mod tests {
     #[test]
     fn man_page_covers_every_command_and_option() {
         let man = include_str!("../man/mdnsctl.1");
-        for (name, _, _) in COMMANDS {
+        for command in Cli::command().get_subcommands() {
+            let name = command.get_name();
             assert!(man.contains(&format!(".B {name}")) || man.contains(&format!("\\fB{name}\\fR")), "{name}");
         }
         for option in ["\\-\\-json", "\\-\\-segmented\\-json", "\\-\\-socket", "\\-\\-help", "\\-\\-verbose"] {
@@ -1413,9 +1350,12 @@ mod tests {
 
     #[test]
     fn usage_lists_every_command() {
-        let text = usage();
-        for (name, _, about) in COMMANDS {
-            assert!(text.contains(name) && text.contains(about), "{name}");
+        Cli::command().debug_assert();
+        let mut cli = Cli::command();
+        let text = cli.render_help().to_string();
+        for command in cli.get_subcommands() {
+            let about = command.get_about().expect("every command says what it does").to_string();
+            assert!(text.contains(command.get_name()) && text.contains(&about), "{}", command.get_name());
         }
     }
 
@@ -1629,7 +1569,7 @@ mod tests {
             &["subscribe", "--log=", "lan", "--", "script"],
             &["subscribe", "--interval=1min", "lan", "--", "script"],
         ] {
-            assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
+            assert!(parse(args).is_err(), "{args:?}");
         }
     }
 
@@ -1910,7 +1850,7 @@ mod tests {
         assert!(o.segmented && !o.json);
         assert!(opts(&["--segmented-json", "devices", "--query=_x._tcp", "IoT"]).segmented);
         for args in [&["--segmented-json", "segments"][..], &["--segmented-json", "watch", "IoT"], &["--json", "--segmented-json", "devices", "IoT"]] {
-            assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
+            assert!(parse(args).is_err(), "{args:?}");
         }
     }
 
@@ -1952,7 +1892,7 @@ mod tests {
         let Command::Devices(t) = opts(&["devices", "--query=_x._tcp", "IoT"]).command else { panic!() };
         assert_eq!(t.wait, None, "the default");
         for args in [&["devices", "--wait=2s", "IoT"][..], &["devices", "--query=_x._tcp", "--wait=0", "IoT"], &["devices", "--query=_x._tcp", "--wait=soon", "IoT"]] {
-            assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
+            assert!(parse(args).is_err(), "{args:?}");
         }
     }
 
