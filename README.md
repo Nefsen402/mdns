@@ -127,10 +127,10 @@ See what the daemon sees:
 
 ```
 $ mdnsctl devices media_stuff
-media_stuff: 3 devices
   Living-Room-TV.local  Living Room TV  10.0.2.40, fd00:2::40
   Speakers.local        Speakers        10.0.2.73
   desktop.local         -               10.0.0.10, fd00::10
+media_stuff: 3 devices
 ```
 
 The rules for what is reflected, and when, are in `mdnsd(8)`. Don't run another
@@ -167,13 +167,15 @@ mdnsctl --json devices lan | jq -r '.devices[] | select(.hostname) | "\(.hostnam
 **Devices that only answer when asked.** Smart plugs and many other IoT devices
 rarely announce themselves, and answer neither waiting nor a general probe:
 they answer when asked for their service type by name. `--query` does that, on
-every interface of the segment, and lists only the devices of that type:
+every interface of the segment, and lists only the devices of that type: those
+already known at once, the others as they answer, for `--wait` (4 seconds unless
+given), then how many there are. With `--json`, it prints one list at the end.
 
 ```sh
 $ mdnsctl devices --query _shelly._tcp lan
-lan: 2 devices
   shellyplug-a1b2.local  shellyplug-a1b2  10.0.1.21
   shellyplug-c3d4.local  shellyplug-c3d4  10.0.1.22
+lan: 2 devices
 ```
 
 Once found, a device stays listed as long as it keeps answering, and plain

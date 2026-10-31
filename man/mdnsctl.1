@@ -33,7 +33,7 @@ List the configured segments, one line each, with the interfaces in the segment
 (an untrusted one marked, as it is announced nothing) and the address families
 (v4, v6) it covers.
 .TP
-\fBdevices\fR [\fB\-\-query\fR \fItype\fR]... \fIname\fR
+\fBdevices\fR [\fB\-\-query\fR \fItype\fR]... [\fB\-\-wait\fR \fIspan\fR] \fIname\fR
 List the devices discovered on the interfaces of the segment called
 .IR name ,
 in both address families.
@@ -45,6 +45,7 @@ and, last, all of its addresses, IPv4 first, whichever family it was heard
 over.
 Devices that have not announced a name yet have no DNS name to show, so they
 are only counted.
+The listing ends with how many devices there are.
 With
 .B \-v
 every device is listed with its interface, addresses of both families (routable
@@ -86,9 +87,29 @@ may be left off, and the option may be given more than once, as
 .I type
 or
 .BI \-\-query= type\fR),
-the daemon first asks for that type by name on every interface of the segment,
-resolving what answers, in three rounds over about four seconds, and then lists
-only the devices of that type, each with only its services of that type.
+only the devices of that type are listed, each with only its services of that
+type, and they are asked for by name on every interface of the segment:
+.B mdnsctl
+watches the segment for the type, as
+.B "watch \-\-query"
+does, for
+.B \-\-wait
+.I span
+(4 seconds unless given, such as
+.B 10s
+or
+.BR 1.5s ).
+Each device is printed as without
+.B \-\-query
+(and with
+.BR \-v )
+as soon as it is found, those of the type already known at once and the others
+as they answer, and the count once the wait is over.
+With
+.BR \-\-json ,
+nothing is printed until the wait is over, then one reply as without
+.BR \-\-query :
+each device as last heard of, and none that went in the meantime.
 Many devices, smart plugs among them, answer only when asked for their type: a
 probe, which asks what types there are, does not find them, and neither does
 waiting.
@@ -342,8 +363,8 @@ prints one line per named device: its DNS name, its pretty name and its addresse
 .PP
 .nf
 .RS
-IoT to br0: 1 device
   printer.local  Printer  10.0.0.10
+IoT to br0: 1 device
 .RE
 .fi
 .PP
@@ -353,10 +374,10 @@ it lists everything, including addresses and service details:
 .PP
 .nf
 .RS
-IoT to br0: 2 devices
   br0   10.0.0.10, fd00::10  printer.local  addr-ttl=120
       Printer  _http._tcp.local  :631 -> printer.local  ttl=4500  [rp=ipp, ty=hp]
   wifi  10.0.1.7             \-
+IoT to br0: 2 devices
 .RE
 .fi
 .PP

@@ -6,7 +6,7 @@
 //! ```text
 //! segments
 //!   {"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"untrusted":[],"families":["v4","v6"]}]}
-//! devices [--query=<type>]... <segment name>
+//! devices <segment name>
 //!   {"ok":true,"name":"IoT","devices":[{"interface":"wifi","hostname":"tv.local",
 //!    "addresses":["10.0.1.7","fd00:0:1::7","fe80::7"],"address_ttl":120,
 //!    "services":[{"instance":...}]}]}
@@ -41,18 +41,19 @@
 //! said goodbye or ran out). Nothing is replayed: only changes from then on. A
 //! failure after the first line is a final `{"ok":false,"error":"..."}`.
 //!
-//! `--query=` names a service type (`_shelly._tcp`, `.local` optional) to
-//! ask for by name on every interface of the segment, and narrows the reply
-//! to the devices of that type, each with only its services of that type;
-//! it may be given more than once. Many devices answer only when asked for
-//! their type, and not when asked what types there are, so neither a probe
-//! nor waiting finds them. `devices` replies once the asking is done, about
-//! four seconds later, with what answered and what was known already.
-//! `watch` first sends a `present` line for each device of the type already
-//! known, asks, and with `--interval=` asks again that often (at least
-//! every ten seconds, never more often). A device that loses its last
-//! service of the type is `removed` from the watch. The types asked for are
-//! remembered, so probes ask for them from then on.
+//! `watch --query=` names a service type (`_shelly._tcp`, `.local` optional)
+//! to ask for by name on every interface of the segment, and narrows the
+//! watch to the devices of that type, each with only its services of that
+//! type; it may be given more than once. Many devices answer only when asked
+//! for their type, and not when asked what types there are, so neither a
+//! probe nor waiting finds them. The watch first sends a `present` line for
+//! each device of the type already known, asks, and with `--interval=` asks
+//! again that often (at least every ten seconds, never more often). A device
+//! that loses its last service of the type is `removed` from the watch. The
+//! types asked for are remembered, so probes ask for them from then on.
+//! `devices` only lists what is known: to ask for a type and see what
+//! answers, watch with a query for as long as you care to wait, as `mdnsctl
+//! devices --query` does.
 //!
 //! `watchers` lists the watches streaming now, oldest first: the segment,
 //! the `--query` types (empty for none) and `--interval` (`null` for none)
@@ -371,8 +372,8 @@ fn links_of<'a>(groups: &'a [Group], name: &str) -> Vec<&'a Segment> {
 }
 
 /// Run `f` on each of `links` at once, as they are independent: it takes
-/// one's time, not one per interface. What each returned, as `probe` and
-/// `devices --query` report it.
+/// one's time, not one per interface. What each returned, as `probe`
+/// reports it.
 fn on_each(links: &[&Segment], f: impl Fn(&Segment) -> Result<usize> + Sync) -> Vec<Value> {
     thread::scope(|scope| {
         let f = &f;
@@ -575,7 +576,7 @@ pub fn handle(groups: &[Group], timers: &Watcher, watches: &Watches, request: &s
         "watch" => error("watch streams events: it needs a connection of its own"),
         "" => error("empty request"),
         other => error(&format!(
-            "unknown command {other:?}; try: segments, devices [--query=<type>] <name>, probe [name], watch <name>, watchers, timers"
+            "unknown command {other:?}; try: segments, devices <name>, probe [name], watch [--query=<type>] <name>, watchers, timers"
         )),
     }
     .to_string()
@@ -613,33 +614,23 @@ fn segment_arg(arg: &str) -> &str {
     arg.strip_prefix('"').and_then(|n| n.strip_suffix('"')).unwrap_or(arg)
 }
 
-fn devices(groups: &[Group], arg: &str) -> Value {
-    let (query, name) = match query_args(arg) {
-        Ok(parsed) => parsed,
-        Err(reply) => return reply,
-    };
-    if query.interval.is_some() {
-        return error("--interval is for watch: devices asks once");
+fn devices(groups: &[Group], name: &str) -> Value {
+    if name.starts_with("--") {
+        return error("devices lists what is known: to ask for a type, watch with --query");
     }
     let name = segment_arg(name);
     if name.is_empty() {
-        return error("usage: devices [--query=<type>]... <segment name>");
+        return error("usage: devices <segment name>");
     }
     let members: Vec<&Group> = groups.iter().filter(|g| g.name == name).collect();
     if members.is_empty() {
         return error(&format!("no such segment: {name}"));
-    }
-    if !query.kinds.is_empty() {
-        on_each(&links_of(groups, name), |seg| seg.query_types(&query.kinds));
     }
 
     let mut list = Vec::new();
     for g in members {
         for seg in g.reflector.segments() {
             let mut found = seg.devices();
-            if !query.kinds.is_empty() {
-                found = found.iter().filter_map(|d| d.only_kinds(&query.kinds)).collect();
-            }
             found.sort_by_key(|d| (d.key(), d.addrs().collect::<Vec<_>>()));
             list.extend(found.iter().map(|d| device_json(seg.interface(), d)));
         }
@@ -1094,35 +1085,20 @@ mod tests {
         assert!(err("--bogus IoT").contains("unknown option --bogus"));
     }
 
-    /// `devices --query` asks for the type on every interface of the segment,
-    /// and lists only devices of it, with only their services of it.
+    /// `devices` lists what is known, and asks nothing: an option is refused,
+    /// pointing to `watch --query`, which asks.
     #[test]
-    fn devices_with_a_query_ask_and_list_only_that_type() {
+    fn devices_lists_what_is_known_and_asks_nothing() {
         let (a, a_rx) = wired("a");
-        let (b, b_rx) = wired("b");
-        let groups = [Group { name: "IoT".into(), reflector: Reflector::new(0, vec![a.clone(), b.clone()]).unwrap() }];
+        let groups = [Group { name: "IoT".into(), reflector: Reflector::new(0, vec![a.clone()]).unwrap() }];
         announce(&a, "10.0.1.7", "tv.local", "TV");
-        a.observe(ip("10.0.1.8"));
-        let reply: Value =
-            serde_json::from_str(&handle(&groups, &Watcher::default(), &Watches::default(), "devices --query=_http._tcp IoT")).unwrap();
-        assert_eq!(reply["ok"], true, "{reply}");
-        let hosts: Vec<&str> = reply["devices"].as_array().unwrap().iter().filter_map(|d| d["hostname"].as_str()).collect();
-        assert_eq!(hosts, ["tv.local"]);
-        assert_eq!(reply["devices"].as_array().unwrap().len(), 1, "not the one without the type");
-        let http = |rx| queries(rx).into_iter().filter(|(names, _)| names == &["_http._tcp.local"]).collect::<Vec<_>>();
-        let on_a = http(&a_rx);
-        assert!(on_a.len() == 3 && on_a.iter().all(|&(_, known)| known == 1), "three rounds, with the TV known: {on_a:?}");
-        assert_eq!(http(&b_rx).len(), 3);
-
-        let reply = handle(&groups, &Watcher::default(), &Watches::default(), "devices --query=_ipp._tcp IoT");
-        assert!(reply.contains(r#""devices":[]"#), "{reply}");
-        for (request, why) in [
-            ("devices --query=_http._tcp --interval=30 IoT", "--interval is for watch"),
-            ("devices --query=http IoT", "not a service type"),
-            ("devices --query=_http._tcp", "usage: devices"),
-        ] {
-            assert!(handle(&groups, &Watcher::default(), &Watches::default(), request).contains(why), "{request}");
+        let ask = |request: &str| handle(&groups, &Watcher::default(), &Watches::default(), request);
+        let reply: Value = serde_json::from_str(&ask("devices IoT")).unwrap();
+        assert_eq!(reply["devices"][0]["hostname"], "tv.local");
+        for request in ["devices --query=_http._tcp IoT", "devices --interval=30 IoT"] {
+            assert!(ask(request).contains("watch with --query"), "{request}");
         }
+        assert!(queries(&a_rx).is_empty(), "nothing asked");
     }
 
     /// `watch --query` shows the devices of the type already known as

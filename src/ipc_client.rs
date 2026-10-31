@@ -13,7 +13,7 @@ use std::process::{ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -25,12 +25,14 @@ const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A probe takes the daemon about four seconds to run before it replies, and
-/// so does `devices --query`.
+/// A probe takes the daemon about four seconds to run before it replies.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Keep in sync with `ipc::MIN_QUERY_INTERVAL` in the daemon.
 const MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long `devices --query` takes what answers, unless `--wait` says.
+const DEFAULT_WAIT: Duration = Duration::from_secs(4);
 
 /// How long a subscriber waits to connect again after losing the daemon, at
 /// first and at most: the wait doubles with each failed try.
@@ -51,7 +53,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// (command, arguments, description): the whole IPC surface.
 const COMMANDS: &[(&str, &str, &str)] = &[
     ("segments", "", "list the configured segments"),
-    ("devices", "[--query TYPE]... <name>", "list the devices discovered in a segment"),
+    ("devices", "[--query TYPE]... [--wait SPAN] <name>", "list the devices discovered in a segment"),
     ("probe", "[<name>]", "actively query for devices (all segments, or one)"),
     ("watch", "[--query TYPE]... [--interval SPAN] <name>", "print the devices of a segment as they appear and go"),
     (
@@ -75,12 +77,14 @@ enum Command {
 }
 
 /// The segment of `devices` or `watch`, and the service types to ask for and
-/// show (`--query`), and how often a watch asks again (`--interval`).
+/// show (`--query`), how often a watch asks again (`--interval`), and how
+/// long `devices --query` takes what answers (`--wait`).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Target {
     segment: String,
     query: Vec<String>,
     interval: Option<Duration>,
+    wait: Option<Duration>,
 }
 
 /// What `subscribe` watches, and the script it runs for each event.
@@ -193,7 +197,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
     let command = match name.as_str() {
         "segments" if rest.is_empty() => Command::Segments,
         "segments" => return Err(Failure::Usage("segments takes no arguments".into())),
-        "devices" => Command::Devices(target("devices", rest, false)?),
+        "devices" => Command::Devices(target("devices", rest)?),
         "probe" => {
             let segment = rest.join(" ");
             if segment.contains(['\n', '\r']) {
@@ -201,7 +205,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
             }
             Command::Probe((!segment.trim().is_empty()).then_some(segment))
         }
-        "watch" => Command::Watch(target("watch", rest, true)?),
+        "watch" => Command::Watch(target("watch", rest)?),
         "subscribe" => Command::Subscribe(subscription(rest)?),
         "watchers" if rest.is_empty() => Command::Watchers,
         "watchers" => return Err(Failure::Usage("watchers takes no arguments".into())),
@@ -248,11 +252,12 @@ fn server_error(reply: &Value) -> Option<Failure> {
 
 /// Follow a segment: print each change the daemon reports until it stops (an
 /// error) or `out` is closed (success: `mdnsctl watch | head` is fine).
-/// The target of `command` from the words after it: `--query` and (for a
-/// watch) `--interval` options, as `--query TYPE` or `--query=TYPE`, and the
-/// segment name of the rest. Names may contain spaces, so `devices IoT to
-/// br0` needs no quoting.
-fn target(command: &str, rest: &[String], watching: bool) -> Result<Target, Failure> {
+/// The target of `command` from the words after it: `--query`, and
+/// `--interval` (for `watch` and `subscribe`) or `--wait` (for `devices`),
+/// as `--query TYPE` or `--query=TYPE`, and the segment name of the rest.
+/// Names may contain spaces, so `devices IoT to br0` needs no quoting.
+fn target(command: &str, rest: &[String]) -> Result<Target, Failure> {
+    let timed = if command == "devices" { "--wait" } else { "--interval" };
     let mut target = Target::default();
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
@@ -263,7 +268,7 @@ fn target(command: &str, rest: &[String], watching: bool) -> Result<Target, Fail
             Some((option, value)) => (option, Some(value)),
             None => (word, None),
         };
-        if option != "--query" && !(watching && option == "--interval") {
+        if option != "--query" && option != timed {
             words.push(word);
             continue;
         }
@@ -281,7 +286,15 @@ fn target(command: &str, rest: &[String], watching: bool) -> Result<Target, Fail
             target.query.push(value.to_string());
             continue;
         }
-        let every = timespan::parse(value).map_err(|e| Failure::Usage(format!("invalid --interval {value:?}: {e}")))?;
+        let span = timespan::parse(value).map_err(|e| Failure::Usage(format!("invalid {option} {value:?}: {e}")))?;
+        if option == "--wait" {
+            if span.is_zero() {
+                return Err(Failure::Usage("--wait must be longer than nothing".into()));
+            }
+            target.wait = Some(span);
+            continue;
+        }
+        let every = span;
         if every < MIN_INTERVAL {
             return Err(Failure::Usage(format!("--interval must be at least {}s", MIN_INTERVAL.as_secs())));
         }
@@ -290,6 +303,9 @@ fn target(command: &str, rest: &[String], watching: bool) -> Result<Target, Fail
     }
     if target.interval.is_some() && target.query.is_empty() {
         return Err(Failure::Usage("--interval needs a --query to ask again".into()));
+    }
+    if target.wait.is_some() && target.query.is_empty() {
+        return Err(Failure::Usage("--wait needs a --query to wait for answers to".into()));
     }
     target.segment = words.join(" ");
     if target.segment.trim().is_empty() {
@@ -350,6 +366,91 @@ fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Fa
     }
 }
 
+/// List the devices of the types `target` asks for: open a watch for them,
+/// which sends those already known and asks for the rest, and take what
+/// comes for `--wait`. Each device is printed as `devices` lists it the first
+/// time it is found (so those known come at once), and the summary that
+/// `devices` ends with after the wait; with `--json`, one reply at the end,
+/// as `devices` gives it, with each device as last heard of and none that
+/// went.
+fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
+    let socket = &opts.socket;
+    let mut reader = open_watch(socket, &target.request("watch"))?;
+    let deadline = Instant::now() + target.wait.unwrap_or(DEFAULT_WAIT);
+    // What is found, by where and who it is, as last heard of.
+    let mut found: Vec<(String, Value)> = Vec::new();
+    // What is printed: hosts, or with -v devices, by their key.
+    let mut shown = HashSet::new();
+    let mut line = String::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        reader.get_ref().set_read_timeout(Some(left)).map_err(|e| connect_err(socket, e))?;
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(n) if n == 0 || !line.ends_with('\n') => {
+                return Err(Failure::Connect("the daemon closed the connection".into()));
+            }
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => break,
+            Err(e) => return Err(connect_err(socket, e)),
+        }
+        let event: Value =
+            serde_json::from_str(line.trim_end()).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
+        if let Some(failure) = server_error(&event) {
+            return Err(failure);
+        }
+        let device = &event["device"];
+        let key = device_key(device);
+        found.retain(|(k, _)| *k != key);
+        if event["event"].as_str().ok_or_else(bad_reply)? == "removed" {
+            continue;
+        }
+        found.push((key.clone(), device.clone()));
+        let text = match (opts.json, opts.verbose) {
+            (true, _) => None,
+            (false, true) if shown.insert(key) => Some(verbose_lines(device, &device_row(device)?, [0, 0])),
+            (false, true) => None,
+            (false, false) => brief_row(device)
+                .filter(|row| shown.insert(row[0].to_ascii_lowercase()))
+                .map(|row| brief_line(&row, [0, 0])),
+        };
+        if let Some(text) = text
+            && out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_err()
+        {
+            return Ok(());
+        }
+    }
+    drop(reader);
+
+    let name = target.segment.trim_matches('"');
+    let text = if opts.json {
+        let mut devices: Vec<Value> = found.into_iter().map(|(_, d)| d).collect();
+        devices.sort_by_key(|d| (d["interface"].to_string(), d["hostname"].to_string().to_ascii_lowercase(), d["addresses"].to_string()));
+        format!("{}\n", serde_json::json!({ "ok": true, "name": name, "devices": devices }))
+    } else if opts.verbose {
+        devices_summary(name, found.len(), 0)
+    } else {
+        let hosts: HashSet<String> = found.iter().filter_map(|(_, d)| d["hostname"].as_str()).map(str::to_ascii_lowercase).collect();
+        let unnamed = found.iter().filter(|(_, d)| !d["hostname"].is_string()).count();
+        devices_summary(name, hosts.len(), unnamed)
+    };
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+    Ok(())
+}
+
+/// What tells a device of a watch apart from the others: where it is, and
+/// its hostname, or else its first address.
+fn device_key(device: &Value) -> String {
+    let who = match device["hostname"].as_str() {
+        Some(host) => host.to_ascii_lowercase(),
+        None => device["addresses"][0].as_str().unwrap_or_default().to_string(),
+    };
+    format!("{}\0{who}", device["interface"].as_str().unwrap_or_default())
+}
+
 /// The subscription the words after `subscribe` describe: options and the
 /// segment name as for `watch`, then `--` and the script, with its
 /// arguments.
@@ -391,7 +492,7 @@ fn subscription(rest: &[String]) -> Result<Subscription, Failure> {
             _ => return Err(Failure::Usage("--log needs a file".into())),
         }
     }
-    Ok(Subscription { target: target("subscribe", &words, true)?, script: script.to_vec(), foreground, log })
+    Ok(Subscription { target: target("subscribe", &words)?, script: script.to_vec(), foreground, log })
 }
 
 /// Subscribe: open the watch, then (unless in the foreground) go into the
@@ -678,8 +779,7 @@ fn utc_now() -> String {
 fn execute(opts: &Options) -> Result<String, Failure> {
     let (line, timeout) = match &opts.command {
         Command::Segments => ("segments".to_string(), TIMEOUT),
-        Command::Devices(target) if target.query.is_empty() => (target.request("devices"), TIMEOUT),
-        Command::Devices(target) => (target.request("devices"), PROBE_TIMEOUT),
+        Command::Devices(target) => (target.request("devices"), TIMEOUT),
         Command::Probe(None) => ("probe".to_string(), PROBE_TIMEOUT),
         Command::Probe(Some(name)) => (format!("probe {name}"), PROBE_TIMEOUT),
         Command::Watchers => ("watchers".to_string(), TIMEOUT),
@@ -876,9 +976,6 @@ fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
 
     let name = reply["name"].as_str().ok_or_else(bad_reply)?;
     let devices = reply["devices"].as_array().ok_or_else(bad_reply)?;
-    if devices.is_empty() {
-        return Ok(format!("{name}: no devices\n"));
-    }
 
     let mut named: Vec<Named> = Vec::new();
     let mut unnamed = 0;
@@ -914,25 +1011,52 @@ fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
             n.addrs.sort_by_key(|(link_local, v6, _)| (*link_local, *v6));
             let pretty = if n.pretty.is_empty() { "-".to_string() } else { n.pretty.join(", ") };
             let addrs: Vec<&str> = n.addrs.iter().map(|(_, _, a)| a.as_str()).collect();
-            [n.host.clone(), pretty, addrs.join(", ")]
+            let addrs = if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") };
+            [n.host.clone(), pretty, addrs]
         })
         .collect();
 
-    let mut out = match rows.len() {
-        0 => format!("{name}: no named devices\n"),
-        1 => format!("{name}: 1 device\n"),
-        n => format!("{name}: {n} devices\n"),
-    };
     let width = |col: usize| rows.iter().map(|r| r[col].len()).max().unwrap_or(0);
-    let (w0, w1) = (width(0), width(1));
-    for [host, pretty, addrs] in &rows {
-        out.push_str(&format!("  {host:<w0$}  {pretty:<w1$}  {addrs}\n"));
-    }
+    let widths = [width(0), width(1)];
+    let mut out: String = rows.iter().map(|row| brief_line(row, widths)).collect();
+    out.push_str(&devices_summary(name, rows.len(), unnamed));
+    Ok(out)
+}
+
+/// A device's line in the brief listing: its DNS name, pretty name and
+/// addresses, the first two padded to `widths` (none when the rest are not
+/// known yet, as when they are printed as they come).
+fn brief_line([host, pretty, addrs]: &[String; 3], [w0, w1]: [usize; 2]) -> String {
+    format!("  {host:<w0$}  {pretty:<w1$}  {addrs}\n")
+}
+
+/// A device as the brief listing has it, or `None` for one without a name:
+/// its DNS name, its pretty names and its addresses, routable IPv4 first,
+/// then routable IPv6, then link-local.
+fn brief_row(device: &Value) -> Option<[String; 3]> {
+    let host = device["hostname"].as_str()?;
+    let pretty = pretty_names(device);
+    let pretty = if pretty.is_empty() { "-".to_string() } else { pretty.join(", ") };
+    let mut addrs = strings(&device["addresses"]);
+    addrs.sort_by_key(|a| (is_link_local(a), a.contains(':')));
+    let addrs = if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") };
+    Some([host.to_string(), pretty, addrs])
+}
+
+/// The line a listing of `name` ends with: how many devices it showed, and
+/// how many without a name it did not.
+fn devices_summary(name: &str, shown: usize, unnamed: usize) -> String {
+    let mut out = match (shown, unnamed) {
+        (0, 0) => format!("{name}: no devices\n"),
+        (0, _) => format!("{name}: no named devices\n"),
+        (1, _) => format!("{name}: 1 device\n"),
+        (n, _) => format!("{name}: {n} devices\n"),
+    };
     if unnamed > 0 {
         let s = if unnamed == 1 { "" } else { "s" };
-        out.push_str(&format!("\n({unnamed} device{s} without a name not shown; use -v to list everything)\n"));
+        out.push_str(&format!("({unnamed} device{s} without a name not shown; use -v to list everything)\n"));
     }
-    Ok(out)
+    out
 }
 
 /// The human names of a device's services, from its instance names: the
@@ -989,20 +1113,22 @@ fn is_link_local(addr: &str) -> bool {
 fn render_devices(reply: &Value) -> Result<String, Failure> {
     let name = reply["name"].as_str().ok_or_else(bad_reply)?;
     let devices = reply["devices"].as_array().ok_or_else(bad_reply)?;
-    if devices.is_empty() {
-        return Ok(format!("{name}: no devices\n"));
-    }
 
     let rows = devices.iter().map(device_row).collect::<Result<Vec<_>, Failure>>()?;
-    let widths: Vec<usize> = (0..2).map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0)).collect();
-
-    let plural = if devices.len() == 1 { "" } else { "s" };
-    let mut out = format!("{name}: {} device{plural}\n", devices.len());
+    let width = |col: usize| rows.iter().map(|r| r[col].len()).max().unwrap_or(0);
+    let widths = [width(0), width(1)];
+    let mut out = String::new();
     for (device, row) in devices.iter().zip(&rows) {
-        out.push_str(&format!("  {:<w0$}  {:<w1$}  {}\n", row[0], row[1], row[2], w0 = widths[0], w1 = widths[1]));
-        out.push_str(&service_lines(device));
+        out.push_str(&verbose_lines(device, row, widths));
     }
+    out.push_str(&devices_summary(name, devices.len(), 0));
     Ok(out)
+}
+
+/// A device as `devices -v` lists it: interface, addresses and hostname
+/// (`row`, the first two padded to `widths`), then its services.
+fn verbose_lines(device: &Value, [interface, addrs, host]: &[String; 3], [w0, w1]: [usize; 2]) -> String {
+    format!("  {interface:<w0$}  {addrs:<w1$}  {host}\n{}", service_lines(device))
 }
 
 /// The columns of a device in the verbose listing: interface, addresses,
@@ -1138,6 +1264,7 @@ fn main() -> ExitCode {
 
     let result = match &opts.command {
         Command::Watch(target) => watch(&opts, target, &mut io::stdout().lock()),
+        Command::Devices(target) if !target.query.is_empty() => devices_query(&opts, target, &mut io::stdout().lock()),
         Command::Subscribe(sub) => subscribe(&opts, sub),
         _ => execute(&opts).map(|text| print!("{text}")),
     };
@@ -1209,7 +1336,7 @@ mod tests {
     #[test]
     fn devices_and_watch_take_a_query() {
         let o = opts(&["devices", "--query", "_shelly._tcp", "IoT", "--query=_hue._tcp", "to", "br0"]);
-        let target = Target { segment: "IoT to br0".into(), query: vec!["_shelly._tcp".into(), "_hue._tcp".into()], interval: None };
+        let target = Target { segment: "IoT to br0".into(), query: vec!["_shelly._tcp".into(), "_hue._tcp".into()], interval: None, wait: None };
         assert_eq!(target.request("devices"), "devices --query=_shelly._tcp --query=_hue._tcp IoT to br0");
         assert_eq!(o.command, Command::Devices(target));
 
@@ -1317,7 +1444,7 @@ mod tests {
         let reply: Value = serde_json::from_str(DEVICES).unwrap();
         assert_eq!(
             render_devices(&reply).unwrap(),
-            "IoT to br0: 2 devices\n  br0   10.0.0.10  printer.local\n      Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]\n  wifi  10.0.1.7   -\n"
+            "  br0   10.0.0.10  printer.local\n      Printer  _http._tcp.local  :631 -> printer.local  [rp=ipp, ty=hp]\n  wifi  10.0.1.7   -\nIoT to br0: 2 devices\n"
         );
         let empty: Value = serde_json::from_str(r#"{"ok":true,"name":"IoT","devices":[]}"#).unwrap();
         assert_eq!(render_devices(&empty).unwrap(), "IoT: no devices\n");
@@ -1335,7 +1462,7 @@ mod tests {
         let out = render_devices(&serde_json::from_str(&json).unwrap()).unwrap();
         assert_eq!(
             out,
-            format!("x: 2 devices\n  a  fd00::5, fe80::5  h.local\n  a  fe80::9{}-\n", " ".repeat(11))
+            format!("  a  fd00::5, fe80::5  h.local\n  a  fe80::9{}-\nx: 2 devices\n", " ".repeat(11))
         );
     }
 
@@ -1361,7 +1488,7 @@ mod tests {
         let reply: Value = serde_json::from_str(DEVICES).unwrap();
         assert_eq!(
             render_devices_brief(&reply).unwrap(),
-            "IoT to br0: 1 device\n  printer.local  Printer  10.0.0.10\n\n(1 device without a name not shown; use -v to list everything)\n"
+            "  printer.local  Printer  10.0.0.10\nIoT to br0: 1 device\n(1 device without a name not shown; use -v to list everything)\n"
         );
     }
 
@@ -1386,7 +1513,7 @@ mod tests {
         );
         assert_eq!(
             brief(&json),
-            "media: 2 devices\n  OZAL-Speakers.local  OZAL Speakers    10.0.2.73, fe80::1\n  tv.local             Living Room. TV  10.0.2.9\n"
+            "  OZAL-Speakers.local  OZAL Speakers    10.0.2.73, fe80::1\n  tv.local             Living Room. TV  10.0.2.9\nmedia: 2 devices\n"
         );
     }
 
@@ -1404,7 +1531,7 @@ mod tests {
         // Routable IPv4, then routable IPv6, then link-local; each address once.
         assert_eq!(
             brief(&json),
-            "x: 2 devices\n  dual.local    -  10.0.0.5, 10.0.1.5, fd00::5, fe80::1\n  v6only.local  -  fe80::2\n"
+            "  dual.local    -  10.0.0.5, 10.0.1.5, fd00::5, fe80::1\n  v6only.local  -  fe80::2\nx: 2 devices\n"
         );
     }
 
@@ -1422,7 +1549,7 @@ mod tests {
         );
         assert_eq!(
             brief(&json),
-            "x: 2 devices\n  A.local  -              1.1.1.2\n  b.local  Kitchen, Hall  1.1.1.1\n"
+            "  A.local  -              1.1.1.2\n  b.local  Kitchen, Hall  1.1.1.1\nx: 2 devices\n"
         );
 
         // Only unnamed devices, none at all.
@@ -1432,9 +1559,14 @@ mod tests {
         );
         assert_eq!(
             brief(&only_unnamed),
-            "x: no named devices\n\n(2 devices without a name not shown; use -v to list everything)\n"
+            "x: no named devices\n(2 devices without a name not shown; use -v to list everything)\n"
         );
         assert_eq!(brief(r#"{"ok":true,"name":"x","devices":[]}"#), "x: no devices\n");
+        // No address yet: a dash, as -v shows it, not trailing blanks.
+        assert_eq!(
+            brief(r#"{"ok":true,"name":"x","devices":[{"interface":"a","hostname":"h.local","addresses":[],"address_ttl":null,"services":[]}]}"#),
+            "  h.local  -  -\nx: 1 device\n"
+        );
     }
 
     #[test]
@@ -1641,6 +1773,129 @@ mod tests {
         assert_eq!(forward(&mut reader, &tx), Err("the daemon closed the connection".into()));
         assert_eq!(rx.try_iter().collect::<Vec<_>>(), [EVENT], "the cut-off second one is not passed on");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A daemon that answers one request with `lines`, then keeps the
+    /// connection open for `hold`, as a watch does, and tells what it was asked.
+    fn holding_daemon(tag: &str, lines: Vec<String>, hold: Duration) -> (PathBuf, JoinHandle<String>) {
+        std::fs::create_dir_all("target").unwrap();
+        let path = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let socket_file = path.clone();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = std::fs::remove_file(&socket_file);
+            let mut asked = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut asked).unwrap();
+            for line in lines {
+                writeln!(stream, "{line}").unwrap();
+            }
+            thread::sleep(hold);
+            asked
+        });
+        (path, handle)
+    }
+
+    fn found(kind: &str, host: Option<&str>, addrs: &[&str]) -> String {
+        serde_json::json!({
+            "event": kind, "segment": "IoT", "ttl": if kind == "removed" { 0 } else { 120 },
+            "device": { "interface": "wifi", "hostname": host, "addresses": addrs, "address_ttl": 120,
+                "services": [{ "instance": format!("{} plug._x._tcp.local", host.unwrap_or("A")), "type": "_x._tcp.local",
+                    "port": 80, "target": host, "txt": [], "subtypes": [], "ttl": 120 }] },
+        })
+        .to_string()
+    }
+
+    /// What `devices --query` sees: one known, one without a name, one that
+    /// answers and then says more, and the first going.
+    fn query_stream() -> Vec<String> {
+        vec![
+            ACK.into(),
+            found("present", Some("a.local"), &["10.0.1.1"]),
+            found("added", None, &["10.0.1.2"]),
+            found("added", Some("c.local"), &["10.0.1.3"]),
+            found("updated", Some("c.local"), &["10.0.1.3", "fd00::3"]),
+            found("removed", Some("a.local"), &["10.0.1.1"]),
+        ]
+    }
+
+    fn query_options(path: &Path, json: bool, verbose: bool, wait: Duration) -> (Options, Target) {
+        let target = Target { segment: "IoT".into(), query: vec!["_x._tcp".into()], wait: Some(wait), ..Target::default() };
+        let opts = Options { socket: path.into(), json, verbose, command: Command::Segments };
+        (opts, target)
+    }
+
+    /// `devices --query` is a watch for the type, taken for `--wait`: each
+    /// device printed as `devices` lists it, as soon as it is found, then the
+    /// summary `devices` ends with, of what is left at the end.
+    #[test]
+    fn devices_with_a_query_print_what_is_found_as_it_comes() {
+        let wait = Duration::from_millis(300);
+        let (path, daemon) = holding_daemon("query-text", query_stream(), wait * 3);
+        let (opts, target) = query_options(&path, false, false, wait);
+        let started = Instant::now();
+        let mut out = Vec::new();
+        devices_query(&opts, &target, &mut out).unwrap();
+        assert!(started.elapsed() >= wait && started.elapsed() < wait * 3, "{:?}", started.elapsed());
+        assert_eq!(daemon.join().unwrap(), "watch --query=_x._tcp IoT\n", "a watch for the type, nothing else");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "  a.local  a.local plug  10.0.1.1\n  c.local  c.local plug  10.0.1.3\n\
+             IoT: 1 device\n(1 device without a name not shown; use -v to list everything)\n",
+            "each as it is first found, then what is left"
+        );
+
+        // And with -v, as `devices -v`, the unnamed one too.
+        let (path, _daemon) = holding_daemon("query-verbose", query_stream(), wait * 3);
+        let (opts, target) = query_options(&path, false, true, wait);
+        let mut out = Vec::new();
+        devices_query(&opts, &target, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with("IoT: 2 devices\n"), "{text}");
+        assert!(text.contains("c.local  addr-ttl=120") && text.contains("10.0.1.2"), "{text}");
+    }
+
+    /// With `--json`, one reply at the end, as `devices` gives it: each
+    /// device as last heard of, and none that went.
+    #[test]
+    fn devices_with_a_query_and_json_print_one_reply_at_the_end() {
+        let wait = Duration::from_millis(300);
+        let (path, _daemon) = holding_daemon("query-json", query_stream(), wait * 3);
+        let (opts, target) = query_options(&path, true, false, wait);
+        let mut out = Vec::new();
+        devices_query(&opts, &target, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let reply: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((&reply["ok"], &reply["name"]), (&Value::Bool(true), &Value::from("IoT")));
+        let devices = reply["devices"].as_array().unwrap();
+        let hosts: Vec<&Value> = devices.iter().map(|d| &d["hostname"]).collect();
+        assert_eq!(hosts, [&Value::from("c.local"), &Value::Null], "{devices:?}");
+        assert_eq!(devices[0]["addresses"], serde_json::json!(["10.0.1.3", "fd00::3"]), "as last heard of");
+    }
+
+    #[test]
+    fn devices_with_a_query_report_a_refusal_or_a_daemon_that_goes() {
+        let (path, _daemon) = holding_daemon("query-refused", vec![r#"{"ok":false,"error":"no such segment: IoT"}"#.into()], Duration::ZERO);
+        let (opts, target) = query_options(&path, false, false, Duration::from_secs(5));
+        assert_eq!(devices_query(&opts, &target, &mut Vec::new()), Err(Failure::Server("no such segment: IoT".into())));
+
+        let (path, _daemon) = holding_daemon("query-gone", vec![ACK.into()], Duration::ZERO);
+        let (opts, target) = query_options(&path, false, false, Duration::from_secs(5));
+        assert!(matches!(devices_query(&opts, &target, &mut Vec::new()), Err(Failure::Connect(_))));
+    }
+
+    #[test]
+    fn devices_take_how_long_to_wait_for_answers() {
+        let Command::Devices(t) = opts(&["devices", "--query", "_x._tcp", "--wait", "1.5s", "IoT"]).command else { panic!() };
+        assert_eq!((t.wait, t.segment.as_str()), (Some(Duration::from_millis(1500)), "IoT"));
+        assert_eq!(t.request("watch"), "watch --query=_x._tcp IoT", "the wait is mdnsctl's own");
+        let Command::Devices(t) = opts(&["devices", "--query=_x._tcp", "IoT"]).command else { panic!() };
+        assert_eq!(t.wait, None, "the default");
+        for args in [&["devices", "--wait=2s", "IoT"][..], &["devices", "--query=_x._tcp", "--wait=0", "IoT"], &["devices", "--query=_x._tcp", "--wait=soon", "IoT"]] {
+            assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
+        }
     }
 
     #[test]
@@ -1901,7 +2156,7 @@ mod tests {
         let reply: Value = serde_json::from_str(&format!(r#"{{"ok":true,"name":"IoT","devices":[{device}]}}"#)).unwrap();
         assert_eq!(
             render_devices(&reply).unwrap(),
-            "IoT: 1 device\n  wifi  10.0.1.9  plug.local  addr-ttl=120\n      Plug S  _shelly._tcp.local  :80 -> plug.local  ttl=4500  [gen=2]\n      Plug S  _http._tcp.local  :80 -> plug.local\n"
+            "  wifi  10.0.1.9  plug.local  addr-ttl=120\n      Plug S  _shelly._tcp.local  :80 -> plug.local  ttl=4500  [gen=2]\n      Plug S  _http._tcp.local  :80 -> plug.local\nIoT: 1 device\n"
         );
         // A watch shows them too, after its own ttl: how long the daemon keeps the device.
         let event: Value = serde_json::from_str(&format!(r#"{{"event":"added","segment":"IoT","ttl":300,"device":{device}}}"#)).unwrap();
@@ -1969,12 +2224,12 @@ mod tests {
         let (path, daemon) = fake_daemon("devices", DEVICES);
         let out = run(&path, false, Command::Devices("IoT to br0".into())).unwrap();
         assert_eq!(daemon.join().unwrap(), "devices IoT to br0\n");
-        assert!(out.starts_with("IoT to br0: 1 device\n"), "brief by default: {out}");
+        assert!(out.ends_with("IoT to br0: 1 device\n(1 device without a name not shown; use -v to list everything)\n"), "brief by default: {out}");
 
         let (path, daemon) = fake_daemon("devices-v", DEVICES);
         let out = run_verbose(&path, Command::Devices("IoT to br0".into())).unwrap();
         daemon.join().unwrap();
-        assert!(out.starts_with("IoT to br0: 2 devices\n") && out.contains("10.0.1.7"), "verbose: {out}");
+        assert!(out.ends_with("IoT to br0: 2 devices\n") && out.contains("10.0.1.7"), "verbose: {out}");
         let _ = std::fs::remove_file(&path);
     }
 
