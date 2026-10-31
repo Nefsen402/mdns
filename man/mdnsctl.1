@@ -5,7 +5,7 @@ mdnsctl \- query the mdnsd daemon
 .B mdnsctl
 [\fB\-s\fR \fIPATH\fR]
 [\fB\-v\fR]
-[\fB\-\-json\fR]
+[\fB\-\-json\fR | \fB\-\-segmented\-json\fR]
 .I command
 [\fIargument\fR ...]
 .br
@@ -339,6 +339,21 @@ are affected.
 .B \-\-json
 Print the daemon's reply unchanged: one line of JSON, suitable for
 .BR jq (1).
+.TP
+.B \-\-segmented\-json
+For
+.B devices
+only: print each device as a line of JSON of its own, as it is in the
+.B devices
+array of
+.BR \-\-json ,
+and nothing else.
+With
+.BR \-\-query ,
+each is printed the moment it is first found, as the text listing is, and not
+again when it changes.
+It cannot be given with
+.BR \-\-json .
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Show usage and exit.

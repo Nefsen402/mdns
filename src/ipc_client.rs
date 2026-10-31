@@ -124,6 +124,8 @@ impl Target {
 struct Options {
     socket: PathBuf,
     json: bool,
+    /// For `devices`: each device a line of JSON of its own.
+    segmented: bool,
     verbose: bool,
     command: Command,
 }
@@ -145,7 +147,7 @@ enum Failure {
 }
 
 fn usage() -> String {
-    let mut out = String::from("usage: mdnsctl [-s PATH] [-v] [--json] <command>\n\ncommands:\n");
+    let mut out = String::from("usage: mdnsctl [-s PATH] [-v] [--json | --segmented-json] <command>\n\ncommands:\n");
     for (name, args, about) in COMMANDS {
         let synopsis = format!("{name} {args}");
         let synopsis = synopsis.trim_end();
@@ -157,7 +159,7 @@ fn usage() -> String {
         }
     }
     out.push_str(&format!(
-        "\noptions:\n  -s, --socket PATH  control socket (default {DEFAULT_SOCKET})\n  -v, --verbose      list devices with all details (addresses, services)\n      --json         print the daemon's reply unchanged\n  -h, --help         show this help\n"
+        "\noptions:\n  -s, --socket PATH  control socket (default {DEFAULT_SOCKET})\n  -v, --verbose      list devices with all details (addresses, services)\n      --json         print the daemon's reply unchanged\n      --segmented-json\n                     with devices: print each device as a line of JSON of its own\n  -h, --help         show this help\n"
     ));
     out
 }
@@ -166,6 +168,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
     let mut args = args.into_iter();
     let mut socket = PathBuf::from(DEFAULT_SOCKET);
     let mut json = false;
+    let mut segmented = false;
     let mut verbose = false;
     let mut words: Vec<String> = Vec::new();
 
@@ -178,6 +181,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--json" => json = true,
+            "--segmented-json" => segmented = true,
             "-v" | "--verbose" => verbose = true,
             "-s" | "--socket" => {
                 let path = args.next().ok_or_else(|| Failure::Usage(format!("{arg} needs a path")))?;
@@ -213,7 +217,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parsed, Failure>
         "timers" => return Err(Failure::Usage("timers takes no arguments".into())),
         other => return Err(Failure::Usage(format!("unknown command {other:?}"))),
     };
-    Ok(Parsed::Run(Options { socket, json, verbose, command }))
+    if segmented && json {
+        return Err(Failure::Usage("--json and --segmented-json are two ways of printing; pick one".into()));
+    }
+    if segmented && !matches!(command, Command::Devices(_)) {
+        return Err(Failure::Usage("--segmented-json is for devices".into()));
+    }
+    Ok(Parsed::Run(Options { socket, json, segmented, verbose, command }))
 }
 
 fn connect_err(socket: &Path, e: io::Error) -> Failure {
@@ -372,7 +382,8 @@ fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Fa
 /// time it is found (so those known come at once), and the summary that
 /// `devices` ends with after the wait; with `--json`, one reply at the end,
 /// as `devices` gives it, with each device as last heard of and none that
-/// went.
+/// went; with `--segmented-json`, each device a line of JSON of its own the
+/// moment it is found, as `--json` has it, and nothing at the end.
 fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
     let socket = &opts.socket;
     let mut reader = open_watch(socket, &target.request("watch"))?;
@@ -410,6 +421,7 @@ fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Resul
         }
         found.push((key.clone(), device.clone()));
         let text = match (opts.json, opts.verbose) {
+            _ if opts.segmented => shown.insert(key).then(|| format!("{device}\n")),
             (true, _) => None,
             (false, true) if shown.insert(key) => Some(verbose_lines(device, &device_row(device)?, [0, 0])),
             (false, true) => None,
@@ -426,7 +438,9 @@ fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Resul
     drop(reader);
 
     let name = target.segment.trim_matches('"');
-    let text = if opts.json {
+    let text = if opts.segmented {
+        String::new()
+    } else if opts.json {
         let mut devices: Vec<Value> = found.into_iter().map(|(_, d)| d).collect();
         devices.sort_by_key(|d| (d["interface"].to_string(), d["hostname"].to_string().to_ascii_lowercase(), d["addresses"].to_string()));
         format!("{}\n", serde_json::json!({ "ok": true, "name": name, "devices": devices }))
@@ -796,6 +810,10 @@ fn execute(opts: &Options) -> Result<String, Failure> {
     }
     if opts.json {
         return Ok(format!("{raw}\n"));
+    }
+    if opts.segmented {
+        let devices = reply["devices"].as_array().ok_or_else(bad_reply)?;
+        return Ok(devices.iter().map(|d| format!("{d}\n")).collect());
     }
     match opts.command {
         Command::Segments => render_segments(&reply),
@@ -1304,7 +1322,7 @@ mod tests {
         let o = opts(&["segments"]);
         assert_eq!(
             o,
-            Options { socket: DEFAULT_SOCKET.into(), json: false, verbose: false, command: Command::Segments }
+            Options { socket: DEFAULT_SOCKET.into(), json: false, segmented: false, verbose: false, command: Command::Segments }
         );
 
         let o = opts(&["-s", "/x.sock", "--json", "devices", "IoT", "to", "br0"]);
@@ -1387,7 +1405,7 @@ mod tests {
         for (name, _, _) in COMMANDS {
             assert!(man.contains(&format!(".B {name}")) || man.contains(&format!("\\fB{name}\\fR")), "{name}");
         }
-        for option in ["\\-\\-json", "\\-\\-socket", "\\-\\-help", "\\-\\-verbose"] {
+        for option in ["\\-\\-json", "\\-\\-segmented\\-json", "\\-\\-socket", "\\-\\-help", "\\-\\-verbose"] {
             assert!(man.contains(option), "{option}");
         }
         assert!(man.contains(DEFAULT_SOCKET));
@@ -1822,7 +1840,7 @@ mod tests {
 
     fn query_options(path: &Path, json: bool, verbose: bool, wait: Duration) -> (Options, Target) {
         let target = Target { segment: "IoT".into(), query: vec!["_x._tcp".into()], wait: Some(wait), ..Target::default() };
-        let opts = Options { socket: path.into(), json, verbose, command: Command::Segments };
+        let opts = Options { socket: path.into(), json, segmented: false, verbose, command: Command::Segments };
         (opts, target)
     }
 
@@ -1884,6 +1902,46 @@ mod tests {
         let (path, _daemon) = holding_daemon("query-gone", vec![ACK.into()], Duration::ZERO);
         let (opts, target) = query_options(&path, false, false, Duration::from_secs(5));
         assert!(matches!(devices_query(&opts, &target, &mut Vec::new()), Err(Failure::Connect(_))));
+    }
+
+    #[test]
+    fn segmented_json_is_for_devices_alone() {
+        let o = opts(&["--segmented-json", "devices", "IoT"]);
+        assert!(o.segmented && !o.json);
+        assert!(opts(&["--segmented-json", "devices", "--query=_x._tcp", "IoT"]).segmented);
+        for args in [&["--segmented-json", "segments"][..], &["--segmented-json", "watch", "IoT"], &["--json", "--segmented-json", "devices", "IoT"]] {
+            assert!(matches!(parse(args), Err(Failure::Usage(_))), "{args:?}");
+        }
+    }
+
+    /// With `--segmented-json`, `devices` prints each device as a line of its
+    /// own, as the daemon has it, and nothing else.
+    #[test]
+    fn devices_print_a_line_of_json_per_device() {
+        let (path, _daemon) = fake_daemon("segmented", DEVICES);
+        let opts = Options { socket: path, json: false, segmented: true, verbose: false, command: Command::Devices("IoT to br0".into()) };
+        let out = execute(&opts).unwrap();
+        let reply: Value = serde_json::from_str(DEVICES).unwrap();
+        let lines: Vec<Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(&lines, reply["devices"].as_array().unwrap());
+    }
+
+    /// With `--segmented-json`, `devices --query` prints each device as a line
+    /// of its own the moment it is found, unnamed ones too, and nothing at
+    /// the end.
+    #[test]
+    fn devices_with_a_query_print_a_line_of_json_per_device_as_found() {
+        let wait = Duration::from_millis(300);
+        let (path, _daemon) = holding_daemon("query-segmented", query_stream(), wait * 3);
+        let (mut opts, target) = query_options(&path, false, false, wait);
+        opts.segmented = true;
+        let mut out = Vec::new();
+        devices_query(&opts, &target, &mut out).unwrap();
+        let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let hosts: Vec<&Value> = lines.iter().map(|d| &d["hostname"]).collect();
+        assert_eq!(hosts, [&Value::from("a.local"), &Value::Null, &Value::from("c.local")], "each once, as found");
+        assert_eq!(lines[2]["addresses"], serde_json::json!(["10.0.1.3"]), "as first found");
+        assert!(lines.iter().all(|d| d["interface"] == "wifi"));
     }
 
     #[test]
@@ -2059,7 +2117,7 @@ mod tests {
     const ACK: &str = r#"{"ok":true,"name":"IoT","watching":true}"#;
 
     fn watch_options(path: &Path, json: bool) -> Options {
-        Options { socket: path.into(), json, verbose: false, command: Command::Watch("IoT".into()) }
+        Options { socket: path.into(), json, segmented: false, verbose: false, command: Command::Watch("IoT".into()) }
     }
 
     #[test]
@@ -2207,11 +2265,11 @@ mod tests {
     }
 
     fn run(path: &Path, json: bool, command: Command) -> Result<String, Failure> {
-        execute(&Options { socket: path.into(), json, verbose: false, command })
+        execute(&Options { socket: path.into(), json, segmented: false, verbose: false, command })
     }
 
     fn run_verbose(path: &Path, command: Command) -> Result<String, Failure> {
-        execute(&Options { socket: path.into(), json: false, verbose: true, command })
+        execute(&Options { socket: path.into(), json: false, segmented: false, verbose: true, command })
     }
 
     #[test]
