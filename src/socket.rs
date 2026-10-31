@@ -557,9 +557,12 @@ impl State {
                 f("refresh", who, at);
             }
         }
-        for (name, m) in &self.manual {
+        for (key, m) in &self.manual {
             if let Some(at) = m.reannounce_at() {
-                f("re-announce", name, at);
+                // By the name as announced, not the key, which is lowercase.
+                let device = m.shown.as_ref().or_else(|| m.claims.values().next().map(|c| &c.device));
+                let name = device.and_then(|d| d.hostname.as_deref()).unwrap_or(key);
+                f("re-announce", &name, at);
             }
         }
     }
@@ -3442,6 +3445,11 @@ mod tests {
         assert!(rows.contains(&("expire", "printer.local")) && rows.contains(&("refresh", "printer.local")));
         assert!(rows.contains(&("re-announce", "tv.local")));
         assert_eq!(rows.len(), 4);
+        // A name is shown as it is announced, not as it is filed, lowercase.
+        let mut mixed = tv("10.0.9.10", &[]);
+        mixed.hostname = Some("Living-Room-TV.local".into());
+        seg.add_manual(Owner::Reflector(0), mixed).unwrap();
+        assert!(seg.pending().iter().any(|p| p.what == "re-announce" && p.who == "Living-Room-TV.local"), "{:?}", seg.pending());
         assert!(pending.windows(2).all(|w| w[0].at <= w[1].at), "soonest first");
         // The timer is set for the first of them.
         assert_eq!(next_due(&seg), Some(pending[0].at));
