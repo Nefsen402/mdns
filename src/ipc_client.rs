@@ -1628,21 +1628,26 @@ mod tests {
     }
 
     /// A script under `target/` that appends its stdin and environment to
-    /// `out`, then exits with `status`.
+    /// `out`, then exits with `status`. It is put in place by `install`: a
+    /// file this process had open for writing could be held open a moment by
+    /// a child another test forks meanwhile, and could not be run ("Text file
+    /// busy") until that child execs.
     fn script(tag: &str, status: u8) -> (PathBuf, PathBuf) {
         std::fs::create_dir_all("target").unwrap();
         let path = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.sh", std::process::id()));
+        let draft = path.with_extension("draft");
         let out = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.out", std::process::id()));
         let _ = std::fs::remove_file(&out);
         std::fs::write(
-            &path,
+            &draft,
             format!(
                 "#!/bin/sh\n{{ cat; echo \"$1|$MDNS_EVENT|$MDNS_HOSTNAME|$MDNS_ADDRESS\"; }} >> {}\nexit {status}\n",
                 out.display()
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = std::process::Command::new("install").arg("-m755").arg(&draft).arg(&path).status().unwrap();
+        assert!(installed.success());
         (executable(path.to_str().unwrap()).unwrap(), out)
     }
 
