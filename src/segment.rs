@@ -366,9 +366,6 @@ struct State {
     types: BTreeSet<String>,
     /// The least a device is kept after it was last heard from.
     min_lifetime: Duration,
-    /// The TTL, in seconds, of the address records of the devices
-    /// [`Segment::add_manual`] announces; `None` follows each device's own.
-    reflect_ttl: Option<u32>,
     /// Whether what is announced here is announced again before its TTL runs
     /// out though it has not changed. It need not be: whoever still wants it
     /// asks again (RFC 6762 section 5.2), and is answered.
@@ -710,18 +707,6 @@ impl Segment {
         max_packet
     }
 
-    /// The TTL, to the second, of the address records of the devices
-    /// [`add_manual`](Segment::add_manual) announces from now on: how long
-    /// others keep them, and so, at 80% of it, how often they are announced
-    /// again if the segment re-announces ([`Segment::set_reannounce`]). `None`, the default, announces each device with the TTL it
-    /// announced itself with (at least ten seconds, and two minutes if it did
-    /// not say). The records of a device's services keep their own TTL either
-    /// way.
-    pub fn set_reflect_ttl(&self, ttl: Option<Duration>) {
-        let secs = ttl.map(|t| u32::try_from(t.as_secs()).unwrap_or(u32::MAX).max(MIN_REFLECT_TTL));
-        self.state.lock().unwrap().reflect_ttl = secs;
-    }
-
     /// Whether what is announced here is announced again, at 80% of its TTL,
     /// though it has not changed; by default it is not. What changes is
     /// announced twice, a second apart, either way.
@@ -858,7 +843,10 @@ impl Segment {
     /// its hostname. It needs a hostname and at least one address, all of
     /// this segment's family, and announces exactly the addresses it has: a
     /// reflected device should arrive with only its routable one, since a
-    /// link-local address is no use on another link.
+    /// link-local address is no use on another link. Its address records are
+    /// announced with the TTL it announced itself with (at least ten seconds,
+    /// and two minutes if it did not say), and those of its services with
+    /// theirs.
     ///
     /// If another owner wants the same hostname announced, the lower
     /// [`Owner`] wins: an outranked device is only remembered, and announced
@@ -872,17 +860,14 @@ impl Segment {
     /// Returns false (and sends nothing) if `owner` already has an identical
     /// device here. If sending fails nothing is recorded.
     pub fn add_manual(&self, owner: Owner, device: Device) -> Result<bool> {
-        let ttl = {
-            let state = self.state.lock().unwrap();
-            state.reflect_ttl.or(device.ttl.map(|t| t.max(MIN_REFLECT_TTL))).unwrap_or(HOST_TTL)
-        };
+        let ttl = device.ttl.map(|t| t.max(MIN_REFLECT_TTL)).unwrap_or(HOST_TTL);
         self.add_manual_ttl(owner, device, Duration::from_secs(ttl.into()))
     }
 
     /// Like [`add_manual`](Segment::add_manual), with the address records
     /// announced for `host_ttl` (whole seconds, at least one) whatever the
-    /// device or the segment's [reflect TTL](Segment::set_reflect_ttl) say,
-    /// and re-announced at 80% of it.
+    /// device says, and, if the segment re-announces, re-announced at 80% of
+    /// it.
     pub fn add_manual_ttl(&self, owner: Owner, device: Device, host_ttl: Duration) -> Result<bool> {
         let host_ttl = u32::try_from(host_ttl.as_secs()).unwrap_or(u32::MAX);
         if host_ttl == 0 {
@@ -3705,10 +3690,9 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_reflect_ttl_wins_for_the_address_only() {
+    fn a_given_address_ttl_wins_for_the_address_only() {
         let (seg, rx) = wired();
-        seg.set_reflect_ttl(Some(Duration::from_secs(900)));
-        seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 600)).unwrap();
+        seg.add_manual_ttl(Owner::Own, tv_with_ttls(Some(300), 600), Duration::from_secs(900)).unwrap();
         let ttls = announced_ttls(&rx);
         assert!(ttls.contains(&(true, 900)), "{ttls:?}");
         assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
@@ -3716,12 +3700,6 @@ mod tests {
         repeat(&seg, &rx);
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
         assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(480)));
-
-        // Even a tiny setting is kept to the floor.
-        seg.set_reflect_ttl(Some(Duration::from_secs(1)));
-        assert_eq!(seg.state.lock().unwrap().reflect_ttl, Some(MIN_REFLECT_TTL));
-        seg.set_reflect_ttl(None);
-        assert_eq!(seg.state.lock().unwrap().reflect_ttl, None);
     }
 
     #[test]

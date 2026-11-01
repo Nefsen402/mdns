@@ -181,13 +181,12 @@ must allow the actual connections between the networks; mDNS only makes the
 device discoverable.
 .PP
 The daemon answers queries for reflected devices, including known-answer
-suppression, keeps them alive with re-announcements at 80% of the shortest TTL they
-announced (see
+suppression, announces them with the TTLs they announced (unless
 .B ReflectTTL=
 in
-.BR mdnsd.conf (5)),
-and withdraws
-them with goodbye packets when the source device disappears.
+.BR mdnsd.conf (5)
+says otherwise), and withdraws them with goodbye packets when the source
+device disappears.
 An interface listed in
 .B Untrusted=
 is announced nothing by its segment, though its own devices are announced to the

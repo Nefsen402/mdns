@@ -87,6 +87,9 @@ struct Inner {
     /// Which of the addresses a device was given from the neighbour table are
     /// reflected with it.
     neighbours: Neighbours,
+    /// The TTL the address records of what it reflects are announced with;
+    /// `None` keeps each device's own.
+    reflect_ttl: Option<Duration>,
     book: Mutex<Book>,
     stop: AtomicBool,
     subscribers: Mutex<Vec<Sender<Notice>>>,
@@ -121,19 +124,21 @@ impl Reflector {
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
     pub fn with_untrusted(rank: u32, segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
-        Self::with_options(rank, segments, untrusted, Forward::default(), Neighbours::default())
+        Self::with_options(rank, segments, untrusted, Forward::default(), Neighbours::default(), None)
     }
 
     /// Like [`with_untrusted`](Reflector::with_untrusted), putting the
-    /// questions asked on each segment to the others as `forward` says, and
+    /// questions asked on each segment to the others as `forward` says,
     /// reflecting the addresses a device was given from the neighbour table as
-    /// `neighbours` says.
+    /// `neighbours` says, and announcing what it reflects with the address TTL
+    /// `reflect_ttl`, if given, in place of each device's own.
     pub fn with_options(
         rank: u32,
         segments: Vec<Segment>,
         untrusted: &[String],
         forward: Forward,
         neighbours: Neighbours,
+        reflect_ttl: Option<Duration>,
     ) -> Result<Reflector> {
         if segments.is_empty() {
             bail!("a reflector needs at least one segment");
@@ -155,6 +160,7 @@ impl Reflector {
             untrusted,
             forward,
             neighbours,
+            reflect_ttl,
             book: Mutex::default(),
             stop: AtomicBool::new(false),
             subscribers: Mutex::default(),
@@ -355,7 +361,11 @@ impl Inner {
                 if book.pushed.get(&(target, key.clone())) == Some(&device) {
                     continue;
                 }
-                match seg.add_manual(self.owner, device.clone()) {
+                let added = match self.reflect_ttl {
+                    Some(ttl) => seg.add_manual_ttl(self.owner, device.clone(), ttl),
+                    None => seg.add_manual(self.owner, device.clone()),
+                };
+                match added {
                     Ok(_) => {
                         book.pushed.insert((target, key), device);
                     }
@@ -750,12 +760,31 @@ mod tests {
     fn a_configured_reflect_ttl_wins_for_the_address_and_leaves_the_services_alone() {
         let (a, _arx) = wired("a");
         let (b, brx) = wired("b");
-        b.set_reflect_ttl(Some(Duration::from_secs(900)));
-        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
+        let ttl = Some(Duration::from_secs(900));
+        let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), ttl).unwrap();
 
         announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
         wait_for(|| b.manual_devices().len() == 1);
         assert_eq!(announced_ttls(&brx), (vec![900], vec![600, 600, 600]));
+    }
+
+    /// An interface in two segments shows what each reflects onto it with
+    /// that segment's TTL: it belongs to what is reflected, not to where.
+    #[test]
+    fn segments_sharing_an_interface_each_reflect_with_their_own_ttl() {
+        let (br0, brx) = wired("br0");
+        let (media, _mrx) = wired("media");
+        let (wifi, _wrx) = wired("wifi");
+        let ttl = Some(Duration::from_secs(900));
+        let _media = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], Forward::default(), Neighbours::default(), ttl);
+        let _wifi = Reflector::new(1, vec![br0.clone(), wifi.clone()]).unwrap();
+
+        announce_ttl(&media, "10.0.2.5", "tv.local", &["TV"], 300, 600);
+        wait_for(|| br0.manual_devices().len() == 1);
+        assert_eq!(announced_ttls(&brx).0, vec![900]);
+        announce_ttl(&wifi, "10.0.3.5", "plug.local", &["Plug"], 300, 600);
+        wait_for(|| br0.manual_devices().len() == 2);
+        assert_eq!(announced_ttls(&brx).0, vec![300]);
     }
 
     /// One device with two hostnames on one address (an LG TV announces
@@ -965,7 +994,8 @@ mod tests {
         let (media, media_rx) = wired("media");
         let (wifi, wifi_rx) = wired("wifi");
         let segments = vec![br0.clone(), media.clone(), wifi.clone()];
-        let _r = Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, Neighbours::default()).unwrap();
+        let _r =
+            Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, Neighbours::default(), None).unwrap();
 
         ask(&br0, "10.0.0.50", "printer.local");
         thread::sleep(Duration::from_millis(100));
@@ -1001,7 +1031,7 @@ mod tests {
         for forward in [Forward::Always, Forward::Unknown, Forward::Never] {
             let (br0, _br0_rx) = wired("br0");
             let (media, media_rx) = wired("media");
-            let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward, Neighbours::default()).unwrap();
+            let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward, Neighbours::default(), None).unwrap();
             announce(&media, "10.0.2.7", "tv.local", &["TV"]);
             wait_for(|| br0.manual_devices().len() == 1);
             drain(&media_rx);
@@ -1106,7 +1136,7 @@ mod tests {
         ] {
             let (a, _arx) = wired("a");
             let (b, _brx) = wired("b");
-            let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), mode).unwrap();
+            let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), mode, None).unwrap();
             a.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
             for (addr, mac) in [("10.0.1.9", 9), ("fd00::9", 9), ("fe80::8", 8), ("fd00::8", 8)] {
                 a.neighbour(ip(addr), Some(vec![2, 0, 0, 0, 0, mac]));

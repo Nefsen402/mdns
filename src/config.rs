@@ -92,6 +92,9 @@ pub struct SegmentConfig {
     /// Whether what is reflected onto its interfaces is announced again
     /// before its TTL runs out though it has not changed.
     pub reannounce: bool,
+    /// The TTL of the address records of the devices it reflects; `None`
+    /// (the default) announces each with the TTL it announced itself with.
+    pub reflect_ttl: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -107,10 +110,6 @@ pub struct Config {
     /// The TTL of the advertised name's address records, which it is
     /// re-announced at 80% of.
     pub advertise_ttl: Duration,
-    /// The TTL of the address records of reflected devices, which they are
-    /// re-announced at 80% of; `None` (the default) announces each with the
-    /// TTL it announced itself with.
-    pub reflect_ttl: Option<Duration>,
     /// How often to probe the interfaces of segments that do not set their
     /// own; `None` (the default) probes only at startup and on request. See
     /// [`Config::probe_interval_of`].
@@ -134,7 +133,6 @@ impl Default for Config {
             socket: PathBuf::from(DEFAULT_SOCKET),
             advertise: None,
             advertise_ttl: DEFAULT_ADVERTISE_TTL,
-            reflect_ttl: None,
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
             min_lifetime: crate::segment::DEFAULT_MIN_LIFETIME,
@@ -239,6 +237,12 @@ impl Config {
                     ("segment", "reannounce") => {
                         config.segments.last_mut().unwrap().reannounce = !value.is_empty() && parse_bool(&entry, lineno)?;
                     }
+                    ("segment", "reflectttl") => {
+                        config.segments.last_mut().unwrap().reflect_ttl = match value.to_ascii_lowercase().as_str() {
+                            "auto" | "" => None,
+                            _ => Some(parse_host_ttl(&value, lineno, "ReflectTTL")?),
+                        };
+                    }
                     ("segment", "forwardquestions") => {
                         config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
                     }
@@ -259,12 +263,6 @@ impl Config {
                         config.advertise = Some(local_name(&value, lineno)?);
                     }
                     ("advertise", "ttl") => config.advertise_ttl = parse_host_ttl(&value, lineno, "TTL")?,
-                    ("devices", "reflectttl") => {
-                        config.reflect_ttl = match value.to_ascii_lowercase().as_str() {
-                            "auto" => None,
-                            _ => Some(parse_host_ttl(&value, lineno, "ReflectTTL")?),
-                        };
-                    }
                     ("ipc", "socket") => {
                         if value.is_empty() {
                             bail!("line {lineno}: Socket= needs a path");
@@ -561,23 +559,26 @@ interfaces=br0,wifi
 
     #[test]
     fn reflect_ttl_follows_the_device_unless_set_and_is_bounded() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().reflect_ttl, None);
-
-        let with = |value: &str| Config::parse(&format!("[Devices]\nReflectTTL={value}\n{EXAMPLE}"));
-        assert_eq!(with("auto").unwrap().reflect_ttl, None);
-        assert_eq!(with("AUTO").unwrap().reflect_ttl, None);
-        assert_eq!(with("2min").unwrap().reflect_ttl, Some(Duration::from_secs(120)));
-        assert_eq!(with("30min").unwrap().reflect_ttl, Some(Duration::from_secs(1800)));
-        assert_eq!(with("10").unwrap().reflect_ttl, Some(Duration::from_secs(10)));
-        for bad in ["9s", "0", "", "off", "infinity", "25h", "soon", "99999999999999s"] {
-            assert!(with(bad).is_err(), "should reject {bad:?}");
+        let segments = |extra: &str| {
+            let c = Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=y,z"));
+            c.map(|c| (c.segments[0].reflect_ttl, c.segments[1].reflect_ttl))
+        };
+        let ttl = |value: &str| segments(&format!("ReflectTTL={value}")).map(|(a, _)| a);
+        assert_eq!(segments("").unwrap(), (None, None));
+        assert_eq!(ttl("auto").unwrap(), None);
+        assert_eq!(ttl("AUTO").unwrap(), None);
+        assert_eq!(ttl("2min").unwrap(), Some(Duration::from_secs(120)));
+        assert_eq!(ttl("30min").unwrap(), Some(Duration::from_secs(1800)));
+        assert_eq!(ttl("10").unwrap(), Some(Duration::from_secs(10)));
+        assert_eq!(segments("ReflectTTL=5min\nReflectTTL=").unwrap(), (None, None), "empty resets");
+        assert_eq!(segments("ReflectTTL=5min").unwrap(), (Some(Duration::from_secs(300)), None), "each its own");
+        for bad in ["9s", "0", "off", "infinity", "25h", "soon", "99999999999999s"] {
+            assert!(ttl(bad).is_err(), "should reject {bad:?}");
         }
-        // It is independent of the advertised name's.
-        let both = Config::parse(&format!("[Devices]\nReflectTTL=5min\n[Advertise]\nTTL=1h\n{EXAMPLE}")).unwrap();
-        assert_eq!(
-            (both.reflect_ttl, both.advertise_ttl),
-            (Some(Duration::from_secs(300)), Duration::from_secs(3600))
-        );
+        // It is independent of the advertised name's, and no longer a device setting.
+        let c = Config::parse("[Advertise]\nTTL=1h\n[Segment]\nName=a\nInterfaces=x\nReflectTTL=5min").unwrap();
+        assert_eq!((c.segments[0].reflect_ttl, c.advertise_ttl), (Some(Duration::from_secs(300)), Duration::from_secs(3600)));
+        assert!(error_of(&format!("[Devices]\nReflectTTL=5min\n{EXAMPLE}")).contains("unknown setting"));
     }
 
     /// The man page must document every key and a config that really parses.

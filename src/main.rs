@@ -75,7 +75,8 @@ fn main() -> Result<()> {
     let mut segments = Vec::new();
     for (rank, seg) in (0..).zip(&config.segments) {
         let members = seg.interfaces.iter().map(|iface| links[iface.as_str()].clone()).collect();
-        let reflector = Reflector::with_options(rank, members, &seg.untrusted, seg.forward, seg.neighbour_addresses)
+        let reflector =
+            Reflector::with_options(rank, members, &seg.untrusted, seg.forward, seg.neighbour_addresses, seg.reflect_ttl)
             .with_context(|| format!("starting segment {:?}", seg.name))?;
         eprintln!("segment {:?}: {}", seg.name, seg.interfaces.join(", "));
         if !seg.untrusted.is_empty() {
@@ -94,6 +95,9 @@ fn main() -> Result<()> {
                 eprintln!("segment {:?}: reflecting only the addresses devices announce, not those from the neighbour table", seg.name)
             }
         }
+        if let Some(ttl) = seg.reflect_ttl {
+            eprintln!("segment {:?}: announcing reflected devices with a TTL of {}s", seg.name, ttl.as_secs());
+        }
         segments.push(Group { name: seg.name.clone(), reflector });
     }
 
@@ -103,10 +107,6 @@ fn main() -> Result<()> {
     // from the other networks. The probes run on their own threads, so startup
     // is not held up; `mdnsctl probe` does the same on demand.
     eprintln!("keeping a device for at least {}s after it was last heard from", config.min_lifetime.as_secs());
-    match config.reflect_ttl {
-        Some(ttl) => eprintln!("announcing reflected devices with a TTL of {}s", ttl.as_secs()),
-        None => eprintln!("announcing reflected devices with the TTL they announced themselves with"),
-    }
     for interface in config.interfaces().into_iter().filter(|i| config.reannounce_on(i)) {
         eprintln!("{interface}: announcing reflected devices again at 80% of their TTL, changed or not");
     }
