@@ -87,7 +87,7 @@
 //! or TXT's), in seconds, `null` when not known. A reflected copy is announced
 //! with them, unless the configuration says otherwise.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -454,12 +454,13 @@ fn stream_events(writer: &mut UnixStream, groups: &Weak<Vec<Group>>, watch: Watc
     let Watch { name, query, events, present } = watch;
     writer.set_write_timeout(Some(STREAM_WRITE))?;
     write_line(writer, &json!({ "ok": true, "name": name, "watching": true }))?;
-    // The devices of the query's types shown, so that one that loses its last
-    // service of them is shown to go.
-    let mut shown: HashSet<(String, String)> = HashSet::new();
+    // The devices of the query's types shown, as shown, so that one that
+    // loses its last service of them is shown to go, and one shown already
+    // is not shown again unchanged.
+    let mut shown: HashMap<(String, String), Value> = HashMap::new();
     for line in &present {
         if let (Some(interface), Some(host)) = (line["device"]["interface"].as_str(), line["device"]["hostname"].as_str()) {
-            shown.insert((interface.to_string(), host.to_ascii_lowercase()));
+            shown.insert((interface.to_string(), host.to_ascii_lowercase()), line["device"].clone());
         }
         write_line(writer, &line)?;
     }
@@ -493,26 +494,28 @@ fn stream_events(writer: &mut UnixStream, groups: &Weak<Vec<Group>>, watch: Watc
 
 /// A change as a watch for the service types `kinds` shows it: the device
 /// with only its services of those types, if it has any, or its going, if
-/// it had and no longer has; `None` for one it never showed.
-fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashSet<(String, String)>) -> Option<Value> {
+/// it had and no longer has; `None` for one it never showed, or shows already
+/// just so. A device it already shows is updated, even when the segment calls
+/// it added: one listed as present when the watch started can be told of again
+/// as it is filed.
+fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashMap<(String, String), Value>) -> Option<Value> {
     let (removed, device) = match &notice.event {
         Event::Added(d) | Event::Updated(d) => (false, d),
         Event::Removed(d) => (true, d),
         Event::Question(_) => return None,
     };
     let key = device.key().map(|k| (notice.interface.clone(), k));
-    let was_shown = key.as_ref().is_some_and(|k| shown.contains(k));
+    let was_shown = key.as_ref().is_some_and(|k| shown.contains_key(k));
     match device.only_kinds(kinds) {
         Some(narrow) if !removed => {
-            let kind = match &notice.event {
-                Event::Added(_) => "added",
-                _ if was_shown => "updated",
-                _ => "added",
-            };
+            let line = event_json(if was_shown { "updated" } else { "added" }, segment, &Notice { event: Event::Updated(narrow), ..notice });
             if let Some(key) = key {
-                shown.insert(key);
+                if shown.get(&key) == Some(&line["device"]) {
+                    return None;
+                }
+                shown.insert(key, line["device"].clone());
             }
-            Some(event_json(kind, segment, &Notice { event: Event::Updated(narrow), ..notice }))
+            Some(line)
         }
         // Gone, or no longer of the types: gone from the watch. One without
         // a hostname cannot be told apart, so its going is shown whenever it
@@ -1132,9 +1135,14 @@ mod tests {
         assert_eq!((present["event"].as_str(), present["device"]["hostname"].as_str()), (Some("present"), Some("tv.local")));
         assert_eq!(present["ttl"], 300);
 
-        // Asked at once, with the TV as a known answer, and again a second on.
-        thread::sleep(Duration::from_millis(1500));
-        let asked: Vec<_> = queries(&rx).into_iter().filter(|(names, _)| names == &["_http._tcp.local"]).collect();
+        // Asked at once, with the TV as a known answer, and again a second on:
+        // waited for, as a busy test run can hold the second round up.
+        let mut asked = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while asked.len() < 6 && Instant::now() < deadline {
+            asked.extend(queries(&rx).into_iter().filter(|(names, _)| names == &["_http._tcp.local"]));
+            thread::sleep(Duration::from_millis(100));
+        }
         assert!(asked.len() >= 6 && asked.iter().all(|&(_, known)| known == 1), "{asked:?}");
 
         // One without the type is not shown; one with it is.
@@ -1150,7 +1158,7 @@ mod tests {
     #[test]
     fn a_watch_for_a_type_narrows_what_it_shows() {
         let kinds = ["_http._tcp.local".to_string()];
-        let mut shown = HashSet::new();
+        let mut shown = HashMap::new();
         let tv = |services: bool| {
             let seg = Segment::new("wifi", &[Family::V4]);
             announce(&seg, "10.0.1.7", "tv.local", "TV");
@@ -1163,9 +1171,20 @@ mod tests {
         let notice = |event| Notice { interface: "wifi".into(), event, ttl: Duration::from_secs(120) };
         let mut show = |event| narrowed("IoT", notice(event), &kinds, &mut shown).map(|v| v["event"].as_str().unwrap().to_string());
 
+        let moved = || {
+            let mut d = tv(true);
+            d.services[0].port = 8080;
+            d
+        };
+
         assert_eq!(show(Event::Updated(tv(false))), None);
         assert_eq!(show(Event::Updated(tv(true))).as_deref(), Some("added"));
-        assert_eq!(show(Event::Updated(tv(true))).as_deref(), Some("updated"));
+        assert_eq!(show(Event::Updated(tv(true))), None, "nothing of it shown changed");
+        assert_eq!(show(Event::Updated(moved())).as_deref(), Some("updated"));
+        // Added again while shown, as one listed as present can be: an update,
+        // or nothing at all if it is just as shown.
+        assert_eq!(show(Event::Added(tv(true))).as_deref(), Some("updated"));
+        assert_eq!(show(Event::Added(tv(true))), None);
         assert_eq!(show(Event::Updated(tv(false))).as_deref(), Some("removed"));
         assert_eq!(show(Event::Updated(tv(false))), None);
         assert_eq!(show(Event::Added(tv(true))).as_deref(), Some("added"));
