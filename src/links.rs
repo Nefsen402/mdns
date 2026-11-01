@@ -115,7 +115,7 @@ impl Link {
         self.index = Some(index);
         self.was_here = true;
         if self.up {
-            self.advertise();
+            self.addresses_changed();
         }
         Ok(true)
     }
@@ -126,6 +126,16 @@ impl Link {
         self.stop.store(true, Ordering::Relaxed);
         self.segment.detach_all();
         self.index = None;
+    }
+
+    /// The interface's addresses are new: tell its segment the networks it is
+    /// on, and announce the advertised name with them.
+    fn addresses_changed(&self) {
+        match socket::prefixes(&self.interface) {
+            Ok(prefixes) => self.segment.set_prefixes(prefixes),
+            Err(e) => eprintln!("{}: {e:#}", self.interface),
+        }
+        self.advertise();
     }
 
     /// Announce the name to advertise with this host's addresses on the
@@ -181,13 +191,13 @@ impl Link {
                     }
                 } else if came_up {
                     eprintln!("{}: up", self.interface);
-                    self.advertise();
+                    self.addresses_changed();
                     self.came_back();
                 }
             }
             Change::Gone { index } if self.index == Some(*index) => self.gone(),
             // An interface going down loses its addresses: that is not news.
-            Change::Address { index } if self.index == Some(*index) && self.up => self.advertise(),
+            Change::Address { index } if self.index == Some(*index) && self.up => self.addresses_changed(),
             Change::Neighbour { index, ip, mac } if self.index == Some(*index) => self.segment.neighbour(*ip, mac.clone()),
             Change::Lost => self.look_again(),
             _ => {}
@@ -212,7 +222,7 @@ impl Link {
             }
             Ok(_) => {
                 self.take_mtu(socket::mtu(&self.interface).ok());
-                self.advertise();
+                self.addresses_changed();
             }
             Err(_) if self.index.is_some() => self.gone(),
             Err(_) => {}

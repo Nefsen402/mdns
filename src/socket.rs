@@ -127,6 +127,85 @@ pub fn local_addr(interface: &str, family: Family) -> Result<IpAddr> {
         .ok_or_else(|| anyhow!("no local address on {interface}"))
 }
 
+/// A network an interface is on: an address of the interface, and the length
+/// of the prefix that makes the network of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefix {
+    pub addr: IpAddr,
+    pub len: u8,
+}
+
+impl Prefix {
+    /// Whether `ip` is in this network.
+    pub fn contains(&self, ip: &IpAddr) -> bool {
+        let bits = |a: &IpAddr| match a {
+            IpAddr::V4(a) => (u128::from(a.to_bits()) << 96, 32),
+            IpAddr::V6(a) => (a.to_bits(), 128),
+        };
+        let ((net, width), (ip, other)) = (bits(&self.addr), bits(ip));
+        if width != other {
+            return false;
+        }
+        let len = u32::from(self.len).min(width);
+        let mask = if len == 0 { 0 } else { u128::MAX << (128 - len) };
+        net & mask == ip & mask
+    }
+}
+
+/// The network written as `addr/len`, for tests.
+#[cfg(test)]
+pub fn prefix(net: &str) -> Prefix {
+    let (addr, len) = net.split_once('/').unwrap();
+    Prefix { addr: addr.parse().unwrap(), len: len.parse().unwrap() }
+}
+
+/// The networks the interface called `name` is on, as its network namespace
+/// has them, of either family: its addresses with their prefix lengths.
+pub fn prefixes(name: &str) -> Result<Vec<Prefix>> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills in `list`, freed below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("listing the interfaces' addresses");
+    }
+    let mut out = Vec::new();
+    let mut at = list;
+    while !at.is_null() {
+        // SAFETY: `at` is an entry of the list getifaddrs made, not yet freed.
+        let ifa = unsafe { &*at };
+        at = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() || ifa.ifa_netmask.is_null() || ifa.ifa_name.is_null() {
+            continue;
+        }
+        // SAFETY: a NUL-terminated name, as getifaddrs gives it.
+        if unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_bytes() != name.as_bytes() {
+            continue;
+        }
+        // SAFETY: the address and mask are sockaddrs of the family the
+        // address says, as getifaddrs gives them.
+        let prefix = unsafe {
+            match i32::from((*ifa.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let addr = &*ifa.ifa_addr.cast::<libc::sockaddr_in>();
+                    let mask = &*ifa.ifa_netmask.cast::<libc::sockaddr_in>();
+                    let addr = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+                    Prefix { addr: IpAddr::V4(addr), len: u32::from_be(mask.sin_addr.s_addr).count_ones() as u8 }
+                }
+                libc::AF_INET6 => {
+                    let addr = &*ifa.ifa_addr.cast::<libc::sockaddr_in6>();
+                    let mask = &*ifa.ifa_netmask.cast::<libc::sockaddr_in6>();
+                    let len = mask.sin6_addr.s6_addr.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
+                    Prefix { addr: IpAddr::V6(Ipv6Addr::from(addr.sin6_addr.s6_addr)), len }
+                }
+                _ => continue,
+            }
+        };
+        out.push(prefix);
+    }
+    // SAFETY: the list getifaddrs made, freed once.
+    unsafe { libc::freeifaddrs(list) };
+    Ok(out)
+}
+
 /// The headers around an mDNS packet: those of IPv6, the larger of the two
 /// families, and of UDP. What an interface's MTU leaves for the packet is its
 /// MTU less these.
@@ -517,24 +596,34 @@ struct State {
     /// The kernel's neighbour table for the interface: each address it has a
     /// link-layer address for, and that link-layer address.
     neighbours: HashMap<IpAddr, Vec<u8>>,
+    /// The networks the interface is on: of the neighbour table, only
+    /// addresses in one of them are learned.
+    prefixes: Vec<Prefix>,
 }
 
 impl State {
     /// Bring the addresses learned from the neighbour table up to date for
     /// the devices of `keys`, noting in `touched` those that change: the
     /// routable addresses listed under the link-layer address of one it
-    /// announced, of a family it announced no routable address of
-    /// ([`Device::take_neighbours`]). A device with a link-local IPv6
-    /// address the table has not got yet, and no routable one, is asked a
-    /// question on it, for the kernel to look up its link-layer address.
+    /// announced, in a network the interface is on (an entry left over from
+    /// one it is no longer on is not the device's to be reached at), of a
+    /// family it announced no routable address of
+    /// ([`Device::take_neighbours`]). A device with a link-local IPv6 address
+    /// the table has not got yet, and no routable one, is asked a question on
+    /// it, for the kernel to look up its link-layer address.
     fn learn_neighbours(&mut self, keys: &[Key], touched: &mut Touched, now: Instant) {
         for key in keys {
             let Some(entry) = self.discovered.get(key) else { continue };
             // Its link-layer address, by any address it announced.
             let announced = entry.device.addresses.iter().filter(|a| a.origin == Origin::Announced);
             let macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
-            let learned: Vec<IpAddr> =
-                self.neighbours.iter().filter(|(ip, mac)| !is_link_local(ip) && macs.contains(mac)).map(|(ip, _)| *ip).collect();
+            let on_link = |ip: &IpAddr| self.prefixes.iter().any(|p| p.contains(ip));
+            let learned: Vec<IpAddr> = self
+                .neighbours
+                .iter()
+                .filter(|(ip, mac)| !is_link_local(ip) && on_link(ip) && macs.contains(mac))
+                .map(|(ip, _)| *ip)
+                .collect();
 
             let unresolved = entry.device.link_local().find(|ll| ll.is_ipv6() && !self.neighbours.contains_key(ll));
             let has_v6 = entry.device.routable().any(|a| a.is_ipv6());
@@ -547,11 +636,30 @@ impl State {
             let mut device = self.discovered[key].device.clone();
             if device.take_neighbours(&learned, self.max_addrs) {
                 touched.note(&self.discovered, key);
+                // A packet from an address it no longer has is not its.
+                self.by_addr.retain(|ip, k| k != key || device.has_addr(ip));
                 for ip in device.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip) {
                     self.by_addr.entry(ip).or_insert_with(|| key.clone());
                 }
                 self.discovered.get_mut(key).expect("looked up above").device = device;
             }
+        }
+    }
+
+    /// Bring the learned addresses of every device with an address up to
+    /// date, as the neighbour table or the interface's networks changed, and
+    /// tell of those that changed.
+    fn relearn_neighbours(&mut self, now: Instant) {
+        let keys: Vec<Key> =
+            self.discovered.iter().filter(|(_, e)| !e.device.addresses.is_empty()).map(|(k, _)| k.clone()).collect();
+        let mut touched = Touched::default();
+        self.learn_neighbours(&keys, &mut touched, now);
+        let events = touched.events(&self.discovered);
+        if !events.is_empty() {
+            self.settle_all(now);
+        }
+        for event in events {
+            self.notify(event);
         }
     }
 
@@ -1410,6 +1518,19 @@ impl Segment {
         }
     }
 
+    /// Take the networks the interface is on, as its addresses change: of the
+    /// neighbour table, only addresses in one of them are learned, and those
+    /// learned of one it is no longer on are dropped.
+    pub fn set_prefixes(&self, prefixes: Vec<Prefix>) {
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        if state.prefixes == prefixes {
+            return;
+        }
+        state.prefixes = prefixes;
+        state.relearn_neighbours(Instant::now());
+    }
+
     /// Take in an entry of the interface's neighbour table, as the kernel
     /// reports it: `ip` is at link-layer address `mac`, or with `None`, no
     /// longer (it went, or could not be reached). The devices it may concern,
@@ -1422,24 +1543,8 @@ impl Segment {
             Some(mac) => state.neighbours.insert(ip, mac.clone()).as_ref() != Some(&mac),
             None => state.neighbours.remove(&ip).is_some(),
         };
-        if !changed {
-            return;
-        }
-        let now = Instant::now();
-        let keys: Vec<Key> = state
-            .discovered
-            .iter()
-            .filter(|(_, e)| !e.device.addresses.is_empty())
-            .map(|(k, _)| k.clone())
-            .collect();
-        let mut touched = Touched::default();
-        state.learn_neighbours(&keys, &mut touched, now);
-        let events = touched.events(&state.discovered);
-        if !events.is_empty() {
-            state.settle_all(now);
-        }
-        for event in events {
-            state.notify(event);
+        if changed {
+            state.relearn_neighbours(Instant::now());
         }
     }
 
@@ -2402,6 +2507,7 @@ mod tests {
             let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
             d.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip).collect()
         };
+        seg.set_prefixes(vec![prefix("10.0.2.0/24"), prefix("fd00:0:2::/64"), prefix("2001:db8:2::/64")]);
         // The table first: the router has talked to it.
         seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
         seg.neighbour(ip("fe80::609:86ff:fe43:e3f6"), Some(MAC.to_vec()));
@@ -2424,6 +2530,7 @@ mod tests {
         // An entry that goes takes its address with it.
         seg.neighbour(ip("2001:db8:2::73"), None);
         assert_eq!(learned(&seg), [ip("fd00:0:2::73")]);
+        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("2001:db8:2::73")));
         assert!(matches!(events.try_recv(), Ok(Event::Updated(_))));
         // The same entry again changes nothing, and says nothing.
         seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
@@ -2436,12 +2543,63 @@ mod tests {
     #[test]
     fn a_device_is_found_in_the_neighbour_table_by_any_address_it_announced() {
         let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        seg.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
         seg.neighbour(ip("10.0.1.9"), Some(MAC.to_vec()));
         seg.neighbour(ip("fd00::9"), Some(MAC.to_vec()));
         hear(&seg, "10.0.1.9", vec![a_record("printer.local", "10.0.1.9"), srv("Printer._ipp._tcp.local", 631, "printer.local")]);
         let printer = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         assert_eq!(printer.addrs().collect::<Vec<_>>(), [ip("10.0.1.9"), ip("fd00::9")]);
         assert_eq!(printer.addresses[1].origin, Origin::Neighbour);
+    }
+
+    /// Only addresses in a network the interface is on are learned: an entry
+    /// left from an old prefix is not, and a device follows the interface's
+    /// networks as they change.
+    #[test]
+    fn only_neighbour_addresses_on_the_interfaces_networks_are_learned() {
+        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let learned = |seg: &Segment| -> Vec<IpAddr> {
+            let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
+            d.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip).collect()
+        };
+        seg.set_prefixes(vec![prefix("10.0.2.0/24"), prefix("2001:db8:2::/64")]);
+        seg.neighbour(ip("fe80::73"), Some(MAC.to_vec()));
+        seg.neighbour(ip("2001:db8:2::73"), Some(MAC.to_vec()));
+        seg.neighbour(ip("2001:db8:1::73"), Some(MAC.to_vec())); // the old prefix
+        hear(&seg, "10.0.2.73", vec![a_record("tv.local", "10.0.2.73"), aaaa("tv.local", "fe80::73")]);
+        assert_eq!(learned(&seg), [ip("2001:db8:2::73")]);
+        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("2001:db8:1::73")));
+
+        // The interface moves to the other prefix: so do its devices.
+        seg.set_prefixes(vec![prefix("10.0.2.0/24"), prefix("2001:db8:1::/64")]);
+        assert_eq!(learned(&seg), [ip("2001:db8:1::73")]);
+        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("2001:db8:2::73")));
+        // With no network known, nothing is.
+        seg.set_prefixes(vec![]);
+        assert_eq!(learned(&seg), Vec::<IpAddr>::new());
+    }
+
+    #[test]
+    fn a_prefix_holds_the_addresses_of_its_network() {
+        for (net, inside, outside) in [
+            ("10.0.2.1/24", "10.0.2.255", "10.0.3.0"),
+            ("10.0.2.1/32", "10.0.2.1", "10.0.2.2"),
+            ("10.0.2.1/0", "192.0.2.1", "::1"),
+            ("2001:db8:2::1/64", "2001:db8:2::ffff:1", "2001:db8:3::1"),
+            ("2001:db8:2::1/128", "2001:db8:2::1", "2001:db8:2::2"),
+            ("::/0", "2001:db8::1", "10.0.2.1"),
+            ("::a00:201/96", "::a00:2ff", "10.0.2.1"), // the families are not mixed
+        ] {
+            assert!(prefix(net).contains(&ip(inside)), "{net} holds {inside}");
+            assert!(!prefix(net).contains(&ip(outside)), "{net} does not hold {outside}");
+        }
+    }
+
+    #[test]
+    fn the_loopback_interface_is_on_its_network() {
+        let nets = prefixes("lo").unwrap();
+        assert!(nets.contains(&prefix("127.0.0.1/8")), "{nets:?}");
+        assert!(prefixes("no-such-interface").unwrap().is_empty());
     }
 
     /// A device whose link-local address the table has not got, and that has

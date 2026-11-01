@@ -408,7 +408,7 @@ mod tests {
 
     use super::*;
     use crate::parser::{rtype, Header, Message, Question, RData, Record};
-    use crate::socket::Family;
+    use crate::socket::{prefix, Family};
 
     /// Its first routable IPv4 or IPv6 address, and link-local one.
     fn v4(d: &Device) -> Option<IpAddr> {
@@ -1070,6 +1070,7 @@ mod tests {
         let (b, _brx) = wired("b");
         let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
         let mac = vec![2, 0, 0, 0, 0, 9];
+        a.set_prefixes(vec![prefix("fd00::/64")]);
         a.neighbour(ip("fe80::9"), Some(mac.clone()));
         let msg = Message {
             header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
@@ -1106,6 +1107,7 @@ mod tests {
             let (a, _arx) = wired("a");
             let (b, _brx) = wired("b");
             let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), mode).unwrap();
+            a.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
             for (addr, mac) in [("10.0.1.9", 9), ("fd00::9", 9), ("fe80::8", 8), ("fd00::8", 8)] {
                 a.neighbour(ip(addr), Some(vec![2, 0, 0, 0, 0, mac]));
             }
