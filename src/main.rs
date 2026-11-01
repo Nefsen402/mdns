@@ -104,12 +104,11 @@ fn main() -> Result<()> {
     // is not held up; `mdnsctl probe` does the same on demand.
     eprintln!("keeping a device for at least {}s after it was last heard from", config.min_lifetime.as_secs());
     match config.reflect_ttl {
-        Some(ttl) => eprintln!(
-            "announcing reflected devices with a TTL of {}s, again every {}s",
-            ttl.as_secs(),
-            ttl.as_secs() * 4 / 5
-        ),
+        Some(ttl) => eprintln!("announcing reflected devices with a TTL of {}s", ttl.as_secs()),
         None => eprintln!("announcing reflected devices with the TTL they announced themselves with"),
+    }
+    for interface in config.interfaces().into_iter().filter(|i| config.reannounce_on(i)) {
+        eprintln!("{interface}: announcing reflected devices again at 80% of their TTL, changed or not");
     }
     match config.refresh_before {
         Some(before) => {

@@ -61,6 +61,7 @@ impl Link {
         segment.set_min_lifetime(config.min_lifetime);
         segment.set_max_addrs(config.max_addrs);
         segment.set_reflect_ttl(config.reflect_ttl);
+        segment.set_reannounce(config.reannounce_on(interface));
 
         // Placeholder consumer: log changes to the discovered list.
         let events = segment.subscribe();

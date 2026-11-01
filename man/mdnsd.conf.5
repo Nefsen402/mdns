@@ -110,19 +110,21 @@ lifetime; the daemon warns at startup if it is not.
 .TP
 .B ReflectTTL=
 How long other networks keep the address of a device this daemon reflects onto
-them, and so how often it is announced again: at 80% of it.
+them, and so, on a segment with
+.BR Reannounce=yes ,
+how often it is announced again: at 80% of it.
 Default
 .BR auto :
 each device is announced with the TTLs it announced itself with (see
 .BR "mdnsctl devices \-v" ).
-Hosts conventionally say two minutes, so their address is announced again every
-96 seconds.
+Hosts conventionally say two minutes, so there their address is announced
+again every 96 seconds.
 A time span, from 10 seconds to 24 hours, replaces the TTL of the
 .I address
 only: a longer one means less traffic, but a stale address lingers that long
 when a device moves or vanishes without a goodbye.
-The records of a device's services always keep their own TTL, and a device is
-announced again before the shortest of them runs out.
+The records of a device's services always keep their own TTL, and a segment
+that re-announces does so before the shortest of them runs out.
 A TTL below 10 seconds is raised to 10; a device that did not say gets two
 minutes for its address and 75 minutes for its services.
 The TTL is the one last heard, not counted down: a copy of a device that went
@@ -249,7 +251,9 @@ No conflict detection is done: the name is assumed to be yours alone.
 How long other devices keep the address of the name, as a time span such as
 .B 2min
 (the default, as Avahi used for host names).
-It is announced again at 80% of this, so by default every 96 seconds; a longer
+On an interface of a segment with
+.BR Reannounce=yes ,
+it is announced again at 80% of this, so by default every 96 seconds; a longer
 TTL means less traffic, but a stale address lingers that long when this host's
 address changes.
 At least 10 seconds and at most 24 hours.
@@ -338,6 +342,18 @@ family came from the table is reflected without it, and one with no routable
 address of its own not at all.
 The addresses are learned all the same, and listed by
 .BR mdnsctl (1).
+.TP
+.B Reannounce=
+Optional boolean, default
+.BR no .
+Whether what is reflected onto the interfaces of this segment is announced
+again at 80% of its TTL (see
+.BR ReflectTTL= )
+though it has not changed.
+It need not be: a device that still wants a record asks for it again before
+its TTL runs out, and is answered (RFC 6762 section 5.2).
+What is new or has changed is announced twice, a second apart, either way.
+An interface in several segments re-announces if any of them says so.
 .TP
 .B ProbeInterval=
 Optional.

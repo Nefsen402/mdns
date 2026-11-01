@@ -116,10 +116,8 @@ On each interface it publishes the address of this host on that interface (an
 A record with the primary IPv4 address, an AAAA record with the link-local
 IPv6 address), read once at startup.
 The name is handled exactly like a reflected device that has no services: it
-is announced, re-announced at 80% of its TTL (see
-.B TTL=
-in
-.BR mdnsd.conf (5)),
+is announced (and re-announced like one, at 80% of its
+.BR TTL= ),
 answers queries, and is withdrawn
 with goodbye packets on
 .BR SIGTERM .
@@ -138,6 +136,15 @@ service types and instance names, SRV port 0, and addresses no device can be
 reached at.
 Each interface remembers at most 1024 devices, at most 64 hosts first described
 by any one sender, and at most 64 services a device.
+A reflected device is announced when it appears or changes, twice, a second
+apart, and with goodbye packets when it goes.
+Unchanged, it is not announced again: whoever still wants its records asks for
+them again before they run out (RFC 6762 section 5.2), and is answered from
+the model, so a quiet network stays quiet.
+A segment can have unchanged devices announced again anyway, with
+.B Reannounce=
+in
+.BR mdnsd.conf (5).
 A link-local address is never reflected: it only means something on the link
 the device is on.
 A device is announced with its routable address only, so one that has only a

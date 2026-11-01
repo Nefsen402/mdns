@@ -25,10 +25,15 @@ use crate::socket::{Family, Prefix, MDNS_PORT};
 use crate::parser::{Message, Question, RData, Record};
 use crate::timer::{self, Next, Timer};
 
-/// Re-announce a reflected device at 80% of the shortest TTL it advertises.
+/// Re-announce a reflected device at 80% of the shortest TTL it advertises,
+/// on a segment that re-announces what has not changed.
 fn reannounce_after(host_ttl: u32) -> Duration {
     Duration::from_secs(u64::from(host_ttl) * 4 / 5)
 }
+/// What is announced anew is announced again this long after, in case the
+/// first was lost: at least twice, a second apart (RFC 6762 sections 8.3 and
+/// 8.4).
+const ANNOUNCE_REPEAT: Duration = Duration::from_secs(1);
 /// How long to wait before trying again after a re-announcement failed to send.
 const ANNOUNCE_RETRY: Duration = Duration::from_secs(10);
 
@@ -280,6 +285,9 @@ struct Manual {
     shown: Option<Device>,
     /// When the full record set was last multicast; drives re-announcement.
     announced: Instant,
+    /// Whether that was what changed, still to be announced a second time
+    /// ([`ANNOUNCE_REPEAT`]).
+    repeat: bool,
     /// When any of its records was last multicast, over each family; drives
     /// the rate limit.
     last_sent: Sent,
@@ -296,6 +304,7 @@ impl Manual {
             claims: BTreeMap::new(),
             shown: None,
             announced: now,
+            repeat: false,
             last_sent: Sent::both(now),
             retry: None,
             host_ttl: HOST_TTL,
@@ -312,9 +321,16 @@ impl Manual {
 
     /// When it is next due for re-announcing, or for another try after
     /// sending failed; `None` if nothing is shown and nothing is pending.
-    fn reannounce_at(&self) -> Option<Instant> {
-        let due = |_: &Device| self.announced.checked_add(reannounce_after(self.shortest_ttl())).unwrap_or(self.announced);
-        self.retry.or_else(|| self.shown.as_ref().map(due))
+    /// What changed is announced a second time; what has not, only if the
+    /// segment re-announces `unchanged` ones.
+    fn reannounce_at(&self, unchanged: bool) -> Option<Instant> {
+        let after = |gap: Duration| self.announced.checked_add(gap).unwrap_or(self.announced);
+        let due = |_: &Device| match (self.repeat, unchanged) {
+            (true, _) => Some(after(ANNOUNCE_REPEAT)),
+            (false, true) => Some(after(reannounce_after(self.shortest_ttl()))),
+            (false, false) => None,
+        };
+        self.retry.or_else(|| self.shown.as_ref().and_then(due))
     }
 }
 
@@ -353,6 +369,10 @@ struct State {
     /// The TTL, in seconds, of the address records of the devices
     /// [`Segment::add_manual`] announces; `None` follows each device's own.
     reflect_ttl: Option<u32>,
+    /// Whether what is announced here is announced again before its TTL runs
+    /// out though it has not changed. It need not be: whoever still wants it
+    /// asks again (RFC 6762 section 5.2), and is answered.
+    reannounce: bool,
     /// How many addresses of a family a discovered device is kept with.
     max_addrs: usize,
     /// The most a packet sent here may hold: what the interface's MTU leaves.
@@ -479,7 +499,7 @@ impl State {
             }
         }
         for (key, m) in &self.manual {
-            if let Some(at) = m.reannounce_at() {
+            if let Some(at) = m.reannounce_at(self.reannounce) {
                 // By the name as announced, not the key, which is lowercase.
                 let device = m.shown.as_ref().or_else(|| m.claims.values().next().map(|c| &c.device));
                 let name = device.and_then(|d| d.hostname.as_deref()).unwrap_or(key);
@@ -560,6 +580,7 @@ impl State {
         let m = self.manual.get_mut(key).expect("looked up above");
         if sent {
             m.announced = now;
+            m.repeat = true;
             m.last_sent = Sent::both(now);
             m.retry = None;
         }
@@ -692,13 +713,20 @@ impl Segment {
     /// The TTL, to the second, of the address records of the devices
     /// [`add_manual`](Segment::add_manual) announces from now on: how long
     /// others keep them, and so, at 80% of it, how often they are announced
-    /// again. `None`, the default, announces each device with the TTL it
+    /// again if the segment re-announces ([`Segment::set_reannounce`]). `None`, the default, announces each device with the TTL it
     /// announced itself with (at least ten seconds, and two minutes if it did
     /// not say). The records of a device's services keep their own TTL either
     /// way.
     pub fn set_reflect_ttl(&self, ttl: Option<Duration>) {
         let secs = ttl.map(|t| u32::try_from(t.as_secs()).unwrap_or(u32::MAX).max(MIN_REFLECT_TTL));
         self.state.lock().unwrap().reflect_ttl = secs;
+    }
+
+    /// Whether what is announced here is announced again, at 80% of its TTL,
+    /// though it has not changed; by default it is not. What changes is
+    /// announced twice, a second apart, either way.
+    pub fn set_reannounce(&self, unchanged: bool) {
+        self.state.lock().unwrap().reannounce = unchanged;
     }
 
     /// Have `timer` run this segment's upkeep from now on: drop devices when
@@ -937,6 +965,7 @@ impl Segment {
             match send(outbound, *max_packet, &device.announcement(m.host_ttl, m.other_ttl)) {
                 Ok(()) => {
                     m.announced = now;
+                    m.repeat = true;
                     m.last_sent = Sent::both(now);
                     m.retry = None;
                 }
@@ -972,8 +1001,10 @@ impl Segment {
         state.manual.values().filter_map(|m| m.shown.clone()).collect()
     }
 
-    /// Re-announce reflected devices that have not had a full announcement
-    /// for 80% of their TTL, and try again what failed to send. A failed send
+    /// Announce a second time what changed a second ago ([`ANNOUNCE_REPEAT`]),
+    /// and, if the segment re-announces ([`Segment::set_reannounce`]), what
+    /// has not had a full announcement for 80% of its TTL; and try again
+    /// what failed to send. A failed send
     /// is retried after [`ANNOUNCE_RETRY`]; the first error is returned after
     /// every device was tried. Run by [`Segment::schedule`] when due.
     pub fn reannounce(&self, now: Instant) -> Result<()> {
@@ -983,7 +1014,7 @@ impl Segment {
         let due: Vec<String> = state
             .manual
             .iter()
-            .filter(|(_, m)| m.reannounce_at().is_some_and(|at| at <= now))
+            .filter(|(_, m)| m.reannounce_at(state.reannounce).is_some_and(|at| at <= now))
             .map(|(key, _)| key.clone())
             .collect();
         let mut first_err = None;
@@ -996,6 +1027,7 @@ impl Segment {
                 if let Some(device) = &m.shown {
                     send(&state.outbound, state.max_packet, &device.announcement(m.host_ttl, m.other_ttl))?;
                     m.announced = now;
+                    m.repeat = false;
                     m.last_sent = Sent::both(now);
                 }
                 m.retry = None;
@@ -2543,6 +2575,7 @@ mod tests {
         hear(&seg, "10.0.1.7", vec![a_record("nas.local", "10.0.1.7"), srv("NAS._smb._tcp.local", 445, "nas.local")]);
         seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
         recv(&rx).unwrap();
+        repeat(&seg, &rx);
         events.try_iter().count();
 
         // Gone: the devices heard on it are forgotten, what it announces kept.
@@ -2560,6 +2593,8 @@ mod tests {
         seg.announce_all().unwrap();
         let m = recv(&rx).expect("announced again");
         assert!(m.answers.iter().any(|r| r.name == "tv.local" && r.ttl > 0));
+        // As anything announced anew: twice.
+        assert!(repeat(&seg, &rx).answers.iter().any(|r| r.name == "tv.local" && r.ttl > 0));
     }
 
     #[test]
@@ -2737,22 +2772,59 @@ mod tests {
     }
 
     #[test]
-    fn reannounces_after_eighty_percent_of_ttl() {
+    fn what_is_announced_anew_is_announced_again_a_second_later_and_then_left_alone() {
         let (seg, rx) = wired();
         seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
         let first = recv(&rx).unwrap();
-
         seg.reannounce(Instant::now()).unwrap();
-        assert!(recv(&rx).is_none());
+        assert!(recv(&rx).is_none(), "not within the second");
 
-        let later = Instant::now() + reannounce_after(HOST_TTL) + Duration::from_secs(1);
-        seg.reannounce(later).unwrap();
-        let again = recv(&rx).expect("re-announcement");
+        let again = repeat(&seg, &rx);
         assert_eq!(again.answers.len(), first.answers.len());
         assert!(again.answers.iter().all(|r| r.ttl > 0));
 
+        // Unchanged, it is not announced again, however long it waits.
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(false), None);
+        seg.reannounce(Instant::now() + Duration::from_secs(100_000)).unwrap();
+        assert!(recv(&rx).is_none());
+        assert!(seg.pending().iter().all(|p| p.what != "re-announce"));
+
+        // A change is, twice again.
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV", "Other TV"])).unwrap();
+        assert!(recv(&rx).is_some());
+        repeat(&seg, &rx);
+        seg.reannounce(Instant::now() + Duration::from_secs(100_000)).unwrap();
+        assert!(recv(&rx).is_none());
+    }
+
+    #[test]
+    fn a_segment_that_reannounces_keeps_unchanged_devices_up_at_80_percent_of_their_ttl() {
+        let (seg, rx) = wired();
+        seg.set_reannounce(true);
+        seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+        let first = recv(&rx).unwrap();
+        repeat(&seg, &rx);
+
+        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        let due = seg.pending().into_iter().find(|p| p.what == "re-announce").expect("waited for");
+        assert_eq!(due.at, announced + reannounce_after(HOST_TTL));
+        seg.reannounce(announced + reannounce_after(HOST_TTL) - Duration::from_secs(1)).unwrap();
+        assert!(recv(&rx).is_none());
+        let later = announced + reannounce_after(HOST_TTL);
+        seg.reannounce(later).unwrap();
+        let again = recv(&rx).expect("re-announcement");
+        assert_eq!(again.answers.len(), first.answers.len());
+
         seg.reannounce(later).unwrap();
         assert!(recv(&rx).is_none());
+    }
+
+    /// Send the second announcement of what `seg` last announced anew, a
+    /// second after, as heard on `rx`.
+    fn repeat(seg: &Segment, rx: &UdpSocket) -> Message {
+        let at = seg.state.lock().unwrap().manual["tv.local"].announced + ANNOUNCE_REPEAT;
+        seg.reannounce(at).unwrap();
+        recv(rx).expect("announced a second time")
     }
 
     /// Make `seg` hear a response carrying `records` from `from`.
@@ -3505,7 +3577,7 @@ mod tests {
         // A reflected device is due for re-announcement, and a failed one not before its retry.
         seg.add_manual(Owner::Own, tv("10.0.9.9", &["TV"])).unwrap();
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + reannounce_after(HOST_TTL))));
+        assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + ANNOUNCE_REPEAT)));
         seg.state.lock().unwrap().manual.get_mut("tv.local").unwrap().retry = Some(announced + Duration::from_secs(500));
         assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)));
     }
@@ -3548,11 +3620,13 @@ mod tests {
     #[test]
     fn a_name_can_be_announced_with_its_own_ttl_and_is_kept_up_at_80_percent_of_it() {
         let (seg, rx) = wired();
+        seg.set_reannounce(true);
         seg.add_manual_ttl(Owner::Own, tv("10.0.1.1", &[]), Duration::from_secs(1000)).unwrap();
         let first = recv(&rx).unwrap();
         assert!(first.answers.iter().all(|r| r.ttl == 1000));
+        assert!(repeat(&seg, &rx).answers.iter().all(|r| r.ttl == 1000));
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), Some(announced + Duration::from_secs(800)));
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(800)));
 
         // Queries are answered with it too.
         age(&seg, 2);
@@ -3602,8 +3676,9 @@ mod tests {
         assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
 
         // It is announced again before the shortest of them runs out: 80% of 300.
+        repeat(&seg, &rx);
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), Some(announced + Duration::from_secs(240)));
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(240)));
     }
 
     #[test]
@@ -3611,8 +3686,9 @@ mod tests {
         let (seg, rx) = wired();
         seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 50)).unwrap();
         assert!(announced_ttls(&rx).contains(&(false, 50)));
+        repeat(&seg, &rx);
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), Some(announced + Duration::from_secs(40)));
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(40)));
     }
 
     #[test]
@@ -3637,8 +3713,9 @@ mod tests {
         assert!(ttls.contains(&(true, 900)), "{ttls:?}");
         assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
         // The services run out first, and it is announced again before that.
+        repeat(&seg, &rx);
         let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(), Some(announced + Duration::from_secs(480)));
+        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(480)));
 
         // Even a tiny setting is kept to the floor.
         seg.set_reflect_ttl(Some(Duration::from_secs(1)));

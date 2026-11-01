@@ -89,6 +89,9 @@ pub struct SegmentConfig {
     /// Which of the addresses a device was given from the neighbour table are
     /// reflected with it.
     pub neighbour_addresses: Neighbours,
+    /// Whether what is reflected onto its interfaces is announced again
+    /// before its TTL runs out though it has not changed.
+    pub reannounce: bool,
 }
 
 #[derive(Debug)]
@@ -169,6 +172,12 @@ impl Config {
             .min()
     }
 
+    /// Whether what is announced on `interface` is announced again though it
+    /// has not changed: if any of its segments says so.
+    pub fn reannounce_on(&self, interface: &str) -> bool {
+        self.segments.iter().any(|seg| seg.reannounce && seg.interfaces.iter().any(|i| i == interface))
+    }
+
     pub fn parse(text: &str) -> Result<Config> {
         let unit = parse_syntax(text)?;
         let mut config = Config::default();
@@ -226,6 +235,9 @@ impl Config {
                     }
                     ("segment", "neighbouraddresses") => {
                         config.segments.last_mut().unwrap().neighbour_addresses = parse_neighbours(&value, lineno)?;
+                    }
+                    ("segment", "reannounce") => {
+                        config.segments.last_mut().unwrap().reannounce = !value.is_empty() && parse_bool(&entry, lineno)?;
                     }
                     ("segment", "forwardquestions") => {
                         config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
@@ -575,6 +587,7 @@ interfaces=br0,wifi
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
             "ReflectTTL=", "MaxAddresses=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
+            "Reannounce=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
@@ -741,6 +754,23 @@ interfaces=br0,wifi
             let err = error_of(&format!("[Segment]\nName=a\nInterfaces=x\nNeighbourAddresses={bad}"));
             assert!(err.contains("line 4") && err.contains("always, link-local or never"), "{err}");
         }
+    }
+
+    /// Unchanged devices are not announced again unless a segment says so,
+    /// and then on each of its interfaces, shared or not.
+    #[test]
+    fn a_segment_can_reannounce_unchanged_devices() {
+        let config = |extra: &str| {
+            Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=y,z")).unwrap()
+        };
+        let on = |c: &Config| ["x", "y", "z"].map(|i| c.reannounce_on(i));
+        assert_eq!(on(&config("")), [false, false, false]);
+        assert_eq!(on(&config("Reannounce=yes")), [true, true, false]);
+        assert_eq!(on(&config("reannounce=TRUE")), [true, true, false]);
+        assert_eq!(on(&config("Reannounce=no")), [false, false, false]);
+        assert_eq!(on(&config("Reannounce=yes\nReannounce=")), [false, false, false], "empty resets");
+        let err = error_of("[Segment]\nName=a\nInterfaces=x\nReannounce=sometimes");
+        assert!(err.contains("line 4"), "{err}");
     }
 
     #[test]
