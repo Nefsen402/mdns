@@ -74,7 +74,7 @@ const MAX_HOST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// gone, and a silly one (`99999999999999s`) would overflow the clock.
 const MAX_MIN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
     pub name: String,
     pub interfaces: Vec<String>,
@@ -86,6 +86,22 @@ pub struct SegmentConfig {
     pub probe_interval: Option<Option<Duration>>,
     /// Which questions asked on one of its interfaces are put to the others.
     pub forward: Forward,
+    /// Whether the addresses a device was given from the neighbour table are
+    /// reflected with it, as well as those it announced.
+    pub neighbour_addresses: bool,
+}
+
+impl Default for SegmentConfig {
+    fn default() -> SegmentConfig {
+        SegmentConfig {
+            name: String::new(),
+            interfaces: Vec::new(),
+            untrusted: Vec::new(),
+            probe_interval: None,
+            forward: Forward::default(),
+            neighbour_addresses: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -220,6 +236,9 @@ impl Config {
                     ("segment", "probeinterval") => {
                         let interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
                         config.segments.last_mut().unwrap().probe_interval = Some(interval);
+                    }
+                    ("segment", "neighbouraddresses") => {
+                        config.segments.last_mut().unwrap().neighbour_addresses = parse_bool(&entry, lineno)?;
                     }
                     ("segment", "forwardquestions") => {
                         config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
@@ -558,7 +577,7 @@ interfaces=br0,wifi
         let man = include_str!("../man/mdnsd.conf.5");
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
-            "ReflectTTL=", "MaxAddresses=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=",
+            "ReflectTTL=", "MaxAddresses=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
@@ -706,6 +725,21 @@ interfaces=br0,wifi
         let fits = format!("{label}.{label}.{label}.{}.local", "a".repeat(52));
         assert_eq!(fits.len(), 250);
         assert!(Config::parse(&format!("[Advertise]\nHostname={fits}\n{EXAMPLE}")).is_ok());
+    }
+
+    /// Addresses from the neighbour table are reflected unless a segment
+    /// says not to.
+    #[test]
+    fn neighbour_addresses_are_reflected_unless_a_segment_says_not() {
+        let segments = |extra: &str| {
+            let c = Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=z")).unwrap();
+            (c.segments[0].neighbour_addresses, c.segments[1].neighbour_addresses)
+        };
+        assert_eq!(segments(""), (true, true));
+        assert_eq!(segments("NeighbourAddresses=no"), (false, true));
+        assert_eq!(segments("neighbouraddresses=off\nNeighbourAddresses=yes"), (true, true));
+        let bad = error_of("[Segment]\nName=a\nInterfaces=x\nNeighbourAddresses=sometimes");
+        assert!(bad.contains("line 4"), "{bad}");
     }
 
     #[test]

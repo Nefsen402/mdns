@@ -7,6 +7,7 @@
 //! interfaces it serves. Only the few fields it needs are read.
 
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// A change to an interface.
@@ -20,6 +21,10 @@ pub enum Change {
     Gone { index: u32 },
     /// An address of the interface with `index` was added or removed.
     Address { index: u32 },
+    /// The neighbour table of the interface with `index` has `ip` at
+    /// link-layer address `mac`, or with `None`, no longer (the entry went,
+    /// or the neighbour could not be reached).
+    Neighbour { index: u32, ip: IpAddr, mac: Option<Vec<u8>> },
     /// Changes were lost (the kernel's queue ran over): what is there has to
     /// be looked at afresh.
     Lost,
@@ -27,12 +32,23 @@ pub enum Change {
 
 // rtnetlink, from <linux/rtnetlink.h> and <linux/if.h>.
 const RTMGRP_LINK: u32 = 0x1;
+const RTMGRP_NEIGH: u32 = 0x4;
 const RTMGRP_IPV4_IFADDR: u32 = 0x10;
 const RTMGRP_IPV6_IFADDR: u32 = 0x100;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_DELNEIGH: u16 = 29;
+const RTM_GETNEIGH: u16 = 30;
+const NLM_F_REQUEST: u16 = 0x1;
+const NLM_F_DUMP: u16 = 0x300;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+/// The states of a neighbour entry whose link-layer address can be used:
+/// reachable, stale, delay, probe and permanent.
+const NUD_USABLE: u16 = 0x02 | 0x04 | 0x08 | 0x10 | 0x80;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
 const IFF_UP: u32 = 0x1;
@@ -43,6 +59,7 @@ const IFF_RUNNING: u32 = 0x40;
 const NLMSG_HDRLEN: usize = 16;
 const IFINFOMSG_LEN: usize = 16;
 const IFADDRMSG_LEN: usize = 8;
+const NDMSG_LEN: usize = 12;
 const RTA_HDRLEN: usize = 4;
 
 /// A socket that hears of link and address changes.
@@ -62,7 +79,7 @@ impl Netlink {
         // SAFETY: an all-zero sockaddr_nl is valid; the fields set are its own.
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR | RTMGRP_NEIGH;
         // SAFETY: `addr` is a valid sockaddr_nl of the size given.
         let rc = unsafe {
             libc::bind(
@@ -75,6 +92,35 @@ impl Netlink {
             return Err(io::Error::last_os_error());
         }
         Ok(Netlink { fd })
+    }
+
+    /// Ask the kernel for every entry of every interface's neighbour table:
+    /// they come as [`Change::Neighbour`]s among the next changes. For what
+    /// was there before the daemon started, or before changes were lost.
+    pub fn request_neighbours(&self) -> io::Result<()> {
+        let mut msg = Vec::with_capacity(NLMSG_HDRLEN + NDMSG_LEN);
+        msg.extend(((NLMSG_HDRLEN + NDMSG_LEN) as u32).to_ne_bytes());
+        msg.extend(RTM_GETNEIGH.to_ne_bytes());
+        msg.extend((NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        msg.extend(1u32.to_ne_bytes()); // sequence
+        msg.extend(0u32.to_ne_bytes()); // port: the kernel fills it in
+        msg.extend([0u8; NDMSG_LEN]); // every family, every interface
+        // SAFETY: an all-zero sockaddr_nl is the kernel's address.
+        let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // SAFETY: `msg` is readable for its length, and `kernel` is a valid
+        // sockaddr_nl of the size given.
+        let n = unsafe {
+            libc::sendto(
+                self.fd.as_raw_fd(),
+                msg.as_ptr().cast(),
+                msg.len(),
+                0,
+                (&kernel as *const libc::sockaddr_nl).cast(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if n < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
     /// Wait for the next changes the kernel reports.
@@ -121,6 +167,15 @@ pub fn parse(buf: &[u8]) -> Vec<Change> {
             RTM_NEWADDR | RTM_DELADDR if body.len() >= IFADDRMSG_LEN => {
                 out.push(Change::Address { index: u32_at(body, 4) });
             }
+            RTM_NEWNEIGH | RTM_DELNEIGH if body.len() >= NDMSG_LEN => {
+                let index = u32_at(body, 4);
+                let state = u16_at(body, 8);
+                let (ip, mac) = neighbour_attrs(&body[NDMSG_LEN..]);
+                if let Some(ip) = ip {
+                    let usable = kind == RTM_NEWNEIGH && state & NUD_USABLE != 0;
+                    out.push(Change::Neighbour { index, ip, mac: mac.filter(|_| usable) });
+                }
+            }
             _ => {}
         }
         at += align(len);
@@ -149,6 +204,27 @@ fn link_attrs(mut attrs: &[u8]) -> (Option<String>, Option<u32>) {
         attrs = attrs.get(align(len)..).unwrap_or_default();
     }
     (name, mtu)
+}
+
+/// The address and link-layer address among a neighbour message's
+/// attributes. Nothing if an attribute runs over the end.
+fn neighbour_attrs(mut attrs: &[u8]) -> (Option<IpAddr>, Option<Vec<u8>>) {
+    let (mut ip, mut mac) = (None, None);
+    while attrs.len() >= RTA_HDRLEN {
+        let len = u16_at(attrs, 0) as usize;
+        if len < RTA_HDRLEN || len > attrs.len() {
+            return (None, None);
+        }
+        let data = &attrs[RTA_HDRLEN..len];
+        match (u16_at(attrs, 2), data.len()) {
+            (NDA_DST, 4) => ip = Some(IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3]))),
+            (NDA_DST, 16) => ip = Some(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(data).expect("16 bytes")))),
+            (NDA_LLADDR, 1..) => mac = Some(data.to_vec()),
+            _ => {}
+        }
+        attrs = attrs.get(align(len)..).unwrap_or_default();
+    }
+    (ip, mac)
 }
 
 /// Netlink lengths are padded to four bytes.
@@ -238,6 +314,42 @@ mod tests {
         assert_eq!(named(vec![]), [Change::Link { index: 9, name: "wifi".into(), up: true, mtu: None }]);
         assert_eq!(named(attr(IFLA_MTU, &[1, 2])), [Change::Link { index: 9, name: "wifi".into(), up: true, mtu: None }]);
         assert_eq!(named(attr(IFLA_MTU, &9000u32.to_ne_bytes())), [Change::Link { index: 9, name: "wifi".into(), up: true, mtu: Some(9000) }]);
+    }
+
+    fn neighbour(kind: u16, index: u32, state: u16, ip: &[u8], mac: Option<&[u8]>) -> Vec<u8> {
+        let mut body = vec![if ip.len() == 4 { 2 } else { 10 }, 0, 0, 0];
+        body.extend(index.to_ne_bytes());
+        body.extend(state.to_ne_bytes());
+        body.extend([0u8, 1]); // flags, type
+        body.extend(attr(NDA_DST, ip));
+        if let Some(mac) = mac {
+            body.extend(attr(NDA_LLADDR, mac));
+        }
+        message(kind, &body)
+    }
+
+    /// A neighbour entry that can be used gives its link-layer address; one
+    /// that went, failed or is still being resolved, none.
+    #[test]
+    fn reads_neighbour_entries() {
+        let mac = [0x04, 0x09, 0x86, 0x43, 0xe3, 0xf6];
+        let v6: IpAddr = "fd00:0:2::73".parse().unwrap();
+        let v6_octets = match v6 { IpAddr::V6(a) => a.octets(), _ => unreachable!() };
+        let mut buf = neighbour(RTM_NEWNEIGH, 5, 0x02, &v6_octets, Some(&mac)); // reachable
+        buf.extend(neighbour(RTM_NEWNEIGH, 5, 0x04, &[10, 0, 2, 73], Some(&mac))); // stale
+        buf.extend(neighbour(RTM_NEWNEIGH, 5, 0x20, &[10, 0, 2, 74], Some(&mac))); // failed
+        buf.extend(neighbour(RTM_NEWNEIGH, 5, 0x01, &[10, 0, 2, 75], None)); // incomplete
+        buf.extend(neighbour(RTM_DELNEIGH, 5, 0x04, &v6_octets, Some(&mac)));
+        let mac = Some(mac.to_vec());
+        assert_eq!(parse(&buf), [
+            Change::Neighbour { index: 5, ip: v6, mac: mac.clone() },
+            Change::Neighbour { index: 5, ip: "10.0.2.73".parse().unwrap(), mac },
+            Change::Neighbour { index: 5, ip: "10.0.2.74".parse().unwrap(), mac: None },
+            Change::Neighbour { index: 5, ip: "10.0.2.75".parse().unwrap(), mac: None },
+            Change::Neighbour { index: 5, ip: v6, mac: None },
+        ]);
+        // Without an address, or with one of another length, it says nothing.
+        assert!(parse(&neighbour(RTM_NEWNEIGH, 5, 0x02, &[1, 2, 3], None)).is_empty());
     }
 
     #[test]

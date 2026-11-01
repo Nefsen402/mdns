@@ -141,7 +141,21 @@ by any one sender, and at most 64 services a device.
 A link-local address is never reflected: it only means something on the link
 the device is on.
 A device is announced with its routable address only, so one that has only a
-link-local IPv6 address is not reflected over IPv6.
+link-local IPv6 address is not reflected over IPv6, unless the kernel knows
+better.
+Of a family a device announced no routable address of, its routable addresses
+are taken from the kernel's neighbour table: those listed under the link-layer
+address of one of its link-local ones.
+They are reflected like those it announced, for as long as the table has them
+(unless a segment says not to, with
+.B NeighbourAddresses=no
+in
+.BR mdnsd.conf (5)),
+and none are taken of a family it announces a routable address of itself.
+The table only has addresses the router has lately exchanged packets with, so a
+device that has said nothing off its link since may not be there yet; to find
+its link-layer address, a device whose link-local IPv6 address the table has
+not got is asked a question on it, at most once a minute.
 With its services go the subtypes they announced, which a probe also asks for
 (the well-known ones of the types around, and those heard before); with its
 hostname, the NSEC record it announced, so a query for a kind of address it lacks

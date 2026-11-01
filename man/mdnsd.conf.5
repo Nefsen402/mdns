@@ -314,6 +314,18 @@ Questions about a name a device on the asking interface owns, and those of a
 device probing for its names, are never asked elsewhere; nor are those of an
 untrusted interface.
 .TP
+.B NeighbourAddresses=
+Optional, a boolean, on unless set.
+Whether to reflect a device with the addresses it was given from the kernel's
+neighbour table (see
+.BR mdnsd (8)),
+as well as those it announced.
+Off, only what devices announce is reflected: one whose only routable address
+of a family came from the table is reflected without it, and one with no
+routable address of its own not at all.
+The addresses are learned all the same, and listed by
+.BR mdnsctl (1).
+.TP
 .B ProbeInterval=
 Optional.
 How often to probe the interfaces of this segment for devices, in place of the

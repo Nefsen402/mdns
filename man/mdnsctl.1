@@ -41,6 +41,14 @@ its pretty name, which is the name of its services (for example
 .BR "OZAL Speakers" ),
 and, last, all of its addresses, IPv4 first, whichever family it was heard
 over.
+An address in parentheses is one the device did not announce, but that the
+kernel's neighbour table lists under the link-layer address of its link-local
+one (see
+.BR mdnsd (8));
+with
+.BR \-\-json ,
+they are also its
+.BR neighbour_addresses .
 Devices that have not announced a name yet have no DNS name to show, so they
 are only counted.
 The listing ends with how many devices there are.

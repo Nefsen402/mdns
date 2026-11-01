@@ -8,7 +8,7 @@
 //!   {"ok":true,"segments":[{"name":"IoT","interfaces":["wifi"],"untrusted":[],"families":["v4","v6"]}]}
 //! devices <segment name>
 //!   {"ok":true,"name":"IoT","devices":[{"interface":"wifi","hostname":"tv.local",
-//!    "addresses":["10.0.1.7","fd00:0:1::7","fe80::7"],"address_ttl":120,
+//!    "addresses":["10.0.1.7","fd00:0:1::7","fe80::7"],"neighbour_addresses":[],"address_ttl":120,
 //!    "services":[{"instance":...}]}]}
 //! probe [<segment name>]
 //!   {"ok":true,"probed":[{"interface":"wifi","queries":14,"error":null}]}
@@ -76,7 +76,11 @@
 //! `addresses` of both: routable ones first (IPv4, then global or ULA IPv6),
 //! then link-local ones (`169.254/16`, `fe80::/10`), which only mean something
 //! on the device's own link. Up to eight of a family; empty when it announced
-//! none and was not heard from.
+//! none and was not heard from. `neighbour_addresses` are those of them it did
+//! not announce: of a family it announced no routable address of, the kernel's
+//! neighbour table lists them under the link-layer address of one of its
+//! link-local ones. They are reflected like the others, for as long as the
+//! table has them.
 //!
 //! The TTLs a device announced itself with are kept: `address_ttl` for its
 //! address records and `ttl` for each service (the SRV record's, else the PTR's
@@ -100,7 +104,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::reflector::Notice;
-use crate::device::{is_type, Device};
+use crate::device::{is_type, Device, Origin};
 use crate::socket::{Event, Family, Segment};
 use crate::timer::Watcher;
 use crate::Group;
@@ -713,6 +717,7 @@ fn device_json(interface: &str, d: &Device) -> Value {
         "interface": interface,
         "hostname": d.hostname,
         "addresses": d.addrs().map(|a| a.to_string()).collect::<Vec<_>>(),
+        "neighbour_addresses": d.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip.to_string()).collect::<Vec<_>>(),
         "address_ttl": d.ttl,
         "services": services,
     })
@@ -853,7 +858,7 @@ mod tests {
         segs[0].observe(ip("10.0.3.9"));
         assert_eq!(
             handle(&[iot], &Watcher::default(), &Watches::default(), r#"devices "IoT to br0""#),
-            r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","hostname":null,"addresses":["10.0.3.9"],"address_ttl":null,"services":[]}]}"#
+            r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","hostname":null,"addresses":["10.0.3.9"],"neighbour_addresses":[],"address_ttl":null,"services":[]}]}"#
         );
     }
 
@@ -864,7 +869,7 @@ mod tests {
         segs[1].observe(ip("10.0.2.1"));
         let out = handle(&[g], &Watcher::default(), &Watches::default(), "DEVICES media");
         assert!(
-            out.contains(r#""interface":"a","hostname":"tv.local","addresses":["10.0.1.5"],"address_ttl":120"#),
+            out.contains(r#""interface":"a","hostname":"tv.local","addresses":["10.0.1.5"],"neighbour_addresses":[],"address_ttl":120"#),
             "{out}"
         );
         assert!(

@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     let mut segments = Vec::new();
     for (rank, seg) in (0..).zip(&config.segments) {
         let members = seg.interfaces.iter().map(|iface| links[iface.as_str()].clone()).collect();
-        let reflector = Reflector::with_options(rank, members, &seg.untrusted, seg.forward)
+        let reflector = Reflector::with_options(rank, members, &seg.untrusted, seg.forward, seg.neighbour_addresses)
             .with_context(|| format!("starting segment {:?}", seg.name))?;
         eprintln!("segment {:?}: {}", seg.name, seg.interfaces.join(", "));
         if !seg.untrusted.is_empty() {
@@ -85,6 +85,9 @@ fn main() -> Result<()> {
             Forward::Never => "no questions",
         };
         eprintln!("segment {:?}: asking {forwarding} on the others", seg.name);
+        if !seg.neighbour_addresses {
+            eprintln!("segment {:?}: reflecting only the addresses devices announce, not those from the neighbour table", seg.name);
+        }
         segments.push(Group { name: seg.name.clone(), reflector });
     }
 

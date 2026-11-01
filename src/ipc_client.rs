@@ -953,7 +953,7 @@ fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
             }
         };
         for addr in strings(&device["addresses"]) {
-            let item = (is_link_local(addr), addr.contains(':'), addr.to_string());
+            let item = (is_link_local(addr), addr.contains(':'), shown_addr(device, addr));
             if !entry.addrs.contains(&item) {
                 entry.addrs.push(item);
             }
@@ -1000,6 +1000,7 @@ fn brief_row(device: &Value) -> Option<[String; 3]> {
     let pretty = if pretty.is_empty() { "-".to_string() } else { pretty.join(", ") };
     let mut addrs = strings(&device["addresses"]);
     addrs.sort_by_key(|a| (is_link_local(a), a.contains(':')));
+    let addrs: Vec<String> = addrs.into_iter().map(|a| shown_addr(device, a)).collect();
     let addrs = if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") };
     Some([host.to_string(), pretty, addrs])
 }
@@ -1057,8 +1058,14 @@ fn unescape_label(label: &str) -> String {
 /// A device's addresses, as the daemon lists them (routable ones first); `-`
 /// if it has none.
 fn device_addrs(device: &Value) -> String {
-    let addrs = strings(&device["addresses"]);
+    let addrs: Vec<String> = strings(&device["addresses"]).into_iter().map(|a| shown_addr(device, a)).collect();
     if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") }
+}
+
+/// `addr` of `device` as a listing shows it: in parentheses if it was learned
+/// from the neighbour table rather than announced.
+fn shown_addr(device: &Value, addr: &str) -> String {
+    if strings(&device["neighbour_addresses"]).contains(&addr) { format!("({addr})") } else { addr.to_string() }
 }
 
 /// Whether `addr` is link-local, `169.254/16` or `fe80::/10`: it only means
@@ -1406,6 +1413,24 @@ mod tests {
         );
         let empty: Value = serde_json::from_str(r#"{"ok":true,"name":"IoT","devices":[]}"#).unwrap();
         assert_eq!(render_devices(&empty).unwrap(), "IoT: no devices\n");
+    }
+
+    /// An address learned from the neighbour table is shown in parentheses,
+    /// in the brief listing and with -v.
+    #[test]
+    fn listings_show_neighbour_addresses_in_parentheses() {
+        let device: Value = serde_json::from_str(
+            r#"{"interface":"media","hostname":"speakers.local","addresses":["10.0.2.73","fd00:0:2::73","fe80::9"],
+                "neighbour_addresses":["fd00:0:2::73"],"address_ttl":120,"services":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(device_addrs(&device), "10.0.2.73, (fd00:0:2::73), fe80::9");
+        assert_eq!(brief_row(&device).unwrap()[2], "10.0.2.73, (fd00:0:2::73), fe80::9");
+        let reply = serde_json::json!({ "ok": true, "name": "media", "devices": [device] });
+        assert_eq!(render_devices_brief(&reply).unwrap(), "  speakers.local  -  10.0.2.73, (fd00:0:2::73), fe80::9\nmedia: 1 device\n");
+        // A daemon that does not say is no matter.
+        let older: Value = serde_json::from_str(r#"{"addresses":["10.0.2.73"]}"#).unwrap();
+        assert_eq!(device_addrs(&older), "10.0.2.73");
     }
 
     #[test]

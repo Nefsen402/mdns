@@ -18,8 +18,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 
 use crate::device::{
-    addr_of, family_of, is_type, responses, service_ttl, Device, Report, DEFAULT_MAX_ADDRS, DEFAULT_MAX_PACKET,
-    HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
+    addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report, DEFAULT_MAX_ADDRS,
+    DEFAULT_MAX_PACKET, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
 };
 use crate::parser::{Message, Question, RData, Record};
 use crate::timer::{self, Next, Timer};
@@ -65,6 +65,10 @@ const MIN_MULTICAST_GAP: Duration = Duration::from_secs(1);
 /// A question put to a segment on another's behalf is not put to it again
 /// within this long: clients ask again after a second, and several ask alike.
 const FORWARD_GAP: Duration = Duration::from_secs(1);
+
+/// How long after asking a device on its link-local address, so that the
+/// kernel looks up its link-layer address, it is not asked so again.
+const NUDGE_GAP: Duration = Duration::from_secs(60);
 
 /// Questions remembered per segment as just put to it, so that a client
 /// asking endless made-up names cannot grow the list without bound.
@@ -288,11 +292,14 @@ struct Entry {
     addr_expires: HashMap<IpAddr, Instant>,
     /// When it was last asked to answer again because it was about to expire.
     refreshed: Option<Instant>,
+    /// When it was last asked on its link-local address, for the kernel to
+    /// find its link-layer address ([`NUDGE_GAP`]).
+    nudged: Option<Instant>,
 }
 
 impl Entry {
     fn new(now: Instant, from: IpAddr) -> Entry {
-        Entry { device: Device::default(), from, expires: now, addr_expires: HashMap::new(), refreshed: None }
+        Entry { device: Device::default(), from, expires: now, addr_expires: HashMap::new(), refreshed: None, nudged: None }
     }
 
     /// Its records that answer `q`, each with the time it has left here as
@@ -507,9 +514,45 @@ struct State {
     /// The questions put to this segment on another's behalf, in lowercase,
     /// and when, for [`FORWARD_GAP`].
     forwarded: HashMap<(String, u16), Instant>,
+    /// The kernel's neighbour table for the interface: each address it has a
+    /// link-layer address for, and that link-layer address.
+    neighbours: HashMap<IpAddr, Vec<u8>>,
 }
 
 impl State {
+    /// Bring the addresses learned from the neighbour table up to date for
+    /// the devices of `keys`, noting in `touched` those that change: the
+    /// routable addresses listed under the link-layer address of one of a
+    /// device's link-local ones, of a family it announced no routable address
+    /// of ([`Device::take_neighbours`]). A device with a link-local IPv6
+    /// address the table has not got yet, and no routable one, is asked a
+    /// question on it, for the kernel to look up its link-layer address.
+    fn learn_neighbours(&mut self, keys: &[Key], touched: &mut Touched, now: Instant) {
+        for key in keys {
+            let Some(entry) = self.discovered.get(key) else { continue };
+            let macs: Vec<&Vec<u8>> = entry.device.link_local().filter_map(|ll| self.neighbours.get(&ll)).collect();
+            let learned: Vec<IpAddr> =
+                self.neighbours.iter().filter(|(ip, mac)| !is_link_local(ip) && macs.contains(mac)).map(|(ip, _)| *ip).collect();
+
+            let unresolved = entry.device.link_local().find(|ll| ll.is_ipv6() && !self.neighbours.contains_key(ll));
+            let has_v6 = entry.device.routable().any(|a| a.is_ipv6());
+            let due = entry.nudged.is_none_or(|t| now.saturating_duration_since(t) >= NUDGE_GAP);
+            if let Some(ll) = unresolved.filter(|_| !has_v6 && due) {
+                nudge(&self.outbound, ll, &Device::refresh_queries(std::slice::from_ref(&entry.device), self.max_packet));
+                self.discovered.get_mut(key).expect("looked up above").nudged = Some(now);
+            }
+
+            let mut device = self.discovered[key].device.clone();
+            if device.take_neighbours(&learned, self.max_addrs) {
+                touched.note(&self.discovered, key);
+                for ip in device.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip) {
+                    self.by_addr.entry(ip).or_insert_with(|| key.clone());
+                }
+                self.discovered.get_mut(key).expect("looked up above").device = device;
+            }
+        }
+    }
+
     fn notify(&mut self, event: Event) {
         // A dropped receiver is an unsubscribe.
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
@@ -1273,8 +1316,11 @@ impl Segment {
             let is_sender = report.addrs.contains(&src)
                 || (!report.addrs.iter().chain(&report.refused).chain(&report.gone).any(same_family)
                     && reports.len() == 1);
+            // A packet sent from an address no device can be reached at
+            // (a device without an IPv4 address sends from 0.0.0.0) vouches
+            // for no address.
             let mut addrs = report.addrs.clone();
-            if is_sender && !addrs.contains(&src) {
+            if is_sender && !addrs.contains(&src) && is_usable(src) {
                 addrs.push(src);
             }
 
@@ -1309,18 +1355,25 @@ impl Segment {
         // bare browse answer, text records), or just a sign of life such as a
         // query. A packet that only describes other devices says nothing about
         // its sender, which is then not recorded at all.
-        let key = sender.unwrap_or_else(|| state.by_addr.get(&src).cloned().unwrap_or(Key::Source(src)));
-        let room = state.discovered.contains_key(&key) || state.discovered.len() < MAX_DEVICES;
-        if (reports.is_empty() || !rest.is_empty()) && room {
+        // One known only by an address no device can be reached at is not
+        // known at all.
+        let usable = is_usable(src);
+        let key = sender.or_else(|| state.by_addr.get(&src).cloned()).or_else(|| usable.then_some(Key::Source(src)));
+        let room = key.as_ref().is_some_and(|k| state.discovered.contains_key(k)) || state.discovered.len() < MAX_DEVICES;
+        if let Some(key) = key.filter(|_| (reports.is_empty() || !rest.is_empty()) && room) {
             touched.note(&state.discovered, &key);
             let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now, src));
             let ttl = rest.iter().map(|r| r.ttl).max().unwrap_or(0);
             let ttl = Duration::from_secs(ttl as u64);
             entry.expires = entry.expires.max(now + ttl.max(floor));
-            entry.device.take_addrs(&[src], &[], &[], max_addrs);
-            entry.renew_addrs(&[src], &HashMap::new(), now, floor);
+            if usable {
+                entry.device.take_addrs(&[src], &[], &[], max_addrs);
+                entry.renew_addrs(&[src], &HashMap::new(), now, floor);
+            }
             entry.device.learn_records(rest.iter().copied());
-            state.by_addr.insert(src, key);
+            if usable {
+                state.by_addr.insert(src, key);
+            }
         }
 
         // An instance that has now been resolved to its host no longer needs
@@ -1342,6 +1395,43 @@ impl Segment {
             }
         }
 
+        // What the neighbour table knows of the devices just heard of.
+        let heard = touched.order.clone();
+        state.learn_neighbours(&heard, &mut touched, now);
+
+        let events = touched.events(&state.discovered);
+        if !events.is_empty() {
+            state.settle_all(now);
+        }
+        for event in events {
+            state.notify(event);
+        }
+    }
+
+    /// Take in an entry of the interface's neighbour table, as the kernel
+    /// reports it: `ip` is at link-layer address `mac`, or with `None`, no
+    /// longer (it went, or could not be reached). The devices it may concern,
+    /// those with a link-local address or addresses learned so, have their
+    /// learned addresses brought up to date, and are reflected so.
+    pub fn neighbour(&self, ip: IpAddr, mac: Option<Vec<u8>>) {
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        let changed = match mac {
+            Some(mac) => state.neighbours.insert(ip, mac.clone()).as_ref() != Some(&mac),
+            None => state.neighbours.remove(&ip).is_some(),
+        };
+        if !changed {
+            return;
+        }
+        let now = Instant::now();
+        let keys: Vec<Key> = state
+            .discovered
+            .iter()
+            .filter(|(_, e)| e.device.link_local().next().is_some() || e.device.addresses.iter().any(|a| a.origin == Origin::Neighbour))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut touched = Touched::default();
+        state.learn_neighbours(&keys, &mut touched, now);
         let events = touched.events(&state.discovered);
         if !events.is_empty() {
             state.settle_all(now);
@@ -1531,6 +1621,23 @@ impl Touched {
             }
         }
         events
+    }
+}
+
+/// Ask `queries` of the device at link-local address `ll`, by unicast to its
+/// port 5353 (RFC 6762 section 5.5), over the socket of its family: to send
+/// it, the kernel has to look up its link-layer address, which is what this
+/// is for. Failing to send is no matter: the next time will do.
+fn nudge(outbound: &[Outbound], ll: IpAddr, queries: &[Message]) {
+    let Some(out) = outbound.iter().find(|o| o.family == family_of(ll)) else { return };
+    let dest = match (ll, out.dest) {
+        (IpAddr::V6(ll), SocketAddr::V6(group)) => SocketAddr::V6(SocketAddrV6::new(ll, MDNS_PORT, 0, group.scope_id())),
+        (ll, _) => SocketAddr::new(ll, MDNS_PORT),
+    };
+    for query in queries {
+        if let Ok(bytes) = query.encode() {
+            let _ = out.socket.send_to(&bytes, dest);
+        }
     }
 }
 
@@ -2262,6 +2369,84 @@ mod tests {
         seg.query_question(&[question("_http._tcp.local", rtype::PTR)]).unwrap();
         let known = packets();
         assert!(known.len() == 1 && known[0] <= max_packet, "known answers left out to fit: {known:?}");
+    }
+
+    /// A device without an IPv4 address sends IPv4 from 0.0.0.0: that is no
+    /// address to credit it with, nor one to know a device by.
+    #[test]
+    fn a_packet_from_an_unusable_address_vouches_for_none() {
+        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        hear(&seg, "0.0.0.0", vec![aaaa("tv.local", "fe80::9"), srv("TV._http._tcp.local", 80, "tv.local")]);
+        let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still heard of");
+        assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("fe80::9")]);
+        assert_eq!(tv.services.len(), 1);
+
+        // A mere query from it makes no device of it.
+        seg.handle(sa("0.0.0.0"), &query("tv.local", rtype::A, vec![])).unwrap();
+        assert_eq!(seg.devices().len(), 1);
+        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("0.0.0.0")));
+    }
+
+    const MAC: [u8; 6] = [0x04, 0x09, 0x86, 0x43, 0xe3, 0xf6];
+
+    /// A device that announced only a link-local IPv6 address is given the
+    /// routable ones the neighbour table lists under its link-layer address,
+    /// whichever comes first, and loses them with their entries.
+    #[test]
+    fn a_device_is_given_the_addresses_the_neighbour_table_has_for_it() {
+        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let events = seg.subscribe();
+        let learned = |seg: &Segment| -> Vec<IpAddr> {
+            let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
+            d.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip).collect()
+        };
+        // The table first: the router has talked to it.
+        seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
+        seg.neighbour(ip("fe80::609:86ff:fe43:e3f6"), Some(MAC.to_vec()));
+        seg.neighbour(ip("fd00:0:2::99"), Some(vec![1, 2, 3, 4, 5, 6])); // someone else
+        hear(&seg, "10.0.2.73", vec![
+            a_record("speakers.local", "10.0.2.73"),
+            aaaa("speakers.local", "fe80::609:86ff:fe43:e3f6"),
+            srv("Speakers._airplay._tcp.local", 7000, "speakers.local"),
+        ]);
+        assert_eq!(learned(&seg), [ip("fd00:0:2::73")]);
+        events.try_iter().count();
+
+        // Then more of it: added, and told.
+        seg.neighbour(ip("2001:db8:2::73"), Some(MAC.to_vec()));
+        assert_eq!(learned(&seg), [ip("2001:db8:2::73"), ip("fd00:0:2::73")]);
+        assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.has_addr(&ip("2001:db8:2::73"))));
+        // A packet from a learned address is the device's.
+        assert_eq!(seg.state.lock().unwrap().by_addr.get(&ip("2001:db8:2::73")), Some(&host_key("speakers.local")));
+
+        // An entry that goes takes its address with it.
+        seg.neighbour(ip("2001:db8:2::73"), None);
+        assert_eq!(learned(&seg), [ip("fd00:0:2::73")]);
+        assert!(matches!(events.try_recv(), Ok(Event::Updated(_))));
+        // The same entry again changes nothing, and says nothing.
+        seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
+        assert!(events.try_recv().is_err());
+    }
+
+    /// A device whose link-local address the table has not got, and that has
+    /// no routable IPv6 address, is asked on it once, for the kernel to look
+    /// up its link-layer address, and not again within NUDGE_GAP.
+    #[test]
+    fn a_device_unknown_to_the_neighbour_table_is_nudged_once() {
+        let rx = UdpSocket::bind("[::1]:0").unwrap();
+        let seg = Segment::new("test", &[Family::V6]);
+        seg.attach(Family::V6, UdpSocket::bind("[::1]:0").unwrap(), rx.local_addr().unwrap());
+        let nudged = |seg: &Segment| seg.state.lock().unwrap().discovered[&host_key("speakers.local")].nudged;
+        hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9")]);
+        let first = nudged(&seg).expect("nudged");
+        hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9")]);
+        assert_eq!(nudged(&seg), Some(first), "not again so soon");
+
+        // One with a routable IPv6 address is not.
+        let seg = Segment::new("test", &[Family::V6]);
+        seg.attach(Family::V6, UdpSocket::bind("[::1]:0").unwrap(), rx.local_addr().unwrap());
+        hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9"), aaaa("speakers.local", "fd00::9")]);
+        assert_eq!(nudged(&seg), None);
     }
 
     /// One sender may describe only so many hosts: a sleep proxy speaks for

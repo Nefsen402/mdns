@@ -188,6 +188,7 @@ impl Link {
             Change::Gone { index } if self.index == Some(*index) => self.gone(),
             // An interface going down loses its addresses: that is not news.
             Change::Address { index } if self.index == Some(*index) && self.up => self.advertise(),
+            Change::Neighbour { index, ip, mac } if self.index == Some(*index) => self.segment.neighbour(*ip, mac.clone()),
             Change::Lost => self.look_again(),
             _ => {}
         }
@@ -243,8 +244,15 @@ impl Link {
     }
 }
 
-/// Follow what `netlink` reports, for `links`, until it fails.
+/// Follow what `netlink` reports, for `links`, until it fails. The
+/// neighbour tables are asked for first, and again when changes were lost.
 pub fn track(netlink: Netlink, mut links: Vec<Link>) {
+    let ask_neighbours = |netlink: &Netlink| {
+        if let Err(e) = netlink.request_neighbours() {
+            eprintln!("netlink: asking for the neighbour tables failed: {e}");
+        }
+    };
+    ask_neighbours(&netlink);
     loop {
         let changes = match netlink.changes() {
             Ok(changes) => changes,
@@ -253,6 +261,9 @@ pub fn track(netlink: Netlink, mut links: Vec<Link>) {
                 return;
             }
         };
+        if changes.contains(&Change::Lost) {
+            ask_neighbours(&netlink);
+        }
         for change in &changes {
             for link in &mut links {
                 link.changed(change);
