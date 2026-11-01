@@ -101,8 +101,9 @@ pub struct Device {
     /// Its addresses: routable ones, which other networks can reach it at
     /// (IPv4, or global or ULA IPv6: a device often has both), then
     /// link-local ones, which only mean something on the link it was heard
-    /// on; IPv4 before IPv6. At most [`MAX_ADDRS`] of a family.
-    pub addresses: Vec<IpAddr>,
+    /// on; IPv4 before IPv6. At most [`DEFAULT_MAX_ADDRS`] of a family, unless
+    /// the segment keeps more. [`Device::addrs`] has them as plain IPs.
+    pub addresses: Vec<Address>,
     /// Those it learned of are in order of their instance names, ignoring
     /// case: names that differ only in case are one and the same.
     pub services: Vec<Service>,
@@ -117,6 +118,33 @@ pub struct Device {
     pub reverse: Vec<IpAddr>,
 }
 
+/// An address of a device, with what is known of it besides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Address {
+    pub ip: IpAddr,
+    pub origin: Origin,
+}
+
+/// Where an address of a device was learned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Origin {
+    /// The device announced it, in an A or AAAA record, or sent from it.
+    #[default]
+    Announced,
+    /// The kernel's neighbour table has it under the link-layer address of
+    /// one of the device's link-local ones: the device did not say it, but
+    /// it is the device's. Learned only of a family the device announced no
+    /// routable address of, it lasts as long as the neighbour entry.
+    Neighbour,
+}
+
+impl From<IpAddr> for Address {
+    /// An announced address.
+    fn from(ip: IpAddr) -> Address {
+        Address { ip, origin: Origin::Announced }
+    }
+}
+
 /// The family of `addr`.
 pub fn family_of(addr: IpAddr) -> Family {
     if addr.is_ipv4() { Family::V4 } else { Family::V6 }
@@ -125,7 +153,13 @@ pub fn family_of(addr: IpAddr) -> Family {
 /// Put addresses in the order a device keeps them: routable before
 /// link-local, IPv4 before IPv6, then by address.
 fn sort_addrs(addrs: &mut [IpAddr]) {
-    addrs.sort_by_key(|a| (is_link_local(a), a.is_ipv6(), *a));
+    addrs.sort_by_key(addr_order);
+}
+
+/// Where `addr` comes among a device's addresses: routable before
+/// link-local, IPv4 before IPv6.
+fn addr_order(addr: &IpAddr) -> (bool, bool, IpAddr) {
+    (is_link_local(addr), addr.is_ipv6(), *addr)
 }
 
 /// Link-local: IPv6 `fe80::/10` and IPv4 `169.254.0.0/16`. Valid on one link
@@ -407,7 +441,12 @@ fn unescape(label: &str) -> String {
 impl Device {
     /// Its addresses, the routable ones first, IPv4 before IPv6.
     pub fn addrs(&self) -> impl Iterator<Item = IpAddr> + '_ {
-        self.addresses.iter().copied()
+        self.addresses.iter().map(|a| a.ip)
+    }
+
+    /// Whether `ip` is one of its addresses.
+    pub fn has_addr(&self, ip: &IpAddr) -> bool {
+        self.addresses.iter().any(|a| a.ip == *ip)
     }
 
     /// Its routable addresses, IPv4 before IPv6.
@@ -429,7 +468,15 @@ impl Device {
     /// its own link.
     pub fn without_link_local(&self) -> Device {
         let mut device = self.clone();
-        device.addresses.retain(|a| !is_link_local(a));
+        device.addresses.retain(|a| !is_link_local(&a.ip));
+        device
+    }
+
+    /// This device without the addresses it was given from the neighbour
+    /// table: only those it announced.
+    pub fn without_neighbours(&self) -> Device {
+        let mut device = self.clone();
+        device.addresses.retain(|a| a.origin == Origin::Announced);
         device
     }
 
@@ -461,20 +508,69 @@ impl Device {
 
     /// Take in the addresses a packet vouches for, of either family. Of a
     /// family in `flushed`, announced with the cache-flush bit, they are all
-    /// it has, and replace those it had (RFC 6762 section 10.2); of another,
-    /// they are added. Those in `gone`, said goodbye to, are dropped. Beyond
-    /// `max_addrs` of a family, more are not taken.
+    /// it has announced, and replace those it had announced (RFC 6762 section
+    /// 10.2); of another, they are added. Those in `gone`, said goodbye to,
+    /// are dropped. Beyond `max_addrs` of a family, more are not taken. One
+    /// learned from the neighbour table that it now announces is announced;
+    /// once it announces a routable address of a family, none of that family
+    /// learned so is kept.
     pub fn take_addrs(&mut self, addrs: &[IpAddr], flushed: &[Family], gone: &[IpAddr], max_addrs: usize) {
-        self.addresses.retain(|a| !flushed.contains(&family_of(*a)) && !gone.contains(a));
+        self.addresses.retain(|a| {
+            let flushed = a.origin == Origin::Announced && flushed.contains(&family_of(a.ip));
+            !flushed && !gone.contains(&a.ip)
+        });
         let mut fresh: Vec<IpAddr> = addrs.iter().copied().filter(|a| !gone.contains(a)).collect();
         sort_addrs(&mut fresh);
         for addr in fresh {
-            let of_family = self.addresses.iter().filter(|a| a.is_ipv4() == addr.is_ipv4()).count();
-            if !self.addresses.contains(&addr) && of_family < max_addrs {
-                self.addresses.push(addr);
+            if let Some(known) = self.addresses.iter_mut().find(|a| a.ip == addr) {
+                known.origin = Origin::Announced;
+                continue;
+            }
+            let of_family = self.addresses.iter().filter(|a| a.ip.is_ipv4() == addr.is_ipv4()).count();
+            if of_family < max_addrs {
+                self.addresses.push(addr.into());
             }
         }
-        sort_addrs(&mut self.addresses);
+        self.drop_neighbours_of_announced_families();
+        self.addresses.sort_by_key(|a| addr_order(&a.ip));
+    }
+
+    /// Take in what the neighbour table says of it: `learned`, the routable
+    /// addresses listed under the link-layer address of one of its link-local
+    /// ones. Of a family it announced no routable address of, they replace
+    /// those it had learned so (up to `max_addrs` of a family in all); of
+    /// another, none are kept, as what it announces is what it has. Returns
+    /// whether its addresses changed.
+    pub fn take_neighbours(&mut self, learned: &[IpAddr], max_addrs: usize) -> bool {
+        let before = self.addresses.clone();
+        self.addresses.retain(|a| a.origin != Origin::Neighbour || learned.contains(&a.ip));
+        let mut learned: Vec<IpAddr> = learned.iter().copied().filter(|a| !is_link_local(a)).collect();
+        sort_addrs(&mut learned);
+        for ip in learned {
+            let of_family = self.addresses.iter().filter(|a| a.ip.is_ipv4() == ip.is_ipv4()).count();
+            if !self.has_addr(&ip) && of_family < max_addrs {
+                self.addresses.push(Address { ip, origin: Origin::Neighbour });
+            }
+        }
+        self.drop_neighbours_of_announced_families();
+        self.addresses.sort_by_key(|a| addr_order(&a.ip));
+        self.addresses != before
+    }
+
+    /// Drop the addresses learned from the neighbour table of a family it
+    /// announced a routable address of itself.
+    fn drop_neighbours_of_announced_families(&mut self) {
+        let announced = |v4: bool| {
+            self.addresses.iter().any(|a| a.origin == Origin::Announced && a.ip.is_ipv4() == v4 && !is_link_local(&a.ip))
+        };
+        let (v4, v6) = (announced(true), announced(false));
+        self.addresses.retain(|a| a.origin != Origin::Neighbour || !(if a.ip.is_ipv4() { v4 } else { v6 }));
+    }
+
+    /// Its link-local addresses, whose link-layer address finds the others in
+    /// the neighbour table.
+    pub fn link_local(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.addrs().filter(is_link_local)
     }
 
     /// Add `addrs` to those it has, up to [`DEFAULT_MAX_ADDRS`] of a family:
@@ -1532,7 +1628,7 @@ mod tests {
         unresolved.hostname = None;
         unresolved.services[0].subtypes = vec!["_scanner._sub._http._tcp.local".into()];
         // Known by name, but only by a link-local address.
-        let named = Device { hostname: Some("nas.local".into()), addresses: vec![ip("169.254.1.1")], ..Device::default() };
+        let named = Device { hostname: Some("nas.local".into()), addresses: vec![ip("169.254.1.1").into()], ..Device::default() };
         let types = BTreeSet::from(["_ipp._tcp.local".to_string()]);
 
         let questions = asked(&Device::probe_queries(&[resolved, unresolved, named], &types, DEFAULT_MAX_PACKET));
@@ -1644,7 +1740,7 @@ mod tests {
 
         // Moved: the new address, and a goodbye for the old one that does not
         // flush the new.
-        let moved = Device { addresses: vec![ip("10.0.1.10")], ..old.clone() };
+        let moved = Device { addresses: vec![ip("10.0.1.10").into()], ..old.clone() };
         let bye = goodbyes(&Device::transition(Some(&old), Some(&moved), &none, false));
         assert_eq!(bye.len(), 1);
         assert_eq!((&bye[0].data, bye[0].cache_flush), (&RData::A("10.0.1.9".parse().unwrap()), false));
@@ -1711,6 +1807,57 @@ mod tests {
         assert_eq!(of_class(255).len(), 1);
         assert!(of_class(3).is_empty(), "CHAOS");
         assert!(of_class(4).is_empty(), "Hesiod");
+    }
+
+    fn origins(d: &Device) -> Vec<(IpAddr, Origin)> {
+        d.addresses.iter().map(|a| (a.ip, a.origin)).collect()
+    }
+
+    /// The neighbour table fills in a family the device announced no
+    /// routable address of, and only that; what it announces itself wins.
+    #[test]
+    fn neighbours_fill_in_what_a_device_did_not_announce() {
+        use Origin::{Announced, Neighbour};
+        let mut d = Device { hostname: Some("tv.local".into()), ..Device::default() };
+        d.take_addrs(&[ip("10.0.1.9"), ip("fe80::9")], &[], &[], DEFAULT_MAX_ADDRS);
+        assert_eq!(d.link_local().collect::<Vec<_>>(), [ip("fe80::9")]);
+
+        // Of IPv6, it announced only its link-local address: the routable
+        // ones listed under its link-layer address are taken; of IPv4 it
+        // announced one, so the neighbour's is not.
+        assert!(d.take_neighbours(&[ip("fd00::9"), ip("2001:db8::9"), ip("10.0.1.99"), ip("fe80::99")], DEFAULT_MAX_ADDRS));
+        assert_eq!(origins(&d), [
+            (ip("10.0.1.9"), Announced),
+            (ip("2001:db8::9"), Neighbour),
+            (ip("fd00::9"), Neighbour),
+            (ip("fe80::9"), Announced),
+        ]);
+        assert!(!d.take_neighbours(&[ip("fd00::9"), ip("2001:db8::9")], DEFAULT_MAX_ADDRS), "nothing new");
+
+        // Its announcements of IPv6 replace what it announced, not what was learned.
+        d.take_addrs(&[ip("fe80::9")], &[Family::V6], &[], DEFAULT_MAX_ADDRS);
+        assert!(d.has_addr(&ip("fd00::9")) && d.has_addr(&ip("2001:db8::9")));
+
+        // A neighbour entry that goes takes its address with it.
+        assert!(d.take_neighbours(&[ip("fd00::9")], DEFAULT_MAX_ADDRS));
+        assert!(!d.has_addr(&ip("2001:db8::9")));
+
+        // Announced after all, it is announced...
+        d.take_addrs(&[ip("fd00::9")], &[], &[], DEFAULT_MAX_ADDRS);
+        assert_eq!(d.addresses.iter().find(|a| a.ip == ip("fd00::9")).unwrap().origin, Announced);
+        // ...and with a routable IPv6 address announced, none is learned of IPv6.
+        d.take_neighbours(&[ip("fd00::9"), ip("2001:db8::77")], DEFAULT_MAX_ADDRS);
+        assert!(!d.has_addr(&ip("2001:db8::77")));
+        assert!(d.addresses.iter().all(|a| a.origin == Announced));
+    }
+
+    /// Learned addresses count towards how many of a family are kept.
+    #[test]
+    fn neighbours_count_towards_the_limit() {
+        let mut d = Device::default();
+        d.take_addrs(&[ip("fe80::9")], &[], &[], 2);
+        d.take_neighbours(&[ip("fd00::1"), ip("fd00::2"), ip("fd00::3")], 2);
+        assert_eq!(d.addrs().filter(|a| a.is_ipv6()).count(), 2);
     }
 
     #[test]
@@ -1887,7 +2034,7 @@ mod tests {
 
     #[test]
     fn a_device_holds_only_so_much() {
-        let mut device = Device { hostname: Some("tv.local".into()), addresses: vec![ip("10.0.1.7")], ..Device::default() };
+        let mut device = Device { hostname: Some("tv.local".into()), addresses: vec![ip("10.0.1.7").into()], ..Device::default() };
         let services: Vec<Record> = (0..MAX_SERVICES + 10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
         device.learn_records(services.iter());
         assert_eq!(device.services.len(), MAX_SERVICES);
@@ -1912,7 +2059,7 @@ mod tests {
             a_record("tv.local", "10.0.1.7"),
         ]);
         assert_eq!(device.hostname.as_deref(), Some("tv.local"));
-        assert_eq!(device.addresses, [ip("10.0.1.7"), ip("fd00:0:1::7"), ip("fe80::7")]);
+        assert_eq!(device.addrs().collect::<Vec<_>>(), [ip("10.0.1.7"), ip("fd00:0:1::7"), ip("fe80::7")]);
 
         // One family heard later leaves the other as it was.
         let mut device = heard(vec![a_record("nas.local", "10.0.1.8")]);
@@ -1930,7 +2077,7 @@ mod tests {
             aaaa("tv.local", "2001:db8::7"),
             a_record("tv.local", "10.0.1.7"),
         ]);
-        assert_eq!(device.addresses, [ip("10.0.1.7"), ip("2001:db8::7"), ip("fd00::7"), ip("fe80::7")]);
+        assert_eq!(device.addrs().collect::<Vec<_>>(), [ip("10.0.1.7"), ip("2001:db8::7"), ip("fd00::7"), ip("fe80::7")]);
         let sent: Vec<RData> = device.announcement(120, 4500).into_iter().filter(|r| r.name == "tv.local").map(|r| r.data).collect();
         assert_eq!(sent.len(), 4, "{sent:?}");
     }
@@ -1944,14 +2091,14 @@ mod tests {
 
         // A new temporary address in place of the old, with the ULA kept.
         hear(&mut device, vec![aaaa("tv.local", "2001:db8::99"), aaaa("tv.local", "fd00::7")]);
-        assert_eq!(device.addresses, [ip("10.0.1.7"), ip("2001:db8::99"), ip("fd00::7")]);
+        assert_eq!(device.addrs().collect::<Vec<_>>(), [ip("10.0.1.7"), ip("2001:db8::99"), ip("fd00::7")]);
 
         let without_flush = |addr: &str| Record { cache_flush: false, ..aaaa("tv.local", addr) };
         hear(&mut device, vec![without_flush("2001:db8::100")]);
-        assert_eq!(device.addresses, [ip("10.0.1.7"), ip("2001:db8::99"), ip("2001:db8::100"), ip("fd00::7")]);
+        assert_eq!(device.addrs().collect::<Vec<_>>(), [ip("10.0.1.7"), ip("2001:db8::99"), ip("2001:db8::100"), ip("fd00::7")]);
 
         hear(&mut device, vec![Record { ttl: 0, ..aaaa("tv.local", "2001:db8::99") }]);
-        assert_eq!(device.addresses, [ip("10.0.1.7"), ip("2001:db8::100"), ip("fd00::7")]);
+        assert_eq!(device.addrs().collect::<Vec<_>>(), [ip("10.0.1.7"), ip("2001:db8::100"), ip("fd00::7")]);
 
         // However many it announces, only so many of a family are kept.
         let many: Vec<Record> = (0..DEFAULT_MAX_ADDRS + 10).map(|i| without_flush(&format!("2001:db8::{:x}", 0x200 + i))).collect();

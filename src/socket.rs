@@ -322,12 +322,12 @@ impl Entry {
     /// did not say) but at least `floor` from `now`, and forget when the
     /// addresses it no longer has run out.
     fn renew_addrs(&mut self, addrs: &[IpAddr], ttls: &HashMap<IpAddr, u32>, now: Instant, floor: Duration) {
-        for addr in addrs.iter().filter(|a| self.device.addresses.contains(a)) {
+        for addr in addrs.iter().filter(|a| self.device.has_addr(a)) {
             let ttl = Duration::from_secs(ttls.get(addr).copied().unwrap_or(0).into());
             self.addr_expires.insert(*addr, now + ttl.max(floor));
         }
-        let have = &self.device.addresses;
-        self.addr_expires.retain(|addr, _| have.contains(addr));
+        let device = &self.device;
+        self.addr_expires.retain(|addr, _| device.has_addr(addr));
     }
 
     /// Drop the addresses that have run out by `now`. Returns whether any had.
@@ -336,7 +336,7 @@ impl Entry {
         for addr in &gone {
             self.addr_expires.remove(addr);
         }
-        self.device.addresses.retain(|a| !gone.contains(a));
+        self.device.addresses.retain(|a| !gone.contains(&a.ip));
         !gone.is_empty()
     }
 
@@ -1485,7 +1485,7 @@ impl Segment {
             }
         }
         let discovered = &state.discovered;
-        state.by_addr.retain(|addr, key| matches!(key, Key::Source(_)) || discovered.get(key).is_some_and(|e| e.device.addresses.contains(addr)));
+        state.by_addr.retain(|addr, key| matches!(key, Key::Source(_)) || discovered.get(key).is_some_and(|e| e.device.has_addr(addr)));
         for key in lost {
             if let Some(device) = state.discovered.get(&key).map(|e| e.device.clone()) {
                 state.notify(Event::Updated(device));
@@ -1862,7 +1862,7 @@ mod tests {
     #[test]
     fn a_device_probing_for_a_name_is_not_answered_with_a_copy() {
         let (seg, rx) = wired();
-        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.1.1")], ..Device::default() };
+        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.1.1").into()], ..Device::default() };
         seg.add_manual(Owner::Own, router).unwrap();
         seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
         while recv(&rx).is_some() {}
@@ -2276,7 +2276,7 @@ mod tests {
         let many: Vec<Record> = (1..=5).map(|i| aaaa("tv.local", &format!("2001:db8::{i}"))).collect();
         hear(&seg, "fe80::5", many);
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
-        assert_eq!(tv.addresses, [ip("2001:db8::1"), ip("2001:db8::2")]);
+        assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("2001:db8::1"), ip("2001:db8::2")]);
     }
 
     /// An address that is not heard of again runs out on its own, its TTL
@@ -2305,8 +2305,8 @@ mod tests {
 
         seg.expire(t0 + Duration::from_secs(400));
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still there");
-        assert_eq!(tv.addresses, [ip("fd00::7")]);
-        assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.addresses == [ip("fd00::7")]));
+        assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("fd00::7")]);
+        assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.addrs().eq([ip("fd00::7")])));
         assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("10.0.1.7")), "nor found by it");
     }
 
@@ -2399,7 +2399,7 @@ mod tests {
         let bye = |addr: &str| Record { ttl: 0, ..aaaa("tv.local", addr) };
         hear(&seg, "2001:db8::5", vec![bye("2001:db8::5"), aaaa("tv.local", "2001:db8::6"), aaaa("tv.local", "fd00::5")]);
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still there");
-        assert_eq!(tv.addresses, [ip("2001:db8::6"), ip("fd00::5")]);
+        assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("2001:db8::6"), ip("fd00::5")]);
         assert_eq!(tv.services.len(), 1);
 
         hear(&seg, "2001:db8::6", vec![bye("2001:db8::6"), bye("fd00::5")]);
@@ -2425,7 +2425,7 @@ mod tests {
             hear(&seg, "10.0.2.160", records(120));
             hear(&seg, first, records(0));
             assert!(
-                seg.devices().iter().all(|d| !d.addresses.contains(&ip("fe80::160"))),
+                seg.devices().iter().all(|d| !d.has_addr(&ip("fe80::160"))),
                 "goodbye from {first}: {:?}",
                 seg.devices()
             );
@@ -2783,7 +2783,7 @@ mod tests {
         let (seg, rx) = wired();
         let router = Device {
             hostname: Some("router.local".into()),
-            addresses: vec![ip("10.0.1.1")],
+            addresses: vec![ip("10.0.1.1").into()],
             ..Device::default()
         };
         seg.add_manual(Owner::Own, router).unwrap();
@@ -2998,7 +2998,7 @@ mod tests {
         let (seg, rx) = wired_family(Family::V6);
         let router = Device {
             hostname: Some("router.local".into()),
-            addresses: vec![ip("fe80::1")],
+            addresses: vec![ip("fe80::1").into()],
             ..Device::default()
         };
         seg.add_manual(Owner::Own, router).unwrap();

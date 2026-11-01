@@ -850,7 +850,7 @@ mod tests {
     fn a_device_named_like_the_advertised_name_leaves_it_alone() {
         let (br0, br0_rx) = wired("br0");
         let (media, _media_rx) = wired("media");
-        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.0.1")], ..Device::default() };
+        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.0.1").into()], ..Device::default() };
         br0.add_manual_ttl(Owner::Own, router.clone(), Duration::from_secs(120)).unwrap();
         let _r = Reflector::new(0, vec![br0.clone(), media.clone()]).unwrap();
         drain(&br0_rx);
@@ -1049,7 +1049,7 @@ mod tests {
         wait_for(|| b.manual_devices().len() == 1);
 
         let there = b.manual_devices().remove(0);
-        assert_eq!(there.addresses, [ip("10.0.1.5"), ip("fd00::5")]);
+        assert_eq!(there.addrs().collect::<Vec<_>>(), [ip("10.0.1.5"), ip("fd00::5")]);
         let sent: Vec<RData> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.name == "tv.local").map(|r| r.data).collect();
         assert_eq!(sent, [RData::A("10.0.1.5".parse().unwrap()), RData::Aaaa("fd00::5".parse().unwrap())]);
     }
@@ -1075,7 +1075,7 @@ mod tests {
         };
         a.handle(SocketAddr::new(ip("fe80::5"), 5353), &msg.encode().unwrap()).unwrap();
         wait_for(|| b.manual_devices().len() == 1);
-        assert_eq!(b.manual_devices()[0].addresses, [ip("2001:db8::5"), ip("fd00::5")]);
+        assert_eq!(b.manual_devices()[0].addrs().collect::<Vec<_>>(), [ip("2001:db8::5"), ip("fd00::5")]);
         let sent: Vec<RData> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.name == "tv.local").map(|r| r.data).collect();
         assert_eq!(sent, [RData::Aaaa("2001:db8::5".parse().unwrap()), RData::Aaaa("fd00::5".parse().unwrap())]);
     }
@@ -1103,7 +1103,7 @@ mod tests {
         drain(&brx);
 
         a.expire(Instant::now() + Duration::from_secs(400));
-        wait_for(|| b.manual_devices().first().is_some_and(|d| d.addresses == [ip("fd00::5")]));
+        wait_for(|| b.manual_devices().first().is_some_and(|d| d.addrs().eq([ip("fd00::5")])));
         let bye: Vec<Record> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.ttl == 0).collect();
         assert_eq!(bye.len(), 1, "{bye:?}");
         assert_eq!(bye[0].data, RData::A("10.0.1.5".parse().unwrap()));
