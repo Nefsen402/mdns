@@ -78,9 +78,9 @@
 //! on the device's own link. Up to eight of a family; empty when it announced
 //! none and was not heard from. `neighbour_addresses` are those of them it did
 //! not announce: of a family it announced no routable address of, the kernel's
-//! neighbour table lists them under the link-layer address of one of its
-//! link-local ones. They are reflected like the others, for as long as the
-//! table has them.
+//! neighbour table lists them under the link-layer address of one it
+//! announced. Which of them are reflected is each segment's to say
+//! (`NeighbourAddresses=`); all are listed here.
 //!
 //! The TTLs a device announced itself with are kept: `address_ttl` for its
 //! address records and `ttl` for each service (the SRV record's, else the PTR's

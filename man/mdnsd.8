@@ -145,13 +145,15 @@ link-local IPv6 address is not reflected over IPv6, unless the kernel knows
 better.
 Of a family a device announced no routable address of, its routable addresses
 are taken from the kernel's neighbour table: those listed under the link-layer
-address of one of its link-local ones.
-They are reflected like those it announced, for as long as the table has them
-(unless a segment says not to, with
-.B NeighbourAddresses=no
+address of one it announced.
+They last as long as the table has them, and none are taken of a family it
+announces a routable address of itself.
+By default those of a family it announced a link-local address of are
+reflected like those it announced, since it speaks that family, if only on its
+own link; a segment can reflect all of them, or none, with
+.B NeighbourAddresses=
 in
-.BR mdnsd.conf (5)),
-and none are taken of a family it announces a routable address of itself.
+.BR mdnsd.conf (5).
 The table only has addresses the router has lately exchanged packets with, so a
 device that has said nothing off its link since may not be there yet; to find
 its link-layer address, a device whose link-local IPv6 address the table has

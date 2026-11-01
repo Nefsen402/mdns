@@ -45,7 +45,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use systemd_unit_edit::{Entry, Parse, SystemdUnit};
 
-use crate::reflector::Forward;
+use crate::reflector::{Forward, Neighbours};
 
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
@@ -74,7 +74,7 @@ const MAX_HOST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// gone, and a silly one (`99999999999999s`) would overflow the clock.
 const MAX_MIN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
     pub name: String,
     pub interfaces: Vec<String>,
@@ -86,22 +86,9 @@ pub struct SegmentConfig {
     pub probe_interval: Option<Option<Duration>>,
     /// Which questions asked on one of its interfaces are put to the others.
     pub forward: Forward,
-    /// Whether the addresses a device was given from the neighbour table are
-    /// reflected with it, as well as those it announced.
-    pub neighbour_addresses: bool,
-}
-
-impl Default for SegmentConfig {
-    fn default() -> SegmentConfig {
-        SegmentConfig {
-            name: String::new(),
-            interfaces: Vec::new(),
-            untrusted: Vec::new(),
-            probe_interval: None,
-            forward: Forward::default(),
-            neighbour_addresses: true,
-        }
-    }
+    /// Which of the addresses a device was given from the neighbour table are
+    /// reflected with it.
+    pub neighbour_addresses: Neighbours,
 }
 
 #[derive(Debug)]
@@ -238,7 +225,7 @@ impl Config {
                         config.segments.last_mut().unwrap().probe_interval = Some(interval);
                     }
                     ("segment", "neighbouraddresses") => {
-                        config.segments.last_mut().unwrap().neighbour_addresses = parse_bool(&entry, lineno)?;
+                        config.segments.last_mut().unwrap().neighbour_addresses = parse_neighbours(&value, lineno)?;
                     }
                     ("segment", "forwardquestions") => {
                         config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
@@ -457,6 +444,16 @@ fn parse_span(value: &str, lineno: usize, key: &str, min: Duration) -> Result<Op
 }
 
 /// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
+fn parse_neighbours(value: &str, lineno: usize) -> Result<Neighbours> {
+    match value.to_ascii_lowercase().as_str() {
+        "always" => Ok(Neighbours::Always),
+        // An empty assignment resets, as everywhere.
+        "link-local" | "" => Ok(Neighbours::LinkLocal),
+        "never" => Ok(Neighbours::Never),
+        _ => bail!("line {lineno}: invalid NeighbourAddresses {value:?}: always, link-local or never"),
+    }
+}
+
 fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
     match value.to_ascii_lowercase().as_str() {
         // An empty assignment resets, as everywhere.
@@ -727,19 +724,23 @@ interfaces=br0,wifi
         assert!(Config::parse(&format!("[Advertise]\nHostname={fits}\n{EXAMPLE}")).is_ok());
     }
 
-    /// Addresses from the neighbour table are reflected unless a segment
-    /// says not to.
+    /// Each segment says which addresses from the neighbour table it
+    /// reflects; of families a device announced a link-local address of,
+    /// unless it says otherwise.
     #[test]
-    fn neighbour_addresses_are_reflected_unless_a_segment_says_not() {
+    fn segments_choose_which_neighbour_addresses_to_reflect() {
         let segments = |extra: &str| {
             let c = Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=z")).unwrap();
             (c.segments[0].neighbour_addresses, c.segments[1].neighbour_addresses)
         };
-        assert_eq!(segments(""), (true, true));
-        assert_eq!(segments("NeighbourAddresses=no"), (false, true));
-        assert_eq!(segments("neighbouraddresses=off\nNeighbourAddresses=yes"), (true, true));
-        let bad = error_of("[Segment]\nName=a\nInterfaces=x\nNeighbourAddresses=sometimes");
-        assert!(bad.contains("line 4"), "{bad}");
+        assert_eq!(segments(""), (Neighbours::LinkLocal, Neighbours::LinkLocal));
+        assert_eq!(segments("NeighbourAddresses=always"), (Neighbours::Always, Neighbours::LinkLocal));
+        assert_eq!(segments("NeighbourAddresses=Never"), (Neighbours::Never, Neighbours::LinkLocal));
+        assert_eq!(segments("neighbouraddresses=never\nNeighbourAddresses="), (Neighbours::LinkLocal, Neighbours::LinkLocal));
+        for bad in ["sometimes", "yes", "no"] {
+            let err = error_of(&format!("[Segment]\nName=a\nInterfaces=x\nNeighbourAddresses={bad}"));
+            assert!(err.contains("line 4") && err.contains("always, link-local or never"), "{err}");
+        }
     }
 
     #[test]

@@ -480,6 +480,18 @@ impl Device {
         device
     }
 
+    /// This device with only those of the addresses it was given from the
+    /// neighbour table that are of a family it announced a link-local address
+    /// of: it speaks that family, if only on its own link.
+    pub fn with_neighbours_of_link_local_families(&self) -> Device {
+        let announced_link_local =
+            |v4: bool| self.addresses.iter().any(|a| a.origin == Origin::Announced && a.ip.is_ipv4() == v4 && is_link_local(&a.ip));
+        let (v4, v6) = (announced_link_local(true), announced_link_local(false));
+        let mut device = self.clone();
+        device.addresses.retain(|a| a.origin == Origin::Announced || if a.ip.is_ipv4() { v4 } else { v6 });
+        device
+    }
+
     /// What identifies it in the manual list and to the reflector: its
     /// hostname, case-insensitively.
     pub fn key(&self) -> Option<String> {
@@ -1849,6 +1861,19 @@ mod tests {
         d.take_neighbours(&[ip("fd00::9"), ip("2001:db8::77")], DEFAULT_MAX_ADDRS);
         assert!(!d.has_addr(&ip("2001:db8::77")));
         assert!(d.addresses.iter().all(|a| a.origin == Announced));
+    }
+
+    /// Of the learned addresses, only those of a family the device announced
+    /// a link-local address of are kept, for reflecting by default.
+    #[test]
+    fn learned_addresses_can_be_kept_to_families_with_a_link_local_address() {
+        let mut d = Device::default();
+        d.take_addrs(&[ip("fe80::9")], &[], &[], DEFAULT_MAX_ADDRS);
+        d.take_neighbours(&[ip("fd00::9"), ip("10.0.1.9")], DEFAULT_MAX_ADDRS);
+        assert_eq!(d.addrs().collect::<Vec<_>>(), [ip("10.0.1.9"), ip("fd00::9"), ip("fe80::9")]);
+        let kept = d.with_neighbours_of_link_local_families();
+        assert_eq!(kept.addrs().collect::<Vec<_>>(), [ip("fd00::9"), ip("fe80::9")], "no IPv4 link-local was announced");
+        assert_eq!(d.without_neighbours().addrs().collect::<Vec<_>>(), [ip("fe80::9")]);
     }
 
     /// Learned addresses count towards how many of a family are kept.

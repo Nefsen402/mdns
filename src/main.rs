@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use config::Config;
 use links::Link;
 use netlink::Netlink;
-use reflector::{Forward, Reflector};
+use reflector::{Forward, Neighbours, Reflector};
 use socket::{Family, Owner, Segment};
 use timer::Timer;
 
@@ -85,8 +85,12 @@ fn main() -> Result<()> {
             Forward::Never => "no questions",
         };
         eprintln!("segment {:?}: asking {forwarding} on the others", seg.name);
-        if !seg.neighbour_addresses {
-            eprintln!("segment {:?}: reflecting only the addresses devices announce, not those from the neighbour table", seg.name);
+        match seg.neighbour_addresses {
+            Neighbours::Always => eprintln!("segment {:?}: reflecting the addresses from the neighbour table of every family", seg.name),
+            Neighbours::LinkLocal => {}
+            Neighbours::Never => {
+                eprintln!("segment {:?}: reflecting only the addresses devices announce, not those from the neighbour table", seg.name)
+            }
         }
         segments.push(Group { name: seg.name.clone(), reflector });
     }

@@ -43,6 +43,22 @@ pub enum Forward {
     Never,
 }
 
+/// Which of the addresses a device was given from the neighbour table a
+/// reflector reflects with it (`NeighbourAddresses=`). They are learned, and
+/// listed, whichever.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Neighbours {
+    /// All of them, of any family: a device that announced only an IPv4
+    /// address is reflected with its IPv6 ones too.
+    Always,
+    /// Those of a family the device announced a link-local address of: it
+    /// speaks that family, if only on its own link.
+    #[default]
+    LinkLocal,
+    /// None: only what devices announce.
+    Never,
+}
+
 /// A change to a device discovered on one of a reflector's segments, as
 /// [`Reflector::watch`] delivers it.
 #[derive(Clone, Debug)]
@@ -68,9 +84,9 @@ struct Inner {
     /// Whether each segment is untrusted: it is not announced anything.
     untrusted: Vec<bool>,
     forward: Forward,
-    /// Whether the addresses a device was given from the neighbour table are
-    /// reflected with it (`NeighbourAddresses=`).
-    neighbours: bool,
+    /// Which of the addresses a device was given from the neighbour table are
+    /// reflected with it.
+    neighbours: Neighbours,
     book: Mutex<Book>,
     stop: AtomicBool,
     subscribers: Mutex<Vec<Sender<Notice>>>,
@@ -105,19 +121,19 @@ impl Reflector {
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
     pub fn with_untrusted(rank: u32, segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
-        Self::with_options(rank, segments, untrusted, Forward::default(), true)
+        Self::with_options(rank, segments, untrusted, Forward::default(), Neighbours::default())
     }
 
     /// Like [`with_untrusted`](Reflector::with_untrusted), putting the
     /// questions asked on each segment to the others as `forward` says, and
-    /// reflecting the addresses a device was given from the neighbour table,
-    /// not only those it announced, if `neighbours`.
+    /// reflecting the addresses a device was given from the neighbour table as
+    /// `neighbours` says.
     pub fn with_options(
         rank: u32,
         segments: Vec<Segment>,
         untrusted: &[String],
         forward: Forward,
-        neighbours: bool,
+        neighbours: Neighbours,
     ) -> Result<Reflector> {
         if segments.is_empty() {
             bail!("a reflector needs at least one segment");
@@ -368,13 +384,17 @@ fn resolved(svc: &Service) -> bool {
 
 /// Keep `device`, discovered on segment `src`, among those to reflect, if it
 /// is reflectable, with the addresses it was given from the neighbour table
-/// only if `neighbours`: without them, one whose only routable address was
-/// given so is not.
-fn track(book: &mut Book, src: usize, device: Device, neighbours: bool) {
+/// that `neighbours` lets through: without them, one whose only routable
+/// address was given so is not.
+fn track(book: &mut Book, src: usize, device: Device, neighbours: Neighbours) {
     // Without a name there is nothing to key it by, and it is not reflectable.
     let Some(key) = device.key() else { return };
     let key = (src, key);
-    let device = if neighbours { device } else { device.without_neighbours() };
+    let device = match neighbours {
+        Neighbours::Always => device,
+        Neighbours::LinkLocal => device.with_neighbours_of_link_local_families(),
+        Neighbours::Never => device.without_neighbours(),
+    };
     if reflectable(&device) {
         book.sources.insert(key, device);
     } else {
@@ -945,7 +965,7 @@ mod tests {
         let (media, media_rx) = wired("media");
         let (wifi, wifi_rx) = wired("wifi");
         let segments = vec![br0.clone(), media.clone(), wifi.clone()];
-        let _r = Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, true).unwrap();
+        let _r = Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, Neighbours::default()).unwrap();
 
         ask(&br0, "10.0.0.50", "printer.local");
         thread::sleep(Duration::from_millis(100));
@@ -981,7 +1001,7 @@ mod tests {
         for forward in [Forward::Always, Forward::Unknown, Forward::Never] {
             let (br0, _br0_rx) = wired("br0");
             let (media, media_rx) = wired("media");
-            let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward, true).unwrap();
+            let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward, Neighbours::default()).unwrap();
             announce(&media, "10.0.2.7", "tv.local", &["TV"]);
             wait_for(|| br0.manual_devices().len() == 1);
             drain(&media_rx);
@@ -1072,48 +1092,55 @@ mod tests {
         wait_for(|| b.manual_devices().is_empty());
     }
 
-    /// With `NeighbourAddresses=no`, only what a device announced is
-    /// reflected: one whose only routable address came from the neighbour
-    /// table is not, and one with an announced address too is reflected with
-    /// that alone.
+    /// What a segment reflects of the addresses from the neighbour table:
+    /// all of them; those of a family a device announced a link-local address
+    /// of (the default); or none. One device announced only IPv4, the other
+    /// only a link-local IPv6 address; the table has an IPv6 address of each.
     #[test]
-    fn a_segment_can_reflect_only_announced_addresses() {
-        let (a, _arx) = wired_v6("a");
-        let (b, _brx) = wired("b");
-        let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), false).unwrap();
-        let mac = vec![2, 0, 0, 0, 0, 9];
-        a.neighbour(ip("fe80::9"), Some(mac.clone()));
-        a.neighbour(ip("fd00::9"), Some(mac));
-        let heard = |answers: Vec<Record>| {
-            let msg = Message {
-                header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
-                questions: vec![],
-                answers,
-                authorities: vec![],
-                additionals: vec![],
+    fn a_segment_chooses_which_neighbour_addresses_to_reflect() {
+        for (mode, printer, tv) in [
+            (Neighbours::Always, vec![ip("10.0.1.9"), ip("fd00::9")], Some(vec![ip("fd00::8")])),
+            (Neighbours::LinkLocal, vec![ip("10.0.1.9")], Some(vec![ip("fd00::8")])),
+            (Neighbours::Never, vec![ip("10.0.1.9")], None),
+        ] {
+            let (a, _arx) = wired("a");
+            let (b, _brx) = wired("b");
+            let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), mode).unwrap();
+            for (addr, mac) in [("10.0.1.9", 9), ("fd00::9", 9), ("fe80::8", 8), ("fd00::8", 8)] {
+                a.neighbour(ip(addr), Some(vec![2, 0, 0, 0, 0, mac]));
+            }
+            let heard = |from: &str, host: &str, addr: RData| {
+                let msg = Message {
+                    header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+                    questions: vec![],
+                    answers: {
+                        let instance = format!("{}._http._tcp.local", host.split('.').next().unwrap());
+                        vec![
+                            rec(host, addr),
+                            rec("_http._tcp.local", RData::Ptr(instance.clone())),
+                            rec(&instance, RData::Srv { priority: 0, weight: 0, port: 80, target: host.into() }),
+                        ]
+                    },
+                    authorities: vec![],
+                    additionals: vec![],
+                };
+                a.handle(SocketAddr::new(ip(from), 5353), &msg.encode().unwrap()).unwrap();
             };
-            a.handle(SocketAddr::new(ip("fe80::9"), 5353), &msg.encode().unwrap()).unwrap();
-        };
-        let service = || {
-            vec![
-                rec("_http._tcp.local", RData::Ptr("TV._http._tcp.local".into())),
-                rec("TV._http._tcp.local", RData::Srv { priority: 0, weight: 0, port: 80, target: "tv.local".into() }),
-            ]
-        };
-        let mut answers = vec![rec("tv.local", RData::Aaaa("fe80::9".parse().unwrap()))];
-        answers.extend(service());
-        heard(answers);
-        thread::sleep(Duration::from_millis(100));
-        assert!(a.devices()[0].has_addr(&ip("fd00::9")), "learned all the same");
-        assert!(b.manual_devices().is_empty(), "but not reflected");
-
-        let mut answers = vec![
-            rec("tv.local", RData::Aaaa("fe80::9".parse().unwrap())),
-            rec("tv.local", RData::A("10.0.1.9".parse().unwrap())),
-        ];
-        answers.extend(service());
-        heard(answers);
-        wait_for(|| b.manual_devices().first().is_some_and(|d| d.addrs().eq([ip("10.0.1.9")])));
+            heard("10.0.1.9", "printer.local", RData::A("10.0.1.9".parse().unwrap()));
+            heard("fe80::8", "tv.local", RData::Aaaa("fe80::8".parse().unwrap()));
+            let copy = |host: &str| b.manual_devices().into_iter().find(|d| d.hostname.as_deref() == Some(host));
+            wait_for(|| copy("printer.local").is_some_and(|d| d.addrs().eq(printer.iter().copied())));
+            match &tv {
+                Some(addrs) => wait_for(|| copy("tv.local").is_some_and(|d| d.addrs().eq(addrs.iter().copied()))),
+                None => {
+                    thread::sleep(Duration::from_millis(100));
+                    assert!(copy("tv.local").is_none(), "{mode:?}: nowhere to reach it at");
+                }
+            }
+            // Learned all the same, whichever the mode.
+            let printer_here = a.devices().into_iter().find(|d| d.hostname.as_deref() == Some("printer.local")).unwrap();
+            assert!(printer_here.has_addr(&ip("fd00::9")), "{mode:?}");
+        }
     }
 
     /// A device's IPv6 address heard over IPv4 is reflected with it, for

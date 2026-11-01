@@ -315,14 +315,27 @@ device probing for its names, are never asked elsewhere; nor are those of an
 untrusted interface.
 .TP
 .B NeighbourAddresses=
-Optional, a boolean, on unless set.
-Whether to reflect a device with the addresses it was given from the kernel's
-neighbour table (see
-.BR mdnsd (8)),
-as well as those it announced.
-Off, only what devices announce is reflected: one whose only routable address
-of a family came from the table is reflected without it, and one with no
-routable address of its own not at all.
+Optional:
+.BR always ,
+.B link\-local
+(the default) or
+.BR never .
+Which of the addresses a device was given from the kernel's neighbour table
+(see
+.BR mdnsd (8))
+to reflect with it, as well as those it announced.
+.B link\-local
+reflects those of a family the device announced a link-local address of, since
+it speaks that family, if only on its own link: a device that announced only a
+link-local IPv6 address is reflected with its routable IPv6 ones, and one that
+announced only IPv4 is reflected with that alone.
+.B always
+reflects all of them, of any family, so that one too is reflected with its IPv6
+addresses.
+.B never
+reflects only what devices announce: one whose only routable address of a
+family came from the table is reflected without it, and one with no routable
+address of its own not at all.
 The addresses are learned all the same, and listed by
 .BR mdnsctl (1).
 .TP

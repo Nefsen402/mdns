@@ -522,15 +522,17 @@ struct State {
 impl State {
     /// Bring the addresses learned from the neighbour table up to date for
     /// the devices of `keys`, noting in `touched` those that change: the
-    /// routable addresses listed under the link-layer address of one of a
-    /// device's link-local ones, of a family it announced no routable address
-    /// of ([`Device::take_neighbours`]). A device with a link-local IPv6
+    /// routable addresses listed under the link-layer address of one it
+    /// announced, of a family it announced no routable address of
+    /// ([`Device::take_neighbours`]). A device with a link-local IPv6
     /// address the table has not got yet, and no routable one, is asked a
     /// question on it, for the kernel to look up its link-layer address.
     fn learn_neighbours(&mut self, keys: &[Key], touched: &mut Touched, now: Instant) {
         for key in keys {
             let Some(entry) = self.discovered.get(key) else { continue };
-            let macs: Vec<&Vec<u8>> = entry.device.link_local().filter_map(|ll| self.neighbours.get(&ll)).collect();
+            // Its link-layer address, by any address it announced.
+            let announced = entry.device.addresses.iter().filter(|a| a.origin == Origin::Announced);
+            let macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
             let learned: Vec<IpAddr> =
                 self.neighbours.iter().filter(|(ip, mac)| !is_link_local(ip) && macs.contains(mac)).map(|(ip, _)| *ip).collect();
 
@@ -1411,8 +1413,8 @@ impl Segment {
     /// Take in an entry of the interface's neighbour table, as the kernel
     /// reports it: `ip` is at link-layer address `mac`, or with `None`, no
     /// longer (it went, or could not be reached). The devices it may concern,
-    /// those with a link-local address or addresses learned so, have their
-    /// learned addresses brought up to date, and are reflected so.
+    /// those with any address, have their learned addresses brought up to
+    /// date, and are reflected so.
     pub fn neighbour(&self, ip: IpAddr, mac: Option<Vec<u8>>) {
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
@@ -1427,7 +1429,7 @@ impl Segment {
         let keys: Vec<Key> = state
             .discovered
             .iter()
-            .filter(|(_, e)| e.device.link_local().next().is_some() || e.device.addresses.iter().any(|a| a.origin == Origin::Neighbour))
+            .filter(|(_, e)| !e.device.addresses.is_empty())
             .map(|(k, _)| k.clone())
             .collect();
         let mut touched = Touched::default();
@@ -2426,6 +2428,20 @@ mod tests {
         // The same entry again changes nothing, and says nothing.
         seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
         assert!(events.try_recv().is_err());
+    }
+
+    /// A device that announced only IPv4 is found in the table by that, and
+    /// given its IPv6 addresses: which of them are reflected is for each
+    /// segment to say.
+    #[test]
+    fn a_device_is_found_in_the_neighbour_table_by_any_address_it_announced() {
+        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        seg.neighbour(ip("10.0.1.9"), Some(MAC.to_vec()));
+        seg.neighbour(ip("fd00::9"), Some(MAC.to_vec()));
+        hear(&seg, "10.0.1.9", vec![a_record("printer.local", "10.0.1.9"), srv("Printer._ipp._tcp.local", 631, "printer.local")]);
+        let printer = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
+        assert_eq!(printer.addrs().collect::<Vec<_>>(), [ip("10.0.1.9"), ip("fd00::9")]);
+        assert_eq!(printer.addresses[1].origin, Origin::Neighbour);
     }
 
     /// A device whose link-local address the table has not got, and that has
