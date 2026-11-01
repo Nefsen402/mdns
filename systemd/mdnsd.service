@@ -9,9 +9,13 @@ ConditionPathExists=/etc/mdnsd.conf
 Type=exec
 ExecStart=/usr/bin/mdnsd /etc/mdnsd.conf
 # The config is read once at startup; SIGTERM makes the daemon send goodbyes
-# for everything it reflected, then exit. It is not restarted if it fails:
-# interfaces that appear late are waited for, so a failure is a fault to look
-# into (systemctl status mdnsd), not something to retry past.
+# for everything it reflected, then exit. It is not restarted if it exits with
+# an error: interfaces that appear late are waited for, so a failure is a fault
+# to look into (systemctl status mdnsd), not something to retry past. A panic
+# aborts it (panic = "abort" in Cargo.toml), and it is restarted after that,
+# with the panic in the journal; one that keeps crashing at once is given up
+# on after five tries.
+Restart=on-abort
 
 # Unprivileged: port 5353 is unprivileged and binding a socket to one
 # interface needs no capability on Linux 5.7 or newer.
