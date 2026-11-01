@@ -5,6 +5,7 @@ mod links;
 mod netlink;
 mod parser;
 mod reflector;
+mod segment;
 mod signal;
 mod socket;
 mod timer;
@@ -22,7 +23,8 @@ use config::Config;
 use links::Link;
 use netlink::Netlink;
 use reflector::{Forward, Neighbours, Reflector};
-use socket::{Family, Owner, Segment};
+use segment::{Owner, Segment};
+use socket::Family;
 use timer::Timer;
 
 /// One configured segment, over every family the daemon listens on.

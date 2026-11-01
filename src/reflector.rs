@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 
 use crate::device::{Device, Service};
-use crate::socket::{Asked, Event, Owner, Segment};
+use crate::segment::{Asked, Event, Owner, Segment};
 
 /// How often a worker checks for shutdown while waiting for events.
 const TICK: Duration = Duration::from_millis(250);
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(first.interface, "a");
         assert!(matches!(first.event, Event::Added(_)));
         // Kept for at least the floor, whatever its records said.
-        assert_eq!(first.ttl, crate::socket::DEFAULT_MIN_LIFETIME);
+        assert_eq!(first.ttl, crate::segment::DEFAULT_MIN_LIFETIME);
 
         b.observe("10.0.2.2".parse().unwrap());
         assert_eq!(next().interface, "b");

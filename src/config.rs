@@ -134,7 +134,7 @@ impl Default for Config {
             reflect_ttl: None,
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
-            min_lifetime: crate::socket::DEFAULT_MIN_LIFETIME,
+            min_lifetime: crate::segment::DEFAULT_MIN_LIFETIME,
             max_addrs: crate::device::DEFAULT_MAX_ADDRS,
         }
     }

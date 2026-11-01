@@ -1,5 +1,5 @@
 //! What is known about a device on a segment: its hostname, addresses and
-//! services. Kept by [`Segment`](crate::socket::Segment), and announced on
+//! services. Kept by [`Segment`](crate::segment::Segment), and announced on
 //! other segments by the [`Reflector`](crate::reflector::Reflector).
 //!
 //! A response is read into one [`Report`] per host it describes, which a

@@ -105,7 +105,8 @@ use serde_json::{json, Value};
 
 use crate::reflector::Notice;
 use crate::device::{is_type, Device, Origin};
-use crate::socket::{Event, Family, Segment};
+use crate::segment::{Event, Segment};
+use crate::socket::Family;
 use crate::timer::Watcher;
 use crate::Group;
 

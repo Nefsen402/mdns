@@ -22,7 +22,8 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 use crate::device::Device;
 use crate::netlink::{Change, Netlink};
-use crate::socket::{self, Event, Family, MdnsSocket, Owner, Segment};
+use crate::segment::{Event, Owner, Segment};
+use crate::socket::{self, Family, MdnsSocket};
 use crate::timer::Timer;
 
 /// How often a receive loop looks up from waiting to see whether it is to
