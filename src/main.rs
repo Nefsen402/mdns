@@ -1,5 +1,13 @@
+// No std: its I/O is rustix's, its memory libc's malloc, and a panic aborts.
+// Tests are built with std.
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+
 extern crate alloc;
 
+// First, for its print macros.
+#[macro_use]
+mod runtime;
 // Shared with mdnsctl, whose options take values; the daemon's take none.
 #[allow(dead_code)]
 mod args;
@@ -19,6 +27,8 @@ mod time;
 mod timespan;
 mod unit;
 
+use core::ffi::c_int;
+
 use hashbrown::HashMap;
 use time::Instant;
 
@@ -31,16 +41,42 @@ use reflector::{Forward, Neighbours, Reflector};
 use segment::{Owner, Segment};
 use socket::Family;
 
+/// What every module takes from alloc, as std's prelude would give it.
+mod prelude {
+    pub use alloc::format;
+    pub use alloc::string::{String, ToString};
+    pub use alloc::vec;
+    pub use alloc::vec::Vec;
+}
+
+use prelude::*;
+
+/// The name the runtime says panics and bad command lines under.
+#[cfg_attr(test, allow(dead_code))]
+const PROGRAM: &str = "mdnsd";
+
+/// Run the command line `args`, after the program's name: the exit status.
+/// An error is said as std says one main returns.
+#[cfg_attr(test, allow(dead_code))]
+fn run(args: Vec<String>) -> c_int {
+    match daemon(args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            1
+        }
+    }
+}
+
 /// One configured segment, over every family the daemon listens on.
 pub struct Group {
     pub name: String,
     pub reflector: Reflector,
 }
 
-fn main() -> Result<()> {
+fn daemon(args: Vec<String>) -> Result<()> {
     let signals = signal::install().context("handling shutdown signals")?;
 
-    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.into_string()).collect::<Result<_, _>>().map_err(|_| args::Error::NotUtf8)?;
     let Some(path) = config_path(args)? else {
         println!("usage: mdnsd [config-file]  (default {})", config::DEFAULT_PATH);
         return Ok(());
@@ -156,7 +192,7 @@ fn main() -> Result<()> {
 
     let mut server = ipc::Server::bind(&config.socket)?;
 
-    let signal = run(&signals, netlink, &mut tracked, &segments, &mut server)?;
+    let signal = event_loop(&signals, netlink, &mut tracked, &segments, &mut server)?;
     eprintln!("received {signal}: withdrawing reflected devices");
     // The loop has stopped, and the upkeep with it, while the goodbyes go
     // out: the watches are told, and dropping the reflectors withdraws all
@@ -199,7 +235,7 @@ fn config_path(args: Vec<String>) -> Result<Option<String>, args::Error> {
 /// netlink fail, interfaces are no longer followed, and the daemon goes on
 /// as they are. Nothing changes but what the loop does, so what it is to
 /// wait for is worked out afresh each time round.
-fn run(
+fn event_loop(
     signals: &signal::Signals,
     netlink: Netlink,
     links: &mut [Link],

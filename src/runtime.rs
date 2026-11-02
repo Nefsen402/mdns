@@ -1,5 +1,6 @@
 //! What std gives a program, for one built without it: print macros, its
-//! start, its memory and an end to it when it panics. The crate names itself
+//! start (SIGPIPE ignored, as std has it), its memory and an end to it when
+//! it panics. The crate names itself
 //! with a `PROGRAM` constant, and runs its command line with
 //! `run(args) -> c_int`. Tests are built with std, and use std's.
 //!
@@ -10,18 +11,22 @@ use core::ffi::c_int;
 // What std's print macros do, to stdout and stderr: tests use std's, which
 // the test harness captures.
 #[cfg(not(test))]
+#[allow(unused_macros)]
 macro_rules! print {
     ($($arg:tt)*) => { $crate::runtime::write_out(1, &::alloc::format!($($arg)*)) };
 }
 #[cfg(not(test))]
+#[allow(unused_macros)]
 macro_rules! println {
     ($($arg:tt)*) => { $crate::runtime::write_out(1, &::alloc::format!("{}\n", format_args!($($arg)*))) };
 }
 #[cfg(not(test))]
+#[allow(unused_macros)]
 macro_rules! eprint {
     ($($arg:tt)*) => { $crate::runtime::write_out(2, &::alloc::format!($($arg)*)) };
 }
 #[cfg(not(test))]
+#[allow(unused_macros)]
 macro_rules! eprintln {
     ($($arg:tt)*) => { $crate::runtime::write_out(2, &::alloc::format!("{}\n", format_args!($($arg)*))) };
 }
@@ -74,6 +79,11 @@ mod start {
                 }
             }
         }
+        // As std does: a write to a pipe or socket no one reads fails, rather
+        // than ending the program, and is dealt with where it happens. A
+        // program it runs starts with SIGPIPE as the system has it.
+        // SAFETY: setting a disposition, before anything else runs.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
         crate::run(args)
     }
 

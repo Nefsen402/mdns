@@ -15,6 +15,8 @@ use rustix::io::Errno;
 
 use crate::errno::{self, Why};
 
+use crate::prelude::*;
+
 /// A change to an interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {

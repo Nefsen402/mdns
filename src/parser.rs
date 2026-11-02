@@ -7,9 +7,14 @@
 //! backslash, so DNS-SD instance names like `Living Room. TV` stay one label;
 //! use [`split_instance`] to take the first label off a name.
 
-use std::collections::BTreeMap;
-use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use alloc::collections::BTreeMap;
+use core::fmt;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
 pub mod rtype {
     pub const A: u16 = 1;
@@ -47,9 +52,9 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
-pub type Result<T> = std::result::Result<T, ParseError>;
+pub type Result<T> = core::result::Result<T, ParseError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
@@ -190,11 +195,11 @@ impl fmt::Display for EncodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl core::error::Error for EncodeError {}
 
 impl Message {
     /// Serialize to wire format. Names are written uncompressed.
-    pub fn encode(&self) -> std::result::Result<Vec<u8>, EncodeError> {
+    pub fn encode(&self) -> core::result::Result<Vec<u8>, EncodeError> {
         let h = &self.header;
         let flags = (h.response as u16) << 15
             | ((h.opcode & 0xf) as u16) << 11
@@ -224,7 +229,7 @@ impl Message {
 }
 
 /// Inverse of the escaping done when parsing: split on unescaped dots.
-fn name_labels(name: &str) -> std::result::Result<Vec<Vec<u8>>, EncodeError> {
+fn name_labels(name: &str) -> core::result::Result<Vec<Vec<u8>>, EncodeError> {
     let name = name.strip_suffix('.').unwrap_or(name);
     if name.is_empty() {
         return Ok(Vec::new());
@@ -251,7 +256,7 @@ fn name_labels(name: &str) -> std::result::Result<Vec<Vec<u8>>, EncodeError> {
         .collect()
 }
 
-fn put_name(out: &mut Vec<u8>, name: &str) -> std::result::Result<(), EncodeError> {
+fn put_name(out: &mut Vec<u8>, name: &str) -> core::result::Result<(), EncodeError> {
     let labels = name_labels(name)?;
     if labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1 > 255 {
         return Err(EncodeError::NameTooLong);
@@ -264,7 +269,7 @@ fn put_name(out: &mut Vec<u8>, name: &str) -> std::result::Result<(), EncodeErro
     Ok(())
 }
 
-fn put_record(out: &mut Vec<u8>, rec: &Record) -> std::result::Result<(), EncodeError> {
+fn put_record(out: &mut Vec<u8>, rec: &Record) -> core::result::Result<(), EncodeError> {
     put_name(out, &rec.name)?;
     out.extend(rec.rtype().to_be_bytes());
     out.extend((rec.class & 0x7fff | (rec.cache_flush as u16) << 15).to_be_bytes());

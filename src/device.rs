@@ -6,13 +6,15 @@
 //! [`Device`] then takes in with [`Device::learn`]; a device is turned back
 //! into records with [`Device::announcement`] and [`Device::answers`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use hashbrown::{HashMap, HashSet};
-use std::net::IpAddr;
+use core::net::IpAddr;
 
 use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
 use crate::socket::Family;
+
+use crate::prelude::*;
 
 /// TTLs for announced records (RFC 6762 section 10): host records are short
 /// lived, everything else long lived. They are what a device that did not say
@@ -902,7 +904,7 @@ impl Device {
     /// Its records that answer `q`, with these TTLs, without the additional
     /// records an answer brings, nor an NSEC saying it has none.
     pub fn records_for(&self, q: &Question, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
-        let (mut records, _) = self.answers(&query(std::slice::from_ref(q)), host_ttl, other_ttl);
+        let (mut records, _) = self.answers(&query(core::slice::from_ref(q)), host_ttl, other_ttl);
         records.retain(|r| r.rtype() != rtype::NSEC);
         records
     }
@@ -910,7 +912,7 @@ impl Device {
     /// Whether it has an answer to `q`: a record, or, by its NSEC, the word
     /// that there is none.
     pub fn knows(&self, q: &Question) -> bool {
-        !self.answers(&query(std::slice::from_ref(q)), 1, 1).0.is_empty()
+        !self.answers(&query(core::slice::from_ref(q)), 1, 1).0.is_empty()
     }
 
     /// The queries that ask `devices` to answer again: each for what it
@@ -1144,7 +1146,7 @@ impl Questions {
         // Names come off the network; one that cannot be re-encoded (lossy
         // UTF-8 can stretch a label past 63 bytes) is skipped rather than
         // failing the whole query.
-        if query(std::slice::from_ref(&q)).encode().is_ok() {
+        if query(core::slice::from_ref(&q)).encode().is_ok() {
             self.list.push(q);
         }
     }

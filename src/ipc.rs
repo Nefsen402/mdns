@@ -88,7 +88,7 @@
 //! with them, unless the configuration says otherwise.
 
 use hashbrown::HashMap;
-use std::time::Duration;
+use core::time::Duration;
 
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::io::Errno;
@@ -106,6 +106,8 @@ use crate::poll;
 use crate::segment::{Event, Probed, Segment};
 use crate::socket::Family;
 use crate::Group;
+
+use crate::prelude::*;
 
 /// Longest request line accepted.
 const MAX_LINE: u64 = 4096;

@@ -21,6 +21,8 @@
 //! Each run is logged to `target/fuzz-runs/<seed>/`: every input sent, the
 //! daemon's own log, and the failures with the inputs that caused them.
 
+extern crate alloc;
+
 #[path = "../../src/parser.rs"]
 #[allow(dead_code)]
 mod parser;

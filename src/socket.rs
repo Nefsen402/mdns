@@ -16,6 +16,7 @@ use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
 
 use crate::errno::{self, Why};
 
+
 pub const MDNS_PORT: u16 = 5353;
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 pub const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);

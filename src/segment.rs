@@ -7,16 +7,16 @@
 //! as they expire, sending through the [`socket`](crate::socket)s attached to
 //! it.
 
-use std::fmt;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use core::fmt;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hashbrown::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+use core::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 use rustix::fd::OwnedFd;
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::time::Duration;
+use core::cell::RefCell;
+use alloc::rc::Rc;
+use core::time::Duration;
 
 use crate::time::Instant;
 
@@ -29,6 +29,8 @@ use crate::device::{
 };
 use crate::socket::{Family, Prefix, MDNS_PORT};
 use crate::parser::{Message, Question, RData, Record};
+
+use crate::prelude::*;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
 /// on a segment that re-announces what has not changed.
@@ -355,7 +357,7 @@ struct Upkeep {
 }
 
 /// What a probe tells whoever asked for it: how many questions it sent.
-pub type Probed = std::result::Result<usize, String>;
+pub type Probed = core::result::Result<usize, String>;
 
 /// A probe, or a query for types by name, under way: which round comes next,
 /// and when.
@@ -464,7 +466,7 @@ impl State {
             let has_v6 = entry.device.routable().any(|a| a.is_ipv6());
             let due = entry.nudged.is_none_or(|t| now.saturating_duration_since(t) >= NUDGE_GAP);
             if let Some(ll) = unresolved.filter(|_| !has_v6 && due) {
-                nudge(&self.outbound, ll, &Device::refresh_queries(std::slice::from_ref(&entry.device), self.max_packet));
+                nudge(&self.outbound, ll, &Device::refresh_queries(core::slice::from_ref(&entry.device), self.max_packet));
                 self.discovered.get_mut(key).expect("looked up above").nudged = Some(now);
             }
 
@@ -571,7 +573,8 @@ impl State {
         };
         self.discovered.get(&key).map_or(Duration::ZERO, |entry| {
             let left = entry.expires.saturating_duration_since(Instant::now());
-            Duration::from_secs(left.as_secs_f64().round() as u64)
+            // To the nearest second, a half up.
+            Duration::from_secs(left.saturating_add(Duration::from_millis(500)).as_secs())
         })
     }
 
@@ -850,7 +853,7 @@ impl Segment {
     /// The changes to its devices since last asked, oldest first, for the
     /// event loop to hand on.
     pub fn take_events(&self) -> Vec<Event> {
-        std::mem::take(&mut self.state.borrow_mut().outbox)
+        core::mem::take(&mut self.state.borrow_mut().outbox)
     }
 
     /// Whether `other` is this very segment, not just one of the same name.

@@ -11,11 +11,11 @@
 //! probed, and one whose addresses change has the advertised name updated.
 //! An interface that is not there when the daemon starts is waited for.
 
-use std::net::{IpAddr, SocketAddr};
+use core::net::{IpAddr, SocketAddr};
 
 use rustix::fd::{AsRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
-use std::time::Duration;
+use core::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -25,6 +25,8 @@ use crate::errno::Why;
 use crate::netlink::{Change, Netlink};
 use crate::segment::{Owner, Segment};
 use crate::socket::{self, Family};
+
+use crate::prelude::*;
 
 /// The most a datagram read from an mDNS socket may hold: mDNS's own limit
 /// (RFC 6762 section 17).

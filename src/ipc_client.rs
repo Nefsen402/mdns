@@ -1668,12 +1668,6 @@ fn run(args: Vec<String>) -> c_int {
         // Help and version to stdout with 0, usage errors to stderr with 2.
         Err(early) => return early.exit(),
     };
-    // As std does: a write to a pipe or socket no one reads fails, rather
-    // than ending mdnsctl, and is dealt with where it happens. A script is
-    // run with SIGPIPE as the system has it.
-    // SAFETY: setting a disposition, before anything else runs.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-
     let result = match &opts.command {
         Command::Watch(target) => watch(&opts, target, &mut Stdout),
         Command::Devices(target) if !target.query.is_empty() => devices_query(&opts, target, &mut Stdout),

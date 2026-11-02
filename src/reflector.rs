@@ -10,12 +10,12 @@
 //! interfaces share a reflector is the caller's policy. A reflector with a
 //! single segment only tracks and reflects nothing.
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 
 use hashbrown::HashMap;
-use std::cell::{RefCell, RefMut};
-use std::rc::Rc;
-use std::time::Duration;
+use core::cell::{RefCell, RefMut};
+use alloc::rc::Rc;
+use core::time::Duration;
 
 use crate::time::Instant;
 
@@ -23,6 +23,8 @@ use anyhow::{bail, Result};
 
 use crate::device::{Device, Service};
 use crate::segment::{Asked, Event, Owner, Segment};
+
+use crate::prelude::*;
 
 /// How many notices are kept until taken.
 const MAX_NOTICES: usize = 4096;
@@ -203,7 +205,7 @@ impl Reflector {
     /// segments this reflector spans since last asked, oldest first. Only so
     /// many are kept for one who never asks.
     pub fn take_notices(&self) -> Vec<Notice> {
-        std::mem::take(&mut *self.inner.notices.borrow_mut())
+        core::mem::take(&mut *self.inner.notices.borrow_mut())
     }
 }
 
@@ -255,21 +257,21 @@ fn deliver_to(inners: &[&Inner]) {
 // loop would.
 #[cfg(test)]
 thread_local! {
-    static MADE: RefCell<Vec<std::rc::Weak<Inner>>> = const { RefCell::new(Vec::new()) };
+    static MADE: RefCell<Vec<alloc::rc::Weak<Inner>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Deliver what has changed to the reflectors made on this thread that are
 /// still there, as the event loop does after anything happens.
 #[cfg(test)]
 pub fn deliver_made() {
-    let inners: Vec<Rc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(std::rc::Weak::upgrade).collect());
+    let inners: Vec<Rc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(alloc::rc::Weak::upgrade).collect());
     deliver_to(&inners.iter().map(|i| &**i).collect::<Vec<_>>());
 }
 
 /// Have the reflectors made on this thread retry as if it were `now`.
 #[cfg(test)]
 pub fn retry_made(now: Instant) {
-    let inners: Vec<Rc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(std::rc::Weak::upgrade).collect());
+    let inners: Vec<Rc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(alloc::rc::Weak::upgrade).collect());
     for inner in inners {
         let mut book = inner.book();
         if book.retry.is_some_and(|at| at <= now) {

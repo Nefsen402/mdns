@@ -39,13 +39,15 @@
 //! and values may be quoted. Interface lists are separated by commas or
 //! whitespace.
 
-use std::time::Duration;
+use core::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::errno::Why;
 use crate::reflector::{Forward, Neighbours};
 use crate::unit::{self, Entry};
+
+use crate::prelude::*;
 
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
