@@ -11,14 +11,17 @@
 //! probed, and one whose addresses change has the advertised name updated.
 //! An interface that is not there when the daemon starts is waited for.
 
-use std::net::{IpAddr, UdpSocket};
-use std::os::fd::{AsRawFd, RawFd};
+use std::net::{IpAddr, SocketAddr};
+
+use rustix::fd::{AsRawFd, OwnedFd, RawFd};
+use rustix::io::Errno;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::device::Device;
+use crate::errno::Why;
 use crate::netlink::{Change, Netlink};
 use crate::segment::{Owner, Segment};
 use crate::socket::{self, Family};
@@ -47,7 +50,7 @@ pub struct Link {
     mtu: Option<u32>,
     /// The sockets it hears on while the interface is there, one per family,
     /// for the event loop to read when they are readable.
-    sockets: Vec<UdpSocket>,
+    sockets: Vec<OwnedFd>,
 }
 
 impl Link {
@@ -95,11 +98,11 @@ impl Link {
         for sock in sockets {
             // Never waited on: the loop reads it when it is readable, and a
             // send that cannot go out at once fails, and is tried again.
-            sock.socket.set_nonblocking(true)?;
+            rustix::io::ioctl_fionbio(&sock.socket, true).map_err(Why)?;
             let (tx, dest) = sock.sender()?;
             self.segment.attach(sock.family, tx, dest);
             eprintln!("listening on {} ({:?})", self.interface, sock.family);
-            receivers.push(sock.socket.into());
+            receivers.push(sock.socket);
         }
         self.sockets = receivers;
         self.index = Some(index);
@@ -240,17 +243,19 @@ impl Link {
         let Some(sock) = self.sockets.iter().find(|s| s.as_raw_fd() == fd) else { return };
         let mut buf = [0u8; MAX_DATAGRAM];
         loop {
-            match sock.recv_from(&mut buf) {
-                Ok((len, from)) => {
+            match rustix::net::recvfrom(sock, &mut buf, rustix::net::RecvFlags::empty()) {
+                Ok((len, _, from)) => {
+                    // A datagram from an IP address, as on a UDP socket.
+                    let Some(from) = from.and_then(|a| SocketAddr::try_from(a).ok()) else { continue };
                     if let Err(e) = self.segment.handle(from, &buf[..len]) {
                         eprintln!("{}: reply failed: {e:#}", self.interface);
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(Errno::AGAIN) => return,
+                Err(Errno::INTR) => {}
                 Err(e) => {
                     // Reported once (an ICMP error, say), it is cleared.
-                    eprintln!("{}: recv failed: {e}", self.interface);
+                    eprintln!("{}: recv failed: {}", self.interface, Why(e));
                     return;
                 }
             }

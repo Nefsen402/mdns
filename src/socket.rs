@@ -4,12 +4,17 @@
 //! multicast group address rather than the wildcard, so it shows up in
 //! `ss` as `224.0.0.251%wifi:5353` and only ever sees that link's traffic.
 
-use std::ffi::CString;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
-use std::os::fd::AsRawFd;
+use alloc::ffi::CString;
+use alloc::format;
+use alloc::vec::Vec;
+use core::ffi::CStr;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use anyhow::{anyhow, bail, Context, Result};
-use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
+use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
+
+use crate::errno::{self, Why};
 
 pub const MDNS_PORT: u16 = 5353;
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
@@ -27,19 +32,19 @@ pub enum Family {
 pub struct MdnsSocket {
     pub index: u32,
     pub family: Family,
-    pub socket: Socket,
+    pub socket: OwnedFd,
 }
 
 impl MdnsSocket {
     /// A second handle on this socket for sending, plus the group address
     /// (scoped to this interface for IPv6) to send to. It keeps the source
     /// port at 5353 and the socket's interface binding.
-    pub fn sender(&self) -> Result<(UdpSocket, SocketAddr)> {
+    pub fn sender(&self) -> Result<(OwnedFd, SocketAddr)> {
         let dest = match self.family {
             Family::V4 => SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT)),
             Family::V6 => SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, self.index)),
         };
-        Ok((self.socket.try_clone()?.into(), dest))
+        Ok((rustix::io::fcntl_dupfd_cloexec(&self.socket, 0).map_err(Why)?, dest))
     }
 
 }
@@ -50,20 +55,17 @@ impl MdnsSocket {
 /// sent.
 pub fn local_addr(interface: &str, family: Family) -> Result<IpAddr> {
     let index = ifindex(interface)?;
-    let (domain, group) = match family {
-        Family::V4 => (Domain::IPV4, SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT))),
-        Family::V6 => (Domain::IPV6, SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, index))),
+    let group = match family {
+        Family::V4 => SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT)),
+        Family::V6 => SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, index)),
     };
     // A throwaway socket: connecting UDP only makes the kernel choose a
-    // source address, which `local_addr` then reveals.
-    let probe = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    probe.bind_device(Some(interface.as_bytes()))?;
-    probe.connect(&group.into()).with_context(|| format!("finding the address used on {interface}"))?;
-    probe
-        .local_addr()?
-        .as_socket()
-        .map(|a| a.ip())
-        .ok_or_else(|| anyhow!("no local address on {interface}"))
+    // source address, which getsockname then reveals.
+    let probe = udp(family)?;
+    bind_device(&probe, interface)?;
+    rustix::net::connect(&probe, &group).map_err(Why).with_context(|| format!("finding the address used on {interface}"))?;
+    let local = rustix::net::getsockname(&probe).map_err(Why)?;
+    SocketAddr::try_from(local).map(|a| a.ip()).map_err(|_| anyhow!("no local address on {interface}"))
 }
 
 /// A network an interface is on: an address of the interface, and the length
@@ -101,10 +103,10 @@ pub fn prefix(net: &str) -> Prefix {
 /// The networks the interface called `name` is on, as its network namespace
 /// has them, of either family: its addresses with their prefix lengths.
 pub fn prefixes(name: &str) -> Result<Vec<Prefix>> {
-    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    let mut list: *mut libc::ifaddrs = core::ptr::null_mut();
     // SAFETY: getifaddrs fills in `list`, freed below.
     if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("listing the interfaces' addresses");
+        return Err(Why(errno::last())).context("listing the interfaces' addresses");
     }
     let mut out = Vec::new();
     let mut at = list;
@@ -116,7 +118,7 @@ pub fn prefixes(name: &str) -> Result<Vec<Prefix>> {
             continue;
         }
         // SAFETY: a NUL-terminated name, as getifaddrs gives it.
-        if unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_bytes() != name.as_bytes() {
+        if unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes() != name.as_bytes() {
             continue;
         }
         // SAFETY: the address and mask are sockaddrs of the family the
@@ -149,7 +151,7 @@ pub fn prefixes(name: &str) -> Result<Vec<Prefix>> {
 /// The MTU of the interface called `name`, as its network namespace has it.
 pub fn mtu(name: &str) -> Result<u32> {
     // SAFETY: an all-zero ifreq is valid: an empty name and a zero union.
-    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    let mut req: libc::ifreq = unsafe { core::mem::zeroed() };
     let bytes = name.as_bytes();
     if bytes.len() >= req.ifr_name.len() || bytes.contains(&0) {
         bail!("not an interface name: {name:?}");
@@ -158,11 +160,11 @@ pub fn mtu(name: &str) -> Result<u32> {
         *dst = b as libc::c_char;
     }
     // Any socket will do for the ioctl; it is closed when `sock` drops.
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
+    let sock = rustix::net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None).map_err(Why)?;
     // SAFETY: `req` is a valid ifreq naming the interface; SIOCGIFMTU fills
     // in its MTU.
     if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut req) } != 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| format!("reading the MTU of {name}"));
+        return Err(Why(errno::last())).with_context(|| format!("reading the MTU of {name}"));
     }
     // SAFETY: SIOCGIFMTU set the MTU member of the union.
     let mtu = unsafe { req.ifr_ifru.ifru_mtu };
@@ -180,41 +182,36 @@ pub fn ifindex(name: &str) -> Result<u32> {
 
 pub fn open(interface: &str, family: Family) -> Result<MdnsSocket> {
     let index = ifindex(interface)?;
-    let domain = match family {
-        Family::V4 => Domain::IPV4,
-        Family::V6 => Domain::IPV6,
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    let socket = udp(family)?;
+    let fd = &socket;
 
     // Share port 5353 with avahi (and anything else) during migration.
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.bind_device(Some(interface.as_bytes()))?;
+    sockopt::set_socket_reuseaddr(fd, true).map_err(Why)?;
+    sockopt::set_socket_reuseport(fd, true).map_err(Why)?;
+    bind_device(fd, interface)?;
 
     // Without this, the kernel delivers group traffic from *any* interface
     // joined by *any* socket on the host, defeating the per-link isolation.
     match family {
-        Family::V4 => set_int(&socket, libc::IPPROTO_IP, libc::IP_MULTICAST_ALL, 0)?,
+        Family::V4 => set_int(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_ALL, 0)?,
         Family::V6 => {
-            socket.set_only_v6(true)?;
-            set_int(&socket, libc::IPPROTO_IPV6, IPV6_MULTICAST_ALL, 0)?;
+            sockopt::set_ipv6_v6only(fd, true).map_err(Why)?;
+            set_int(fd, libc::IPPROTO_IPV6, IPV6_MULTICAST_ALL, 0)?;
         }
     }
 
     match family {
         Family::V4 => {
-            socket.set_multicast_loop_v4(false)?;
-            socket.set_multicast_ttl_v4(255)?;
-            socket.bind(&SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT)).into())?;
-            socket.join_multicast_v4_n(&GROUP_V4, &InterfaceIndexOrAddress::Index(index))?;
+            sockopt::set_ip_multicast_loop(fd, false).map_err(Why)?;
+            sockopt::set_ip_multicast_ttl(fd, 255).map_err(Why)?;
+            rustix::net::bind(fd, &SocketAddrV4::new(GROUP_V4, MDNS_PORT)).map_err(Why)?;
+            sockopt::set_ip_add_membership_with_ifindex(fd, &GROUP_V4, &Ipv4Addr::UNSPECIFIED, index).map_err(Why)?;
         }
         Family::V6 => {
-            socket.set_multicast_loop_v6(false)?;
-            socket.set_multicast_hops_v6(255)?;
-            socket.bind(
-                &SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, index)).into(),
-            )?;
-            socket.join_multicast_v6(&GROUP_V6, index)?;
+            sockopt::set_ipv6_multicast_loop(fd, false).map_err(Why)?;
+            sockopt::set_ipv6_multicast_hops(fd, 255).map_err(Why)?;
+            rustix::net::bind(fd, &SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, index)).map_err(Why)?;
+            sockopt::set_ipv6_add_membership(fd, &GROUP_V6, index).map_err(Why)?;
         }
     }
 
@@ -225,20 +222,44 @@ pub fn open(interface: &str, family: Family) -> Result<MdnsSocket> {
     })
 }
 
-fn set_int(socket: &Socket, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> Result<()> {
-    // SAFETY: the fd is valid for the lifetime of `socket`, and we pass a
-    // pointer to a c_int along with its exact size.
+/// A UDP socket of `family`, not inherited by programs run from here.
+fn udp(family: Family) -> Result<OwnedFd> {
+    let domain = match family {
+        Family::V4 => AddressFamily::INET,
+        Family::V6 => AddressFamily::INET6,
+    };
+    Ok(rustix::net::socket_with(domain, SocketType::DGRAM, SocketFlags::CLOEXEC, Some(rustix::net::ipproto::UDP)).map_err(Why)?)
+}
+
+/// Pin `fd` to `interface`: it hears and sends nothing elsewhere.
+fn bind_device(fd: impl AsFd, interface: &str) -> Result<()> {
+    let name = interface.as_bytes();
+    // SAFETY: the descriptor is open, and `name` is readable for its length;
+    // the kernel takes the name without a NUL.
+    let rc = unsafe {
+        libc::setsockopt(fd.as_fd().as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE, name.as_ptr().cast(), name.len() as libc::socklen_t)
+    };
+    if rc != 0 {
+        return Err(Why(errno::last())).with_context(|| format!("binding to {interface}"));
+    }
+    Ok(())
+}
+
+/// An integer socket option rustix has no wrapper for.
+fn set_int(fd: impl AsFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> Result<()> {
+    // SAFETY: the descriptor is open, and we pass a pointer to a c_int along
+    // with its exact size.
     let rc = unsafe {
         libc::setsockopt(
-            socket.as_raw_fd(),
+            fd.as_fd().as_raw_fd(),
             level,
             name,
             &value as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(Why(errno::last()).into());
     }
     Ok(())
 }

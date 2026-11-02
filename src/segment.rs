@@ -11,7 +11,9 @@ use std::fmt;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hashbrown::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+
+use rustix::fd::OwnedFd;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -20,6 +22,7 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::errno::Why;
 use crate::device::{
     addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report, DEFAULT_MAX_ADDRS,
     DEFAULT_MAX_PACKET, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
@@ -223,7 +226,7 @@ impl Entry {
 /// A way to send over one family: a socket, and the group to send to.
 struct Outbound {
     family: Family,
-    socket: UdpSocket,
+    socket: OwnedFd,
     dest: SocketAddr,
 }
 
@@ -828,7 +831,7 @@ impl Segment {
     /// Give the segment a way to send over `family`: `socket`, to the group
     /// at `dest`. Replaces an earlier one of the family. Without any (as in
     /// unit tests), manual changes are recorded but nothing goes on the wire.
-    pub fn attach(&self, family: Family, socket: UdpSocket, dest: SocketAddr) {
+    pub fn attach(&self, family: Family, socket: OwnedFd, dest: SocketAddr) {
         let mut state = self.state.borrow_mut();
         state.outbound.retain(|o| o.family != family);
         state.outbound.push(Outbound { family, socket, dest });
@@ -1651,7 +1654,7 @@ fn nudge(outbound: &[Outbound], ll: IpAddr, queries: &[Message]) {
     };
     for query in queries {
         if let Ok(bytes) = query.encode() {
-            let _ = out.socket.send_to(&bytes, dest);
+            let _ = send_to(&out.socket, &bytes, dest);
         }
     }
 }
@@ -1684,7 +1687,7 @@ fn multicast(outbound: &[Outbound], msg: &Message) -> Result<()> {
     let bytes = msg.encode()?;
     let mut first_err = None;
     for out in outbound {
-        if let Err(e) = out.socket.send_to(&bytes, out.dest) {
+        if let Err(e) = send_to(&out.socket, &bytes, out.dest) {
             first_err.get_or_insert(anyhow!(e).context(format!("sending to {}", out.dest)));
         }
     }
@@ -1700,17 +1703,30 @@ fn transmit(outbound: &[Outbound], family: Family, msg: &Message, dest: Option<S
         return Ok(());
     };
     let dest = dest.unwrap_or(out.dest);
-    out.socket.send_to(&msg.encode()?, dest).with_context(|| format!("sending to {dest}"))?;
+    send_to(&out.socket, &msg.encode()?, dest).with_context(|| format!("sending to {dest}"))?;
     Ok(())
+}
+
+/// Send the datagram `bytes` to `dest` on `socket`.
+fn send_to(socket: &OwnedFd, bytes: &[u8], dest: SocketAddr) -> Result<(), Why> {
+    rustix::net::sendto(socket, bytes, rustix::net::SendFlags::empty(), &dest).map(drop).map_err(Why)
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::net::UdpSocket;
     use std::collections::VecDeque;
     use std::net::Ipv4Addr;
 
     use super::*;
+
+    /// `socket` as the segment takes a socket.
+    fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
+        use std::os::fd::IntoRawFd;
+        // SAFETY: a descriptor just given up by its owner.
+        unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
+    }
     use crate::device::{record, Service, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
     use crate::parser::{self, rtype, Header};
     use crate::socket::{open, prefix};
@@ -1816,7 +1832,7 @@ mod tests {
         rx.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let seg = Segment::new("test", &[Family::V4]);
-        seg.attach(Family::V4, tx, rx.local_addr().unwrap());
+        seg.attach(Family::V4, fd(tx), rx.local_addr().unwrap());
         (seg, rx)
     }
 
@@ -2162,7 +2178,7 @@ mod tests {
 
     /// Give `seg` a working way to send again, to `rx`.
     fn repair(seg: &Segment, rx: &UdpSocket) {
-        seg.attach(Family::V4, UdpSocket::bind("127.0.0.1:0").unwrap(), rx.local_addr().unwrap());
+        seg.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
     }
 
     fn retry_of(seg: &Segment, host: &str) -> Option<Instant> {
@@ -2176,7 +2192,7 @@ mod tests {
     fn a_device_that_cannot_be_announced_is_not_recorded() {
         let (seg, rx) = wired();
         let (socket, dest) = broken();
-        seg.attach(Family::V4, socket, dest);
+        seg.attach(Family::V4, fd(socket), dest);
         let err = seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap_err();
         assert!(format!("{err:#}").contains("sending to [::1]:5353"), "{err:#}");
         assert!(seg.manual_devices().is_empty());
@@ -2187,7 +2203,7 @@ mod tests {
         recv(&rx).unwrap();
 
         let (socket, dest) = broken();
-        seg.attach(Family::V4, socket, dest);
+        seg.attach(Family::V4, fd(socket), dest);
         assert!(seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV", "Cast"])).is_err());
         let shown: Vec<String> = seg.manual_devices()[0].services.iter().map(|s| s.instance.clone()).collect();
         assert_eq!(shown, ["TV._http._tcp.local"], "still what was announced");
@@ -2204,7 +2220,7 @@ mod tests {
         recv(&rx).unwrap();
 
         let (socket, dest) = broken();
-        seg.attach(Family::V4, socket, dest);
+        seg.attach(Family::V4, fd(socket), dest);
         assert!(seg.remove_manual(Owner::Reflector(0), "tv.local").is_err());
         assert_eq!(seg.manual_devices().len(), 1, "kept");
 
@@ -2225,7 +2241,7 @@ mod tests {
         recv(&rx).unwrap();
 
         let (socket, dest) = broken();
-        seg.attach(Family::V4, socket, dest);
+        seg.attach(Family::V4, fd(socket), dest);
         let before = Instant::now();
         assert!(seg.announce_all().is_err());
         let retry = retry_of(&seg, "tv.local").expect("to be tried again");
@@ -2256,7 +2272,7 @@ mod tests {
         recv(&rx).unwrap();
 
         let (socket, dest) = broken();
-        seg.attach(Family::V4, socket, dest);
+        seg.attach(Family::V4, fd(socket), dest);
         hear(&seg, "10.0.1.50", vec![a_record("tv.local", "10.0.1.50"), srv("Den._http._tcp.local", 80, "tv.local")]);
         let retry = retry_of(&seg, "tv.local").expect("to be tried again");
         assert_eq!(seg.manual_devices().len(), 1, "still shown: the goodbye did not go out");
@@ -2278,8 +2294,8 @@ mod tests {
         let (_, rx) = wired();
         let seg = Segment::new("test", &[Family::V4, Family::V6]);
         let (socket, dest) = broken();
-        seg.attach(Family::V4, socket, dest);
-        seg.attach(Family::V6, UdpSocket::bind("127.0.0.1:0").unwrap(), rx.local_addr().unwrap());
+        seg.attach(Family::V4, fd(socket), dest);
+        seg.attach(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
         let err = seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap_err();
         assert!(format!("{err:#}").contains("[::1]:5353"), "{err:#}");
         let sent = recv(&rx).expect("sent over the other family all the same");
@@ -2491,7 +2507,7 @@ mod tests {
     fn a_device_unknown_to_the_neighbour_table_is_nudged_once() {
         let rx = UdpSocket::bind("[::1]:0").unwrap();
         let seg = Segment::new("test", &[Family::V6]);
-        seg.attach(Family::V6, UdpSocket::bind("[::1]:0").unwrap(), rx.local_addr().unwrap());
+        seg.attach(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap());
         let nudged = |seg: &Segment| seg.state.borrow_mut().discovered[&host_key("speakers.local")].nudged;
         hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9")]);
         let first = nudged(&seg).expect("nudged");
@@ -2500,7 +2516,7 @@ mod tests {
 
         // One with a routable IPv6 address is not.
         let seg = Segment::new("test", &[Family::V6]);
-        seg.attach(Family::V6, UdpSocket::bind("[::1]:0").unwrap(), rx.local_addr().unwrap());
+        seg.attach(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap());
         hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9"), aaaa("speakers.local", "fd00::9")]);
         assert_eq!(nudged(&seg), None);
     }
@@ -2699,7 +2715,7 @@ mod tests {
 
         // Back: a new socket, and everything announced again.
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        seg.attach(Family::V4, tx, rx.local_addr().unwrap());
+        seg.attach(Family::V4, fd(tx), rx.local_addr().unwrap());
         seg.announce_all().unwrap();
         let m = recv(&rx).expect("announced again");
         assert!(m.answers.iter().any(|r| r.name == "tv.local" && r.ttl > 0));
@@ -3167,8 +3183,8 @@ mod tests {
         let (_, rx4) = wired();
         let (_, rx6) = wired_family(Family::V6);
         let seg = Segment::new("test", &[Family::V4, Family::V6]);
-        seg.attach(Family::V4, UdpSocket::bind("127.0.0.1:0").unwrap(), rx4.local_addr().unwrap());
-        seg.attach(Family::V6, UdpSocket::bind("127.0.0.1:0").unwrap(), rx6.local_addr().unwrap());
+        seg.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx4.local_addr().unwrap());
+        seg.attach(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx6.local_addr().unwrap());
         (seg, rx4, rx6)
     }
 
@@ -3224,7 +3240,7 @@ mod tests {
         let (_, rx) = wired();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let seg = Segment::new("test", &[family]);
-        seg.attach(family, tx, rx.local_addr().unwrap());
+        seg.attach(family, fd(tx), rx.local_addr().unwrap());
         (seg, rx)
     }
 
@@ -4136,8 +4152,8 @@ mod tests {
             let sock = open(&iface, family).unwrap();
             // Let a listener on this same host hear it.
             match family {
-                Family::V4 => sock.socket.set_multicast_loop_v4(true).unwrap(),
-                Family::V6 => sock.socket.set_multicast_loop_v6(true).unwrap(),
+                Family::V4 => rustix::net::sockopt::set_ip_multicast_loop(&sock.socket, true).unwrap(),
+                Family::V6 => rustix::net::sockopt::set_ipv6_multicast_loop(&sock.socket, true).unwrap(),
             }
             let seg = Segment::new(&iface, &[family]);
             let (tx, dest) = sock.sender().unwrap();
@@ -4159,14 +4175,15 @@ mod tests {
     fn live_respond() {
         let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
         let sock = open(&iface, Family::V4).unwrap();
-        sock.socket.set_multicast_loop_v4(true).unwrap();
+        rustix::net::sockopt::set_ip_multicast_loop(&sock.socket, true).unwrap();
         let seg = Segment::new(&iface, &[Family::V4]);
         let (tx, dest) = sock.sender().unwrap();
         seg.attach(Family::V4, tx, dest);
         seg.add_manual(Owner::Own, tv("10.9.9.9", &["LiveTV"])).unwrap();
         age(&seg, 2);
 
-        let udp: UdpSocket = sock.socket.try_clone().unwrap().into();
+        // SAFETY: a descriptor given up by its owner.
+        let udp: UdpSocket = unsafe { std::os::fd::FromRawFd::from_raw_fd(rustix::fd::IntoRawFd::into_raw_fd(sock.socket)) };
         udp.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         let end = Instant::now() + Duration::from_secs(4);
         let mut buf = [0u8; 9000];

@@ -475,6 +475,13 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
     use super::*;
+
+    /// `socket` as the segment takes a socket.
+    fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
+        use std::os::fd::IntoRawFd;
+        // SAFETY: a descriptor just given up by its owner.
+        unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
+    }
     use crate::parser::{rtype, Header, Message, Question, RData, Record};
     use crate::socket::{prefix, Family};
 
@@ -495,7 +502,7 @@ mod tests {
         rx.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let seg = Segment::new(name, &[Family::V4]);
-        seg.attach(Family::V4, tx, rx.local_addr().unwrap());
+        seg.attach(Family::V4, fd(tx), rx.local_addr().unwrap());
         (seg, rx)
     }
 
@@ -504,7 +511,7 @@ mod tests {
         let (_, rx) = wired(name);
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let seg = Segment::new(name, &[Family::V6]);
-        seg.attach(Family::V6, tx, rx.local_addr().unwrap());
+        seg.attach(Family::V6, fd(tx), rx.local_addr().unwrap());
         (seg, rx)
     }
 
@@ -1106,9 +1113,9 @@ mod tests {
         let (a, _a_rx) = wired("a");
         let (b, b_rx) = wired("b");
         let broken = || (UdpSocket::bind("127.0.0.1:0").unwrap(), "[::1]:5353".parse::<SocketAddr>().unwrap());
-        let repair = || b.attach(Family::V4, UdpSocket::bind("127.0.0.1:0").unwrap(), b_rx.local_addr().unwrap());
+        let repair = || b.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), b_rx.local_addr().unwrap());
         let (socket, dest) = broken();
-        b.attach(Family::V4, socket, dest);
+        b.attach(Family::V4, fd(socket), dest);
         let r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
 
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
@@ -1128,7 +1135,7 @@ mod tests {
 
         // Gone from a while b cannot send: the copy stays until its goodbye goes out.
         let (socket, dest) = broken();
-        b.attach(Family::V4, socket, dest);
+        b.attach(Family::V4, fd(socket), dest);
         a.expire(Instant::now() + Duration::from_secs(100_000));
         deliver_made();
         assert_eq!(b.manual_devices().len(), 1, "kept: its goodbye did not go out");

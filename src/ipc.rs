@@ -915,6 +915,13 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// `socket` as the segment takes a socket.
+    fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
+        use std::os::fd::IntoRawFd;
+        // SAFETY: a descriptor just given up by its owner.
+        unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
+    }
     use crate::parser::{Header, Message, RData, Record};
     use crate::reflector::{deliver_made, Reflector};
 
@@ -1343,7 +1350,7 @@ mod tests {
         let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         rx.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
         let seg = Segment::new(interface, &[Family::V4]);
-        seg.attach(Family::V4, std::net::UdpSocket::bind("127.0.0.1:0").unwrap(), rx.local_addr().unwrap());
+        seg.attach(Family::V4, fd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
         (seg, rx)
     }
 
