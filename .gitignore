@@ -8,3 +8,4 @@
 
 # The fuzzer builds on its own
 /fuzz/target
+__pycache__/
