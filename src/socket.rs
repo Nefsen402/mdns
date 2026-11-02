@@ -164,7 +164,7 @@ pub fn mtu(name: &str) -> Result<u32> {
     let sock = rustix::net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None).map_err(Why)?;
     // SAFETY: `req` is a valid ifreq naming the interface; SIOCGIFMTU fills
     // in its MTU.
-    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut req) } != 0 {
+    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU as _, &mut req) } != 0 {
         return Err(Why(errno())).with_context(|| format!("reading the MTU of {name}"));
     }
     // SAFETY: SIOCGIFMTU set the MTU member of the union.
