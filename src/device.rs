@@ -538,12 +538,27 @@ impl Device {
                 known.origin = Origin::Announced;
                 continue;
             }
-            let of_family = self.addresses.iter().filter(|a| a.ip.is_ipv4() == addr.is_ipv4()).count();
-            if of_family < max_addrs {
+            // Only what it announced counts: what the neighbour table said of
+            // it gives way to that, below.
+            let announced = |a: &&Address| a.origin == Origin::Announced && a.ip.is_ipv4() == addr.is_ipv4();
+            if self.addresses.iter().filter(announced).count() < max_addrs {
                 self.addresses.push(addr.into());
             }
         }
         self.drop_neighbours_of_announced_families();
+        // One it announced only link-local leaves the learned ones of its
+        // family, which must still fit with it.
+        for v4 in [true, false] {
+            let mut room = max_addrs;
+            self.addresses.retain(|a| {
+                if a.ip.is_ipv4() != v4 {
+                    return true;
+                }
+                let keep = room > 0 || a.origin == Origin::Announced;
+                room = room.saturating_sub(1);
+                keep
+            });
+        }
         self.addresses.sort_by_key(|a| addr_order(&a.ip));
     }
 
@@ -1883,6 +1898,16 @@ mod tests {
         d.take_addrs(&[ip("fe80::9")], &[], &[], 2);
         d.take_neighbours(&[ip("fd00::1"), ip("fd00::2"), ip("fd00::3")], 2);
         assert_eq!(d.addrs().filter(|a| a.is_ipv6()).count(), 2);
+    }
+
+    /// What a device announces itself comes before what the neighbour table
+    /// says of it: a full set of learned addresses must not turn it away.
+    #[test]
+    fn announced_addresses_are_not_turned_away_by_learned_ones() {
+        let mut d = Device::default();
+        d.take_neighbours(&[ip("2001:db8::1"), ip("2001:db8::2")], 2);
+        d.take_addrs(&[ip("2001:db8::99")], &[], &[], 2);
+        assert_eq!(d.addrs().collect::<Vec<_>>(), [ip("2001:db8::99")]);
     }
 
     #[test]
