@@ -8,9 +8,6 @@
 //! [Ipc]               ; optional
 //! Socket=/run/mdnsd/mdnsd.sock
 //!
-//! [Devices]           ; optional
-//! MinimumLifetime=5min
-//!
 //! [Probe]             ; optional
 //! RefreshBefore=30s
 //! ProbeInterval=4min  ; off unless set
@@ -27,6 +24,13 @@
 //! Interfaces=wifi
 //! ProbeInterval=1min  ; [Probe] ProbeInterval= unless set
 //! ForwardQuestions=unknown  ; always, unknown or never; always unless set
+//!
+//! [Interface]         ; optional: without a Name=, for every interface
+//! MaxAddresses=8      ; 8 unless set
+//!
+//! [Interface]         ; optional, for each interface that needs its own
+//! Name=wifi
+//! MinimumLifetime=1h  ; 5min unless set
 //! ```
 //!
 //! Each `[Segment]` is a group of interfaces whose devices are reflected
@@ -83,7 +87,7 @@ pub const DEFAULT_MIN_LIFETIME: Duration = Duration::from_secs(300);
 
 /// The default for how many addresses of a family a device is kept with:
 /// enough for a global and a ULA address, a few temporary ones, and a
-/// link-local one. See `[Devices] MaxAddresses=`.
+/// link-local one. See `[Interface] MaxAddresses=`.
 pub const DEFAULT_MAX_ADDRS: usize = 8;
 
 /// Which of the questions asked on one of a reflector's segments it puts to
@@ -140,9 +144,25 @@ pub struct SegmentConfig {
     pub reflect_ttl: Option<Duration>,
 }
 
+/// What is set for one interface, whichever segments it is in, or, without a
+/// name, for every interface that has no setting of its own. Each setting
+/// that is `None` is left to the nameless section, and then to its default.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct InterfaceConfig {
+    pub name: Option<String>,
+    /// The least a device heard on it is kept after it was last heard from,
+    /// whatever TTLs it announced: the default is [`DEFAULT_MIN_LIFETIME`],
+    /// and zero keeps it for exactly its longest TTL.
+    pub min_lifetime: Option<Duration>,
+    /// How many addresses of a family a device heard on it is kept with, at
+    /// most: the default is [`DEFAULT_MAX_ADDRS`].
+    pub max_addrs: Option<usize>,
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub segments: Vec<SegmentConfig>,
+    pub interface_settings: Vec<InterfaceConfig>,
     pub ipv4: bool,
     pub ipv6: bool,
     /// Where the IPC server listens.
@@ -160,17 +180,13 @@ pub struct Config {
     /// How long before a device would expire to ask it to answer again;
     /// `None` leaves that to the periodic probe.
     pub refresh_before: Option<Duration>,
-    /// The least a device is kept after it was last heard from, whatever TTLs
-    /// it announced. Zero keeps it for exactly its longest TTL.
-    pub min_lifetime: Duration,
-    /// How many addresses of a family a device is kept with, at most.
-    pub max_addrs: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             segments: Vec::new(),
+            interface_settings: Vec::new(),
             ipv4: true,
             ipv6: true,
             socket: DEFAULT_SOCKET.to_string(),
@@ -178,8 +194,6 @@ impl Default for Config {
             advertise_ttl: DEFAULT_ADVERTISE_TTL,
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
-            min_lifetime: DEFAULT_MIN_LIFETIME,
-            max_addrs: DEFAULT_MAX_ADDRS,
         }
     }
 }
@@ -212,6 +226,27 @@ impl Config {
             .min()
     }
 
+    /// A setting of `interface`: the one in its own `[Interface]`, or else the
+    /// one in the `[Interface]` without a name.
+    fn setting_of<T>(&self, interface: &str, get: impl Fn(&InterfaceConfig) -> Option<T>) -> Option<T> {
+        let named = |i: &&InterfaceConfig| i.name.as_deref() == Some(interface);
+        let all = |i: &&InterfaceConfig| i.name.is_none();
+        let own = self.interface_settings.iter().find(named).and_then(&get);
+        own.or_else(|| self.interface_settings.iter().find(all).and_then(&get))
+    }
+
+    /// The least a device heard on `interface` is kept after it was last
+    /// heard from: its `MinimumLifetime=`, or else [`DEFAULT_MIN_LIFETIME`].
+    pub fn min_lifetime_of(&self, interface: &str) -> Duration {
+        self.setting_of(interface, |i| i.min_lifetime).unwrap_or(DEFAULT_MIN_LIFETIME)
+    }
+
+    /// How many addresses of a family a device heard on `interface` is kept
+    /// with, at most: its `MaxAddresses=`, or else [`DEFAULT_MAX_ADDRS`].
+    pub fn max_addrs_of(&self, interface: &str) -> usize {
+        self.setting_of(interface, |i| i.max_addrs).unwrap_or(DEFAULT_MAX_ADDRS)
+    }
+
     /// Whether what is announced on `interface` is announced again though it
     /// has not changed: if any of its segments says so.
     pub fn reannounce_on(&self, interface: &str) -> bool {
@@ -221,14 +256,19 @@ impl Config {
     pub fn parse(text: &str) -> Result<Config> {
         let unit = parse_unit(text)?;
         let mut config = Config::default();
-        // Header line of each [Segment], for error messages.
+        // Header line of each [Segment] and [Interface], for error messages.
         let mut segment_lines = Vec::new();
+        let mut interface_lines = Vec::new();
 
         for section in &unit.sections {
             let name = section.name.to_ascii_lowercase();
             if name == "segment" {
                 config.segments.push(SegmentConfig::default());
                 segment_lines.push(section.line);
+            }
+            if name == "interface" {
+                config.interface_settings.push(InterfaceConfig::default());
+                interface_lines.push(section.line);
             }
 
             for entry in &section.entries {
@@ -270,6 +310,15 @@ impl Config {
                         let interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
                         config.segments.last_mut().unwrap().probe_interval = Some(interval);
                     }
+                    ("interface", "name") => {
+                        config.interface_settings.last_mut().unwrap().name = Some(value).filter(|v| !v.is_empty());
+                    }
+                    ("interface", "maxaddresses") => {
+                        config.interface_settings.last_mut().unwrap().max_addrs = Some(parse_max_addrs(&value, lineno)?);
+                    }
+                    ("interface", "minimumlifetime") => {
+                        config.interface_settings.last_mut().unwrap().min_lifetime = Some(parse_lifetime(&value, lineno)?);
+                    }
                     ("segment", "neighbouraddresses") => {
                         config.segments.last_mut().unwrap().neighbour_addresses = parse_neighbours(&value, lineno)?;
                     }
@@ -292,9 +341,11 @@ impl Config {
                     }
                     ("probe", "interval") => bail!("line {lineno}: Interval= is now called ProbeInterval="),
                     ("devices", "minimumlifetime") => {
-                        config.min_lifetime = parse_lifetime(&value, lineno)?;
+                        bail!("line {lineno}: MinimumLifetime= is now a setting of [Interface]")
                     }
-                    ("devices", "maxaddresses") => config.max_addrs = parse_max_addrs(&value, lineno)?,
+                    ("devices", "maxaddresses") => {
+                        bail!("line {lineno}: MaxAddresses= is now a setting of [Interface]")
+                    }
                     ("probe", "refreshbefore") => {
                         config.refresh_before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
                     }
@@ -313,11 +364,11 @@ impl Config {
             }
         }
 
-        config.validate(&segment_lines)?;
+        config.validate(&segment_lines, &interface_lines)?;
         Ok(config)
     }
 
-    fn validate(&self, segment_lines: &[usize]) -> Result<()> {
+    fn validate(&self, segment_lines: &[usize], interface_lines: &[usize]) -> Result<()> {
         if self.segments.is_empty() {
             bail!("no [Segment] defined");
         }
@@ -371,6 +422,21 @@ impl Config {
                         shared.join(" and ")
                     );
                 }
+            }
+        }
+        for (i, setting) in self.interface_settings.iter().enumerate() {
+            let at = interface_lines[i];
+            let Some(name) = &setting.name else {
+                if self.interface_settings[..i].iter().any(|other| other.name.is_none()) {
+                    bail!("[Interface] at line {at} has no Name=, like an earlier one: only one can be for every interface");
+                }
+                continue;
+            };
+            if !self.segments.iter().any(|seg| seg.interfaces.contains(name)) {
+                bail!("[Interface] {name} (line {at}) is not in the Interfaces= of any segment");
+            }
+            if self.interface_settings[..i].iter().any(|other| other.name.as_ref() == Some(name)) {
+                bail!("two [Interface] sections are named {name}");
             }
         }
         Ok(())
@@ -1098,24 +1164,69 @@ ProbeInterval=off
 
     #[test]
     fn max_addresses_defaults_to_eight_and_has_no_upper_bound() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().max_addrs, DEFAULT_MAX_ADDRS);
-        let with = |v: &str| Config::parse(&format!("[Devices]\nMaxAddresses={v}\n{EXAMPLE}"));
-        assert_eq!(with("2").unwrap().max_addrs, 2);
-        assert_eq!(with("100000").unwrap().max_addrs, 100_000);
-        assert_eq!(with("infinity").unwrap().max_addrs, usize::MAX, "no limit at all");
-        assert_eq!(with("Infinity").unwrap().max_addrs, usize::MAX);
+        assert_eq!(Config::parse(EXAMPLE).unwrap().max_addrs_of("br0"), DEFAULT_MAX_ADDRS);
+        let with = |v: &str| Config::parse(&format!("{EXAMPLE}\n[Interface]\nMaxAddresses={v}"));
+        let max = |v: &str| with(v).unwrap().max_addrs_of("br0");
+        assert_eq!(max("2"), 2);
+        assert_eq!(max("100000"), 100_000);
+        assert_eq!(max("infinity"), usize::MAX, "no limit at all");
+        assert_eq!(max("Infinity"), usize::MAX);
         for bad in ["0", "-1", "many", ""] {
-            let err = error_of(&format!("[Devices]\nMaxAddresses={bad}\n{EXAMPLE}"));
-            assert!(err.contains("line 2") && err.contains("MaxAddresses="), "{bad:?}: {err}");
+            let err = error_of(&format!("{EXAMPLE}\n[Interface]\nMaxAddresses={bad}"));
+            assert!(err.contains("MaxAddresses="), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_interface_is_set_its_own_minimum_lifetime_whatever_segments_it_is_in() {
+        let c = Config::parse(&format!("{EXAMPLE}\n[Interface]\nName=wifi\nMinimumLifetime=1h\n[Interface]\nName=media\nMinimumLifetime=0"))
+            .unwrap();
+        let secs = |i: &str| c.min_lifetime_of(i).as_secs();
+        assert_eq!((secs("wifi"), secs("media")), (3600, 0), "wifi is in two segments");
+        assert_eq!(secs("br0"), 300, "an interface with no section has the default");
+        assert_eq!(secs("elsewhere"), 300);
+    }
+
+    #[test]
+    fn an_interface_section_without_a_name_is_for_every_interface_that_has_none_of_its_own() {
+        let c = Config::parse(&format!(
+            "{EXAMPLE}\n[Interface]\nMinimumLifetime=1h\nMaxAddresses=4\n[Interface]\nName=wifi\nMinimumLifetime=30s"
+        ))
+        .unwrap();
+        let (secs, max) = (|i: &str| c.min_lifetime_of(i).as_secs(), |i: &str| c.max_addrs_of(i));
+        assert_eq!((secs("br0"), secs("media"), secs("wifi")), (3600, 3600, 30));
+        // A setting the interface's own section leaves out comes from the one for all.
+        assert_eq!((max("br0"), max("wifi")), (4, 4));
+        // Whichever comes first.
+        let c = Config::parse(&format!("{EXAMPLE}\n[Interface]\nName=wifi\nMaxAddresses=2\n[Interface]\nMaxAddresses=4")).unwrap();
+        assert_eq!((c.max_addrs_of("wifi"), c.max_addrs_of("br0")), (2, 4));
+        // An empty Name= names nothing, so the section is for every interface.
+        assert!(Config::parse(&format!("{EXAMPLE}\n[Interface]\nName=\nMaxAddresses=3")).is_ok(), "an empty Name= is no name");
+    }
+
+    #[test]
+    fn an_interface_section_names_an_interface_of_a_segment_once() {
+        let err = |text: &str| error_of(&format!("{EXAMPLE}\n{text}"));
+        assert!(err("[Interface]\nMaxAddresses=2\n[Interface]\nMinimumLifetime=1h").contains("only one can be for every interface"));
+        assert!(err("[Interface]\nName=eth9\nMinimumLifetime=1h").contains("not in the Interfaces= of any segment"));
+        assert!(err("[Interface]\nName=br0\n[Interface]\nName=br0").contains("two [Interface] sections are named br0"));
+        assert!(err("[Interface]\nName=br0\nBogus=1").contains("unknown setting"));
+    }
+
+    #[test]
+    fn the_settings_that_were_a_devices_are_now_an_interfaces() {
+        for key in ["MinimumLifetime=5min", "MaxAddresses=4"] {
+            let err = error_of(&format!("[Devices]\n{key}\n{EXAMPLE}"));
+            assert!(err.contains("line 2") && err.contains("now a setting of [Interface]"), "{err}");
         }
     }
 
     #[test]
     fn the_minimum_lifetime_defaults_to_five_minutes_and_takes_systemd_time_spans() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().min_lifetime, Duration::from_secs(300));
+        assert_eq!(Config::parse(EXAMPLE).unwrap().min_lifetime_of("br0"), Duration::from_secs(300));
 
-        let with = |v: &str| Config::parse(&format!("[Devices]\nMinimumLifetime={v}\n{EXAMPLE}"));
-        let secs = |v: &str| with(v).unwrap().min_lifetime.as_secs();
+        let with = |v: &str| Config::parse(&format!("{EXAMPLE}\n[Interface]\nName=br0\nMinimumLifetime={v}"));
+        let secs = |v: &str| with(v).unwrap().min_lifetime_of("br0").as_secs();
         assert_eq!(secs("5min"), 300);
         assert_eq!(secs("90s"), 90);
         assert_eq!(secs("1h"), 3600);
@@ -1123,8 +1234,8 @@ ProbeInterval=off
         assert_eq!(secs("0"), 0, "zero means no minimum: a device lives for exactly its TTL");
         assert_eq!(secs("0s"), 0);
 
-        let err = |v: &str| error_of(&format!("[Devices]\nMinimumLifetime={v}\n{EXAMPLE}"));
-        assert!(err("2d").contains("at most 24 hours") && err("2d").contains("line 2"));
+        let err = |v: &str| error_of(&format!("{EXAMPLE}\n[Interface]\nName=br0\nMinimumLifetime={v}"));
+        assert!(err("2d").contains("at most 24 hours"));
         // A value that parses but would overflow the clock when added to "now".
         assert!(err("99999999999999s").contains("at most 24 hours"), "{}", err("99999999999999s"));
         assert!(err("18446744073709551615s").contains("at most 24 hours"));
@@ -1132,7 +1243,7 @@ ProbeInterval=off
         assert!(err("5fortnights").contains("invalid MinimumLifetime"), "an unknown unit is just invalid");
         assert_eq!(secs("1.5h"), 5400, "a fraction, as systemd takes it");
         assert!(err("soon").contains("invalid MinimumLifetime"));
-        assert!(err("").contains("line 2"), "an empty value is not a time span");
+        assert!(err("").contains("MinimumLifetime"), "an empty value is not a time span");
         // Unlike the probe settings, `off` and `infinity` are not "never": a device must be able to expire.
         assert!(err("off").contains("invalid MinimumLifetime"));
         assert!(err("infinity").contains("invalid MinimumLifetime"));

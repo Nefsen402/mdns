@@ -82,45 +82,6 @@ Unix socket paths are limited to about 108 bytes.
 The socket is created with mode 0660 (owner and group only).
 A stale socket left by a crashed run is replaced; a live instance, or a file
 that is not a socket, is never overwritten.
-.SS [Devices]
-Optional.
-.TP
-.B MinimumLifetime=
-The least a device is kept after it was last heard from, as a systemd time span
-such as
-.BR 5min ,
-.B 90s
-or
-.BR 1h ,
-at most one day.
-Default
-.BR 5min .
-A device lives for the longest TTL it announced, but never for less than this, so
-a device that announces tiny TTLs is not dropped between two of the daemon's
-checks.
-.B 0
-removes the minimum: each device then lives for exactly its longest TTL.
-.IP
-It is also the price of a device that vanishes without saying goodbye: it stays
-listed, and announced to the other networks, for up to this long.
-Keep
-.B RefreshBefore=
-shorter than it, because that margin is counted back from the end of this
-lifetime; the daemon warns at startup if it is not.
-.TP
-.B MaxAddresses=
-How many addresses of each family a device is kept with, and reflected with, at
-most.
-Default
-.BR 8 :
-enough for a global and a ULA IPv6 address, a few temporary ones and a
-link-local one.
-Addresses announced with the cache-flush bit replace those of their family, so
-this only bounds what one device can pile up; more are ignored.
-At least 1; there is no upper bound, and
-.B infinity
-lifts the limit altogether, at the cost of letting one device announce as many
-addresses as it likes.
 .SS [Probe]
 Optional.
 Both settings are systemd time spans, such as
@@ -393,6 +354,71 @@ Two segments may not share two or more interfaces, since both would reflect
 between that pair; sharing one interface is fine.
 .IP \(bu 2
 An interface may be listed only once per segment.
+.SS [Interface]
+Optional.
+Settings of an interface, whichever segments it is in: devices are tracked per
+interface, so what is kept of them is too.
+There is at most one section for each interface.
+.TP
+.B Name=
+The interface, as it is written in
+.B Interfaces=
+of a segment, which must have it.
+Without a
+.BR Name= ,
+the section is for every interface: a setting it has applies to each interface
+whose own section does not set it.
+There is at most one such section.
+.TP
+.B MaxAddresses=
+How many addresses of each family a device is kept with, and reflected with, at
+most.
+Default
+.BR 8 :
+enough for a global and a ULA IPv6 address, a few temporary ones and a
+link-local one.
+Addresses announced with the cache-flush bit replace those of their family, so
+this only bounds what one device can pile up; more are ignored.
+At least 1; there is no upper bound, and
+.B infinity
+lifts the limit altogether, at the cost of letting one device announce as many
+addresses as it likes.
+.TP
+.B MinimumLifetime=
+Optional.
+The least a device heard on this interface is kept after it was last heard from,
+as a systemd time span such as
+.BR 5min ,
+.B 90s
+or
+.BR 1h ,
+at most one day.
+Default
+.BR 5min .
+A device lives for the longest TTL it announced, but never for less than this, so
+a device that announces tiny TTLs is not dropped between two of the daemon's
+checks.
+.B 0
+removes the minimum: each device then lives for exactly its longest TTL.
+.IP
+It is also the price of a device that vanishes without saying goodbye: it stays
+listed, and announced to the other networks, for up to this long.
+A longer one keeps a device that goes quiet (one that sleeps and ignores
+multicast, say) listed through the silence, so it is a setting for the network
+of the devices that do, and a shorter one for a network of laptops and phones.
+Keep
+.B RefreshBefore=
+shorter than it, because that margin is counted back from the end of this
+lifetime; the daemon warns at startup if it is not.
+.IP
+It applies to the devices heard on the interface whichever segment reflects them.
+.PP
+.B MinimumLifetime=
+and
+.B MaxAddresses=
+used to be set in
+.BR [Devices] ,
+which is gone: either there is now an error that names the new place.
 .SH EXAMPLE
 Three networks: a trusted LAN
 .RB ( br0 ),
@@ -418,9 +444,6 @@ IPv6=yes
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
 
-[Devices]
-MinimumLifetime=5min
-
 [Probe]
 RefreshBefore=30s
 
@@ -442,6 +465,15 @@ Interfaces=wifi
 Name="IoT to br0"
 Interfaces=br0,wifi
 Untrusted=wifi
+
+# For every interface.
+[Interface]
+MaxAddresses=8
+
+# Some IoT devices sleep and ignore multicast: keep them listed for an hour.
+[Interface]
+Name=wifi
+MinimumLifetime=1h
 .fi
 .RE
 .SH FILES

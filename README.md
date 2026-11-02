@@ -62,7 +62,7 @@ the speaker never hears the phone.
 - **Both IP families as one.** A device is one device whichever family it spoke:
   one that only speaks IPv6 is announced over IPv4 too, with its IPv6
   addresses, and its global and ULA addresses are kept alike (up to
-  `MaxAddresses=`).
+  `MaxAddresses=`, see `mdnsd.conf(5)`).
 
 ### What it costs
 
