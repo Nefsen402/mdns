@@ -31,3 +31,41 @@ jobs:
       # that was not committed with its lock file is caught here.
       - name: Test
         run: cargo test --locked
+
+  # The built daemon, run through what the unit tests cannot: interfaces that
+  # come and go, real sockets, signals, the control and avahi sockets. See e2e/.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The harness makes its own user and network namespaces. Recent Ubuntu
+      # forbids unprivileged user namespaces unless AppArmor is told not to;
+      # where that does not work, the harness is run as root, which makes only
+      # a network namespace.
+      - name: Allow user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo modprobe veth || true
+
+      - name: End-to-end tests
+        run: |
+          if unshare -r -n true 2>/dev/null; then as=""; else as="sudo -E"; fi
+          $as python3 e2e/e2e.py --slow --ctl target/release/mdnsctl \
+            --logs e2e-logs target/release/mdnsd
+
+      - name: Keep the daemon's logs of a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: e2e-logs
