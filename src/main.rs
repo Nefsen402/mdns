@@ -16,6 +16,7 @@ mod signal;
 mod socket;
 mod time;
 mod timespan;
+mod unit;
 
 use hashbrown::HashMap;
 use std::path::PathBuf;

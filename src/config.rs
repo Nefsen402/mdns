@@ -43,9 +43,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use systemd_unit_edit::{Entry, Parse, SystemdUnit};
 
 use crate::reflector::{Forward, Neighbours};
+use crate::unit::{self, Entry};
 
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
@@ -177,25 +177,22 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Config> {
-        let unit = parse_syntax(text)?;
+        let unit = unit::parse(text)?;
         let mut config = Config::default();
         // Header line of each [Segment], for error messages.
         let mut segment_lines = Vec::new();
 
-        for section in unit.sections() {
-            let name = section.name().unwrap_or_default().to_ascii_lowercase();
+        for section in &unit.sections {
+            let name = section.name.to_ascii_lowercase();
             if name == "segment" {
                 config.segments.push(SegmentConfig::default());
-                segment_lines.push(section.line() + 1);
+                segment_lines.push(section.line);
             }
 
-            for entry in section.entries() {
-                // Comments and blank lines come back as entries without a key.
-                let Some(key) = entry.key() else { continue };
-                let key = key.to_ascii_lowercase();
-                let lineno = entry.line() + 1;
-                // An empty assignment has no value at all.
-                let value = entry.unquoted_value().unwrap_or_default();
+            for entry in &section.entries {
+                let key = entry.key.to_ascii_lowercase();
+                let lineno = entry.line;
+                let value = entry.unquoted().to_string();
 
                 match (name.as_str(), key.as_str()) {
                     ("segment", "name") => {
@@ -235,7 +232,7 @@ impl Config {
                         config.segments.last_mut().unwrap().neighbour_addresses = parse_neighbours(&value, lineno)?;
                     }
                     ("segment", "reannounce") => {
-                        config.segments.last_mut().unwrap().reannounce = !value.is_empty() && parse_bool(&entry, lineno)?;
+                        config.segments.last_mut().unwrap().reannounce = !value.is_empty() && parse_bool(entry, lineno)?;
                     }
                     ("segment", "reflectttl") => {
                         config.segments.last_mut().unwrap().reflect_ttl = match value.to_ascii_lowercase().as_str() {
@@ -246,8 +243,8 @@ impl Config {
                     ("segment", "forwardquestions") => {
                         config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
                     }
-                    ("listen", "ipv4") => config.ipv4 = parse_bool(&entry, lineno)?,
-                    ("listen", "ipv6") => config.ipv6 = parse_bool(&entry, lineno)?,
+                    ("listen", "ipv4") => config.ipv4 = parse_bool(entry, lineno)?,
+                    ("listen", "ipv6") => config.ipv6 = parse_bool(entry, lineno)?,
                     ("probe", "probeinterval") => {
                         config.probe_interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
                     }
@@ -363,38 +360,6 @@ fn local_name(value: &str, lineno: usize) -> Result<String> {
 
 /// Parse the text as systemd unit syntax, reporting the first error with the
 /// line it is on.
-fn parse_syntax(text: &str) -> Result<SystemdUnit> {
-    let parse = Parse::<SystemdUnit>::parse_unit(text);
-    if parse.ok() {
-        return Ok(parse.to_result().expect("no syntax errors"));
-    }
-    let message = match parse.errors().first().map(String::as_str) {
-        // The parser calls an assignment before any [Section] header a missing header.
-        Some(m) if m.starts_with("expected section header") => "assignment outside of a section",
-        Some(m) => m,
-        None => "syntax error",
-    };
-    match failing_line(text) {
-        Some(line) => bail!("line {line}: {message}"),
-        None => bail!("{message}"),
-    }
-}
-
-/// The line a syntax error is on. The parser reports its errors without a
-/// position, so ask it: the error is on the first line at which the text up to
-/// and including that line no longer parses. Config files are small, so
-/// parsing every prefix costs nothing.
-fn failing_line(text: &str) -> Option<usize> {
-    let mut end = 0;
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        end += line.len();
-        if !Parse::<SystemdUnit>::parse_unit(&text[..end]).ok() {
-            return Some(i + 1);
-        }
-    }
-    None
-}
-
 /// A systemd time span such as `4min`, `1.5h` or `1h 30min`; one that adds
 /// up to zero (`0`, `0s`) is `Duration::ZERO`.
 fn timespan(value: &str, lineno: usize, key: &str) -> Result<Duration> {
@@ -453,7 +418,6 @@ fn parse_span(value: &str, lineno: usize, key: &str, min: Duration) -> Result<Op
     Ok(Some(span))
 }
 
-/// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
 fn parse_neighbours(value: &str, lineno: usize) -> Result<Neighbours> {
     match value.to_ascii_lowercase().as_str() {
         "always" => Ok(Neighbours::Always),
@@ -474,10 +438,9 @@ fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
     }
 }
 
+/// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
 fn parse_bool(entry: &Entry, lineno: usize) -> Result<bool> {
-    entry
-        .value_as_bool()
-        .ok_or_else(|| anyhow!("line {lineno}: invalid boolean {:?}", entry.unquoted_value().unwrap_or_default()))
+    entry.as_bool().ok_or_else(|| anyhow!("line {lineno}: invalid boolean {:?}", entry.unquoted()))
 }
 
 #[cfg(test)]
