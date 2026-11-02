@@ -94,7 +94,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -158,9 +157,9 @@ struct Client {
 enum State {
     /// Answering requests, a line each.
     Requests,
-    /// Waiting for the probes it asked for, to reply once they are done, or
-    /// once it has waited `until`.
-    Probing { probes: Vec<(String, Receiver<Probed>, Option<Probed>)>, until: Instant },
+    /// Waiting for the probes it asked for, by interface and number, to reply
+    /// once they are done, or once it has waited `until`.
+    Probing { probes: Vec<(String, u64, Option<Probed>)>, until: Instant },
     /// Streaming what happens to a segment's devices.
     Watching(Streaming),
 }
@@ -170,7 +169,6 @@ struct Streaming {
     id: u64,
     name: String,
     query: Query,
-    events: Receiver<Notice>,
     /// The devices of the query's types shown, as shown, so that one that
     /// loses its last service of them is shown to go, and one shown already
     /// is not shown again unchanged.
@@ -252,15 +250,16 @@ impl Server {
     /// go of clients that are done, gone, idle or not reading.
     pub fn tick(&mut self, groups: &[Group], now: Instant) {
         let watching = self.watches();
+        let notices: Vec<(&str, Notice)> =
+            groups.iter().flat_map(|g| g.reflector.take_notices().into_iter().map(move |n| (g.name.as_str(), n))).collect();
+        let links = links_of(groups, "");
         for i in 0..self.clients.len() {
             let c = &mut self.clients[i];
             match &mut c.state {
                 State::Requests => {}
                 State::Probing { probes, until } => {
-                    for (_, done, result) in probes.iter_mut().filter(|(_, _, r)| r.is_none()) {
-                        if let Ok(r) = done.try_recv() {
-                            *result = Some(r);
-                        }
+                    for (interface, id, result) in probes.iter_mut().filter(|(_, _, r)| r.is_none()) {
+                        *result = links.iter().find(|s| s.interface() == interface).and_then(|s| s.probed(*id));
                     }
                     if probes.iter().all(|(_, _, r)| r.is_some()) || now >= *until {
                         let results = probes.drain(..).map(|(interface, _, r)| (interface, r)).collect();
@@ -273,24 +272,14 @@ impl Server {
                         ask_for_types(groups, &watch.name, &watch.query.kinds);
                         watch.next_ask = watch.query.interval.map(|every| at + every);
                     }
-                    loop {
-                        match watch.events.try_recv() {
-                            Ok(notice) => {
-                                let line = if watch.query.kinds.is_empty() {
-                                    notice_json(&watch.name, &notice)
-                                } else {
-                                    narrowed(&watch.name, notice, &watch.query.kinds, &mut watch.shown)
-                                };
-                                if let Some(line) = line {
-                                    push_line(&mut c.output, &line);
-                                }
-                            }
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => {
-                                push_line(&mut c.output, &error("shutting down"));
-                                c.closing = true;
-                                break;
-                            }
+                    for (_, notice) in notices.iter().filter(|(name, _)| *name == watch.name) {
+                        let line = if watch.query.kinds.is_empty() {
+                            notice_json(&watch.name, notice)
+                        } else {
+                            narrowed(&watch.name, notice.clone(), &watch.query.kinds, &mut watch.shown)
+                        };
+                        if let Some(line) = line {
+                            push_line(&mut c.output, &line);
                         }
                     }
                 }
@@ -429,7 +418,7 @@ impl Client {
             } else if let Some(arg) = probe_arg(request) {
                 match start_probes(groups, arg) {
                     Ok(probes) => {
-                        let probes = probes.into_iter().map(|(interface, done)| (interface, done, None)).collect();
+                        let probes = probes.into_iter().map(|(interface, id)| (interface, id, None)).collect();
                         self.state = State::Probing { probes, until: now + PROBE_WAIT };
                     }
                     Err(reply) => push_line(&mut self.output, &reply),
@@ -444,7 +433,7 @@ impl Client {
     /// Start streaming `watch`: say so, list what is there of its types, and
     /// ask for them at once.
     fn watch(&mut self, watch: Watch, id: u64, now: Instant) {
-        let Watch { name, query, events, present } = watch;
+        let Watch { name, query, present } = watch;
         push_line(&mut self.output, &json!({ "ok": true, "name": name, "watching": true }));
         let mut shown = HashMap::new();
         for line in &present {
@@ -454,7 +443,7 @@ impl Client {
             push_line(&mut self.output, line);
         }
         let next_ask = (!query.kinds.is_empty()).then_some(now);
-        self.state = State::Watching(Streaming { id, name, query, events, shown, next_ask, since: now });
+        self.state = State::Watching(Streaming { id, name, query, shown, next_ask, since: now });
     }
 }
 
@@ -616,14 +605,13 @@ fn links_of<'a>(groups: &'a [Group], name: &str) -> Vec<&'a Segment> {
 struct Watch {
     name: String,
     query: Query,
-    events: Receiver<Notice>,
     /// With a query, the devices of its types known when it started, as
     /// `present` lines.
     present: Vec<Value>,
 }
 
 /// Start following the devices of the named segment, on every interface and
-/// family of it. The receiver ends when the segments are dropped.
+/// family of it: its reflectors' notices are streamed from now on.
 fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
     let (query, name) = query_args(arg)?;
     let name = segment_arg(name);
@@ -633,10 +621,6 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
     let members: Vec<&Group> = groups.iter().filter(|g| g.name == name).collect();
     if members.is_empty() {
         return Err(error(&format!("no such segment: {name}")));
-    }
-    let (tx, rx) = mpsc::channel();
-    for group in &members {
-        group.reflector.watch(tx.clone());
     }
     let mut present = Vec::new();
     if !query.kinds.is_empty() {
@@ -648,7 +632,7 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
             }
         }
     }
-    Ok(Watch { name: name.to_string(), query, events: rx, present })
+    Ok(Watch { name: name.to_string(), query, present })
 }
 
 /// Ask for the types of a watch's query on the interfaces of the named
@@ -796,10 +780,10 @@ fn devices(groups: &[Group], name: &str) -> Value {
 }
 
 /// Start probing every interface of the named segment, or of all segments:
-/// each one's name, and where it says how it went once it is done. An
-/// interface shared by several segments is probed once. They run at once, as
-/// they are independent: they take one's time, not one per interface.
-fn start_probes(groups: &[Group], name: &str) -> Result<Vec<(String, Receiver<Probed>)>, Value> {
+/// each one's name, and the number its probe is known by. An interface shared
+/// by several segments is probed once. They run at once, as they are
+/// independent: they take one's time, not one per interface.
+fn start_probes(groups: &[Group], name: &str) -> Result<Vec<(String, u64)>, Value> {
     let name = segment_arg(name);
     let links = links_of(groups, name);
     if links.is_empty() {
@@ -824,12 +808,16 @@ fn probe_reply(results: Vec<(String, Option<Probed>)>) -> Value {
     json!({ "ok": true, "probed": probed })
 }
 
-/// Probe, waiting for the probes to finish: only for a caller other than the
-/// event loop, which runs their rounds. The server starts them, and replies
-/// once they are done, without waiting.
+/// Probe, and reply with what is done at once, as on an interface that
+/// cannot send: the rest is "did not finish". The server starts the probes,
+/// and replies once the event loop has run them.
 fn probe(groups: &[Group], name: &str) -> Value {
     match start_probes(groups, name) {
-        Ok(probes) => probe_reply(probes.into_iter().map(|(interface, done)| (interface, done.recv_timeout(PROBE_WAIT).ok())).collect()),
+        Ok(probes) => {
+            let links = links_of(groups, "");
+            let done = |interface: &str, id| links.iter().find(|s| s.interface() == interface).and_then(|s| s.probed(id));
+            probe_reply(probes.into_iter().map(|(interface, id)| (interface.clone(), done(&interface, id))).collect())
+        }
         Err(reply) => reply,
     }
 }

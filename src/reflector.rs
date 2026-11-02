@@ -11,7 +11,6 @@
 //! single segment only tracks and reflects nothing.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -19,6 +18,9 @@ use anyhow::{bail, Result};
 
 use crate::device::{Device, Service};
 use crate::segment::{Asked, Event, Owner, Segment};
+
+/// How many notices are kept until taken.
+const MAX_NOTICES: usize = 4096;
 
 /// How long after a send failed it is tried again.
 const RETRY: Duration = Duration::from_secs(5);
@@ -85,7 +87,8 @@ struct Inner {
     /// `None` keeps each device's own.
     reflect_ttl: Option<Duration>,
     book: Mutex<Book>,
-    subscribers: Mutex<Vec<Sender<Notice>>>,
+    /// What has happened, for watches, until taken.
+    notices: Mutex<Vec<Notice>>,
 }
 
 #[derive(Default)]
@@ -157,7 +160,7 @@ impl Reflector {
             neighbours,
             reflect_ttl,
             book: Mutex::default(),
-            subscribers: Mutex::default(),
+            notices: Mutex::default(),
         });
 
         // What is known already; what changes from now on is handed in by
@@ -191,11 +194,11 @@ impl Reflector {
         (0..segments.len()).filter(|&i| self.inner.untrusted[i]).map(|i| segments[i].interface()).collect()
     }
 
-    /// Send a [`Notice`] to `tx` for every device that appears, changes or goes
-    /// on the segments this reflector spans, from now on. Stops when the
-    /// receiver is dropped.
-    pub fn watch(&self, tx: Sender<Notice>) {
-        self.inner.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+    /// A [`Notice`] of every device that appeared, changed or went on the
+    /// segments this reflector spans since last asked, oldest first. Only so
+    /// many are kept for one who never asks.
+    pub fn take_notices(&self) -> Vec<Notice> {
+        std::mem::take(&mut *self.inner.notices.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -291,19 +294,18 @@ impl Inner {
         }
     }
 
-    /// Tell the subscribers, before the reflecting, which can take a while.
+    /// Note what happened for the watches, before the reflecting.
     fn notify(&self, src: usize, event: &Event) {
-        let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
-        if subscribers.is_empty() {
-            return;
-        }
         let seg = &self.segments[src];
         let ttl = match event {
             Event::Removed(_) | Event::Question(_) => Duration::ZERO,
             Event::Added(device) | Event::Updated(device) => seg.lifetime_left(device),
         };
-        let notice = Notice { interface: seg.interface().to_string(), event: event.clone(), ttl };
-        subscribers.retain(|tx| tx.send(notice.clone()).is_ok());
+        let mut notices = self.notices.lock().unwrap_or_else(|e| e.into_inner());
+        if notices.len() >= MAX_NOTICES {
+            notices.remove(0);
+        }
+        notices.push(Notice { interface: seg.interface().to_string(), event: event.clone(), ttl });
     }
 
     fn apply(&self, src: usize, event: Event) {
@@ -503,15 +505,15 @@ mod tests {
     }
 
     #[test]
-    fn watching_a_reflector_follows_every_segment_it_spans() {
+    fn notices_follow_every_segment_it_spans() {
         let (a, _ra) = wired("a");
         let (b, _rb) = wired("b");
         let reflector = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
-        let (tx, notices) = std::sync::mpsc::channel();
-        reflector.watch(tx);
         let next = || {
             deliver_made();
-            notices.recv_timeout(Duration::from_secs(2)).unwrap()
+            let mut notices = reflector.take_notices();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            notices.remove(0)
         };
 
         a.observe("10.0.1.1".parse().unwrap());
@@ -529,21 +531,7 @@ mod tests {
         let gone = next();
         assert!(matches!(gone.event, Event::Removed(_)));
         assert_eq!((gone.interface.as_str(), gone.ttl), ("a", Duration::ZERO));
-    }
-
-    #[test]
-    fn a_watcher_that_is_dropped_is_forgotten_and_reflecting_goes_on() {
-        let (a, _ra) = wired("a");
-        let (b, rb) = wired("b");
-        let reflector = Reflector::new(0, vec![a.clone(), b]).unwrap();
-        let (tx, notices) = std::sync::mpsc::channel();
-        reflector.watch(tx);
-        drop(notices);
-        // The first event finds the receiver gone; reflecting is unaffected.
-        a.observe("10.0.1.1".parse().unwrap());
-        deliver_made();
-        assert!(reflector.inner.subscribers.lock().unwrap().is_empty());
-        let _ = rb;
+        assert!(reflector.take_notices().is_empty(), "taken");
     }
 
     fn drain(rx: &UdpSocket) -> Vec<Message> {

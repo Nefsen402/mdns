@@ -8,9 +8,8 @@
 //! it.
 
 use std::fmt;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,6 +42,9 @@ const PROBE_GAPS: [Duration; 3] = if cfg!(test) {
 } else {
     [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(1)]
 };
+
+/// How many probes' results are kept until whoever asked for them takes them.
+const MAX_PROBED: usize = 64;
 
 /// Service types remembered per segment, so a hostile device cannot grow it
 /// without bound by announcing endless made-up types.
@@ -355,13 +357,15 @@ struct Probing {
     /// Why it runs, for the journal: at startup it says how it went, and
     /// otherwise only if it failed.
     why: &'static str,
+    /// Its number, under which how it went is kept for whoever asked for it
+    /// ([`Segment::probed`]), if anyone did.
+    id: u64,
+    asked: bool,
     /// The next round, or [`PROBE_GAPS`]'s length when only the wait for the
     /// last answers is left.
     round: usize,
     next: Instant,
     sent: usize,
-    /// Who to tell how it went, when it is done.
-    done: Vec<Sender<Probed>>,
 }
 
 /// How a segment's upkeep has run, for `timers`.
@@ -389,8 +393,11 @@ struct State {
     manual: HashMap<String, Manual>,
     /// Changes not yet taken by the event loop ([`Segment::take_events`]).
     outbox: Vec<Event>,
-    /// The probes and queries for types under way.
+    /// The probes and queries for types under way, the number of the last
+    /// one started, and how those asked for went, by number, until taken.
     probing: Vec<Probing>,
+    probes_started: u64,
+    probed: VecDeque<(u64, Probed)>,
     /// How often to probe on its own, if at all, and when next.
     probe_interval: Option<Duration>,
     next_routine: Option<Instant>,
@@ -1359,18 +1366,25 @@ impl Segment {
     /// where it is (target and port). Three rounds, a few seconds in all,
     /// because each round's answers decide the next one's questions; the
     /// upkeep runs them as they come due, and the answers are handled as they
-    /// arrive. How many questions it sent is told to the receiver returned,
-    /// once it is done. One asked for while another is under way is that one.
-    pub fn probe(&self) -> Receiver<Probed> {
-        let (tx, rx) = mpsc::channel();
-        self.begin(None, "asked for", Some(tx));
-        rx
+    /// arrive. How many questions it sent is kept under the number returned,
+    /// once it is done ([`Segment::probed`]). One asked for while another is
+    /// under way is that one.
+    pub fn probe(&self) -> u64 {
+        self.begin(None, "asked for", true)
+    }
+
+    /// How the probe numbered `id` went, if it is done, and has not been
+    /// asked about before.
+    pub fn probed(&self, id: u64) -> Option<Probed> {
+        let mut state = self.state.lock().unwrap();
+        let at = state.probed.iter().position(|&(done, _)| done == id)?;
+        state.probed.remove(at).map(|(_, result)| result)
     }
 
     /// Like [`Segment::probe`], with no one to tell but the journal: `why`
     /// says what it is for there.
     pub fn start_probe(&self, why: &'static str) {
-        self.begin(None, why, None);
+        self.begin(None, why, false);
     }
 
     /// Probe on its own every `every`, the first one that long from now, as
@@ -1389,26 +1403,29 @@ impl Segment {
     /// What is known here already goes along as known answers, so only what
     /// is new, or about to run out, answers.
     pub fn query_types(&self, kinds: &[String]) {
-        self.begin(Some(kinds.to_vec()), "query for types", None);
+        self.begin(Some(kinds.to_vec()), "query for types", false);
     }
 
     /// Start a probe (`kinds` `None`) or a query for types, unless the same
-    /// is under way already, which `done` is then told of instead. A segment
-    /// that cannot send has nothing to do, and is done at once.
-    fn begin(&self, kinds: Option<Vec<String>>, why: &'static str, done: Option<Sender<Probed>>) {
+    /// is under way already, which it then is; its number. How it went is
+    /// kept if it was `asked` for. A segment that cannot send has nothing to
+    /// do, and is done at once.
+    fn begin(&self, kinds: Option<Vec<String>>, why: &'static str, asked: bool) -> u64 {
         let mut state = self.state.lock().unwrap();
+        if let Some(p) = state.probing.iter_mut().find(|p| p.kinds == kinds) {
+            p.asked |= asked;
+            return p.id;
+        }
+        state.probes_started += 1;
+        let probing = Probing { kinds, why, id: state.probes_started, asked, round: 0, next: Instant::now(), sent: 0 };
+        let id = probing.id;
         if state.outbound.is_empty() {
             drop(state);
-            self.finish(Probing { kinds, why, round: 0, next: Instant::now(), sent: 0, done: done.into_iter().collect() }, Ok(0));
-            return;
+            self.finish(probing, Ok(0));
+        } else {
+            state.probing.push(probing);
         }
-        if let Some(p) = state.probing.iter_mut().find(|p| p.kinds == kinds) {
-            p.done.extend(done);
-            return;
-        }
-        let probing = Probing { kinds, why, round: 0, next: Instant::now(), sent: 0, done: done.into_iter().collect() };
-        state.probing.push(probing);
-        drop(state);
+        id
     }
 
     /// Run the rounds of the probes and queries that are due at `now`, and
@@ -1424,7 +1441,7 @@ impl Segment {
             due
         };
         if routine {
-            self.begin(None, "periodic", None);
+            self.begin(None, "periodic", false);
         }
         let due: Vec<(Option<Vec<String>>, usize)> = {
             let state = self.state.lock().unwrap();
@@ -1455,16 +1472,21 @@ impl Segment {
         }
     }
 
-    /// Tell whoever asked how `probing` went, and the journal if it is worth
-    /// a line.
+    /// Keep how `probing` went for whoever asked for it, and tell the
+    /// journal if it is worth a line. Only so many are kept: one never asked
+    /// about, its asker gone, does not stay for ever.
     fn finish(&self, probing: Probing, result: Probed) {
         match (&result, probing.why) {
             (Ok(sent), "startup") => eprintln!("{}: startup probe sent {sent} queries", self.interface),
             (Ok(_), _) => {}
             (Err(e), why) => eprintln!("{}: {why} probe failed: {e}", self.interface),
         }
-        for tx in probing.done {
-            let _ = tx.send(result.clone());
+        if probing.asked {
+            let mut state = self.state.lock().unwrap();
+            if state.probed.len() >= MAX_PROBED {
+                state.probed.pop_front();
+            }
+            state.probed.push_back((probing.id, result));
         }
     }
 
@@ -3003,11 +3025,10 @@ mod tests {
     /// event loop would: the upkeep at each time it says it is due. How it
     /// went, and when each round, and its end, came due.
     fn run_probe(seg: &Segment, kinds: Option<&[String]>) -> (Probed, Vec<Instant>) {
-        let (tx, rx) = mpsc::channel();
-        seg.begin(kinds.map(<[String]>::to_vec), "asked for", Some(tx));
+        let id = seg.begin(kinds.map(<[String]>::to_vec), "asked for", true);
         let mut rounds = Vec::new();
         loop {
-            if let Ok(result) = rx.try_recv() {
+            if let Some(result) = seg.probed(id) {
                 return (result, rounds);
             }
             let at = seg.next_due().expect("a round or its end is due");
@@ -3033,9 +3054,11 @@ mod tests {
         seg.start_probe("startup");
         let joined = seg.probe();
         assert_eq!(seg.state.lock().unwrap().probing.len(), 1);
+        assert_eq!(seg.probed(joined), None, "not done yet");
         let (result, _) = run_probe(&seg, None);
-        assert_eq!(joined.try_recv(), Ok(result));
         assert!(seg.state.lock().unwrap().probing.is_empty());
+        assert_eq!(seg.probed(joined), None, "the same one: taken already");
+        assert_eq!(result, Ok(3));
     }
 
     #[test]
@@ -3089,7 +3112,9 @@ mod tests {
     #[test]
     fn probe_without_a_sender_does_nothing() {
         let seg = Segment::new("test", &[Family::V4]);
-        assert_eq!(seg.probe().try_recv(), Ok(Ok(0)), "done at once");
+        let id = seg.probe();
+        assert_eq!(seg.probed(id), Some(Ok(0)), "done at once");
+        assert_eq!(seg.probed(id), None, "taken");
     }
 
     #[test]
