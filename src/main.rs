@@ -4,6 +4,7 @@ mod ipc;
 mod links;
 mod netlink;
 mod parser;
+mod poll;
 mod reflector;
 mod segment;
 mod signal;
@@ -34,8 +35,7 @@ pub struct Group {
 }
 
 fn main() -> Result<()> {
-    // Before any thread exists, so that every thread inherits the mask.
-    signal::block().context("blocking shutdown signals")?;
+    let signals = signal::install().context("handling shutdown signals")?;
 
     let path = std::env::args_os()
         .nth(1)
@@ -67,7 +67,6 @@ fn main() -> Result<()> {
         links.insert(interface, link.segment().clone());
         tracked.push(link);
     }
-    thread::spawn(move || links::track(netlink, tracked));
 
     // One reflector per configured segment, over the shared links. Where
     // segments share an interface and both want a hostname announced there,
@@ -173,7 +172,7 @@ fn main() -> Result<()> {
     let segments = Arc::new(segments);
     ipc::serve(&config.socket, &segments, timer.watcher())?;
 
-    let signal = signal::wait().context("waiting for shutdown signal")?;
+    let signal = run(&signals, netlink, &mut tracked)?;
     eprintln!("received {signal}: withdrawing reflected devices");
     // No more upkeep while the goodbyes go out.
     drop(timer);
@@ -189,6 +188,31 @@ fn main() -> Result<()> {
     }
     let _ = std::fs::remove_file(&config.socket);
     Ok(())
+}
+
+/// The event loop: follow what netlink reports for `links`, until a shutdown
+/// signal comes, whose name is returned. Should netlink fail, interfaces are
+/// no longer followed, and the daemon goes on as they are.
+fn run(signals: &signal::Signals, netlink: Netlink, links: &mut [Link]) -> Result<&'static str> {
+    links::ask_neighbours(&netlink);
+    let mut netlink = Some(netlink);
+    loop {
+        let mut fds = vec![poll::readable(signals.fd())];
+        fds.extend(netlink.as_ref().map(|n| poll::readable(n.fd())));
+        poll::wait(&mut fds, None).context("waiting for something to do")?;
+        if let Some(name) = signals.take() {
+            return Ok(name);
+        }
+        if let Some(n) = netlink.as_ref().filter(|_| fds.get(1).is_some_and(poll::ready)) {
+            match n.changes() {
+                Ok(changes) => links::follow(n, links, &changes),
+                Err(e) => {
+                    eprintln!("netlink: {e}; no longer following interfaces as they come and go");
+                    netlink = None;
+                }
+            }
+        }
+    }
 }
 
 /// Drop the reflectors, which sends goodbyes for everything they announced.

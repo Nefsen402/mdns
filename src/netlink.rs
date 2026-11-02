@@ -8,7 +8,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// A change to an interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,18 +123,27 @@ impl Netlink {
         if n < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
-    /// Wait for the next changes the kernel reports.
+    /// The descriptor to wait on: readable when there are changes.
+    pub fn fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    /// The changes the kernel has reported since last asked, without
+    /// waiting: none if there are none yet.
     pub fn changes(&self) -> io::Result<Vec<Change>> {
         let mut buf = vec![0u8; 64 * 1024];
+        let mut changes = Vec::new();
         loop {
             // SAFETY: `buf` is writable for its whole length.
-            let n = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+            let n = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
             if n >= 0 {
-                return Ok(parse(&buf[..n as usize]));
+                changes.extend(parse(&buf[..n as usize]));
+                continue;
             }
             match io::Error::last_os_error() {
                 e if e.kind() == io::ErrorKind::Interrupted => continue,
-                e if e.raw_os_error() == Some(libc::ENOBUFS) => return Ok(vec![Change::Lost]),
+                e if e.kind() == io::ErrorKind::WouldBlock => return Ok(changes),
+                e if e.raw_os_error() == Some(libc::ENOBUFS) => changes.push(Change::Lost),
                 e => return Err(e),
             }
         }

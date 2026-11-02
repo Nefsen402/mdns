@@ -5,7 +5,7 @@
 //! daemon. Its sockets do not: an interface can be deleted and created again
 //! (a VLAN reconfigured, hostapd restarted), and a socket bound to the old one
 //! hears nothing. So a [`Link`] opens sockets while the interface is there,
-//! and [`track`] follows what [`netlink`](crate::netlink) reports: an
+//! and [`follow`] acts on what [`netlink`](crate::netlink) reports: an
 //! interface gone has its sockets closed and its devices forgotten, one that
 //! comes back gets new sockets, has everything announced on it again and is
 //! probed, and one whose addresses change has the advertised name updated.
@@ -245,30 +245,22 @@ impl Link {
     }
 }
 
-/// Follow what `netlink` reports, for `links`, until it fails. The
-/// neighbour tables are asked for first, and again when changes were lost.
-pub fn track(netlink: Netlink, mut links: Vec<Link>) {
-    let ask_neighbours = |netlink: &Netlink| {
-        if let Err(e) = netlink.request_neighbours() {
-            eprintln!("netlink: asking for the neighbour tables failed: {e}");
-        }
-    };
-    ask_neighbours(&netlink);
-    loop {
-        let changes = match netlink.changes() {
-            Ok(changes) => changes,
-            Err(e) => {
-                eprintln!("netlink: {e}; no longer following interfaces as they come and go");
-                return;
-            }
-        };
-        if changes.contains(&Change::Lost) {
-            ask_neighbours(&netlink);
-        }
-        for change in &changes {
-            for link in &mut links {
-                link.changed(change);
-            }
+/// Ask `netlink` for the neighbour tables: at startup, for what was there
+/// already, and when changes were lost.
+pub fn ask_neighbours(netlink: &Netlink) {
+    if let Err(e) = netlink.request_neighbours() {
+        eprintln!("netlink: asking for the neighbour tables failed: {e}");
+    }
+}
+
+/// Act on the `changes` `netlink` reported, for `links`.
+pub fn follow(netlink: &Netlink, links: &mut [Link], changes: &[Change]) {
+    if changes.contains(&Change::Lost) {
+        ask_neighbours(netlink);
+    }
+    for change in changes {
+        for link in links.iter_mut() {
+            link.changed(change);
         }
     }
 }
