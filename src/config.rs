@@ -14,6 +14,7 @@
 //!
 //! [Advertise]         ; optional
 //! Hostname=router.local
+//! Interface=br0       ; all of them unless set
 //! Services=_ssh._tcp:22
 //!
 //! [Segment]
@@ -242,6 +243,8 @@ pub struct Config {
     /// The services to announce under the advertised name, each as its type
     /// (`_ssh._tcp`) and port, by an instance named for the host.
     pub advertise_services: Vec<(String, u16)>,
+    /// The interfaces to advertise on; all of those listened to if none.
+    pub advertise_interfaces: Vec<String>,
     /// How often to probe the interfaces of segments that do not set their
     /// own; `None` (the default) probes only at startup and on request. See
     /// [`Config::probe_interval_of`].
@@ -262,6 +265,7 @@ impl Default for Config {
             advertise: None,
             advertise_ttl: DEFAULT_ADVERTISE_TTL,
             advertise_services: Vec::new(),
+            advertise_interfaces: Vec::new(),
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
         }
@@ -445,6 +449,16 @@ impl Config {
                     ("advertise", "hostname") => {
                         config.advertise = Some(local_name(&value, lineno)?);
                     }
+                    ("advertise", "interface") => {
+                        if value.is_empty() {
+                            config.advertise_interfaces.clear();
+                        }
+                        for name in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+                            if !config.advertise_interfaces.iter().any(|i| i == name) {
+                                config.advertise_interfaces.push(name.to_string());
+                            }
+                        }
+                    }
                     ("advertise", "services") => {
                         if value.is_empty() {
                             config.advertise_services.clear();
@@ -481,6 +495,13 @@ impl Config {
         }
         if !self.advertise_services.is_empty() && self.advertise.is_none() {
             bail!("[Advertise] Services= needs a Hostname=, to be at");
+        }
+        if !self.advertise_interfaces.is_empty() && self.advertise.is_none() {
+            bail!("[Advertise] Interface= needs a Hostname=, to advertise");
+        }
+        let listened = self.interfaces();
+        if let Some(stray) = self.advertise_interfaces.iter().find(|i| !listened.contains(&i.as_str())) {
+            bail!("[Advertise] Interface={stray} is not in any segment's Interfaces=");
         }
 
         for (i, seg) in self.segments.iter().enumerate() {
@@ -1000,6 +1021,19 @@ interfaces=br0,wifi
             assert!(e.contains("line 3") && e.contains("a type and a port"), "{bad}: {e}");
         }
         let e = Config::parse(&format!("[Advertise]\nServices=_ssh._tcp:22\n{EXAMPLE}")).unwrap_err().to_string();
+        assert!(e.contains("needs a Hostname="), "{e}");
+    }
+
+    #[test]
+    fn advertising_can_be_limited_to_interfaces_that_are_listened_to() {
+        let with = |lines: &str| Config::parse(&format!("[Advertise]\nHostname=pc\n{lines}\n[Segment]\nName=a\nInterfaces=br0,media\n"));
+        assert!(with("").unwrap().advertise_interfaces.is_empty());
+        assert_eq!(with("Interface=br0").unwrap().advertise_interfaces, ["br0"]);
+        assert_eq!(with("Interface=br0, media\nInterface=br0").unwrap().advertise_interfaces, ["br0", "media"]);
+        assert!(with("Interface=br0\nInterface=").unwrap().advertise_interfaces.is_empty());
+        let e = with("Interface=eth9").unwrap_err().to_string();
+        assert!(e.contains("eth9") && e.contains("not in any segment"), "{e}");
+        let e = Config::parse("[Advertise]\nInterface=br0\n[Segment]\nName=a\nInterfaces=br0\n").unwrap_err().to_string();
         assert!(e.contains("needs a Hostname="), "{e}");
     }
 

@@ -83,7 +83,11 @@ impl Link {
             families: families.to_vec(),
             unicast: unicast.to_vec(),
             segment,
-            advertise: config.advertise.clone().map(|name| (name, config.advertise_ttl)),
+            advertise: config
+                .advertise
+                .clone()
+                .filter(|_| config.advertise_interfaces.is_empty() || config.advertise_interfaces.iter().any(|i| i == interface))
+                .map(|name| (name, config.advertise_ttl)),
             services: config.advertise_services.clone(),
             index: None,
             up: true,

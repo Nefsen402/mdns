@@ -205,6 +205,16 @@ The name is announced and kept alive like a reflected device, answers queries
 shutdown.
 No conflict detection is done: the name is assumed to be yours alone.
 .TP
+.B Interface=
+The interfaces to announce the name and its services on, and to answer for
+there, separated by spaces or commas; the setting may be repeated, and an
+empty one clears the list.
+Each must be in a segment's
+.BR Interfaces= .
+Default: all of them.
+Needs
+.BR Hostname= .
+.TP
 .B Services=
 Services this host offers, announced under the name and answered for, as a
 type and a port:
