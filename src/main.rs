@@ -25,7 +25,6 @@ mod signal;
 mod socket;
 mod time;
 mod timespan;
-mod unit;
 
 use core::ffi::c_int;
 
