@@ -55,7 +55,7 @@ What to listen for, and to announce, over IPv4 (the group 224.0.0.251): one of
 or
 .BR on .
 Default
-.BR multicast .
+.BR on .
 .B off
 does not use the family.
 .B multicast
@@ -513,8 +513,8 @@ never see each other.
 .RS
 .nf
 [Listen]
-IPv4=multicast
-IPv6=multicast
+IPv4=on
+IPv6=on
 
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock

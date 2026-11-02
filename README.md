@@ -269,9 +269,8 @@ and the daemon hands the datagram to that interface, in userspace; one that
 came in on an interface it does not serve is dropped. Sending says which
 interface it goes out of, each time. A datagram is read once, whichever
 interface it came in on. What is sent to port 5353 itself, not to the group, is
-heard only where `[Listen]` says `on` for the family, as on Linux (`multicast`,
-the default, is the group alone), and then only from a host on the interface's
-networks or link-local.
+heard unless `[Listen]` says `multicast` for the family (the group alone), as on
+Linux, and then only from a host on the interface's networks or link-local.
 
 Where it does less than on Linux:
 

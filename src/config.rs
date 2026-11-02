@@ -204,10 +204,11 @@ pub enum Listen {
     Off,
     /// What is sent to the mDNS group, which is what devices send to be heard
     /// by all on the link, and all that is asked of them.
-    #[default]
     Multicast,
-    /// That, and what is sent to the daemon's own address at the mDNS port.
-    /// Nothing checks that what is sent there is from the link.
+    /// That, and what is sent to the daemon's own address at the mDNS port,
+    /// of a host on the interface's networks or link-local: the answers to a
+    /// question it asked of a device directly, and what resolvers ask it.
+    #[default]
     On,
 }
 
@@ -1017,7 +1018,7 @@ interfaces=br0,wifi
             ]
         );
         assert_eq!(c.interfaces(), ["br0", "media", "wifi"]);
-        assert_eq!((c.ipv4, c.ipv6), (Listen::Multicast, Listen::Multicast));
+        assert_eq!((c.ipv4, c.ipv6), (Listen::On, Listen::On));
     }
 
     #[test]
@@ -1027,7 +1028,7 @@ interfaces=br0,wifi
         )
         .unwrap();
         assert_eq!(c.segments, [seg("a b", &["x", "y", "z", "w"])]);
-        assert_eq!((c.ipv4, c.ipv6), (Listen::Multicast, Listen::Off));
+        assert_eq!((c.ipv4, c.ipv6), (Listen::On, Listen::Off));
     }
 
     #[test]
@@ -1079,9 +1080,9 @@ interfaces=br0,wifi
         }
         assert!((Listen::Multicast.enabled(), Listen::Off.enabled()) == (true, false));
         assert_eq!((Listen::On.unicast(), Listen::Multicast.unicast(), Listen::Off.unicast()), (true, false, false));
-        // Unset, it is multicast, as listening was before.
+        // Unset, it is on.
         let c = Config::parse("[Segment]\nName=a\nInterfaces=x\n").unwrap();
-        assert_eq!((c.ipv4, c.ipv6), (Listen::Multicast, Listen::Multicast));
+        assert_eq!((c.ipv4, c.ipv6), (Listen::On, Listen::On));
         // Both off is nothing to listen to.
         let both_off = error_of("[Listen]\nIPv4=off\nIPv6=off\n[Segment]\nName=a\nInterfaces=x\n");
         assert!(both_off.contains("both off"), "{both_off}");
