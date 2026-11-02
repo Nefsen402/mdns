@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 use crate::device::Device;
 use crate::netlink::{Change, Netlink};
-use crate::segment::{Event, Owner, Segment};
+use crate::segment::{Owner, Segment};
 use crate::socket::{self, Family, MdnsSocket};
 use crate::timer::Timer;
 
@@ -54,23 +54,13 @@ pub struct Link {
 
 impl Link {
     /// The link for `interface`, over `families`, configured by `config`,
-    /// with its upkeep on `timer` and its changes logged. It has no sockets
-    /// until [`open`](Link::open).
+    /// with its upkeep on `timer`. It has no sockets until
+    /// [`open`](Link::open).
     pub fn new(interface: &str, families: &[Family], config: &Config, timer: &Timer) -> Link {
         let segment = Segment::new(interface, families);
         segment.set_min_lifetime(config.min_lifetime);
         segment.set_max_addrs(config.max_addrs);
         segment.set_reannounce(config.reannounce_on(interface));
-
-        // Placeholder consumer: log changes to the discovered list.
-        let events = segment.subscribe();
-        let name = interface.to_string();
-        thread::spawn(move || {
-            // Questions passed on for the reflector are not worth a line each.
-            for event in events.iter().filter(|e| !matches!(e, Event::Question(_))) {
-                eprintln!("{name}: {event:?}");
-            }
-        });
         segment.schedule(timer, config.refresh_before);
 
         Link {
