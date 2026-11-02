@@ -13,9 +13,7 @@ mod timespan;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 
@@ -148,15 +146,16 @@ fn main() -> Result<()> {
         link.start_probe("startup");
     }
 
-    let segments = Arc::new(segments);
     let mut server = ipc::Server::bind(&config.socket)?;
 
     let signal = run(&signals, netlink, &mut tracked, &segments, &mut server)?;
     eprintln!("received {signal}: withdrawing reflected devices");
+    // The loop has stopped, and the upkeep with it, while the goodbyes go
+    // out: the watches are told, and dropping the reflectors withdraws all
+    // they announced.
     server.shut_down();
     drop(server);
-    // The loop has stopped, and the upkeep with it, while the goodbyes go out.
-    release(segments);
+    drop(segments);
     // With the reflectors gone, what is left in the manual lists is the
     // advertised name: say goodbye to it too.
     for link in links.values() {
@@ -229,24 +228,5 @@ fn run(
             r.retry(now);
         }
         server.tick(groups, now);
-    }
-}
-
-/// Drop the reflectors, which sends goodbyes for everything they announced.
-/// An IPC request may be holding a reference for a moment, so wait it out.
-fn release(mut segments: Arc<Vec<Group>>) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match Arc::try_unwrap(segments) {
-            Ok(groups) => return drop(groups),
-            Err(still_shared) if Instant::now() < deadline => {
-                segments = still_shared;
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => {
-                eprintln!("segments still in use after 5s; exiting without goodbyes");
-                return;
-            }
-        }
     }
 }

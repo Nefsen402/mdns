@@ -911,9 +911,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread::{self, JoinHandle};
 
     use super::*;
     use crate::parser::{Header, Message, RData, Record};
@@ -1140,53 +1137,68 @@ mod tests {
         path
     }
 
-    /// The server at `path`, with `groups`, run on a thread of its own the
-    /// way the event loop runs it, with the segments' upkeep and the
-    /// reflectors' deliveries, until this is dropped, when it shuts down.
-    struct Serving {
-        stop: Arc<AtomicBool>,
-        thread: Option<JoinHandle<()>>,
+    /// The server at `path`, with `groups`, run the way the event loop runs
+    /// it, with the segments' upkeep and the reflectors' deliveries, a turn
+    /// at a time, as a test waits for what a client is told.
+    struct Harness {
+        server: Server,
+        groups: Vec<Group>,
     }
 
-    fn serving(path: &Path, groups: &Arc<Vec<Group>>) -> Serving {
-        let mut server = Server::bind(path).unwrap();
-        let groups = Arc::clone(groups);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::clone(&stop);
-        let thread = thread::spawn(move || {
-            let reflectors: Vec<&Reflector> = groups.iter().map(|g| &g.reflector).collect();
-            while !stopped.load(Ordering::Relaxed) {
-                let mut fds = server.fds();
-                poll::wait(&mut fds, Some(Duration::from_millis(5))).unwrap();
-                server.ready(&fds);
-                let now = Instant::now();
-                for seg in groups.iter().flat_map(|g| g.reflector.segments()) {
-                    if seg.next_due().is_some_and(|at| at <= now) {
-                        seg.upkeep(now);
-                    }
+    impl Harness {
+        fn new(path: &Path, groups: Vec<Group>) -> Harness {
+            Harness { server: Server::bind(path).unwrap(), groups }
+        }
+
+        /// One turn of the loop.
+        fn pump(&mut self) {
+            let mut fds = self.server.fds();
+            poll::wait(&mut fds, Some(Duration::from_millis(1))).unwrap();
+            self.server.ready(&fds);
+            let now = Instant::now();
+            for seg in self.groups.iter().flat_map(|g| g.reflector.segments()) {
+                if seg.next_due().is_some_and(|at| at <= now) {
+                    seg.upkeep(now);
                 }
-                crate::reflector::deliver(&reflectors);
-                server.tick(&groups, now);
             }
-            server.shut_down();
-        });
-        Serving { stop, thread: Some(thread) }
-    }
+            crate::reflector::deliver(&self.groups.iter().map(|g| &g.reflector).collect::<Vec<_>>());
+            self.server.tick(&self.groups, now);
+        }
 
-    impl Drop for Serving {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+        /// The next line the server tells `reader`, turning the loop until it
+        /// comes; empty if the server closes the connection instead.
+        fn line(&mut self, reader: &mut BufReader<UnixStream>) -> String {
+            reader.get_ref().set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut line = String::new();
+            loop {
+                match reader.read_line(&mut line) {
+                    Ok(0) => return line,
+                    Ok(_) if line.ends_with('\n') => return line.trim_end().to_string(),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("{e}"),
+                }
+                assert!(Instant::now() < deadline, "nothing from the server; so far {line:?}");
+                self.pump();
             }
+        }
+
+        fn json(&mut self, reader: &mut BufReader<UnixStream>) -> Value {
+            serde_json::from_str(&self.line(reader)).unwrap()
+        }
+
+        fn ask(&mut self, stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, request: &str) -> String {
+            writeln!(stream, "{request}").unwrap();
+            self.line(reader)
         }
     }
 
-    fn ask(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, request: &str) -> String {
-        writeln!(stream, "{request}").unwrap();
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        line.trim_end().to_string()
+    /// A client of the server at `path`, and its replies.
+    fn connect(path: &Path) -> (UnixStream, BufReader<UnixStream>) {
+        let stream = UnixStream::connect(path).unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        (stream, reader)
     }
 
     #[test]
@@ -1194,42 +1206,34 @@ mod tests {
         let (g, segs) = group("IoT", Family::V4, &["wifi"]);
         segs[0].observe(ip("10.0.1.7"));
         let path = temp_socket("serve");
-        let groups = Arc::new(vec![g]);
-        let _serving = serving(&path, &groups);
+        let mut h = Harness::new(&path, vec![g]);
 
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o660);
 
-        let mut stream = UnixStream::connect(&path).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let (mut stream, mut reader) = connect(&path);
         // Several requests on one connection.
-        assert!(ask(&mut stream, &mut reader, "segments").contains(r#""name":"IoT""#));
-        assert!(ask(&mut stream, &mut reader, "devices IoT").contains(r#""addresses":["10.0.1.7"]"#));
-        assert!(ask(&mut stream, &mut reader, "bogus").contains(r#""ok":false"#));
+        assert!(h.ask(&mut stream, &mut reader, "segments").contains(r#""name":"IoT""#));
+        assert!(h.ask(&mut stream, &mut reader, "devices IoT").contains(r#""addresses":["10.0.1.7"]"#));
+        assert!(h.ask(&mut stream, &mut reader, "bogus").contains(r#""ok":false"#));
 
         // Oversized requests are refused and the connection closed.
-        let mut big = UnixStream::connect(&path).unwrap();
+        let (mut big, mut big_reader) = connect(&path);
         big.write_all(&vec![b'x'; MAX_LINE as usize + 10]).unwrap();
-        let mut reply = String::new();
-        BufReader::new(big).read_line(&mut reply).unwrap();
-        assert!(reply.contains("request too long"));
+        assert!(h.line(&mut big_reader).contains("request too long"));
+        assert_eq!(h.line(&mut big_reader), "", "closed");
 
         // Requests that come in pieces, or several in one, are answered a
         // line each.
         stream.write_all(b"segm").unwrap();
-        thread::sleep(Duration::from_millis(20));
+        h.pump();
         stream.write_all(b"ents\ndevices IoT\n").unwrap();
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        assert!(line.contains(r#""segments""#), "{line}");
-        line.clear();
-        reader.read_line(&mut line).unwrap();
-        assert!(line.contains(r#""devices""#), "{line}");
+        assert!(h.line(&mut reader).contains(r#""segments""#));
+        assert!(h.line(&mut reader).contains(r#""devices""#));
 
         // One that says nothing for long enough is let go.
-        let mut idle = BufReader::new(UnixStream::connect(&path).unwrap());
-        idle.get_ref().set_read_timeout(Some(IDLE * 10)).unwrap();
+        let (_idle, mut idle_reader) = connect(&path);
         let start = Instant::now();
-        assert_eq!(idle.read_line(&mut String::new()).unwrap(), 0, "closed");
+        assert_eq!(h.line(&mut idle_reader), "", "closed");
         assert!(start.elapsed() >= IDLE);
         let _ = fs::remove_file(&path);
     }
@@ -1240,21 +1244,15 @@ mod tests {
     fn probe_is_answered_once_done_while_the_rest_goes_on() {
         let (seg, _rx) = wired("wifi");
         let path = temp_socket("probe");
-        let groups = Arc::new(vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }]);
-        let _serving = serving(&path, &groups);
+        let mut h = Harness::new(&path, vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }]);
 
-        let mut stream = UnixStream::connect(&path).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let (mut stream, mut reader) = connect(&path);
         writeln!(stream, "probe IoT").unwrap();
-        let mut other = UnixStream::connect(&path).unwrap();
-        let mut other_reader = BufReader::new(other.try_clone().unwrap());
-        assert!(ask(&mut other, &mut other_reader, "segments").contains("IoT"), "answered meanwhile");
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        assert_eq!(line.trim_end(), r#"{"ok":true,"probed":[{"interface":"wifi","queries":3,"error":null}]}"#);
+        let (mut other, mut other_reader) = connect(&path);
+        assert!(h.ask(&mut other, &mut other_reader, "segments").contains("IoT"), "answered meanwhile");
+        assert_eq!(h.line(&mut reader), r#"{"ok":true,"probed":[{"interface":"wifi","queries":3,"error":null}]}"#);
         // And the connection takes requests again.
-        assert!(ask(&mut stream, &mut reader, "segments").contains("IoT"));
+        assert!(h.ask(&mut stream, &mut reader, "segments").contains("IoT"));
         let _ = fs::remove_file(&path);
     }
 
@@ -1308,47 +1306,33 @@ mod tests {
     fn watch_streams_changes_until_the_daemon_stops() {
         let (g, segs) = group("IoT", Family::V4, &["wifi"]);
         let path = temp_socket("watch");
-        let groups = Arc::new(vec![g]);
-        let serving = serving(&path, &groups);
+        let mut h = Harness::new(&path, vec![g]);
 
-        let mut stream = UnixStream::connect(&path).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        assert_eq!(ask(&mut stream, &mut reader, "WATCH IoT"), r#"{"ok":true,"name":"IoT","watching":true}"#);
+        let (mut stream, mut reader) = connect(&path);
+        assert_eq!(h.ask(&mut stream, &mut reader, "WATCH IoT"), r#"{"ok":true,"name":"IoT","watching":true}"#);
 
-        let mut next = || {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            serde_json::from_str::<Value>(&line).unwrap()
-        };
         segs[0].observe(ip("10.0.1.7"));
-        deliver_made();
-        let added = next();
+        let added = h.json(&mut reader);
         assert_eq!((added["event"].as_str(), added["segment"].as_str()), (Some("added"), Some("IoT")));
         assert_eq!(added["ttl"], 300);
         assert_eq!(added["device"]["interface"], "wifi");
         assert_eq!(added["device"]["addresses"][0], "10.0.1.7");
 
         segs[0].expire(Instant::now() + Duration::from_secs(3600));
-        deliver_made();
-        let removed = next();
+        let removed = h.json(&mut reader);
         assert_eq!(removed["event"], "removed");
         assert_eq!(removed["ttl"], 0);
         assert_eq!(removed["device"]["addresses"][0], "10.0.1.7");
 
         // Failures are ordinary replies, and the connection can go on.
-        let mut other = UnixStream::connect(&path).unwrap();
-        let mut other_reader = BufReader::new(other.try_clone().unwrap());
-        assert!(ask(&mut other, &mut other_reader, "watch nope").contains("no such segment: nope"));
-        let mut other = UnixStream::connect(&path).unwrap();
-        let mut other_reader = BufReader::new(other.try_clone().unwrap());
-        assert!(ask(&mut other, &mut other_reader, "watch").contains("usage: watch"));
+        let (mut other, mut other_reader) = connect(&path);
+        assert!(h.ask(&mut other, &mut other_reader, "watch nope").contains("no such segment: nope"));
+        let (mut other, mut other_reader) = connect(&path);
+        assert!(h.ask(&mut other, &mut other_reader, "watch").contains("usage: watch"));
 
         // When the daemon stops, the watch is told so.
-        drop(serving);
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        assert!(line.contains("shutting down"), "{line}");
+        h.server.shut_down();
+        assert!(h.line(&mut reader).contains("shutting down"));
         let _ = fs::remove_file(&path);
     }
 
@@ -1408,50 +1392,34 @@ mod tests {
         assert!(queries(&a_rx).is_empty(), "nothing asked");
     }
 
-    /// `watch --query` shows the devices of the type already known as
-    /// present, asks for it, then and every interval, and shows only devices
-    /// of it from then on.
     #[test]
     fn watch_with_a_query_shows_what_is_there_asks_and_asks_again() {
         let (seg, rx) = wired("wifi");
-        let groups = Arc::new(vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }]);
+        let groups = vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }];
         announce(&seg, "10.0.1.7", "tv.local", "TV");
         let path = temp_socket("watch-query");
-        let _serving = serving(&path, &groups);
+        let mut h = Harness::new(&path, groups);
 
-        let mut stream = UnixStream::connect(&path).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let ack = ask(&mut stream, &mut reader, "watch --query=_http._tcp --interval=1 IoT");
+        let (mut stream, mut reader) = connect(&path);
+        let ack = h.ask(&mut stream, &mut reader, "watch --query=_http._tcp --interval=1 IoT");
         assert_eq!(ack, r#"{"ok":true,"name":"IoT","watching":true}"#);
-        let mut next = || {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            serde_json::from_str::<Value>(&line).unwrap()
-        };
-        let present = next();
+        let present = h.json(&mut reader);
         assert_eq!((present["event"].as_str(), present["device"]["hostname"].as_str()), (Some("present"), Some("tv.local")));
         assert_eq!(present["ttl"], 300);
 
-        // Asked at once, with the TV as a known answer, and again a second on:
-        // waited for, as a busy test run can hold the second round up.
+        // Asked at once, with the TV as a known answer, and again a second on.
         let mut asked = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while asked.len() < 6 && Instant::now() < deadline {
-            // The rounds, run as the event loop would.
-            if seg.next_due().is_some_and(|at| at <= Instant::now()) {
-                seg.upkeep(Instant::now());
-            }
+            h.pump();
             asked.extend(queries(&rx).into_iter().filter(|(names, _)| names == &["_http._tcp.local"]));
-            thread::sleep(Duration::from_millis(5));
         }
         assert!(asked.len() >= 6 && asked.iter().all(|&(_, known)| known == 1), "{asked:?}");
 
         // One without the type is not shown; one with it is.
         seg.observe(ip("10.0.1.8"));
         announce(&seg, "10.0.1.9", "plug.local", "Plug");
-        deliver_made();
-        let added = next();
+        let added = h.json(&mut reader);
         assert_eq!((added["event"].as_str(), added["device"]["hostname"].as_str()), (Some("added"), Some("plug.local")));
         let _ = fs::remove_file(&path);
     }
@@ -1500,34 +1468,27 @@ mod tests {
         assert_eq!(show(Event::Removed(nameless)).as_deref(), Some("removed"));
     }
 
-    /// `watchers` lists the open watches, oldest first, with what each asked
-    /// for and who holds it, and one is gone from the list once its client
-    /// hangs up.
     #[test]
     fn watchers_lists_the_open_watches_and_who_holds_them() {
         let (g, _segs) = group("IoT", Family::V4, &["wifi"]);
         let path = temp_socket("watchers");
-        let groups = Arc::new(vec![g]);
-        let _serving = serving(&path, &groups);
-        let open = |request: &str| {
-            let mut stream = UnixStream::connect(&path).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            assert!(ask(&mut stream, &mut reader, request).contains(r#""watching":true"#));
+        let mut h = Harness::new(&path, vec![g]);
+        let open = |h: &mut Harness, request: &str| {
+            let (mut stream, mut reader) = connect(&path);
+            assert!(h.ask(&mut stream, &mut reader, request).contains(r#""watching":true"#));
             stream
         };
-        let list = || {
-            let mut stream = UnixStream::connect(&path).unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let reply: Value = serde_json::from_str(&ask(&mut stream, &mut reader, "watchers")).unwrap();
+        let list = |h: &mut Harness| {
+            let (mut stream, mut reader) = connect(&path);
+            let reply: Value = serde_json::from_str(&h.ask(&mut stream, &mut reader, "watchers")).unwrap();
             assert_eq!(reply["ok"], true);
             reply["watchers"].as_array().unwrap().clone()
         };
-        assert!(list().is_empty());
+        assert!(list(&mut h).is_empty());
 
-        let first = open("watch IoT");
-        let _second = open("watch --query=_shelly._tcp --interval=60 IoT");
-        let watchers = list();
+        let first = open(&mut h, "watch IoT");
+        let _second = open(&mut h, "watch --query=_shelly._tcp --interval=60 IoT");
+        let watchers = list(&mut h);
         assert_eq!(watchers.len(), 2, "{watchers:?}");
         let me = (std::process::id() as i64, unsafe { libc::getuid() } as i64);
         for w in &watchers {
@@ -1540,14 +1501,12 @@ mod tests {
         assert_eq!(watchers[1]["query"][0], "_shelly._tcp.local");
         assert_eq!(watchers[1]["interval_s"], 60);
 
-        // A watch whose client is gone leaves the list (within a check or two).
+        // A watch whose client is gone leaves the list at once.
         drop(first);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while list().len() != 1 {
-            assert!(Instant::now() < deadline, "the closed watch is still listed");
-            thread::sleep(Duration::from_millis(100));
-        }
-        assert_eq!(list()[0]["query"][0], "_shelly._tcp.local");
+        h.pump();
+        let watchers = list(&mut h);
+        assert_eq!(watchers.len(), 1, "{watchers:?}");
+        assert_eq!(watchers[0]["query"][0], "_shelly._tcp.local");
         let _ = fs::remove_file(&path);
     }
 

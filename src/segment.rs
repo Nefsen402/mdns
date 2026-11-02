@@ -10,7 +10,8 @@
 use std::fmt;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -707,9 +708,9 @@ impl State {
 /// it and the control socket can each hold one.
 #[derive(Clone)]
 pub struct Segment {
-    interface: Arc<str>,
-    families: Arc<[Family]>,
-    state: Arc<Mutex<State>>,
+    interface: Rc<str>,
+    families: Rc<[Family]>,
+    state: Rc<RefCell<State>>,
 }
 
 impl Segment {
@@ -719,7 +720,7 @@ impl Segment {
         Segment {
             interface: interface.into(),
             families: families.into(),
-            state: Arc::new(Mutex::new(State {
+            state: Rc::new(RefCell::new(State {
                 min_lifetime: DEFAULT_MIN_LIFETIME,
                 max_addrs: DEFAULT_MAX_ADDRS,
                 max_packet: DEFAULT_MAX_PACKET,
@@ -734,14 +735,14 @@ impl Segment {
     /// two of the daemon's checks. The default is [`DEFAULT_MIN_LIFETIME`].
     /// Applies to what is heard from now on.
     pub fn set_min_lifetime(&self, min_lifetime: Duration) {
-        self.state.lock().unwrap().min_lifetime = min_lifetime;
+        self.state.borrow_mut().min_lifetime = min_lifetime;
     }
 
     /// How many addresses of a family a discovered device is kept with, at
     /// most: more are not taken. The default is [`DEFAULT_MAX_ADDRS`].
     /// Applies to what is heard from now on.
     pub fn set_max_addrs(&self, max_addrs: usize) {
-        self.state.lock().unwrap().max_addrs = max_addrs.max(1);
+        self.state.borrow_mut().max_addrs = max_addrs.max(1);
     }
 
     /// Take the interface's MTU: no packet sent here is bigger than it leaves
@@ -751,7 +752,7 @@ impl Segment {
     pub fn set_mtu(&self, mtu: u32) -> usize {
         let room = usize::try_from(mtu.saturating_sub(IP_UDP_HEADERS)).unwrap_or(usize::MAX);
         let max_packet = room.clamp(MIN_MAX_PACKET, MAX_MAX_PACKET);
-        self.state.lock().unwrap().max_packet = max_packet;
+        self.state.borrow_mut().max_packet = max_packet;
         max_packet
     }
 
@@ -759,19 +760,19 @@ impl Segment {
     /// though it has not changed; by default it is not. What changes is
     /// announced twice, a second apart, either way.
     pub fn set_reannounce(&self, unchanged: bool) {
-        self.state.lock().unwrap().reannounce = unchanged;
+        self.state.borrow_mut().reannounce = unchanged;
     }
 
     /// Ask devices to answer again `before` ahead of expiring, from now on;
     /// `None` (the default) does not.
     pub fn set_refresh_before(&self, before: Option<Duration>) {
-        self.state.lock().unwrap().upkeep.before = before;
+        self.state.borrow_mut().upkeep.before = before;
     }
 
     /// When [`Segment::upkeep`] next has something to do, or `None` if never;
     /// a time in the past means it is due now.
     pub fn next_due(&self) -> Option<Instant> {
-        self.state.lock().unwrap().next_due(Instant::now())
+        self.state.borrow_mut().next_due(Instant::now())
     }
 
     /// Do what is due at `now`: drop what has run out, ask the devices about
@@ -780,7 +781,7 @@ impl Segment {
     pub fn upkeep(&self, now: Instant) {
         let started = Instant::now();
         let before = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.borrow_mut();
             state.upkeep.running = true;
             state.upkeep.last_run = Some(started);
             state.upkeep.before
@@ -798,7 +799,7 @@ impl Segment {
             eprintln!("{}: re-announce failed: {e:#}", self.interface);
         }
         self.run_probes(now);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         state.upkeep.running = false;
         state.upkeep.runs += 1;
         state.upkeep.last_took = Some(started.elapsed());
@@ -806,7 +807,7 @@ impl Segment {
 
     /// How its upkeep has run, and when it is next due.
     pub fn upkeep_info(&self) -> UpkeepInfo {
-        let state = self.state.lock().unwrap();
+        let state = self.state.borrow_mut();
         let u = &state.upkeep;
         UpkeepInfo { due: state.next_due(Instant::now()), running: u.running, runs: u.runs, last_run: u.last_run, last_took: u.last_took }
     }
@@ -824,7 +825,7 @@ impl Segment {
     /// at `dest`. Replaces an earlier one of the family. Without any (as in
     /// unit tests), manual changes are recorded but nothing goes on the wire.
     pub fn attach(&self, family: Family, socket: UdpSocket, dest: SocketAddr) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         state.outbound.retain(|o| o.family != family);
         state.outbound.push(Outbound { family, socket, dest });
     }
@@ -833,7 +834,7 @@ impl Segment {
 
     /// Devices currently active on this segment (excludes manual ones).
     pub fn devices(&self) -> Vec<Device> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.borrow_mut();
         state.discovered.values().map(|e| e.device.clone()).collect()
     }
 
@@ -842,19 +843,19 @@ impl Segment {
     /// The changes to its devices since last asked, oldest first, for the
     /// event loop to hand on.
     pub fn take_events(&self) -> Vec<Event> {
-        std::mem::take(&mut self.state.lock().unwrap().outbox)
+        std::mem::take(&mut self.state.borrow_mut().outbox)
     }
 
     /// Whether `other` is this very segment, not just one of the same name.
     pub fn is(&self, other: &Segment) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
+        Rc::ptr_eq(&self.state, &other.state)
     }
 
     /// Everything this segment's timer is waiting for, soonest first: devices
     /// to expire, to ask again, and to re-announce. The timer's own time is the
     /// first of these.
     pub fn pending(&self) -> Vec<Pending> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.borrow_mut();
         let mut all = Vec::new();
         state.for_each_deadline(Instant::now(), &mut |what, who, at| {
             all.push(Pending { what, who: who.to_string(), at });
@@ -867,7 +868,7 @@ impl Segment {
     /// it is not heard from again, to the second; zero if it is not (or no
     /// longer) known.
     pub fn lifetime_left(&self, device: &Device) -> Duration {
-        self.state.lock().unwrap().lifetime_left(device)
+        self.state.borrow_mut().lifetime_left(device)
     }
 
     // 3. Reflected devices, invisible to 1 and 2.
@@ -915,7 +916,7 @@ impl Segment {
 
         let claim = Claim { device, host_ttl };
         let now = Instant::now();
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let m = state.manual.entry(key.clone()).or_insert_with(|| Manual::new(now));
         if m.claims.get(&owner) == Some(&claim) {
@@ -946,7 +947,7 @@ impl Segment {
     /// device. If sending fails it is kept.
     pub fn remove_manual(&self, owner: Owner, hostname: &str) -> Result<bool> {
         let key = hostname.to_ascii_lowercase();
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let Some(previous) = state.manual.get_mut(&key).and_then(|m| m.claims.remove(&owner)) else {
             return Ok(false);
@@ -965,7 +966,7 @@ impl Segment {
     /// Let go of every way to send, as when the interface is gone: what is
     /// announced here is kept, to announce again once it is back.
     pub fn detach_all(&self) {
-        self.state.lock().unwrap().outbound.clear();
+        self.state.borrow_mut().outbound.clear();
     }
 
     /// Announce again everything announced here, as when the interface has
@@ -973,7 +974,7 @@ impl Segment {
     /// is retried by [`Segment::reannounce`].
     pub fn announce_all(&self) -> Result<()> {
         let now = Instant::now();
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let State { manual, outbound, max_packet, .. } = &mut *guard;
         let mut first_err = None;
         for m in manual.values_mut() {
@@ -999,7 +1000,7 @@ impl Segment {
     /// they cannot be reached through it, and their copies elsewhere are
     /// withdrawn. They are found again once it is back.
     pub fn forget_discovered(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         let keys: Vec<Key> = state.discovered.keys().cloned().collect();
         for key in keys {
             if let Some(entry) = state.forget(&key) {
@@ -1012,7 +1013,7 @@ impl Segment {
     /// The devices announced on this segment: for each hostname, what is
     /// shown of the one that won.
     pub fn manual_devices(&self) -> Vec<Device> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.borrow_mut();
         state.manual.values().filter_map(|m| m.shown.clone()).collect()
     }
 
@@ -1023,7 +1024,7 @@ impl Segment {
     /// is retried after [`ANNOUNCE_RETRY`]; the first error is returned after
     /// every device was tried. Run by [`Segment::schedule`] when due.
     pub fn reannounce(&self, now: Instant) -> Result<()> {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let local = state.local_instances();
         let due: Vec<String> = state
@@ -1080,7 +1081,7 @@ impl Segment {
         let family = family_of(from.ip());
         let now = Instant::now();
 
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let asked = state.asked(query);
         if !asked.is_empty() {
@@ -1118,7 +1119,7 @@ impl Segment {
     /// asked. A no-op when the segment has no sender attached.
     pub fn query_question(&self, questions: &[Question]) -> Result<usize> {
         let now = Instant::now();
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         if state.outbound.is_empty() {
             return Ok(0);
@@ -1163,7 +1164,7 @@ impl Segment {
         // Records in a query are other devices' known answers, not the
         // sender's own data.
         let msg = msg.filter(|m| m.header.response);
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let (floor, max_addrs) = (state.min_lifetime, state.max_addrs);
         let mut touched = Touched::default();
@@ -1335,7 +1336,7 @@ impl Segment {
     /// neighbour table, only addresses in one of them are learned, and those
     /// learned of one it is no longer on are dropped.
     pub fn set_prefixes(&self, prefixes: Vec<Prefix>) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         if state.prefixes == prefixes {
             return;
@@ -1350,7 +1351,7 @@ impl Segment {
     /// those with any address, have their learned addresses brought up to
     /// date, and are reflected so.
     pub fn neighbour(&self, ip: IpAddr, mac: Option<Vec<u8>>) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let changed = match mac {
             Some(mac) => state.neighbours.insert(ip, mac.clone()).as_ref() != Some(&mac),
@@ -1376,7 +1377,7 @@ impl Segment {
     /// How the probe numbered `id` went, if it is done, and has not been
     /// asked about before.
     pub fn probed(&self, id: u64) -> Option<Probed> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         let at = state.probed.iter().position(|&(done, _)| done == id)?;
         state.probed.remove(at).map(|(_, result)| result)
     }
@@ -1390,7 +1391,7 @@ impl Segment {
     /// Probe on its own every `every`, the first one that long from now, as
     /// well as when asked; `None` (the default) does not.
     pub fn set_probe_interval(&self, every: Option<Duration>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         state.probe_interval = every;
         state.next_routine = every.and_then(|every| Instant::now().checked_add(every));
         drop(state);
@@ -1411,7 +1412,7 @@ impl Segment {
     /// kept if it was `asked` for. A segment that cannot send has nothing to
     /// do, and is done at once.
     fn begin(&self, kinds: Option<Vec<String>>, why: &'static str, asked: bool) -> u64 {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         if let Some(p) = state.probing.iter_mut().find(|p| p.kinds == kinds) {
             p.asked |= asked;
             return p.id;
@@ -1433,7 +1434,7 @@ impl Segment {
     /// probe if one is due.
     fn run_probes(&self, now: Instant) {
         let routine = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.borrow_mut();
             let due = state.next_routine.is_some_and(|at| at <= now);
             if due {
                 state.next_routine = state.probe_interval.and_then(|every| now.checked_add(every));
@@ -1444,7 +1445,7 @@ impl Segment {
             self.begin(None, "periodic", false);
         }
         let due: Vec<(Option<Vec<String>>, usize)> = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.borrow_mut();
             state.probing.iter().filter(|p| p.next <= now).map(|p| (p.kinds.clone(), p.round)).collect()
         };
         for (kinds, round) in due {
@@ -1453,7 +1454,7 @@ impl Segment {
                 (true, None) => Some(self.probe_round()),
                 (true, Some(kinds)) => Some(self.query_types_round(kinds)),
             };
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.borrow_mut();
             let Some(at) = state.probing.iter().position(|p| p.kinds == kinds) else { continue };
             let p = &mut state.probing[at];
             let result = match ran {
@@ -1482,7 +1483,7 @@ impl Segment {
             (Err(e), why) => eprintln!("{}: {why} probe failed: {e}", self.interface),
         }
         if probing.asked {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.borrow_mut();
             if state.probed.len() >= MAX_PROBED {
                 state.probed.pop_front();
             }
@@ -1493,7 +1494,7 @@ impl Segment {
     /// One round of queries, built from what is known right now. A no-op
     /// when the segment has no sender attached.
     fn probe_round(&self) -> Result<usize> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.borrow_mut();
         if state.outbound.is_empty() {
             return Ok(0);
         }
@@ -1503,7 +1504,7 @@ impl Segment {
     }
 
     fn query_types_round(&self, kinds: &[String]) -> Result<usize> {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         if state.outbound.is_empty() {
             return Ok(0);
@@ -1535,7 +1536,7 @@ impl Segment {
     /// [`Segment::schedule`] when due, after [`Segment::expire`]; returns how
     /// many questions were sent.
     pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let State { discovered, outbound, max_packet, .. } = &mut *guard;
         if outbound.is_empty() {
             return Ok(0);
@@ -1561,7 +1562,7 @@ impl Segment {
 
     /// Drop devices whose lifetime has run out as of `now`.
     pub fn expire(&self, now: Instant) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let stale: Vec<Key> = state
             .discovered
@@ -2072,7 +2073,7 @@ mod tests {
         assert!(recv(&rx).is_none());
 
         // A second on, it is.
-        for at in seg.state.lock().unwrap().forwarded.values_mut() {
+        for at in seg.state.borrow_mut().forwarded.values_mut() {
             *at -= FORWARD_GAP;
         }
         assert_eq!(seg.query_question(&questions[..1]).unwrap(), 1);
@@ -2081,7 +2082,7 @@ mod tests {
         // However many made-up names are asked, only so many are waited out.
         let flood: Vec<Question> = (0..MAX_FORWARDED + 10).map(|i| question(&format!("x{i}.local"), rtype::A)).collect();
         assert_eq!(seg.query_question(&flood).unwrap(), MAX_FORWARDED - 1);
-        assert!(seg.state.lock().unwrap().forwarded.len() <= MAX_FORWARDED);
+        assert!(seg.state.borrow_mut().forwarded.len() <= MAX_FORWARDED);
         while recv(&rx).is_some() {}
 
         // Without a sender, nothing.
@@ -2102,7 +2103,7 @@ mod tests {
         hear(&seg, "10.0.1.10", vec![ptr("_http._tcp.local", "Bare._http._tcp.local")]);
         let now = Instant::now();
         {
-            let mut state = seg.state.lock().unwrap();
+            let mut state = seg.state.borrow_mut();
             let tv = state.discovered.get_mut(&host_key("tv.local")).unwrap();
             tv.addr_expires.insert(ip("10.0.1.7"), now + Duration::from_secs(50));
             tv.expires = now + Duration::from_secs(70);
@@ -2138,7 +2139,7 @@ mod tests {
             assert_eq!(m.answers[0].data, RData::Ptr("Plug._shelly._tcp.local".into()));
         }
         assert!(recv(&rx).is_none());
-        let types = seg.state.lock().unwrap().types.clone();
+        let types = seg.state.borrow_mut().types.clone();
         assert!(types.contains("_hue._tcp.local") && types.contains("_shelly._tcp.local") && !types.contains("bogus"));
 
         seg.probe_round().unwrap();
@@ -2161,7 +2162,7 @@ mod tests {
     }
 
     fn retry_of(seg: &Segment, host: &str) -> Option<Instant> {
-        seg.state.lock().unwrap().manual[host].retry
+        seg.state.borrow_mut().manual[host].retry
     }
 
     /// A device that cannot be announced is not recorded, so that it is
@@ -2175,7 +2176,7 @@ mod tests {
         let err = seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap_err();
         assert!(format!("{err:#}").contains("sending to [::1]:5353"), "{err:#}");
         assert!(seg.manual_devices().is_empty());
-        assert!(seg.state.lock().unwrap().manual.is_empty(), "nothing left behind");
+        assert!(seg.state.borrow_mut().manual.is_empty(), "nothing left behind");
 
         repair(&seg, &rx);
         assert!(seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap());
@@ -2287,14 +2288,14 @@ mod tests {
     #[test]
     fn the_mtu_sets_what_a_packet_may_hold() {
         let seg = Segment::new("test", &[Family::V4, Family::V6]);
-        assert_eq!(seg.state.lock().unwrap().max_packet, DEFAULT_MAX_PACKET, "a standard frame until told");
+        assert_eq!(seg.state.borrow_mut().max_packet, DEFAULT_MAX_PACKET, "a standard frame until told");
         assert_eq!(seg.set_mtu(1500), 1452);
         assert_eq!(seg.set_mtu(1492), 1444, "PPPoE");
         assert_eq!(seg.set_mtu(9000), 8952, "jumbo frames");
         assert_eq!(seg.set_mtu(65536), 9000, "loopback: mDNS's own limit");
         assert_eq!(seg.set_mtu(300), 512);
         assert_eq!(seg.set_mtu(0), 512);
-        assert_eq!(seg.state.lock().unwrap().max_packet, 512);
+        assert_eq!(seg.state.borrow_mut().max_packet, 512);
     }
 
     /// An announcement bigger than the interface allows goes out in packets
@@ -2364,7 +2365,7 @@ mod tests {
         seg.handle(sa("10.0.1.200"), &query("_http._tcp.local", rtype::PTR, vec![])).unwrap();
         within("a reply", packets());
         // Types with long names, so that size, not the count, splits a probe.
-        seg.state.lock().unwrap().types.extend((0..20).map(|i| format!("_{}{i}._tcp.local", "t".repeat(40))));
+        seg.state.borrow_mut().types.extend((0..20).map(|i| format!("_{}{i}._tcp.local", "t".repeat(40))));
         seg.probe_round().unwrap();
         within("a probe", packets());
         // Every device due: a margin longer than any lifetime.
@@ -2391,7 +2392,7 @@ mod tests {
         // A mere query from it makes no device of it.
         seg.handle(sa("0.0.0.0"), &query("tv.local", rtype::A, vec![])).unwrap();
         assert_eq!(seg.devices().len(), 1);
-        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("0.0.0.0")));
+        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("0.0.0.0")));
     }
 
     const MAC: [u8; 6] = [0x04, 0x09, 0x86, 0x43, 0xe3, 0xf6];
@@ -2425,12 +2426,12 @@ mod tests {
         assert_eq!(learned(&seg), [ip("2001:db8:2::73"), ip("fd00:0:2::73")]);
         assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.has_addr(&ip("2001:db8:2::73"))));
         // A packet from a learned address is the device's.
-        assert_eq!(seg.state.lock().unwrap().by_addr.get(&ip("2001:db8:2::73")), Some(&host_key("speakers.local")));
+        assert_eq!(seg.state.borrow_mut().by_addr.get(&ip("2001:db8:2::73")), Some(&host_key("speakers.local")));
 
         // An entry that goes takes its address with it.
         seg.neighbour(ip("2001:db8:2::73"), None);
         assert_eq!(learned(&seg), [ip("fd00:0:2::73")]);
-        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("2001:db8:2::73")));
+        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("2001:db8:2::73")));
         assert!(matches!(events.try_recv(), Ok(Event::Updated(_))));
         // The same entry again changes nothing, and says nothing.
         seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
@@ -2468,12 +2469,12 @@ mod tests {
         seg.neighbour(ip("2001:db8:1::73"), Some(MAC.to_vec())); // the old prefix
         hear(&seg, "10.0.2.73", vec![a_record("tv.local", "10.0.2.73"), aaaa("tv.local", "fe80::73")]);
         assert_eq!(learned(&seg), [ip("2001:db8:2::73")]);
-        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("2001:db8:1::73")));
+        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("2001:db8:1::73")));
 
         // The interface moves to the other prefix: so do its devices.
         seg.set_prefixes(vec![prefix("10.0.2.0/24"), prefix("2001:db8:1::/64")]);
         assert_eq!(learned(&seg), [ip("2001:db8:1::73")]);
-        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("2001:db8:2::73")));
+        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("2001:db8:2::73")));
         // With no network known, nothing is.
         seg.set_prefixes(vec![]);
         assert_eq!(learned(&seg), Vec::<IpAddr>::new());
@@ -2487,7 +2488,7 @@ mod tests {
         let rx = UdpSocket::bind("[::1]:0").unwrap();
         let seg = Segment::new("test", &[Family::V6]);
         seg.attach(Family::V6, UdpSocket::bind("[::1]:0").unwrap(), rx.local_addr().unwrap());
-        let nudged = |seg: &Segment| seg.state.lock().unwrap().discovered[&host_key("speakers.local")].nudged;
+        let nudged = |seg: &Segment| seg.state.borrow_mut().discovered[&host_key("speakers.local")].nudged;
         hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9")]);
         let first = nudged(&seg).expect("nudged");
         hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9")]);
@@ -2543,7 +2544,7 @@ mod tests {
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still there");
         assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("fd00::7")]);
         assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.addrs().eq([ip("fd00::7")])));
-        assert!(!seg.state.lock().unwrap().by_addr.contains_key(&ip("10.0.1.7")), "nor found by it");
+        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("10.0.1.7")), "nor found by it");
     }
 
     /// A device whose services live long is still asked again before its
@@ -2785,7 +2786,7 @@ mod tests {
 
     /// Pretend the last multicast of every reflected device was `secs` ago.
     fn age(seg: &Segment, secs: u64) {
-        let mut state = seg.state.lock().unwrap();
+        let mut state = seg.state.borrow_mut();
         for m in state.manual.values_mut() {
             m.announced -= Duration::from_secs(secs);
             m.last_sent.v4 -= Duration::from_secs(secs);
@@ -2915,7 +2916,7 @@ mod tests {
         assert!(again.answers.iter().all(|r| r.ttl > 0));
 
         // Unchanged, it is not announced again, however long it waits.
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(false), None);
+        assert_eq!(seg.state.borrow_mut().manual["tv.local"].reannounce_at(false), None);
         seg.reannounce(Instant::now() + Duration::from_secs(100_000)).unwrap();
         assert!(recv(&rx).is_none());
         assert!(seg.pending().iter().all(|p| p.what != "re-announce"));
@@ -2936,7 +2937,7 @@ mod tests {
         let first = recv(&rx).unwrap();
         repeat(&seg, &rx);
 
-        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        let announced = seg.state.borrow_mut().manual["tv.local"].announced;
         let due = seg.pending().into_iter().find(|p| p.what == "re-announce").expect("waited for");
         assert_eq!(due.at, announced + reannounce_after(HOST_TTL));
         seg.reannounce(announced + reannounce_after(HOST_TTL) - Duration::from_secs(1)).unwrap();
@@ -2953,7 +2954,7 @@ mod tests {
     /// Send the second announcement of what `seg` last announced anew, a
     /// second after, as heard on `rx`.
     fn repeat(seg: &Segment, rx: &UdpSocket) -> Message {
-        let at = seg.state.lock().unwrap().manual["tv.local"].announced + ANNOUNCE_REPEAT;
+        let at = seg.state.borrow_mut().manual["tv.local"].announced + ANNOUNCE_REPEAT;
         seg.reannounce(at).unwrap();
         recv(rx).expect("announced a second time")
     }
@@ -3053,10 +3054,10 @@ mod tests {
         let (seg, _rx) = wired();
         seg.start_probe("startup");
         let joined = seg.probe();
-        assert_eq!(seg.state.lock().unwrap().probing.len(), 1);
+        assert_eq!(seg.state.borrow_mut().probing.len(), 1);
         assert_eq!(seg.probed(joined), None, "not done yet");
         let (result, _) = run_probe(&seg, None);
-        assert!(seg.state.lock().unwrap().probing.is_empty());
+        assert!(seg.state.borrow_mut().probing.is_empty());
         assert_eq!(seg.probed(joined), None, "the same one: taken already");
         assert_eq!(result, Ok(3));
     }
@@ -3069,10 +3070,10 @@ mod tests {
         assert!(at > Instant::now() + Duration::from_secs(239), "not at once: startup does that");
         seg.upkeep(at);
         assert_eq!(drain_queries(&rx), 1, "its first round");
-        let next = seg.state.lock().unwrap().next_routine.unwrap();
+        let next = seg.state.borrow_mut().next_routine.unwrap();
         assert_eq!(next, at + Duration::from_secs(240));
         seg.set_probe_interval(None);
-        assert_eq!(seg.state.lock().unwrap().next_routine, None);
+        assert_eq!(seg.state.borrow_mut().next_routine, None);
     }
 
     fn drain_queries(rx: &UdpSocket) -> usize {
@@ -3124,7 +3125,7 @@ mod tests {
             .map(|i| record(META_QUERY.into(), false, 4500, RData::Ptr(format!("_t{i}._tcp.local"))))
             .collect();
         hear(&seg, "10.0.2.73", ptrs);
-        assert_eq!(seg.state.lock().unwrap().types.len(), MAX_TYPES);
+        assert_eq!(seg.state.borrow_mut().types.len(), MAX_TYPES);
     }
 
     /// `router.local` is advertised as a reflected device that has a hostname
@@ -3480,7 +3481,7 @@ mod tests {
     /// Pretend `host` and its addresses run out at `at`, as hearing from it
     /// would make them.
     fn set_expiry(seg: &Segment, host: &str, at: Instant) {
-        let mut state = seg.state.lock().unwrap();
+        let mut state = seg.state.borrow_mut();
         let entry = state.discovered.get_mut(&host_key(host)).expect("no such device");
         entry.expires = at;
         for expiry in entry.addr_expires.values_mut() {
@@ -3716,11 +3717,11 @@ mod tests {
     // The timer-driven upkeep.
 
     fn expiry_of(seg: &Segment, host: &str) -> Instant {
-        seg.state.lock().unwrap().discovered[&host_key(host)].expires
+        seg.state.borrow_mut().discovered[&host_key(host)].expires
     }
 
     fn next_due(seg: &Segment) -> Option<Instant> {
-        seg.state.lock().unwrap().next_due(Instant::now())
+        seg.state.borrow_mut().next_due(Instant::now())
     }
 
     #[test]
@@ -3742,9 +3743,9 @@ mod tests {
 
         // A reflected device is due for re-announcement, and a failed one not before its retry.
         seg.add_manual(Owner::Own, tv("10.0.9.9", &["TV"])).unwrap();
-        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        let announced = seg.state.borrow_mut().manual["tv.local"].announced;
         assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + ANNOUNCE_REPEAT)));
-        seg.state.lock().unwrap().manual.get_mut("tv.local").unwrap().retry = Some(announced + Duration::from_secs(500));
+        seg.state.borrow_mut().manual.get_mut("tv.local").unwrap().retry = Some(announced + Duration::from_secs(500));
         assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)));
     }
 
@@ -3789,8 +3790,8 @@ mod tests {
         let first = recv(&rx).unwrap();
         assert!(first.answers.iter().all(|r| r.ttl == 1000));
         assert!(repeat(&seg, &rx).answers.iter().all(|r| r.ttl == 1000));
-        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(800)));
+        let announced = seg.state.borrow_mut().manual["tv.local"].announced;
+        assert_eq!(seg.state.borrow_mut().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(800)));
 
         // Queries are answered with it too.
         age(&seg, 2);
@@ -3798,7 +3799,7 @@ mod tests {
         assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 1000));
 
         // Not yet at 799 s; again at 800, with the same TTL.
-        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
+        let announced = seg.state.borrow_mut().manual["tv.local"].announced;
         seg.reannounce(announced + Duration::from_secs(799)).unwrap();
         assert!(recv(&rx).is_none());
         seg.reannounce(announced + Duration::from_secs(800)).unwrap();
@@ -3841,8 +3842,8 @@ mod tests {
 
         // It is announced again before the shortest of them runs out: 80% of 300.
         repeat(&seg, &rx);
-        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(240)));
+        let announced = seg.state.borrow_mut().manual["tv.local"].announced;
+        assert_eq!(seg.state.borrow_mut().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(240)));
     }
 
     #[test]
@@ -3851,8 +3852,8 @@ mod tests {
         seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 50)).unwrap();
         assert!(announced_ttls(&rx).contains(&(false, 50)));
         repeat(&seg, &rx);
-        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(40)));
+        let announced = seg.state.borrow_mut().manual["tv.local"].announced;
+        assert_eq!(seg.state.borrow_mut().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(40)));
     }
 
     #[test]
@@ -3877,8 +3878,8 @@ mod tests {
         assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
         // The services run out first, and it is announced again before that.
         repeat(&seg, &rx);
-        let announced = seg.state.lock().unwrap().manual["tv.local"].announced;
-        assert_eq!(seg.state.lock().unwrap().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(480)));
+        let announced = seg.state.borrow_mut().manual["tv.local"].announced;
+        assert_eq!(seg.state.borrow_mut().manual["tv.local"].reannounce_at(true), Some(announced + Duration::from_secs(480)));
     }
 
     #[test]
@@ -3990,7 +3991,7 @@ mod tests {
         let seg = Segment::new("test", &[Family::V4]);
         let meta = |kind: &str| ptr("_services._dns-sd._udp.local", kind);
         hear(&seg, "10.0.1.7", vec![meta("_http._tcp.local"), meta("_HTTP._tcp.LOCAL")]);
-        assert_eq!(seg.state.lock().unwrap().types.len(), 1);
+        assert_eq!(seg.state.borrow_mut().types.len(), 1);
     }
 
     /// Subtypes are not sent in answers to a browse of their type, so a probe

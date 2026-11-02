@@ -11,7 +11,8 @@
 //! single segment only tracks and reflects nothing.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::cell::{RefCell, RefMut};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -69,7 +70,7 @@ pub struct Notice {
 }
 
 pub struct Reflector {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
 }
 
 struct Inner {
@@ -86,9 +87,9 @@ struct Inner {
     /// The TTL the address records of what it reflects are announced with;
     /// `None` keeps each device's own.
     reflect_ttl: Option<Duration>,
-    book: Mutex<Book>,
+    book: RefCell<Book>,
     /// What has happened, for watches, until taken.
-    notices: Mutex<Vec<Notice>>,
+    notices: RefCell<Vec<Notice>>,
 }
 
 #[derive(Default)]
@@ -152,15 +153,15 @@ impl Reflector {
         }
         let untrusted = segments.iter().map(|s| untrusted.iter().any(|name| name == s.interface())).collect();
 
-        let inner = Arc::new(Inner {
+        let inner = Rc::new(Inner {
             owner: Owner::Reflector(rank),
             segments,
             untrusted,
             forward,
             neighbours,
             reflect_ttl,
-            book: Mutex::default(),
-            notices: Mutex::default(),
+            book: RefCell::default(),
+            notices: RefCell::default(),
         });
 
         // What is known already; what changes from now on is handed in by
@@ -177,7 +178,7 @@ impl Reflector {
         }
 
         #[cfg(test)]
-        MADE.with(|made| made.borrow_mut().push(Arc::downgrade(&inner)));
+        MADE.with(|made| made.borrow_mut().push(Rc::downgrade(&inner)));
         Ok(Reflector { inner })
     }
 }
@@ -198,7 +199,7 @@ impl Reflector {
     /// segments this reflector spans since last asked, oldest first. Only so
     /// many are kept for one who never asks.
     pub fn take_notices(&self) -> Vec<Notice> {
-        std::mem::take(&mut *self.inner.notices.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(&mut *self.inner.notices.borrow_mut())
     }
 }
 
@@ -250,21 +251,21 @@ fn deliver_to(inners: &[&Inner]) {
 // loop would.
 #[cfg(test)]
 thread_local! {
-    static MADE: std::cell::RefCell<Vec<std::sync::Weak<Inner>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static MADE: RefCell<Vec<std::rc::Weak<Inner>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Deliver what has changed to the reflectors made on this thread that are
 /// still there, as the event loop does after anything happens.
 #[cfg(test)]
 pub fn deliver_made() {
-    let inners: Vec<Arc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(std::sync::Weak::upgrade).collect());
+    let inners: Vec<Rc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(std::rc::Weak::upgrade).collect());
     deliver_to(&inners.iter().map(|i| &**i).collect::<Vec<_>>());
 }
 
 /// Have the reflectors made on this thread retry as if it were `now`.
 #[cfg(test)]
 pub fn retry_made(now: Instant) {
-    let inners: Vec<Arc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(std::sync::Weak::upgrade).collect());
+    let inners: Vec<Rc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(std::rc::Weak::upgrade).collect());
     for inner in inners {
         let mut book = inner.book();
         if book.retry.is_some_and(|at| at <= now) {
@@ -283,9 +284,8 @@ impl Drop for Reflector {
 }
 
 impl Inner {
-    fn book(&self) -> MutexGuard<'_, Book> {
-        // The book is rebuilt by reconciling, so a poisoned lock is usable.
-        self.book.lock().unwrap_or_else(|e| e.into_inner())
+    fn book(&self) -> RefMut<'_, Book> {
+        self.book.borrow_mut()
     }
 
     fn handle(&self, segment: &Segment, event: Event) {
@@ -301,7 +301,7 @@ impl Inner {
             Event::Removed(_) | Event::Question(_) => Duration::ZERO,
             Event::Added(device) | Event::Updated(device) => seg.lifetime_left(device),
         };
-        let mut notices = self.notices.lock().unwrap_or_else(|e| e.into_inner());
+        let mut notices = self.notices.borrow_mut();
         if notices.len() >= MAX_NOTICES {
             notices.remove(0);
         }
