@@ -11,6 +11,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use hashbrown::{HashMap, HashSet};
 use core::net::IpAddr;
 
+use crate::config::DEFAULT_MAX_ADDRS;
 use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
 use crate::socket::Family;
 
@@ -63,11 +64,6 @@ const KNOWN_SUBTYPES: [&str; 4] = [
 const MAX_SERVICES: usize = 64;
 const MAX_SUBTYPES: usize = 16;
 const MAX_REVERSE: usize = 8;
-
-/// The default for how many addresses of a family a device is kept with:
-/// enough for a global and a ULA address, a few temporary ones, and a
-/// link-local one. See `[Devices] MaxAddresses=`.
-pub const DEFAULT_MAX_ADDRS: usize = 8;
 
 /// A reflected device is never announced for less than this, however short a
 /// TTL it announced itself with: it is announced again at 80% of its TTL, and

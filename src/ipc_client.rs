@@ -42,8 +42,10 @@ mod errno;
 mod poll;
 #[path = "signal.rs"]
 mod signal;
-#[path = "timespan.rs"]
-mod timespan;
+// The daemon's: for its socket's path, and systemd time spans.
+#[allow(dead_code)]
+#[path = "config.rs"]
+mod config;
 
 /// Stdout, for what streams to it: a write fails once no one reads it.
 struct Stdout;
@@ -53,9 +55,6 @@ impl fmt::Write for Stdout {
         runtime::write_all(1, s.as_bytes()).map_err(|_| fmt::Error)
     }
 }
-
-/// Keep in sync with `config::DEFAULT_SOCKET` in the daemon.
-const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -292,7 +291,7 @@ fn service_type(value: &str) -> Result<String, String> {
 
 /// A `--wait`: a time span longer than nothing.
 fn wait_span(value: &str) -> Result<Duration, String> {
-    let span = timespan::parse(value).map_err(|e| e.to_string())?;
+    let span = config::parse_timespan(value).map_err(|e| e.to_string())?;
     if span.is_zero() {
         return Err("it must be longer than nothing".into());
     }
@@ -303,7 +302,7 @@ fn wait_span(value: &str) -> Result<Duration, String> {
 /// seconds as the daemon takes it, part of a second more being a second
 /// more, so it is never asked more often than said.
 fn interval_span(value: &str) -> Result<Duration, String> {
-    let span = timespan::parse(value).map_err(|e| e.to_string())?;
+    let span = config::parse_timespan(value).map_err(|e| e.to_string())?;
     if span < MIN_INTERVAL {
         return Err(format!("it must be at least {}s", MIN_INTERVAL.as_secs()));
     }
@@ -321,7 +320,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
     let mut args: Vec<String> = args.into_iter().collect();
     let after_dashes = args.iter().position(|a| a == "--").map(|at| args.split_off(at).split_off(1));
     let mut parser = args::Parser::new(args);
-    let (mut socket, mut verbose, mut json, mut segmented, mut asked_help) = (DEFAULT_SOCKET.to_string(), false, false, false, false);
+    let (mut socket, mut verbose, mut json, mut segmented, mut asked_help) = (config::DEFAULT_SOCKET.to_string(), false, false, false, false);
     let mut command: Option<&CommandInfo> = None;
     let (mut words, mut query, mut interval, mut wait, mut foreground, mut log) = (Vec::new(), Vec::new(), None, None, false, None);
     let takes = |command: Option<&CommandInfo>, option: &str| command.is_some_and(|c| c.options.iter().any(|(o, _)| o.starts_with(option)));
@@ -1711,7 +1710,7 @@ mod tests {
         let o = opts(&["segments"]);
         assert_eq!(
             o,
-            Options { socket: DEFAULT_SOCKET.into(), json: false, segmented: false, verbose: false, command: Command::Segments }
+            Options { socket: config::DEFAULT_SOCKET.into(), json: false, segmented: false, verbose: false, command: Command::Segments }
         );
 
         let o = opts(&["-s", "/x.sock", "--json", "devices", "IoT", "to", "br0"]);
@@ -1801,7 +1800,7 @@ mod tests {
         for option in ["\\-\\-json", "\\-\\-segmented\\-json", "\\-\\-socket", "\\-\\-help", "\\-\\-verbose"] {
             assert!(man.contains(option), "{option}");
         }
-        assert!(man.contains(DEFAULT_SOCKET));
+        assert!(man.contains(config::DEFAULT_SOCKET));
     }
 
     #[test]

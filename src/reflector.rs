@@ -21,6 +21,7 @@ use crate::time::Instant;
 
 use anyhow::{bail, Result};
 
+use crate::config::{Forward, Neighbours};
 use crate::device::{Device, Service};
 use crate::segment::{Asked, Event, Owner, Segment};
 
@@ -31,37 +32,6 @@ const MAX_NOTICES: usize = 4096;
 
 /// How long after a send failed it is tried again.
 const RETRY: Duration = Duration::from_secs(5);
-
-/// Which of the questions asked on one of a reflector's segments it puts to
-/// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
-/// device on the asking segment owns: it answers for itself.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Forward {
-    /// Every one. A browse for a type that one device was heard to have can
-    /// have other answers still, from devices that only answer when asked.
-    #[default]
-    Always,
-    /// Those that nothing announced on the asking segment has an answer to.
-    Unknown,
-    /// None: only what devices announce, or answer a probe with, is reflected.
-    Never,
-}
-
-/// Which of the addresses a device was given from the neighbour table a
-/// reflector reflects with it (`NeighbourAddresses=`). They are learned, and
-/// listed, whichever.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Neighbours {
-    /// All of them, of any family: a device that announced only an IPv4
-    /// address is reflected with its IPv6 ones too.
-    Always,
-    /// Those of a family the device announced a link-local address of: it
-    /// speaks that family, if only on its own link.
-    #[default]
-    LinkLocal,
-    /// None: only what devices announce.
-    Never,
-}
 
 /// A change to a device discovered on one of a reflector's segments, as
 /// [`Reflector::watch`] delivers it.
@@ -534,7 +504,7 @@ mod tests {
         assert_eq!(first.interface, "a");
         assert!(matches!(first.event, Event::Added(_)));
         // Kept for at least the floor, whatever its records said.
-        assert_eq!(first.ttl, crate::segment::DEFAULT_MIN_LIFETIME);
+        assert_eq!(first.ttl, crate::config::DEFAULT_MIN_LIFETIME);
 
         b.observe("10.0.2.2".parse().unwrap());
         assert_eq!(next().interface, "b");

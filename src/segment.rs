@@ -22,9 +22,10 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MIN_LIFETIME};
 use crate::errno::Why;
 use crate::device::{
-    addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report, DEFAULT_MAX_ADDRS,
+    addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report,
     DEFAULT_MAX_PACKET, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
 };
 use crate::socket::{Family, Prefix, MDNS_PORT};
@@ -82,10 +83,6 @@ const NUDGE_GAP: Duration = Duration::from_secs(60);
 /// Questions remembered per segment as just put to it, so that a client
 /// asking endless made-up names cannot grow the list without bound.
 const MAX_FORWARDED: usize = 1024;
-
-/// The default for how long a device is kept at least after it was last heard
-/// from, whatever TTLs it announced. See [`Segment::set_min_lifetime`].
-pub const DEFAULT_MIN_LIFETIME: Duration = Duration::from_secs(300);
 
 /// The headers around an mDNS packet: those of IPv6, the larger of the two
 /// families, and of UDP. What an interface's MTU leaves for the packet is its

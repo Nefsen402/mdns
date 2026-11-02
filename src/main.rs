@@ -24,7 +24,6 @@ mod segment;
 mod signal;
 mod socket;
 mod time;
-mod timespan;
 
 use core::ffi::c_int;
 
@@ -33,10 +32,10 @@ use time::Instant;
 
 use anyhow::{Context, Result};
 
-use config::Config;
+use config::{Config, Forward, Neighbours};
 use links::Link;
 use netlink::Netlink;
-use reflector::{Forward, Neighbours, Reflector};
+use reflector::Reflector;
 use segment::{Owner, Segment};
 use socket::Family;
 

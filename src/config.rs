@@ -45,9 +45,10 @@ use core::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::errno::Why;
-use crate::reflector::{Forward, Neighbours};
 
-use crate::prelude::*;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
@@ -75,6 +76,46 @@ const MAX_HOST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// A longer floor than this is a typo: it would keep devices that are long
 /// gone, and a silly one (`99999999999999s`) would overflow the clock.
 const MAX_MIN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The default for how long a device is kept at least after it was last heard
+/// from, whatever TTLs it announced. See [`Segment::set_min_lifetime`].
+pub const DEFAULT_MIN_LIFETIME: Duration = Duration::from_secs(300);
+
+/// The default for how many addresses of a family a device is kept with:
+/// enough for a global and a ULA address, a few temporary ones, and a
+/// link-local one. See `[Devices] MaxAddresses=`.
+pub const DEFAULT_MAX_ADDRS: usize = 8;
+
+/// Which of the questions asked on one of a reflector's segments it puts to
+/// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
+/// device on the asking segment owns: it answers for itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Forward {
+    /// Every one. A browse for a type that one device was heard to have can
+    /// have other answers still, from devices that only answer when asked.
+    #[default]
+    Always,
+    /// Those that nothing announced on the asking segment has an answer to.
+    Unknown,
+    /// None: only what devices announce, or answer a probe with, is reflected.
+    Never,
+}
+
+/// Which of the addresses a device was given from the neighbour table a
+/// reflector reflects with it (`NeighbourAddresses=`). They are learned, and
+/// listed, whichever.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Neighbours {
+    /// All of them, of any family: a device that announced only an IPv4
+    /// address is reflected with its IPv6 ones too.
+    Always,
+    /// Those of a family the device announced a link-local address of: it
+    /// speaks that family, if only on its own link.
+    #[default]
+    LinkLocal,
+    /// None: only what devices announce.
+    Never,
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
@@ -137,8 +178,8 @@ impl Default for Config {
             advertise_ttl: DEFAULT_ADVERTISE_TTL,
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
-            min_lifetime: crate::segment::DEFAULT_MIN_LIFETIME,
-            max_addrs: crate::device::DEFAULT_MAX_ADDRS,
+            min_lifetime: DEFAULT_MIN_LIFETIME,
+            max_addrs: DEFAULT_MAX_ADDRS,
         }
     }
 }
@@ -362,7 +403,7 @@ fn local_name(value: &str, lineno: usize) -> Result<String> {
 /// A systemd time span such as `4min`, `1.5h` or `1h 30min`; one that adds
 /// up to zero (`0`, `0s`) is `Duration::ZERO`.
 fn timespan(value: &str, lineno: usize, key: &str) -> Result<Duration> {
-    crate::timespan::parse(value).map_err(|e| anyhow!("line {lineno}: invalid {key} {value:?}: {e}"))
+    parse_timespan(value).map_err(|e| anyhow!("line {lineno}: invalid {key} {value:?}: {e}"))
 }
 
 /// How many addresses of a family a device is kept with: a number, at least
@@ -453,6 +494,101 @@ fn read_to_string(path: &str) -> Result<String> {
 /// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
 fn parse_bool(entry: &Entry, lineno: usize) -> Result<bool> {
     entry.as_bool().ok_or_else(|| anyhow!("line {lineno}: invalid boolean {:?}", entry.unquoted()))
+}
+
+// systemd time spans, as `systemd.time(7)` has them: `30`, `1.5h`,
+// `2min 30s`, `.5s`. Numbers, each with an optional fraction and an optional
+// unit (seconds if none), added up; whitespace between them, and between a
+// number and its unit, is optional. Units are case-sensitive: `m` is
+// minutes, `M` months.
+
+const NS_PER_SEC: u128 = 1_000_000_000;
+
+/// Each unit's names, and how many nanoseconds it is. A month and a year are
+/// systemd's: 30.44 and 365.25 days.
+const UNITS: &[(&[&str], u128)] = &[
+    (&["nsec", "ns"], 1),
+    (&["usec", "us", "µs", "μs"], 1_000),
+    (&["msec", "ms"], 1_000_000),
+    (&["seconds", "second", "sec", "s"], NS_PER_SEC),
+    (&["minutes", "minute", "min", "m"], 60 * NS_PER_SEC),
+    (&["hours", "hour", "hr", "h"], 3_600 * NS_PER_SEC),
+    (&["days", "day", "d"], 86_400 * NS_PER_SEC),
+    (&["weeks", "week", "w"], 604_800 * NS_PER_SEC),
+    (&["months", "month", "M"], 2_629_800 * NS_PER_SEC),
+    (&["years", "year", "y"], 31_557_600 * NS_PER_SEC),
+];
+
+/// What is wrong with a time span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimespanError {
+    /// Nothing but whitespace.
+    Empty,
+    /// No number where one was due: what was there instead.
+    Number(String),
+    /// A unit that is not one.
+    Unit(String),
+    /// More than a `Duration` holds.
+    TooLong,
+}
+
+impl fmt::Display for TimespanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TimespanError::Empty => write!(f, "empty time span"),
+            TimespanError::Number(at) => write!(f, "expected a number at {at:?}"),
+            TimespanError::Unit(unit) => write!(f, "unknown unit {unit:?}"),
+            TimespanError::TooLong => write!(f, "time span too long"),
+        }
+    }
+}
+
+/// The time span `s` adds up to. One that adds up to nothing (`0`, `0s`) is
+/// `Duration::ZERO`; a fraction finer than a nanosecond is dropped.
+pub fn parse_timespan(s: &str) -> Result<Duration, TimespanError> {
+    let mut rest = s.trim();
+    if rest.is_empty() {
+        return Err(TimespanError::Empty);
+    }
+    let mut total: u128 = 0;
+    while !rest.is_empty() {
+        let (whole, after) = digits(rest);
+        let (fraction, after) = match after.strip_prefix('.') {
+            Some(after) => digits(after),
+            None => ("", after),
+        };
+        if whole.is_empty() && fraction.is_empty() {
+            return Err(TimespanError::Number(rest.to_string()));
+        }
+        // A number straight after a fraction ("1.2.3s") is a typo.
+        if after.starts_with('.') {
+            return Err(TimespanError::Number(after.to_string()));
+        }
+        let after = after.trim_start();
+        let end = after.find(|c: char| c.is_ascii_digit() || c == '.' || c.is_whitespace()).unwrap_or(after.len());
+        let (unit, after) = after.split_at(end);
+        let per = match unit {
+            "" => NS_PER_SEC,
+            _ => UNITS.iter().find(|(names, _)| names.contains(&unit)).map(|&(_, ns)| ns).ok_or_else(|| TimespanError::Unit(unit.into()))?,
+        };
+
+        let whole: u128 = if whole.is_empty() { 0 } else { whole.parse().map_err(|_| TimespanError::TooLong)? };
+        let mut part = whole.checked_mul(per).ok_or(TimespanError::TooLong)?;
+        let mut place = per;
+        for digit in fraction.bytes() {
+            place /= 10;
+            part += u128::from(digit - b'0') * place;
+        }
+        total = total.checked_add(part).ok_or(TimespanError::TooLong)?;
+        rest = after.trim_start();
+    }
+    let secs = u64::try_from(total / NS_PER_SEC).map_err(|_| TimespanError::TooLong)?;
+    Ok(Duration::new(secs, (total % NS_PER_SEC) as u32))
+}
+
+/// The ASCII digits `s` starts with, and what follows them.
+fn digits(s: &str) -> (&str, &str) {
+    s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()))
 }
 
 // The syntax of systemd unit files, as far as this file uses it: `[Section]`
@@ -962,7 +1098,7 @@ ProbeInterval=off
 
     #[test]
     fn max_addresses_defaults_to_eight_and_has_no_upper_bound() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().max_addrs, crate::device::DEFAULT_MAX_ADDRS);
+        assert_eq!(Config::parse(EXAMPLE).unwrap().max_addrs, DEFAULT_MAX_ADDRS);
         let with = |v: &str| Config::parse(&format!("[Devices]\nMaxAddresses={v}\n{EXAMPLE}"));
         assert_eq!(with("2").unwrap().max_addrs, 2);
         assert_eq!(with("100000").unwrap().max_addrs, 100_000);
@@ -1078,5 +1214,61 @@ ProbeInterval=off
         assert_eq!(error("[Segment]\nName a\n"), "line 2: not an assignment (Key=Value)");
         assert_eq!(error("[Segment\nName=a\n"), "line 1: a section header without its closing ]");
         assert_eq!(error("[S]\n=a\n"), "line 2: an assignment without a key");
+    }
+
+    fn ms(s: &str) -> u128 {
+        parse_timespan(s).unwrap_or_else(|e| panic!("{s:?}: {e}")).as_millis()
+    }
+
+    #[test]
+    fn whole_numbers_with_and_without_units_add_up() {
+        assert_eq!(ms("30"), 30_000);
+        assert_eq!(ms("2min"), 120_000);
+        assert_eq!(ms("1h 30min"), 5_400_000);
+        assert_eq!(ms("2min30s"), 150_000);
+        assert_eq!(ms(" 5 min  10 "), 310_000);
+        assert_eq!(ms("1d"), 86_400_000);
+        assert_eq!(ms("1w"), 604_800_000);
+        assert_eq!(ms("1m"), 60_000, "minutes");
+        assert_eq!(ms("1M"), 2_629_800_000, "months");
+        assert_eq!(ms("1y"), 31_557_600_000);
+        assert_eq!(parse_timespan("250us"), Ok(Duration::from_micros(250)));
+        assert_eq!(parse_timespan("3µs 7ns"), Ok(Duration::from_nanos(3_007)));
+    }
+
+    #[test]
+    fn numbers_may_have_a_fraction() {
+        assert_eq!(ms("1.5s"), 1_500);
+        assert_eq!(ms("10.5"), 10_500);
+        assert_eq!(ms("1.5h"), 5_400_000);
+        assert_eq!(ms("0.25min"), 15_000);
+        assert_eq!(ms(".5s"), 500);
+        assert_eq!(ms("5."), 5_000);
+        assert_eq!(ms("1.5min 30.25s"), 120_250);
+        assert_eq!(parse_timespan("1.5us"), Ok(Duration::from_nanos(1_500)));
+        // Finer than a nanosecond is dropped.
+        assert_eq!(parse_timespan("1.123456789123s"), Ok(Duration::from_nanos(1_123_456_789)));
+    }
+
+    #[test]
+    fn nothing_adds_up_to_zero() {
+        assert_eq!(parse_timespan("0"), Ok(Duration::ZERO));
+        assert_eq!(parse_timespan("0s 0.0min"), Ok(Duration::ZERO));
+    }
+
+    #[test]
+    fn what_is_not_a_time_span_is_refused() {
+        assert_eq!(parse_timespan(""), Err(TimespanError::Empty));
+        assert_eq!(parse_timespan("  "), Err(TimespanError::Empty));
+        assert_eq!(parse_timespan("soon"), Err(TimespanError::Number("soon".into())));
+        assert_eq!(parse_timespan("-5s"), Err(TimespanError::Number("-5s".into())));
+        assert_eq!(parse_timespan("."), Err(TimespanError::Number(".".into())));
+        assert_eq!(parse_timespan("5 s s"), Err(TimespanError::Number("s".into())));
+        assert_eq!(parse_timespan("5fortnights"), Err(TimespanError::Unit("fortnights".into())));
+        assert_eq!(parse_timespan("5MIN"), Err(TimespanError::Unit("MIN".into())));
+        assert_eq!(parse_timespan("5s$"), Err(TimespanError::Unit("s$".into())));
+        assert_eq!(parse_timespan("1.2.3s"), Err(TimespanError::Number(".3s".into())));
+        assert_eq!(parse_timespan("99999999999999999999999999999999999999999"), Err(TimespanError::TooLong));
+        assert_eq!(parse_timespan("999999999999999999999y"), Err(TimespanError::TooLong));
     }
 }
