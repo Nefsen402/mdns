@@ -83,7 +83,11 @@ fn daemon(args: Vec<String>) -> Result<()> {
 
     let families: Vec<Family> = [(config.ipv4, Family::V4), (config.ipv6, Family::V6)]
         .into_iter()
-        .filter_map(|(enabled, family)| enabled.then_some(family))
+        .filter_map(|(listen, family)| listen.enabled().then_some(family))
+        .collect();
+    let unicast: Vec<Family> = [(config.ipv4, Family::V4), (config.ipv6, Family::V6)]
+        .into_iter()
+        .filter_map(|(listen, family)| listen.unicast().then_some(family))
         .collect();
 
     // Hear of interfaces coming and going from before the sockets are opened,
@@ -94,11 +98,11 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // for each family and one list of devices for both: mDNS records do not
     // belong to the transport they come over. One that is not there yet is
     // waited for.
-    let hub = Rc::new(socket::Hub::new(&families).context("opening the sockets")?);
+    let hub = Rc::new(socket::Hub::new(&families, &unicast).context("opening the sockets")?);
     let mut tracked = Vec::new();
     let mut links: HashMap<&str, Segment> = HashMap::new();
     for interface in config.interfaces() {
-        let mut link = Link::new(interface, &families, &config, hub.clone());
+        let mut link = Link::new(interface, &families, &unicast, &config, hub.clone());
         if !link.open()? {
             eprintln!("{interface}: not there yet; waiting for it");
         }
@@ -291,9 +295,9 @@ fn event_loop(
         // A datagram of a shared socket goes to the link of the interface it came
         // in on, and to none if that is not one of ours.
         for (&fd, _) in shared.iter().zip(&fds[shared_at..clients]).filter(|(_, p)| poll::ready(p)) {
-            hub.receive(fd, |index, from, datagram| {
+            hub.receive(fd, |index, from, to, datagram| {
                 if let Some(link) = links.iter().find(|l| l.index() == Some(index)) {
-                    link.heard(from, datagram);
+                    link.heard(from, to, datagram);
                 }
             });
         }

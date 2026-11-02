@@ -2,8 +2,8 @@
 //!
 //! ```ini
 //! [Listen]            ; optional
-//! IPv4=yes
-//! IPv6=yes
+//! IPv4=multicast      ; off, multicast or on (which also hears what is sent to the
+//! IPv6=multicast      ; daemon itself); multicast unless set
 //!
 //! [Ipc]               ; optional
 //! Socket=/run/mdnsd/mdnsd.sock
@@ -197,12 +197,38 @@ pub struct InterfaceConfig {
     pub max_services: Option<usize>,
 }
 
+/// What is listened for over one family of IP (`IPv4=`, `IPv6=`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Listen {
+    /// Nothing: the family is not used.
+    Off,
+    /// What is sent to the mDNS group, which is what devices send to be heard
+    /// by all on the link, and all that is asked of them.
+    #[default]
+    Multicast,
+    /// That, and what is sent to the daemon's own address at the mDNS port.
+    /// Nothing checks that what is sent there is from the link.
+    On,
+}
+
+impl Listen {
+    /// Whether the family is used at all.
+    pub fn enabled(self) -> bool {
+        self != Listen::Off
+    }
+
+    /// Whether what is sent to the daemon itself is heard.
+    pub fn unicast(self) -> bool {
+        self == Listen::On
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub segments: Vec<SegmentConfig>,
     pub interface_settings: Vec<InterfaceConfig>,
-    pub ipv4: bool,
-    pub ipv6: bool,
+    pub ipv4: Listen,
+    pub ipv6: Listen,
     /// Where the IPC server listens.
     pub socket: String,
     /// A `.local` name to announce and answer for with this host's own
@@ -225,8 +251,8 @@ impl Default for Config {
         Config {
             segments: Vec::new(),
             interface_settings: Vec::new(),
-            ipv4: true,
-            ipv6: true,
+            ipv4: Listen::default(),
+            ipv6: Listen::default(),
             socket: DEFAULT_SOCKET.to_string(),
             advertise: None,
             advertise_ttl: DEFAULT_ADVERTISE_TTL,
@@ -395,8 +421,8 @@ impl Config {
                     ("segment", "forwardquestions") => {
                         config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
                     }
-                    ("listen", "ipv4") => config.ipv4 = parse_bool(entry, lineno)?,
-                    ("listen", "ipv6") => config.ipv6 = parse_bool(entry, lineno)?,
+                    ("listen", "ipv4") => config.ipv4 = parse_listen(entry, lineno, "IPv4")?,
+                    ("listen", "ipv6") => config.ipv6 = parse_listen(entry, lineno, "IPv6")?,
                     ("probe", "probeinterval") => {
                         config.probe_interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
                     }
@@ -433,8 +459,8 @@ impl Config {
         if self.segments.is_empty() {
             bail!("no [Segment] defined");
         }
-        if !self.ipv4 && !self.ipv6 {
-            bail!("[Listen] IPv4= and IPv6= are both disabled");
+        if !self.ipv4.enabled() && !self.ipv6.enabled() {
+            bail!("[Listen] IPv4= and IPv6= are both off");
         }
 
         for (i, seg) in self.segments.iter().enumerate() {
@@ -640,6 +666,18 @@ fn read_to_string(path: &str) -> Result<String> {
 }
 
 /// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
+/// What is listened for over a family: `off`, `multicast` or `on`, and no
+/// other.
+fn parse_listen(entry: &Entry, lineno: usize, key: &str) -> Result<Listen> {
+    let value = entry.unquoted();
+    match value.to_ascii_lowercase().as_str() {
+        "off" => Ok(Listen::Off),
+        "multicast" => Ok(Listen::Multicast),
+        "on" => Ok(Listen::On),
+        _ => bail!("line {lineno}: {key}= must be off, multicast or on, not {value:?}"),
+    }
+}
+
 fn parse_bool(entry: &Entry, lineno: usize) -> Result<bool> {
     entry.as_bool().ok_or_else(|| anyhow!("line {lineno}: invalid boolean {:?}", entry.unquoted()))
 }
@@ -979,17 +1017,17 @@ interfaces=br0,wifi
             ]
         );
         assert_eq!(c.interfaces(), ["br0", "media", "wifi"]);
-        assert!(c.ipv4 && c.ipv6);
+        assert_eq!((c.ipv4, c.ipv6), (Listen::Multicast, Listen::Multicast));
     }
 
     #[test]
     fn keys_are_case_insensitive_and_lists_flexible() {
         let c = Config::parse(
-            "# c\n[Listen]\nIPv6=no\n[SEGMENT]\nNAME = 'a b'\nInterfaces=x y, z\nInterfaces=w\n",
+            "# c\n[Listen]\nIPv6=off\n[SEGMENT]\nNAME = 'a b'\nInterfaces=x y, z\nInterfaces=w\n",
         )
         .unwrap();
         assert_eq!(c.segments, [seg("a b", &["x", "y", "z", "w"])]);
-        assert!(c.ipv4 && !c.ipv6);
+        assert_eq!((c.ipv4, c.ipv6), (Listen::Multicast, Listen::Off));
     }
 
     #[test]
@@ -1028,22 +1066,30 @@ interfaces=br0,wifi
     fn semantic_errors_name_their_line() {
         let with = |body: &str| error_of(&format!("\n# comment\n{body}"));
         assert!(with("[Segment]\nName=a\nInterfaces=x\nBogus=1\n").contains("line 6"), "unknown key");
-        assert!(with("[Listen]\nIPv4=maybe\n[Segment]\nName=a\nInterfaces=x\n").contains("line 4"), "bad boolean");
+        assert!(with("[Listen]\nIPv4=maybe\n[Segment]\nName=a\nInterfaces=x\n").contains("line 4"), "bad value");
         assert!(with("[Segment]\nInterfaces=x\n").contains("line 3"), "segment without a name, at its header");
         assert!(with("[Advertise]\nHostname=router.lan\n").contains("line 4"), "hostname outside .local");
     }
 
     #[test]
-    fn booleans_follow_systemd() {
-        let parse = |v: &str| Config::parse(&format!("[Listen]\nIPv4={v}\nIPv6=no\n[Segment]\nName=a\nInterfaces=x\n"));
-        for yes in ["1", "yes", "true", "on", "YES", "True", "\"on\""] {
-            assert!(parse(yes).unwrap().ipv4, "{yes}");
+    fn a_family_is_listened_to_off_multicast_or_on_and_nothing_else() {
+        let parse = |v: &str| Config::parse(&format!("[Listen]\nIPv4={v}\nIPv6=multicast\n[Segment]\nName=a\nInterfaces=x\n"));
+        for (value, listen) in [("off", Listen::Off), ("multicast", Listen::Multicast), ("on", Listen::On), ("ON", Listen::On), ("\"Multicast\"", Listen::Multicast)] {
+            assert_eq!(parse(value).unwrap().ipv4, listen, "{value}");
         }
-        for no in ["0", "no", "false", "off", "OFF"] {
-            // IPv6=no as well makes both families off, which is its own error.
-            assert!(error_of(&format!("[Listen]\nIPv4={no}\nIPv6=no\n[Segment]\nName=a\nInterfaces=x\n")).contains("both disabled"), "{no}");
+        assert!((Listen::Multicast.enabled(), Listen::Off.enabled()) == (true, false));
+        assert_eq!((Listen::On.unicast(), Listen::Multicast.unicast(), Listen::Off.unicast()), (true, false, false));
+        // Unset, it is multicast, as listening was before.
+        let c = Config::parse("[Segment]\nName=a\nInterfaces=x\n").unwrap();
+        assert_eq!((c.ipv4, c.ipv6), (Listen::Multicast, Listen::Multicast));
+        // Both off is nothing to listen to.
+        let both_off = error_of("[Listen]\nIPv4=off\nIPv6=off\n[Segment]\nName=a\nInterfaces=x\n");
+        assert!(both_off.contains("both off"), "{both_off}");
+        // Nothing else is one of them, and the error says which line and what was written.
+        for other in ["yes", "no", "true", "1", "0", "enabled", ""] {
+            let err = parse(other).unwrap_err().to_string();
+            assert!(err.contains("line 2") && err.contains("IPv4= must be off, multicast or on"), "{other:?}: {err}");
         }
-        assert!(parse("enabled").is_err());
     }
 
     #[test]
@@ -1384,7 +1430,7 @@ ProbeInterval=off
                 "[Segment]\nName=a\nInterfaces=x,y\n[Segment]\nName=b\nInterfaces=y,x,z\n",
                 "two segments reflect the same pair",
             ),
-            ("[Listen]\nIPv4=no\nIPv6=no\n[Segment]\nName=a\nInterfaces=x\n", "no families"),
+            ("[Listen]\nIPv4=off\nIPv6=off\n[Segment]\nName=a\nInterfaces=x\n", "no families"),
             ("[Segment]\nName=a\nInterfaces=x\nBogus=1\n", "unknown key"),
             ("[Other]\nName=a\n", "unknown section"),
             ("Name=a\n", "outside a section"),

@@ -1639,6 +1639,19 @@ impl Segment {
         state.relearn_neighbours(Instant::now());
     }
 
+    /// Whether a datagram from `from`, sent to `to` if that is known, is to be
+    /// heard. What is sent to the group is, whoever sends it. What is sent to the
+    /// daemon itself is only from a host on a network the interface is on, or
+    /// link-local: one of any other address came through some router, and an
+    /// interface is not where it is to be believed of devices.
+    pub fn accepts(&self, from: IpAddr, to: Option<IpAddr>) -> bool {
+        match to {
+            None => true,
+            Some(to) if to.is_multicast() => true,
+            Some(_) => is_link_local(&from) || self.state.borrow().prefixes.iter().any(|p| p.contains(&from)),
+        }
+    }
+
     /// Take in an entry of the interface's neighbour table, as the kernel
     /// reports it: `ip` is at link-layer address `mac`, or with `None`, no
     /// longer (it went, or could not be reached). The devices it may concern,
@@ -2863,6 +2876,35 @@ mod tests {
         // With no network known, nothing is.
         seg.set_prefixes(vec![]);
         assert_eq!(learned(&seg), Vec::<IpAddr>::new());
+    }
+
+    /// What is sent to the group is heard of anyone; what is sent to the
+    /// daemon itself, only of a host on the interface's networks or link-local.
+    #[test]
+    fn what_is_sent_to_the_daemon_is_only_heard_of_a_host_on_the_interface() {
+        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        seg.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
+        let group = Some(ip("224.0.0.251"));
+        let group6 = Some(ip("ff02::fb"));
+        let me = Some(ip("10.0.1.1"));
+        let me6 = Some(ip("fd00::1"));
+        // To the group, or where it is not known: of anyone.
+        assert!(seg.accepts(ip("192.168.9.9"), group));
+        assert!(seg.accepts(ip("2001:db8::9"), group6));
+        assert!(seg.accepts(ip("192.168.9.9"), None));
+        // To the daemon: of the networks it is on.
+        assert!(seg.accepts(ip("10.0.1.77"), me));
+        assert!(seg.accepts(ip("fd00::77"), me6));
+        assert!(seg.accepts(ip("169.254.3.3"), me));
+        assert!(seg.accepts(ip("fe80::7"), me6));
+        // Not of any other.
+        assert!(!seg.accepts(ip("10.0.2.77"), me));
+        assert!(!seg.accepts(ip("192.168.9.9"), me));
+        assert!(!seg.accepts(ip("2001:db8::9"), me6));
+        // With no network known, only link-local.
+        seg.set_prefixes(vec![]);
+        assert!(!seg.accepts(ip("10.0.1.77"), me));
+        assert!(seg.accepts(ip("fe80::7"), me6));
     }
 
     /// A device whose link-local address the table has not got, and that has
@@ -4993,7 +5035,7 @@ mod tests {
     fn live_announce() {
         let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
         for family in [Family::V4, Family::V6] {
-            let sock = open(&iface, family).unwrap();
+            let sock = open(&iface, family, false).unwrap();
             // Let a listener on this same host hear it.
             match family {
                 Family::V4 => rustix::net::sockopt::set_ip_multicast_loop(&sock.socket, true).unwrap(),
@@ -5019,7 +5061,7 @@ mod tests {
     #[ignore]
     fn live_respond() {
         let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
-        let sock = open(&iface, Family::V4).unwrap();
+        let sock = open(&iface, Family::V4, false).unwrap();
         rustix::net::sockopt::set_ip_multicast_loop(&sock.socket, true).unwrap();
         let seg = Segment::new(&iface, &[Family::V4]);
         let (tx, dest) = sock.sender().unwrap();

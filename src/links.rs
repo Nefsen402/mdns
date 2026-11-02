@@ -38,6 +38,9 @@ pub const MAX_DATAGRAM: usize = 9000;
 pub struct Link {
     interface: String,
     families: Vec<Family>,
+    /// The families of which what is sent to the daemon itself is heard too.
+    #[cfg_attr(not(all(target_os = "linux", not(feature = "portable-sockets"))), allow(dead_code))]
+    unicast: Vec<Family>,
     segment: Segment,
     /// The name to advertise with this host's addresses, and its TTL.
     advertise: Option<(String, Duration)>,
@@ -63,7 +66,7 @@ pub struct Link {
 impl Link {
     /// The link for `interface`, over `families`, configured by `config`. It
     /// has no sockets until [`open`](Link::open).
-    pub fn new(interface: &str, families: &[Family], config: &Config, hub: Rc<Hub>) -> Link {
+    pub fn new(interface: &str, families: &[Family], unicast: &[Family], config: &Config, hub: Rc<Hub>) -> Link {
         let segment = Segment::new(interface, families);
         segment.set_min_lifetime(config.min_lifetime_of(interface));
         segment.set_max_addrs(config.max_addrs_of(interface));
@@ -75,6 +78,7 @@ impl Link {
         Link {
             interface: interface.to_string(),
             families: families.to_vec(),
+            unicast: unicast.to_vec(),
             segment,
             advertise: config.advertise.clone().map(|name| (name, config.advertise_ttl)),
             index: None,
@@ -112,7 +116,7 @@ impl Link {
     fn open_sockets(&mut self) -> Result<()> {
         let mut sockets = Vec::new();
         for &family in &self.families {
-            let sock = socket::open(&self.interface, family)
+            let sock = socket::open(&self.interface, family, self.unicast.contains(&family))
                 .with_context(|| format!("opening {family:?} socket on {}", self.interface))?;
             sockets.push(sock);
         }
@@ -281,7 +285,10 @@ impl Link {
     }
 
     /// Handle a datagram that came in on this interface.
-    pub fn heard(&self, from: SocketAddr, datagram: &[u8]) {
+    pub fn heard(&self, from: SocketAddr, to: Option<IpAddr>, datagram: &[u8]) {
+        if !self.segment.accepts(from.ip(), to) {
+            return;
+        }
         if let Err(e) = self.segment.handle(from, datagram) {
             eprintln!("{}: reply failed: {e:#}", self.interface);
         }
@@ -297,7 +304,7 @@ impl Link {
                 Ok(datagram) => {
                     // A datagram from an IP address, as on a UDP socket.
                     let Some(from) = datagram.from else { continue };
-                    self.heard(from, &buf[..datagram.len]);
+                    self.heard(from, datagram.to, &buf[..datagram.len]);
                 }
                 Err(Errno::AGAIN) => return,
                 Err(Errno::INTR) => {}

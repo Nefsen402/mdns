@@ -3,7 +3,7 @@
 devices in, and how long one more device takes to be reflected, with n already
 there.
 
-    bench.py [--own-address] DAEMON N [N ...]
+    bench.py [--own-address] [--unicast] [--offlink] [--listen MODE] DAEMON N [N ...]
 
 For each N, a fresh daemon is given N devices, announced at 500 packets a
 second on one interface of a segment of two, and the other is listened to.
@@ -20,6 +20,12 @@ It prints a line of JSON for each N:
     latency_median_us, latency_p90_us
                          how long one more device took to be heard on the other
                          interface, with N there already
+
+With --unicast each device is announced to the daemon's own address and not to
+the group (it needs --own-address), and --listen MODE is what `[Listen] IPv4=`
+says (off, multicast or on): a daemon hears the unicast only if it says on. With --offlink the unicast is from
+addresses that are not on the interface's network, as a host routed in through it
+would send from.
 
 By default the devices share twenty source addresses, as a few proxies would
 speak for them. With --own-address each is sent from an address of its own, as
@@ -55,6 +61,14 @@ PORT = 5353
 SENDERS = 20
 RATE = 500  # packets a second while filling
 OWN_ADDRESS = os.environ.get("BENCH_OWN_ADDRESS") == "1"
+UNICAST = os.environ.get("BENCH_UNICAST") == "1"
+LISTEN = os.environ.get("BENCH_LISTEN", "multicast")
+OFFLINK = os.environ.get("BENCH_OFFLINK") == "1"
+
+
+def offlink_addr(i):
+    """An address that is not on the interface's network."""
+    return f"192.168.77.{1 + i % 250}"
 # The interface's network: a /16 if each device has an address of its own.
 PREFIX = 16 if OWN_ADDRESS else 24
 
@@ -96,11 +110,23 @@ def router(conf, daemon):
         time.sleep(0.025)
     for iface in ("default", "all"):
         no_dad(iface)
+    # A packet from an address that is not on the network is not to be dropped by the kernel.
+    for iface in ("default", "all"):
+        try:
+            with open(f"/proc/sys/net/ipv4/conf/{iface}/rp_filter", "w") as f:
+                f.write("0")
+        except OSError:
+            pass
     sh("ip", "link", "set", "lo", "up")
     for iface, addr in (("mdns-a", f"10.0.1.1/{PREFIX}" if not OWN_ADDRESS else "10.0.0.1/16"), ("mdns-b", "10.0.2.1/24")):
         no_dad(iface)
         sh("ip", "addr", "add", addr, "dev", iface)
         sh("ip", "link", "set", iface, "up")
+        try:
+            with open(f"/proc/sys/net/ipv4/conf/{iface}/rp_filter", "w") as f:
+                f.write("0")
+        except OSError:
+            pass
     os.execv(daemon, [daemon, conf])
 
 
@@ -221,7 +247,7 @@ class Senders:
     def sock(self, i):
         key = i if OWN_ADDRESS else i % SENDERS
         if key not in self.socks:
-            src = device_addr(i) if OWN_ADDRESS else f"10.0.1.{100 + key}"
+            src = (offlink_addr(i) if OFFLINK else device_addr(i)) if OWN_ADDRESS else f"10.0.1.{100 + key}"
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -234,7 +260,8 @@ class Senders:
 
     def announce(self, i):
         addr = device_addr(i) if OWN_ADDRESS else f"10.0.1.{130 + i % 100}"
-        self.sock(i).sendto(announcement(i, addr), (GROUP, PORT))
+        to = ("10.0.0.1", PORT) if UNICAST else (GROUP, PORT)
+        self.sock(i).sendto(announcement(i, addr), to)
 
 
 def wait_for(listener, names, timeout):
@@ -250,7 +277,7 @@ def run_once(daemon, n, probes, rundir):
     resource.setrlimit(resource.RLIMIT_NOFILE, (resource.getrlimit(resource.RLIMIT_NOFILE)[1],) * 2)
     conf = os.path.join(rundir, "mdnsd.conf")
     with open(conf, "w") as f:
-        f.write(f"[Listen]\nIPv6=no\n[Ipc]\nSocket={rundir}/mdnsd.sock\n[Segment]\nName=bench\nInterfaces=mdns-a,mdns-b\n")
+        f.write(f"[Listen]\nIPv4={LISTEN}\nIPv6=off\n[Ipc]\nSocket={rundir}/mdnsd.sock\n[Segment]\nName=bench\nInterfaces=mdns-a,mdns-b\n")
     for iface in ("mdns-a", "mdns-b", "fuzz-a", "fuzz-b"):
         sh("ip", "link", "del", iface, check=False)
     sh("ip", "link", "add", "mdns-a", "type", "veth", "peer", "name", "fuzz-a")
@@ -269,7 +296,9 @@ def run_once(daemon, n, probes, rundir):
         no_dad(iface)
         sh("ip", "addr", "add", addr, "dev", iface)
         sh("ip", "link", "set", iface, "up")
-    if OWN_ADDRESS:
+    if OWN_ADDRESS and OFFLINK:
+        batch = "".join(f"addr add 192.168.77.{k}/24 dev fuzz-a\n" for k in range(1, 251))
+    elif OWN_ADDRESS:
         wanted = list(range(n)) + list(range(9000, 9120)) + list(range(100000, 100000 + probes))
         batch = "".join(f"addr add {device_addr(i)}/16 dev fuzz-a\n" for i in wanted)
     else:
@@ -358,7 +387,10 @@ def measure(proc, listener, socks, n, probes):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--own-address"]
+    args = [a for a in sys.argv[1:] if a not in ("--own-address", "--unicast", "--offlink")]
+    if "--listen" in args:
+        at = args.index("--listen")
+        del args[at:at + 2]
     daemon, ns = args[0], [int(a) for a in args[1:]]
     rundir = tempfile.mkdtemp(prefix="mdnsd-bench-", dir=os.environ.get("TMPDIR", "/tmp"))
     results = []
@@ -372,6 +404,10 @@ if STAGE == "router":
 elif STAGE == "":
     os.environ["BENCH_STAGE"] = "fuzzer"
     os.environ["BENCH_OWN_ADDRESS"] = "1" if "--own-address" in sys.argv else "0"
+    os.environ["BENCH_UNICAST"] = "1" if ("--unicast" in sys.argv or "--offlink" in sys.argv) else "0"
+    os.environ["BENCH_OFFLINK"] = "1" if "--offlink" in sys.argv else "0"
+    if "--listen" in sys.argv:
+        os.environ["BENCH_LISTEN"] = sys.argv[sys.argv.index("--listen") + 1]
     os.execvp("unshare", ["unshare", "-r", "-n", "--", sys.executable, ME, *sys.argv[1:]])
 else:
     main()

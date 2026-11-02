@@ -2,7 +2,10 @@
 //!
 //! On Linux each socket is pinned to a single interface and bound to the mDNS
 //! multicast group address rather than the wildcard, so it shows up in
-//! `ss` as `224.0.0.251%wifi:5353` and only ever sees that link's traffic.
+//! `ss` as `224.0.0.251%wifi:5353` and only ever sees that link's traffic. If
+//! what is sent to the daemon itself is to be heard too (`on` in `[Listen]`) it
+//! is bound to the wildcard address instead, `0.0.0.0%wifi:5353`: pinned to the
+//! interface still, and joined to the group on it alone.
 //!
 //! The BSDs cannot pin a socket to an interface. There is one socket for each
 //! family, shared by every interface, bound to the wildcard address and joined
@@ -101,6 +104,10 @@ pub struct Datagram {
     /// pinned to one: the [`Hub`] hands it to that interface's link.
     #[cfg_attr(all(target_os = "linux", not(feature = "portable-sockets")), allow(dead_code))]
     pub arrived_on: Option<u32>,
+    /// The address it was sent to, where the socket is bound to the wildcard
+    /// and so hears what is sent to others: the group, or the daemon itself.
+    #[cfg_attr(all(target_os = "linux", not(feature = "portable-sockets")), allow(dead_code))]
+    pub to: Option<IpAddr>,
 }
 
 /// Whether sockets are pinned to their interface, as only Linux does.
@@ -130,7 +137,10 @@ mod pinned {
         SocketAddr::try_from(local).map(|a| a.ip()).map_err(|_| anyhow!("no local address on {interface}"))
     }
 
-    pub fn open(interface: &str, family: Family) -> Result<MdnsSocket> {
+    /// A socket pinned to `interface` over `family`: bound to the group, or, if
+    /// `unicast`, to the wildcard address, which hears what is sent to the
+    /// daemon itself too.
+    pub fn open(interface: &str, family: Family, unicast: bool) -> Result<MdnsSocket> {
         let index = ifindex(interface)?;
         let socket = udp(family)?;
         let fd = &socket;
@@ -139,6 +149,15 @@ mod pinned {
         sockopt::set_socket_reuseaddr(fd, true).map_err(Why)?;
         sockopt::set_socket_reuseport(fd, true).map_err(Why)?;
         bind_device(fd, interface)?;
+
+        // A socket that hears the daemon itself is told what each datagram was sent to,
+        // for the sender to be checked of those that were not to the group.
+        if unicast {
+            match family {
+                Family::V4 => set_int(fd, libc::IPPROTO_IP, IP_ARRIVAL, 1)?,
+                Family::V6 => set_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1)?,
+            }
+        }
 
         // Without this, the kernel delivers group traffic from *any* interface
         // joined by *any* socket on the host, defeating the per-link isolation.
@@ -154,13 +173,15 @@ mod pinned {
             Family::V4 => {
                 sockopt::set_ip_multicast_loop(fd, false).map_err(Why)?;
                 sockopt::set_ip_multicast_ttl(fd, 255).map_err(Why)?;
-                rustix::net::bind(fd, &SocketAddrV4::new(GROUP_V4, MDNS_PORT)).map_err(Why)?;
+                let addr = if unicast { Ipv4Addr::UNSPECIFIED } else { GROUP_V4 };
+                rustix::net::bind(fd, &SocketAddrV4::new(addr, MDNS_PORT)).map_err(Why)?;
                 sockopt::set_ip_add_membership_with_ifindex(fd, &GROUP_V4, &Ipv4Addr::UNSPECIFIED, index).map_err(Why)?;
             }
             Family::V6 => {
                 sockopt::set_ipv6_multicast_loop(fd, false).map_err(Why)?;
                 sockopt::set_ipv6_multicast_hops(fd, 255).map_err(Why)?;
-                rustix::net::bind(fd, &SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, index)).map_err(Why)?;
+                let (addr, scope) = if unicast { (Ipv6Addr::UNSPECIFIED, 0) } else { (GROUP_V6, index) };
+                rustix::net::bind(fd, &SocketAddrV6::new(addr, MDNS_PORT, 0, scope)).map_err(Why)?;
                 sockopt::set_ipv6_add_membership(fd, &GROUP_V6, index).map_err(Why)?;
             }
         }
@@ -185,17 +206,10 @@ mod pinned {
         }
         Ok(())
     }
-
-    /// A datagram the socket has, as it came: it is only of the interface the
-    /// socket is pinned to, so it says nothing of which it came in on.
-    pub fn recv(sock: impl AsFd, buf: &mut [u8]) -> core::result::Result<Datagram, Errno> {
-        let (len, _, from) = rustix::net::recvfrom(sock, buf, rustix::net::RecvFlags::empty())?;
-        Ok(Datagram { len, from: from.and_then(|a| SocketAddr::try_from(a).ok()), arrived_on: None })
-    }
 }
 
 #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
-pub use pinned::{local_addr, open, recv};
+pub use pinned::{local_addr, open};
 
 /// Where sockets are pinned to their interface, each hears for itself and
 /// there is nothing shared to read.
@@ -204,7 +218,7 @@ pub struct Hub;
 
 #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
 impl Hub {
-    pub fn new(_families: &[Family]) -> Result<Hub> {
+    pub fn new(_families: &[Family], _unicast: &[Family]) -> Result<Hub> {
         Ok(Hub)
     }
 
@@ -212,7 +226,7 @@ impl Hub {
         core::iter::empty()
     }
 
-    pub fn receive(&self, _fd: RawFd, _deliver: impl FnMut(u32, SocketAddr, &[u8])) {}
+    pub fn receive(&self, _fd: RawFd, _deliver: impl FnMut(u32, SocketAddr, Option<IpAddr>, &[u8])) {}
 }
 /// A network an interface is on: an address of the interface, and the length
 /// of the prefix that makes the network of it.
@@ -355,18 +369,85 @@ pub fn ifindex(name: &str) -> Result<u32> {
     }
 }
 
+/// The option that has the system say, with each datagram, which interface
+/// it came in on (IPv4): `IP_PKTINFO` on Linux, `IP_RECVIF` on the BSDs.
+#[cfg(target_os = "linux")]
+const IP_ARRIVAL: libc::c_int = libc::IP_PKTINFO;
+#[cfg(not(target_os = "linux"))]
+const IP_ARRIVAL: libc::c_int = libc::IP_RECVIF;
+
+/// A datagram the socket has, with the interface it came in on and the address it was
+/// sent to, where the socket was asked to say (see `IP_ARRIVAL`).
+pub fn recv(sock: impl AsFd, buf: &mut [u8]) -> core::result::Result<Datagram, Errno> {
+    // Room for the interface of either family, and more.
+    let mut control = [0u64; 32];
+    // SAFETY: all-zero is valid for a sockaddr_storage and a msghdr.
+    let mut name: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+    msg.msg_name = (&mut name as *mut libc::sockaddr_storage).cast();
+    msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = core::mem::size_of_val(&control) as _;
+    // SAFETY: the descriptor is open, and `msg` points at buffers that live
+    // as long as the call, with the lengths it says.
+    let len = unsafe { libc::recvmsg(sock.as_fd().as_raw_fd(), &mut msg, 0) };
+    if len < 0 {
+        return Err(errno());
+    }
+    let (arrived_on, to) = control_of(&msg);
+    Ok(Datagram { len: len as usize, from: socket_addr(&name, msg.msg_namelen), arrived_on, to })
+}
+
+/// The address a datagram came from, as the system wrote it.
+fn socket_addr(name: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<SocketAddr> {
+    let len = len as usize;
+    // SAFETY: the storage is big enough for either, and the family says
+    // which it was filled in as, to as long as `len`.
+    unsafe {
+        match i32::from(name.ss_family) {
+            libc::AF_INET if len >= core::mem::size_of::<libc::sockaddr_in>() => {
+                let a = &*(name as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>();
+                let ip = Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr));
+                Some(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(a.sin_port))))
+            }
+            libc::AF_INET6 if len >= core::mem::size_of::<libc::sockaddr_in6>() => {
+                let a = &*(name as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>();
+                let ip = Ipv6Addr::from(a.sin6_addr.s6_addr);
+                Some(SocketAddr::V6(SocketAddrV6::new(ip, u16::from_be(a.sin6_port), 0, a.sin6_scope_id)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The interface the datagram came in on, and the address it was sent to,
+/// by the control messages that came with it.
+fn control_of(msg: &libc::msghdr) -> (Option<u32>, Option<IpAddr>) {
+    let (mut index, mut to) = (None, None);
+    // SAFETY: the control messages are those the system wrote in the buffer
+    // `msg` points at, walked as the macros say.
+    unsafe {
+        let mut at = libc::CMSG_FIRSTHDR(msg);
+        while !at.is_null() {
+            let header = &*at;
+            let data_len = (header.cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+            let data = core::slice::from_raw_parts(libc::CMSG_DATA(at), data_len);
+            index = index.or_else(|| arrival::index_of(header.cmsg_level, header.cmsg_type, data));
+            to = to.or_else(|| arrival::destination_of(header.cmsg_level, header.cmsg_type, data));
+            at = libc::CMSG_NXTHDR(msg, at);
+        }
+    }
+    (index, to)
+}
+
 /// Whether sockets are told apart by the interface a datagram came in on: the
 /// BSDs, and Linux with `portable-sockets`.
 #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
 mod portable {
     use super::*;
-
-    /// The option that has the system say, with each datagram, which interface
-    /// it came in on (IPv4): `IP_PKTINFO` on Linux, `IP_RECVIF` on the BSDs.
-    #[cfg(target_os = "linux")]
-    const IP_ARRIVAL: libc::c_int = libc::IP_PKTINFO;
-    #[cfg(not(target_os = "linux"))]
-    const IP_ARRIVAL: libc::c_int = libc::IP_RECVIF;
 
     /// The first IPv4 address of `interface`: what the group is joined by, and
     /// what traffic to it is sent from, where an interface is named by its
@@ -404,13 +485,15 @@ mod portable {
     /// The sockets of the BSDs and of `portable-sockets`: one for each family,
     /// shared by every interface.
     pub struct Hub {
-        sockets: Vec<(Family, OwnedFd)>,
+        /// Each with whether what is sent to the daemon itself is heard too, and
+        /// not only what is sent to the group.
+        sockets: Vec<(Family, bool, OwnedFd)>,
     }
 
     impl Hub {
         /// The sockets for `families`, bound to the wildcard address and not yet
         /// joined to the group on any interface.
-        pub fn new(families: &[Family]) -> Result<Hub> {
+        pub fn new(families: &[Family], unicast: &[Family]) -> Result<Hub> {
             let mut sockets = Vec::new();
             for &family in families {
                 let socket = udp(family)?;
@@ -421,6 +504,9 @@ mod portable {
                 match family {
                     Family::V4 => {
                         set_int(fd, libc::IPPROTO_IP, IP_ARRIVAL, 1)?;
+                        // Where the address it was sent to is not with the interface's.
+                        #[cfg(not(target_os = "linux"))]
+                        set_int(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, 1)?;
                         sockopt::set_ip_multicast_loop(fd, false).map_err(Why)?;
                         sockopt::set_ip_multicast_ttl(fd, 255).map_err(Why)?;
                         rustix::net::bind(fd, &SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)).map_err(Why)?;
@@ -435,18 +521,18 @@ mod portable {
                 }
                 // Never waited on: the loop reads it when it is readable.
                 rustix::io::ioctl_fionbio(fd, true).map_err(Why)?;
-                sockets.push((family, socket));
+                sockets.push((family, unicast.contains(&family), socket));
             }
             Ok(Hub { sockets })
         }
 
         /// The descriptors to wait on.
         pub fn fds(&self) -> impl Iterator<Item = RawFd> + '_ {
-            self.sockets.iter().map(|(_, s)| s.as_raw_fd())
+            self.sockets.iter().map(|(_, _, s)| s.as_raw_fd())
         }
 
         fn socket(&self, family: Family) -> Result<&OwnedFd> {
-            self.sockets.iter().find(|(f, _)| *f == family).map(|(_, s)| s).ok_or_else(|| anyhow!("no {family:?} socket"))
+            self.sockets.iter().find(|(f, _, _)| *f == family).map(|(_, _, s)| s).ok_or_else(|| anyhow!("no {family:?} socket"))
         }
 
         /// Join the group on `interface` over `family`, and give back what to send
@@ -486,12 +572,28 @@ mod portable {
         /// Everything the socket `fd`, if it is one of these, has heard: each
         /// datagram with the index of the interface it came in on, and who sent
         /// it. What the system does not say the interface of is not given.
-        pub fn receive(&self, fd: RawFd, mut deliver: impl FnMut(u32, SocketAddr, &[u8])) {
-            let Some((_, socket)) = self.sockets.iter().find(|(_, s)| s.as_raw_fd() == fd) else { return };
+        pub fn receive(&self, fd: RawFd, mut deliver: impl FnMut(u32, SocketAddr, Option<IpAddr>, &[u8])) {
+            let Some((family, unicast, socket)) = self.sockets.iter().find(|(_, _, s)| s.as_raw_fd() == fd) else { return };
+            let group = match family {
+                Family::V4 => IpAddr::V4(GROUP_V4),
+                Family::V6 => IpAddr::V6(GROUP_V6),
+            };
             let mut buf = [0u8; crate::links::MAX_DATAGRAM];
             loop {
                 match recv(socket, &mut buf) {
-                    Ok(Datagram { len, from: Some(from), arrived_on: Some(index) }) => deliver(index, from, &buf[..len]),
+                    Ok(Datagram { len, from: Some(from), arrived_on: Some(index), to }) => {
+                        // To the group is what is heard; to the daemon itself only if asked
+                        // to; to any other group, or to what the system does not say, not.
+                        let wanted = match to {
+                            Some(to) if to == group => true,
+                            Some(to) if to.is_multicast() => false,
+                            Some(_) => *unicast,
+                            None => false,
+                        };
+                        if wanted {
+                            deliver(index, from, to, &buf[..len]);
+                        }
+                    }
                     Ok(_) => {}
                     Err(Errno::AGAIN) => return,
                     Err(Errno::INTR) => {}
@@ -504,85 +606,17 @@ mod portable {
             }
         }
     }
-
-    /// A datagram the socket has, with the interface it came in on.
-    pub fn recv(sock: impl AsFd, buf: &mut [u8]) -> core::result::Result<Datagram, Errno> {
-        // Room for the interface of either family, and more.
-        let mut control = [0u64; 32];
-        // SAFETY: all-zero is valid for a sockaddr_storage and a msghdr.
-        let mut name: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
-        let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
-        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-        msg.msg_name = (&mut name as *mut libc::sockaddr_storage).cast();
-        msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = core::mem::size_of_val(&control) as _;
-        // SAFETY: the descriptor is open, and `msg` points at buffers that live
-        // as long as the call, with the lengths it says.
-        let len = unsafe { libc::recvmsg(sock.as_fd().as_raw_fd(), &mut msg, 0) };
-        if len < 0 {
-            return Err(errno());
-        }
-        Ok(Datagram {
-            len: len as usize,
-            from: socket_addr(&name, msg.msg_namelen),
-            arrived_on: arrived_on(&msg),
-        })
-    }
-
-    /// The address a datagram came from, as the system wrote it.
-    fn socket_addr(name: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<SocketAddr> {
-        let len = len as usize;
-        // SAFETY: the storage is big enough for either, and the family says
-        // which it was filled in as, to as long as `len`.
-        unsafe {
-            match i32::from(name.ss_family) {
-                libc::AF_INET if len >= core::mem::size_of::<libc::sockaddr_in>() => {
-                    let a = &*(name as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>();
-                    let ip = Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr));
-                    Some(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(a.sin_port))))
-                }
-                libc::AF_INET6 if len >= core::mem::size_of::<libc::sockaddr_in6>() => {
-                    let a = &*(name as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>();
-                    let ip = Ipv6Addr::from(a.sin6_addr.s6_addr);
-                    Some(SocketAddr::V6(SocketAddrV6::new(ip, u16::from_be(a.sin6_port), 0, a.sin6_scope_id)))
-                }
-                _ => None,
-            }
-        }
-    }
-
-    /// The interface the datagram came in on, by the control messages that came
-    /// with it.
-    fn arrived_on(msg: &libc::msghdr) -> Option<u32> {
-        // SAFETY: the control messages are those the system wrote in the buffer
-        // `msg` points at, walked as the macros say.
-        unsafe {
-            let mut at = libc::CMSG_FIRSTHDR(msg);
-            while !at.is_null() {
-                let header = &*at;
-                let data_len = (header.cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
-                let data = core::slice::from_raw_parts(libc::CMSG_DATA(at), data_len);
-                if let Some(index) = arrival::index_of(header.cmsg_level, header.cmsg_type, data) {
-                    return Some(index);
-                }
-                at = libc::CMSG_NXTHDR(msg, at);
-            }
-        }
-        None
-    }
 }
 
 #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
-pub use portable::{local_addr, recv, Hub};
+pub use portable::{local_addr, Hub};
 
 /// Reading the control message that says which interface a datagram came in
 /// on. Pure, so it is tested with the bytes of each system's, which can all be
 /// had here.
-#[cfg(any(test, not(all(target_os = "linux", not(feature = "portable-sockets")))))]
 mod arrival {
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
     /// The interface a control message of `level` and `kind` says a datagram
     /// came in on, if it is one that does.
     pub fn index_of(level: libc::c_int, kind: libc::c_int, data: &[u8]) -> Option<u32> {
@@ -594,6 +628,32 @@ mod arrival {
             (libc::IPPROTO_IP, libc::IP_RECVIF) => from_sockaddr_dl(data),
             _ => None,
         }
+    }
+
+    /// The address a control message of `level` and `kind` says a datagram was
+    /// sent to, if it is one that does.
+    pub fn destination_of(level: libc::c_int, kind: libc::c_int, data: &[u8]) -> Option<IpAddr> {
+        match (level, kind) {
+            (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => Some(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(data.get(..16)?).ok()?))),
+            #[cfg(target_os = "linux")]
+            (libc::IPPROTO_IP, libc::IP_PKTINFO) => addr_from_in_pktinfo(data),
+            #[cfg(not(target_os = "linux"))]
+            (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => addr_from_in_addr(data),
+            _ => None,
+        }
+    }
+
+    /// Linux's `struct in_pktinfo`: the interface, then the address it was
+    /// routed to, then the one in its header, which is the one it was sent to.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn addr_from_in_pktinfo(data: &[u8]) -> Option<IpAddr> {
+        Some(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(data.get(8..12)?).ok()?)))
+    }
+
+    /// The BSDs' `IP_RECVDSTADDR`: the address, as a `struct in_addr`.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub fn addr_from_in_addr(data: &[u8]) -> Option<IpAddr> {
+        Some(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(data.get(..4)?).ok()?)))
     }
 
     /// `struct in6_pktinfo`: the address it was sent to, then the interface.
@@ -679,6 +739,17 @@ mod tests {
         assert_eq!(arrival::from_sockaddr_dl(&dl), Some(300), "an index too big for a byte");
         assert_eq!(arrival::from_sockaddr_dl(&dl[..3]), None);
         assert_eq!(arrival::from_sockaddr_dl(&[0u8; 20]), None);
+
+        // The address it was sent to, in the form of each: IPv6's, Linux's and the BSDs'.
+        let group = "224.0.0.251".parse::<Ipv4Addr>().unwrap();
+        in4[8..12].copy_from_slice(&group.octets());
+        assert_eq!(arrival::addr_from_in_pktinfo(&in4), Some(IpAddr::V4(group)));
+        assert_eq!(arrival::addr_from_in_pktinfo(&in4[..11]), None);
+        assert_eq!(arrival::addr_from_in_addr(&group.octets()), Some(IpAddr::V4(group)));
+        assert_eq!(arrival::addr_from_in_addr(&[224, 0, 0]), None);
+        assert_eq!(arrival::destination_of(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &in6), Some("ff02::fb".parse().unwrap()));
+        assert_eq!(arrival::destination_of(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &in6[..15]), None);
+        assert_eq!(arrival::destination_of(libc::IPPROTO_IPV6, -1, &in6), None);
 
         // Told apart by level and kind: what is not about the interface is not read.
         assert_eq!(arrival::index_of(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &in6), Some(7));

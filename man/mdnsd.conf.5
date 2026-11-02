@@ -49,17 +49,33 @@ Unknown sections and keys are errors, so that typos fail loudly.
 Optional.
 .TP
 .B IPv4=
-Listen and announce on IPv4 (224.0.0.251).
+What to listen for, and to announce, over IPv4 (the group 224.0.0.251): one of
+.BR off ,
+.B multicast
+or
+.BR on .
 Default
-.BR yes .
+.BR multicast .
+.B off
+does not use the family.
+.B multicast
+hears what is sent to the group, which is what devices send to be heard by
+everyone on the link, and all that is asked of them.
+.B on
+hears that, and what is sent to the daemon's own address at the mDNS port,
+5353, as well: the answers a device may give to one that asked, and from a
+resolver that asks it directly.
+Of what is sent there, only that from a host on a network the interface is on,
+or link-local, is heard: a host that is routed to the address does not tell the
+daemon of devices.
 .TP
 .B IPv6=
-Listen and announce on IPv6 (ff02::fb).
-Default
-.BR yes .
+What to listen for, and to announce, over IPv6 (the group ff02::fb), as
+.BR IPv4= .
 .PP
-At least one of the two must be enabled.
-They choose the transports: each interface has a socket per family enabled, but
+At least one of the two must not be
+.BR off .
+They choose the transports: each interface has a socket per family used, but
 one list of devices for both, since mDNS records do not belong to the transport
 they come over.
 A device's addresses of both families are kept, whichever family it was heard
@@ -497,8 +513,8 @@ never see each other.
 .RS
 .nf
 [Listen]
-IPv4=yes
-IPv6=yes
+IPv4=multicast
+IPv6=multicast
 
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
