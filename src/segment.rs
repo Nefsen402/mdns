@@ -22,7 +22,7 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MIN_LIFETIME};
+use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
 use crate::runtime::Why;
 use crate::device::{
     addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report,
@@ -243,8 +243,8 @@ impl Entry {
     }
 
     /// Take over what was learned about this device before its name was known.
-    fn absorb(&mut self, earlier: Entry) {
-        self.device.absorb(earlier.device);
+    fn absorb(&mut self, earlier: Entry, max_services: usize) {
+        self.device.absorb(earlier.device, max_services);
         self.expires = self.expires.max(earlier.expires);
         for (addr, at) in earlier.addr_expires {
             let mine = self.addr_expires.entry(addr).or_insert(at);
@@ -464,6 +464,8 @@ struct State {
     max_addrs: usize,
     /// How many devices it remembers, at most.
     max_devices: usize,
+    /// How many services a device is kept with, at most.
+    max_services: usize,
     /// The most a packet sent here may hold: what the interface's MTU leaves.
     max_packet: usize,
     upkeep: Upkeep,
@@ -776,6 +778,7 @@ impl Segment {
                 min_lifetime: DEFAULT_MIN_LIFETIME,
                 max_addrs: DEFAULT_MAX_ADDRS,
                 max_devices: DEFAULT_MAX_DEVICES,
+                max_services: DEFAULT_MAX_SERVICES,
                 max_packet: DEFAULT_MAX_PACKET,
                 ..State::default()
             })),
@@ -802,6 +805,12 @@ impl Segment {
     /// learned of. The default is [`DEFAULT_MAX_DEVICES`].
     pub fn set_max_devices(&self, max_devices: usize) {
         self.state.borrow_mut().max_devices = max_devices.max(1);
+    }
+
+    /// How many services a device is kept with, at most: more are not taken.
+    /// The default is [`DEFAULT_MAX_SERVICES`].
+    pub fn set_max_services(&self, max_services: usize) {
+        self.state.borrow_mut().max_services = max_services.max(1);
     }
 
     /// Take the interface's MTU: no packet sent here is bigger than it leaves
@@ -1221,7 +1230,7 @@ impl Segment {
         let msg = msg.filter(|m| m.header.response);
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let (floor, max_addrs) = (state.min_lifetime, state.max_addrs);
+        let (floor, max_addrs, max_services) = (state.min_lifetime, state.max_addrs, state.max_services);
         let mut touched = Touched::default();
 
         // A response saying goodbye (TTL 0) to the address it came from, and
@@ -1314,12 +1323,12 @@ impl Segment {
             touched.note(&state.discovered, &key);
             let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now, src));
             if let Some(earlier) = earlier {
-                entry.absorb(earlier);
+                entry.absorb(earlier, max_services);
             }
             let ttl = Duration::from_secs(report.longest_ttl().into());
             entry.expires = entry.expires.max(now + ttl.max(floor));
             entry.make_room(&addrs, &report.flushed, &report.gone, max_addrs);
-            entry.device.learn(report, &addrs, max_addrs);
+            entry.device.learn(report, &addrs, max_addrs, max_services);
             entry.renew_addrs(&addrs, &report.ttls, now, floor);
 
             for addr in addrs {
@@ -1351,7 +1360,7 @@ impl Segment {
                 entry.device.take_addrs(&[src], &[], &[], max_addrs);
                 entry.renew_addrs(&[src], &HashMap::new(), now, floor);
             }
-            entry.device.learn_records(rest.iter().copied());
+            entry.device.learn_records(rest.iter().copied(), max_services);
             if usable {
                 state.by_addr.insert(src, key);
             }
@@ -2665,6 +2674,20 @@ mod tests {
             seg.observe(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i as u32 + 1)));
         }
         assert_eq!(seg.devices().len(), DEFAULT_MAX_DEVICES);
+    }
+
+    #[test]
+    fn the_number_of_services_a_device_is_kept_with_can_be_set() {
+        let seg = Segment::new("test", &[Family::V4]);
+        seg.set_max_services(3);
+        let services: Vec<Record> = (0..10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
+        hear(&seg, "10.0.1.7", [vec![a_record("tv.local", "10.0.1.7")], services.clone()].concat());
+        assert_eq!(seg.devices()[0].services.len(), 3);
+
+        // Raised, the rest are taken the next time they are heard, and one it has stays up to date.
+        seg.set_max_services(8);
+        hear(&seg, "10.0.1.7", services);
+        assert_eq!(seg.devices()[0].services.len(), 8);
     }
 
     #[test]

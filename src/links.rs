@@ -63,6 +63,7 @@ impl Link {
         segment.set_min_lifetime(config.min_lifetime_of(interface));
         segment.set_max_addrs(config.max_addrs_of(interface));
         segment.set_max_devices(config.max_devices_of(interface));
+        segment.set_max_services(config.max_services_of(interface));
         segment.set_reannounce(config.reannounce_on(interface));
         segment.set_refresh_before(config.refresh_before);
 

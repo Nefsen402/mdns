@@ -143,7 +143,7 @@ reached at.
 Each interface remembers at most 1024 devices (\fBMaxDevices=\fR in
 .BR mdnsd.conf (5)),
 at most 64 hosts first described
-by any one sender, and at most 64 services a device.
+by any one sender, and at most 64 services a device (\fBMaxServices=\fR).
 A reflected device is announced when it appears or changes, twice, a second
 apart, and with goodbye packets when it goes.
 Unchanged, it is not announced again: whoever still wants its records asks for

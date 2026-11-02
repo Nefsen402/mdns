@@ -12,6 +12,8 @@ use hashbrown::{HashMap, HashSet};
 use core::net::IpAddr;
 
 use crate::config::DEFAULT_MAX_ADDRS;
+#[cfg(test)]
+use crate::config::DEFAULT_MAX_SERVICES;
 use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
 use crate::socket::Family;
 
@@ -60,8 +62,7 @@ const KNOWN_SUBTYPES: [&str; 4] = [
 ];
 
 /// What one device may have, however much it announces: more would be a
-/// flood, not a device.
-const MAX_SERVICES: usize = 64;
+/// flood, not a device. (Its services are limited by `MaxServices=`.)
 const MAX_SUBTYPES: usize = 16;
 const MAX_REVERSE: usize = 8;
 
@@ -510,12 +511,12 @@ impl Device {
 
     /// Take in what `report` says about it, with the addresses that vouch for
     /// it: those announced, and the one the packet came from if it sent it,
-    /// keeping at most `max_addrs` of a family.
-    pub fn learn(&mut self, report: &Report<'_>, addrs: &[IpAddr], max_addrs: usize) {
+    /// keeping at most `max_addrs` of a family and `max_services` services.
+    pub fn learn(&mut self, report: &Report<'_>, addrs: &[IpAddr], max_addrs: usize, max_services: usize) {
         self.hostname = Some(report.host.clone());
         self.take_addrs(addrs, &report.flushed, &report.gone, max_addrs);
         self.ttl = report.addr_ttl().or(self.ttl);
-        self.learn_records(report.records.iter().copied());
+        self.learn_records(report.records.iter().copied(), max_services);
     }
 
     /// Take in the addresses a packet vouches for, of either family. Of a
@@ -606,9 +607,10 @@ impl Device {
         self.take_addrs(addrs, &[], &[], DEFAULT_MAX_ADDRS);
     }
 
-    /// Take in the service records, NSEC and reverse mappings in `records`. A
-    /// TTL of 0 is a goodbye for what the record says.
-    pub fn learn_records<'a>(&mut self, records: impl Iterator<Item = &'a Record>) {
+    /// Take in the service records, NSEC and reverse mappings in `records`, up
+    /// to `max_services` services. A TTL of 0 is a goodbye for what the
+    /// record says.
+    pub fn learn_records<'a>(&mut self, records: impl Iterator<Item = &'a Record>, max_services: usize) {
         for rec in records {
             match &rec.data {
                 RData::Ptr(host) if parser::reverse_addr(&rec.name).is_some() => {
@@ -633,7 +635,7 @@ impl Device {
                             if let Some(svc) = self.services.iter_mut().find(|s| s.instance.eq_ignore_ascii_case(instance)) {
                                 svc.subtypes.retain(|sub| !same(sub));
                             }
-                        } else if let Some(svc) = self.service_mut(instance)
+                        } else if let Some(svc) = self.service_mut(instance, max_services)
                             && !svc.subtypes.iter().any(same)
                             && svc.subtypes.len() < MAX_SUBTYPES
                         {
@@ -643,7 +645,7 @@ impl Device {
                     }
                     if rec.ttl == 0 {
                         self.forget_service(instance);
-                    } else if let Some(svc) = self.service_mut(instance) {
+                    } else if let Some(svc) = self.service_mut(instance, max_services) {
                         svc.kind = rec.name.clone();
                         // The SRV record's TTL is the one that counts, if known.
                         if svc.ttl == 0 {
@@ -654,7 +656,7 @@ impl Device {
                 RData::Srv { port, target, .. } => {
                     if rec.ttl == 0 {
                         self.forget_service(&rec.name);
-                    } else if let Some(svc) = self.service_mut(&rec.name) {
+                    } else if let Some(svc) = self.service_mut(&rec.name, max_services) {
                         svc.port = *port;
                         svc.target = Some(target.clone());
                         svc.ttl = rec.ttl;
@@ -667,7 +669,7 @@ impl Device {
                 }
                 RData::Txt(strings) => {
                     if rec.ttl != 0
-                        && let Some(svc) = self.service_mut(&rec.name)
+                        && let Some(svc) = self.service_mut(&rec.name, max_services)
                     {
                         svc.txt = strings
                             .iter()
@@ -684,10 +686,11 @@ impl Device {
         }
     }
 
-    /// Take over the services learned about it before its name was known.
-    pub fn absorb(&mut self, earlier: Device) {
+    /// Take over the services learned about it before its name was known, up
+    /// to `max_services`.
+    pub fn absorb(&mut self, earlier: Device, max_services: usize) {
         for svc in earlier.services {
-            if self.service(&svc.instance).is_none() && self.services.len() < MAX_SERVICES {
+            if self.service(&svc.instance).is_none() && self.services.len() < max_services {
                 self.insert_service(svc);
             }
         }
@@ -696,11 +699,11 @@ impl Device {
     /// Get or create a service, deriving its type from the instance name
     /// until a PTR record states it explicitly. It keeps the spelling it was
     /// first heard with, whatever the case of later records. `None` if it is
-    /// new and the device has [`MAX_SERVICES`] already.
-    fn service_mut(&mut self, instance: &str) -> Option<&mut Service> {
+    /// new and the device has `max_services` already.
+    fn service_mut(&mut self, instance: &str, max_services: usize) -> Option<&mut Service> {
         let at = match self.services.iter().position(|s| s.instance.eq_ignore_ascii_case(instance)) {
             Some(at) => at,
-            None if self.services.len() >= MAX_SERVICES => return None,
+            None if self.services.len() >= max_services => return None,
             None => self.insert_service(Service {
                 instance: instance.to_string(),
                 kind: parser::split_instance(instance).map(|(_, kind)| kind.to_string()).unwrap_or_default(),
@@ -1418,9 +1421,9 @@ mod tests {
         let msg = response(records);
         let (reports, rest) = Report::all(&msg);
         for report in &reports {
-            device.learn(report, &report.addrs, DEFAULT_MAX_ADDRS);
+            device.learn(report, &report.addrs, DEFAULT_MAX_ADDRS, DEFAULT_MAX_SERVICES);
         }
-        device.learn_records(rest.into_iter());
+        device.learn_records(rest.into_iter(), DEFAULT_MAX_SERVICES);
     }
 
     fn heard(records: Vec<Record>) -> Device {
@@ -2085,17 +2088,17 @@ mod tests {
     #[test]
     fn a_device_holds_only_so_much() {
         let mut device = Device { hostname: Some("tv.local".into()), addresses: vec![ip("10.0.1.7").into()], ..Device::default() };
-        let services: Vec<Record> = (0..MAX_SERVICES + 10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
-        device.learn_records(services.iter());
-        assert_eq!(device.services.len(), MAX_SERVICES);
+        let services: Vec<Record> = (0..DEFAULT_MAX_SERVICES + 10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
+        device.learn_records(services.iter(), DEFAULT_MAX_SERVICES);
+        assert_eq!(device.services.len(), DEFAULT_MAX_SERVICES);
 
         let subtypes: Vec<Record> =
             (0..MAX_SUBTYPES + 5).map(|i| ptr(&format!("_s{i}._sub._http._tcp.local"), "S0._http._tcp.local")).collect();
-        device.learn_records(subtypes.iter());
+        device.learn_records(subtypes.iter(), DEFAULT_MAX_SERVICES);
         assert_eq!(device.service("S0._http._tcp.local").unwrap().subtypes.len(), MAX_SUBTYPES);
 
         let mappings: Vec<Record> = (0..MAX_REVERSE + 5).map(|i| reverse(&format!("10.0.2.{i}"), "tv.local")).collect();
-        device.learn_records(mappings.iter());
+        device.learn_records(mappings.iter(), DEFAULT_MAX_SERVICES);
         assert_eq!(device.reverse.len(), MAX_REVERSE);
     }
 
@@ -2348,7 +2351,7 @@ mod tests {
         assert_eq!(report.host, "tv.local");
 
         let mut device = Device::default();
-        device.learn(report, &report.addrs, DEFAULT_MAX_ADDRS);
+        device.learn(report, &report.addrs, DEFAULT_MAX_ADDRS, DEFAULT_MAX_SERVICES);
         assert_eq!(v4(&device), Some(ip("10.0.1.7")), "the proxy's address is not the host's");
         assert_eq!((device.nsec, device.reverse), (Some(vec![rtype::A]), vec![ip("10.0.1.7")]));
     }

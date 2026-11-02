@@ -29,6 +29,7 @@
 //! [Interface]         ; optional: without a Name=, for every interface
 //! MaxAddresses=8      ; 8 unless set
 //! MaxDevices=1024     ; 1024 unless set
+//! MaxServices=64      ; 64 unless set
 //!
 //! [Interface]         ; optional, for each interface that needs its own
 //! Name=wifi
@@ -97,6 +98,10 @@ pub const DEFAULT_MAX_ADDRS: usize = 8;
 /// without bound. A sleep proxy or Thread border router speaks for several
 /// hosts, but not for this many. See `[Interface] MaxDevices=`.
 pub const DEFAULT_MAX_DEVICES: usize = 1024;
+
+/// The default for how many services a device is kept with: more would be a
+/// flood, not a device. See `[Interface] MaxServices=`.
+pub const DEFAULT_MAX_SERVICES: usize = 64;
 
 /// Which of the questions asked on one of a reflector's segments it puts to
 /// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
@@ -187,6 +192,9 @@ pub struct InterfaceConfig {
     /// How many devices it remembers, at most: the default is
     /// [`DEFAULT_MAX_DEVICES`]. A host beyond that is not learned of.
     pub max_devices: Option<usize>,
+    /// How many services a device heard on it is kept with, at most: the
+    /// default is [`DEFAULT_MAX_SERVICES`].
+    pub max_services: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -271,6 +279,12 @@ impl Config {
         self.setting_of(interface, |i| i.max_devices).unwrap_or(DEFAULT_MAX_DEVICES)
     }
 
+    /// How many services a device heard on `interface` is kept with, at most:
+    /// its `MaxServices=`, or else [`DEFAULT_MAX_SERVICES`].
+    pub fn max_services_of(&self, interface: &str) -> usize {
+        self.setting_of(interface, |i| i.max_services).unwrap_or(DEFAULT_MAX_SERVICES)
+    }
+
     /// The least a device heard on `interface` is kept after it was last
     /// heard from: its `MinimumLifetime=`, or else [`DEFAULT_MIN_LIFETIME`].
     pub fn min_lifetime_of(&self, interface: &str) -> Duration {
@@ -348,6 +362,10 @@ impl Config {
                     }
                     ("interface", "name") => {
                         config.interface_settings.last_mut().unwrap().name = Some(value).filter(|v| !v.is_empty());
+                    }
+                    ("interface", "maxservices") => {
+                        config.interface_settings.last_mut().unwrap().max_services =
+                            Some(parse_limit(&value, lineno, "MaxServices")?);
                     }
                     ("interface", "maxdevices") => {
                         config.interface_settings.last_mut().unwrap().max_devices =
@@ -936,7 +954,7 @@ interfaces=br0,wifi
         let man = include_str!("../man/mdnsd.conf.5");
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
-            "ReflectTTL=", "MaxAddresses=", "MaxDevices=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
+            "ReflectTTL=", "MaxAddresses=", "MaxDevices=", "MaxServices=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
             "Reannounce=", "ReflectedWhen=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
@@ -1265,8 +1283,15 @@ ProbeInterval=off
     }
 
     #[test]
-    fn max_devices_defaults_to_1024_and_is_an_interfaces_setting_like_max_addresses() {
+    fn max_devices_and_services_default_and_are_an_interfaces_setting_like_max_addresses() {
         assert_eq!(Config::parse(EXAMPLE).unwrap().max_devices_of("br0"), DEFAULT_MAX_DEVICES);
+        assert_eq!(Config::parse(EXAMPLE).unwrap().max_services_of("br0"), DEFAULT_MAX_SERVICES);
+        let c = Config::parse(&format!("{EXAMPLE}\n[Interface]\nMaxServices=200\n[Interface]\nName=wifi\nMaxServices=infinity")).unwrap();
+        assert_eq!((c.max_services_of("br0"), c.max_services_of("wifi")), (200, usize::MAX));
+        for bad in ["0", "many", ""] {
+            let err = error_of(&format!("{EXAMPLE}\n[Interface]\nMaxServices={bad}"));
+            assert!(err.contains("MaxServices="), "{bad:?}: {err}");
+        }
         let c = Config::parse(&format!("{EXAMPLE}\n[Interface]\nMaxDevices=5000\n[Interface]\nName=wifi\nMaxDevices=infinity")).unwrap();
         assert_eq!((c.max_devices_of("br0"), c.max_devices_of("wifi")), (5000, usize::MAX));
         for bad in ["0", "-1", "many", ""] {

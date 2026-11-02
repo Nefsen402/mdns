@@ -433,6 +433,16 @@ with the number of devices it has, so a larger limit is for a network that
 needs it.
 At most 64 hosts are learned of from any one sender, whatever this is.
 .TP
+.B MaxServices=
+How many services a device is kept with, and reflected with, at most; more are
+ignored.
+Default
+.BR 64 ,
+far more than a device offers.
+At least 1, or
+.B infinity
+for no limit, at the cost of letting one device announce as many as it likes.
+.TP
 .B MinimumLifetime=
 Optional.
 The least a device heard on this interface is kept after it was last heard from,
@@ -519,6 +529,7 @@ Untrusted=wifi
 [Interface]
 MaxAddresses=8
 MaxDevices=1024
+MaxServices=64
 
 # Some IoT devices sleep and ignore multicast: keep them listed for an hour.
 [Interface]
