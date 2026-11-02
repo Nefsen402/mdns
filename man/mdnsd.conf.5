@@ -124,6 +124,13 @@ A device lives for as long as the longest TTL it announced, and at least
 This long before that runs out, the daemon asks that device, and only it, for
 the records it announced, and asks again about every quarter of this margin
 until it answers or expires.
+Where the family of its address is
+.BR on ,
+the first question is sent to the device's own address, not to the group, as
+a device that sleeps may ignore the group and still answer what is sent to it;
+the questions after it go to the group, and with
+.B multicast
+all do.
 .IP
 Each address of a device lives for the TTL it was announced with, at least the
 minimum lifetime, so one the device stops announcing is dropped on its own, and

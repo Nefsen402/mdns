@@ -576,6 +576,9 @@ struct State {
     reannounce: bool,
     /// How many addresses of a family a discovered device is kept with.
     max_addrs: usize,
+    /// The families a device is asked directly over, to refresh it: those that
+    /// hear what is sent to the daemon.
+    direct: Vec<Family>,
     /// How many devices it remembers, at most.
     max_devices: usize,
     /// How many services a device is kept with, at most.
@@ -923,6 +926,7 @@ impl Segment {
             state: Rc::new(RefCell::new(State {
                 min_lifetime: DEFAULT_MIN_LIFETIME,
                 max_addrs: DEFAULT_MAX_ADDRS,
+                direct: vec![Family::V4, Family::V6],
                 max_devices: DEFAULT_MAX_DEVICES,
                 max_services: DEFAULT_MAX_SERVICES,
                 max_packet: DEFAULT_MAX_PACKET,
@@ -938,6 +942,14 @@ impl Segment {
     /// Applies to what is heard from now on.
     pub fn set_min_lifetime(&self, min_lifetime: Duration) {
         self.state.borrow_mut().min_lifetime = min_lifetime;
+    }
+
+    /// The families a device is asked directly over, to refresh it, rather than
+    /// on the group: those the daemon hears what is sent to it over, which is
+    /// where the answer comes if the device sends it to the daemon. The
+    /// default is both.
+    pub fn set_direct(&self, families: &[Family]) {
+        self.state.borrow_mut().direct = families.to_vec();
     }
 
     /// How many addresses of a family a discovered device is kept with, at
@@ -1856,7 +1868,7 @@ impl Segment {
     /// many questions were sent.
     pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
         let mut guard = self.state.borrow_mut();
-        let State { discovered, outbound, max_packet, .. } = &mut *guard;
+        let State { discovered, outbound, max_packet, direct, .. } = &mut *guard;
         if outbound.is_empty() {
             return Ok(0);
         }
@@ -1865,17 +1877,28 @@ impl Segment {
         // Due when it, or one of its addresses, is about to run out. Not what
         // has already run out: it is about to be dropped. A margin too long to
         // add to a time reaches past every expiry.
-        let mut asking = Vec::new();
+        let (mut asking, mut asked) = (Vec::new(), 0);
         for id in discovered.about_to_run_out(now, before) {
             let entry = discovered.get(id);
             let recent = entry.refreshed.is_some_and(|t| now.saturating_duration_since(t) < gap);
             if !entry.askable() || recent {
                 continue;
             }
-            asking.push(entry.device.clone());
+            // A device that sleeps may ignore the group, and still answers what
+            // is sent to it. If it did not answer that (a retry, as it was asked
+            // already in this window), the group is tried, in case it ignores
+            // what is sent to it instead.
+            let retry = entry.refreshed.is_some_and(|t| entry.soonest().checked_sub(before).is_none_or(|from| t >= from));
+            let device = entry.device.clone();
             discovered.edit(id, |entry| entry.refreshed = Some(now));
+            let direct = direct_address(&device, direct).filter(|_| !retry);
+            let queries = Device::refresh_queries(core::slice::from_ref(&device), *max_packet);
+            match direct {
+                Some(addr) if ask_at(outbound, addr, &queries) => asked += queries.iter().map(|q| q.questions.len()).sum::<usize>(),
+                _ => asking.push(device),
+            }
         }
-        ask(outbound, &Device::refresh_queries(&asking, *max_packet))
+        Ok(asked + ask(outbound, &Device::refresh_queries(&asking, *max_packet))?)
     }
 
     /// Drop devices whose lifetime has run out as of `now`.
@@ -2001,21 +2024,32 @@ impl Touched {
     }
 }
 
-/// Ask `queries` of the device at link-local address `ll`, by unicast to its
-/// port 5353 (RFC 6762 section 5.5), over the socket of its family: to send
-/// it, the kernel has to look up its link-layer address, which is what this
-/// is for. Failing to send is no matter: the next time will do.
-fn nudge(outbound: &[Outbound], ll: IpAddr, queries: &[Message]) {
-    let Some(out) = outbound.iter().find(|o| o.family == family_of(ll)) else { return };
-    let dest = match (ll, out.dest) {
-        (IpAddr::V6(ll), SocketAddr::V6(group)) => SocketAddr::V6(SocketAddrV6::new(ll, MDNS_PORT, 0, group.scope_id())),
-        (ll, _) => SocketAddr::new(ll, MDNS_PORT),
+/// Ask `queries` of the device at `addr`, by unicast to its port 5353 (RFC
+/// 6762 section 5.5), over the socket of its family. Whether all were sent.
+/// To a link-local address, the kernel has to look up its link-layer address,
+/// which is what [`nudge`] is for.
+fn ask_at(outbound: &[Outbound], addr: IpAddr, queries: &[Message]) -> bool {
+    let Some(out) = outbound.iter().find(|o| o.family == family_of(addr)) else { return false };
+    let dest = match (addr, out.dest) {
+        (IpAddr::V6(addr), SocketAddr::V6(group)) => SocketAddr::V6(SocketAddrV6::new(addr, MDNS_PORT, 0, group.scope_id())),
+        (addr, _) => SocketAddr::new(addr, MDNS_PORT),
     };
-    for query in queries {
-        if let Ok(bytes) = query.encode() {
-            let _ = send_to(&out.socket, &bytes, dest);
-        }
-    }
+    queries.iter().all(|query| query.encode().is_ok_and(|bytes| send_to(&out.socket, &bytes, dest).is_ok()))
+}
+
+/// Ask `queries` of the device at link-local address `ll`, for the kernel to
+/// look up its link-layer address. Failing to send is no matter: the next
+/// time will do.
+fn nudge(outbound: &[Outbound], ll: IpAddr, queries: &[Message]) {
+    ask_at(outbound, ll, queries);
+}
+
+/// Where to ask `device` directly, over one of `families`: a routable
+/// address, IPv4 first, else a link-local one.
+fn direct_address(device: &Device, families: &[Family]) -> Option<IpAddr> {
+    let allowed = |a: &IpAddr| families.contains(&family_of(*a));
+    let routable = || device.routable().filter(allowed);
+    routable().find(IpAddr::is_ipv4).or_else(|| routable().next()).or_else(|| device.link_local().find(allowed))
 }
 
 /// Multicast `queries`, over every family. Returns how many questions they
@@ -4056,6 +4090,37 @@ mod tests {
             ])
         );
         assert!(recv(&rx).is_none());
+    }
+
+    /// A device is asked to refresh at its own address: a routable one, IPv4
+    /// first, else a link-local one, and where it has none, on the group.
+    #[test]
+    fn a_refresh_is_asked_at_a_routable_address_of_the_device_before_a_link_local() {
+        let device = |addrs: &[&str]| {
+            let mut d = Device { hostname: Some("pc.local".into()), ..Device::default() };
+            d.add_addrs(&addrs.iter().map(|a| ip(a)).collect::<Vec<_>>());
+            d
+        };
+        let both = [Family::V4, Family::V6];
+        assert_eq!(direct_address(&device(&["fe80::1", "fd00::2", "10.0.1.3"]), &both), Some(ip("10.0.1.3")));
+        assert_eq!(direct_address(&device(&["fe80::1", "fd00::2"]), &both), Some(ip("fd00::2")));
+        assert_eq!(direct_address(&device(&["fe80::1"]), &both), Some(ip("fe80::1")));
+        assert_eq!(direct_address(&device(&[]), &both), None);
+        // Only over a family that hears what is sent to the daemon.
+        assert_eq!(direct_address(&device(&["fe80::1", "fd00::2", "10.0.1.3"]), &[Family::V6]), Some(ip("fd00::2")));
+        assert_eq!(direct_address(&device(&["fe80::1", "10.0.1.3"]), &[Family::V4]), Some(ip("10.0.1.3")));
+        assert_eq!(direct_address(&device(&["fe80::1", "fd00::2"]), &[Family::V4]), None);
+        assert_eq!(direct_address(&device(&["10.0.1.3"]), &[]), None);
+    }
+
+    /// Where the device cannot be sent to, the question goes to the group.
+    #[test]
+    fn a_refresh_that_cannot_be_sent_to_the_device_goes_to_the_group() {
+        let (seg, rx) = wired();
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        // 10.0.1.7 is not reachable from the socket the test sends from.
+        assert_eq!(seg.refresh(Instant::now() + Duration::from_secs(250), Duration::from_secs(60)).unwrap(), 3);
+        assert!(recv(&rx).is_some());
     }
 
     #[test]
