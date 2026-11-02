@@ -12,8 +12,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# What is built once, and what every other job runs: the daemon, mdnsctl and
+# the unit tests' executables, built to record what they run. What a profile of
+# coverage says is about the binary that wrote it, so the jobs that run them
+# and the one that reports on them use these and none of their own.
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -29,5 +33,169 @@ jobs:
 
       # --locked fails if Cargo.lock is out of date, so a dependency change
       # that was not committed with its lock file is caught here.
+      - name: Build
+        run: python3 e2e/coverage.py build --out binaries
+
+      - name: Keep the binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: binaries
+          retention-days: 1
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: binaries
+
       - name: Test
-        run: cargo test --locked
+        run: python3 e2e/coverage.py unit --binaries binaries --out profile-unit
+
+      - name: Keep the profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-unit
+          path: profile-unit
+          retention-days: 1
+
+  # The built daemon, run through what the unit tests cannot: interfaces that
+  # come and go, real sockets, signals, the control and avahi sockets. See e2e/.
+  e2e:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: binaries
+
+      # The harness makes its own user and network namespaces. Recent Ubuntu
+      # forbids unprivileged user namespaces unless AppArmor is told not to;
+      # where that does not work, the harness is run as root, which makes only
+      # a network namespace.
+      - name: Allow user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo modprobe veth || true
+
+      - name: End-to-end tests
+        run: python3 e2e/coverage.py e2e --binaries binaries --out profile-e2e --logs e2e-logs
+
+      - name: Keep the daemon's logs of a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: e2e-logs
+          retention-days: 7
+
+      - name: Keep the profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-e2e
+          path: profile-e2e
+          retention-days: 1
+
+  # What the unit tests and the end-to-end tests cover together, as a table in
+  # the job's summary and, on a pull request, a comment that says how it moved
+  # from master. The tests are not run again: this merges what they recorded.
+  # The report by line is kept as an artifact.
+  coverage:
+    needs: [test, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      # The source is read from where it was when it was built, which is here.
+      - uses: actions/checkout@v4
+
+      # The LLVM tools of the compiler read what it wrote.
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview --no-self-update
+          rustup default stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: binaries
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: profile-unit
+          path: profile-unit
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: profile-e2e
+          path: profile-e2e
+
+      # What master last measured, to say how this moved. Best effort: with none,
+      # the table is of this alone.
+      - name: Fetch the coverage of master
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p baseline
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --branch master \
+                --status success --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+          if [ -n "$run" ]; then
+            gh run download "$run" --repo "$GITHUB_REPOSITORY" --name coverage-summary --dir baseline || true
+          fi
+          ls baseline
+
+      - name: Report
+        run: |
+          python3 e2e/coverage.py report --binaries binaries \
+            --profiles profile-unit profile-e2e --out coverage-report \
+            $( [ -f baseline/summary.json ] && echo --baseline baseline/summary.json )
+
+      # master's figures are what the next pull request is compared with.
+      - name: Keep the figures
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: coverage-report/summary.json
+
+      - name: Keep the report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage-report/html
+            coverage-report/lcov.info
+            coverage-report/summary.md
+
+      # One comment, kept up to date, and only where the token may write: not
+      # on a pull request from a fork.
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- coverage-report -->';
+            const body = marker + '\n' + fs.readFileSync('coverage-report/summary.md', 'utf8') +
+              `\n[The report, line by line](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) (artifact \`coverage-report\`).`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const mine = comments.find(c => c.body && c.body.startsWith(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
