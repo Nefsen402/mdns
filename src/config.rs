@@ -76,7 +76,7 @@ const MIN_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 /// Two minutes is the usual for host names (Avahi used it for `router.local`).
 pub const DEFAULT_ADVERTISE_TTL: Duration = Duration::from_secs(120);
 
-/// Names are re-announced at 80% of their TTL, so a shorter one would be a flood.
+/// A name may be re-announced at 80% of its TTL (`Reannounce=`), so a shorter one would be a flood.
 const MIN_HOST_TTL: Duration = Duration::from_secs(10);
 
 /// A longer one is a typo, and a name would outlive its host for a day.
@@ -234,17 +234,8 @@ pub struct Config {
     pub ipv6: Listen,
     /// Where the IPC server listens.
     pub socket: String,
-    /// A `.local` name to announce and answer for with this host's own
-    /// addresses on every interface.
-    pub advertise: Option<String>,
-    /// The TTL of the advertised name's address records, which it is
-    /// re-announced at 80% of.
-    pub advertise_ttl: Duration,
-    /// The services to announce under the advertised name, each as its type
-    /// (`_ssh._tcp`) and port, by an instance named for the host.
-    pub advertise_services: Vec<(String, u16)>,
-    /// The interfaces to advertise on; all of those listened to if none.
-    pub advertise_interfaces: Vec<String>,
+    /// The names this host announces and answers for, with its own addresses.
+    pub advertise: Vec<AdvertiseConfig>,
     /// How often to probe the interfaces of segments that do not set their
     /// own; `None` (the default) probes only at startup and on request. See
     /// [`Config::probe_interval_of`].
@@ -262,10 +253,7 @@ impl Default for Config {
             ipv4: Listen::default(),
             ipv6: Listen::default(),
             socket: DEFAULT_SOCKET.to_string(),
-            advertise: None,
-            advertise_ttl: DEFAULT_ADVERTISE_TTL,
-            advertise_services: Vec::new(),
-            advertise_interfaces: Vec::new(),
+            advertise: Vec::new(),
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
         }
@@ -345,12 +333,17 @@ impl Config {
         // Header line of each [Segment] and [Interface], for error messages.
         let mut segment_lines = Vec::new();
         let mut interface_lines = Vec::new();
+        let mut advertise_lines = Vec::new();
 
         for section in &unit.sections {
             let name = section.name.to_ascii_lowercase();
             if name == "segment" {
                 config.segments.push(SegmentConfig::default());
                 segment_lines.push(section.line);
+            }
+            if name == "advertise" {
+                config.advertise.push(AdvertiseConfig::default());
+                advertise_lines.push(section.line);
             }
             if name == "interface" {
                 config.interface_settings.push(InterfaceConfig::default());
@@ -447,30 +440,32 @@ impl Config {
                         config.refresh_before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
                     }
                     ("advertise", "hostname") => {
-                        config.advertise = Some(local_name(&value, lineno)?);
+                        config.advertise.last_mut().unwrap().name = local_name(&value, lineno)?;
                     }
                     ("advertise", "interface") => {
+                        let block = config.advertise.last_mut().unwrap();
                         if value.is_empty() {
-                            config.advertise_interfaces.clear();
+                            block.interfaces.clear();
                         }
                         for name in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) {
-                            if !config.advertise_interfaces.iter().any(|i| i == name) {
-                                config.advertise_interfaces.push(name.to_string());
+                            if !block.interfaces.iter().any(|i| i == name) {
+                                block.interfaces.push(name.to_string());
                             }
                         }
                     }
                     ("advertise", "services") => {
+                        let block = config.advertise.last_mut().unwrap();
                         if value.is_empty() {
-                            config.advertise_services.clear();
+                            block.services.clear();
                         }
                         for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) {
                             let service = parse_service(word, lineno)?;
-                            if !config.advertise_services.contains(&service) {
-                                config.advertise_services.push(service);
+                            if !block.services.contains(&service) {
+                                block.services.push(service);
                             }
                         }
                     }
-                    ("advertise", "ttl") => config.advertise_ttl = parse_host_ttl(&value, lineno, "TTL")?,
+                    ("advertise", "ttl") => config.advertise.last_mut().unwrap().ttl = parse_host_ttl(&value, lineno, "TTL")?,
                     ("ipc", "socket") => {
                         if value.is_empty() {
                             bail!("line {lineno}: Socket= needs a path");
@@ -482,26 +477,34 @@ impl Config {
             }
         }
 
-        config.validate(&segment_lines, &interface_lines)?;
+        config.validate(&segment_lines, &interface_lines, &advertise_lines)?;
         Ok(config)
     }
 
-    fn validate(&self, segment_lines: &[usize], interface_lines: &[usize]) -> Result<()> {
+    fn validate(&self, segment_lines: &[usize], interface_lines: &[usize], advertise_lines: &[usize]) -> Result<()> {
         if self.segments.is_empty() {
             bail!("no [Segment] defined");
         }
         if !self.ipv4.enabled() && !self.ipv6.enabled() {
             bail!("[Listen] IPv4= and IPv6= are both off");
         }
-        if !self.advertise_services.is_empty() && self.advertise.is_none() {
-            bail!("[Advertise] Services= needs a Hostname=, to be at");
-        }
-        if !self.advertise_interfaces.is_empty() && self.advertise.is_none() {
-            bail!("[Advertise] Interface= needs a Hostname=, to advertise");
-        }
         let listened = self.interfaces();
-        if let Some(stray) = self.advertise_interfaces.iter().find(|i| !listened.contains(&i.as_str())) {
-            bail!("[Advertise] Interface={stray} is not in any segment's Interfaces=");
+        for (i, block) in self.advertise.iter().enumerate() {
+            let at = advertise_lines[i];
+            if block.name.is_empty() {
+                bail!("[Advertise] at line {at} has no Hostname=");
+            }
+            if let Some(stray) = block.interfaces.iter().find(|i| !listened.contains(&i.as_str())) {
+                bail!("[Advertise] at line {at} has Interface={stray}, which is not in any segment's Interfaces=");
+            }
+            // One name is of one set of addresses on an interface.
+            let on = |b: &AdvertiseConfig, iface: &str| b.interfaces.is_empty() || b.interfaces.iter().any(|i| i == iface);
+            if let Some(other) = self.advertise[..i]
+                .iter()
+                .find(|o| o.name.eq_ignore_ascii_case(&block.name) && listened.iter().any(|&iface| on(o, iface) && on(block, iface)))
+            {
+                bail!("[Advertise] at line {at} has Hostname={}, which another does on the same interface", other.name);
+            }
         }
 
         for (i, seg) in self.segments.iter().enumerate() {
@@ -568,6 +571,29 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+/// One `[Advertise]` section: a name, and what it is announced with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdvertiseConfig {
+    /// The `.local` name to announce and answer for with this host's own
+    /// addresses.
+    pub name: String,
+    /// The TTL of the name's address records: how long others keep them, and,
+    /// on an interface of a segment that re-announces, when it is announced
+    /// again (at 80% of it).
+    pub ttl: Duration,
+    /// The services to announce under the name, each as its type
+    /// (`_ssh._tcp`) and port, by an instance named for the host.
+    pub services: Vec<(String, u16)>,
+    /// The interfaces to advertise on; all of those listened to if none.
+    pub interfaces: Vec<String>,
+}
+
+impl Default for AdvertiseConfig {
+    fn default() -> Self {
+        AdvertiseConfig { name: String::new(), ttl: DEFAULT_ADVERTISE_TTL, services: Vec::new(), interfaces: Vec::new() }
     }
 }
 
@@ -990,13 +1016,14 @@ interfaces=br0,wifi
 
     #[test]
     fn advertise_is_optional_and_validated() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().advertise, None);
+        let names = |c: Config| c.advertise.into_iter().map(|a| a.name).collect::<Vec<_>>();
+        assert!(Config::parse(EXAMPLE).unwrap().advertise.is_empty());
 
         let with = |value: &str| Config::parse(&format!("[Advertise]\nHostname={value}\n{EXAMPLE}"));
-        assert_eq!(with("router.local").unwrap().advertise.as_deref(), Some("router.local"));
-        assert_eq!(with("\"My-Router.LOCAL\"").unwrap().advertise.as_deref(), Some("My-Router.LOCAL"));
+        assert_eq!(names(with("router.local").unwrap()), ["router.local"]);
+        assert_eq!(names(with("\"My-Router.LOCAL\"").unwrap()), ["My-Router.LOCAL"]);
         // A bare label means that label under .local.
-        assert_eq!(with("router").unwrap().advertise.as_deref(), Some("router.local"));
+        assert_eq!(names(with("router").unwrap()), ["router.local"]);
 
         for bad in ["", "router.lan", "router.example.com", "bad name.local", "a..local", ".local", "ro_uter.local"] {
             assert!(with(bad).is_err(), "should reject {bad:?}");
@@ -1005,49 +1032,74 @@ interfaces=br0,wifi
         assert!(with(&format!("{}.local", "x".repeat(63))).is_ok());
     }
 
+    /// Any number of them, each with its own name, services, interfaces and TTL.
     #[test]
-    fn advertised_services_are_a_type_and_a_port_and_need_a_hostname() {
-        let ok = |value: &str| Config::parse(&format!("[Advertise]\nHostname=pc\nServices={value}\n{EXAMPLE}")).map(|c| c.advertise_services);
+    fn there_may_be_any_number_of_advertise_sections() {
+        let c = Config::parse(&format!(
+            "[Advertise]\nHostname=pc\nServices=_ssh._tcp:22\nInterface=br0\nTTL=1h\n\
+             [Advertise]\nHostname=files\nServices=_smb._tcp:445\nInterface=media\n\
+             [Advertise]\nHostname=other\n\
+             [Segment]\nName=a\nInterfaces=br0,media\n"
+        ))
+        .unwrap();
+        assert_eq!(c.advertise.len(), 3);
+        assert_eq!((c.advertise[0].name.as_str(), c.advertise[0].ttl), ("pc.local", Duration::from_secs(3600)));
+        assert_eq!(c.advertise[1].services, [("_smb._tcp".to_string(), 445)]);
+        assert_eq!((c.advertise[2].interfaces.len(), c.advertise[2].ttl), (0, Duration::from_secs(120)));
+
+        let err = |text: &str| Config::parse(&format!("{text}\n[Segment]\nName=a\nInterfaces=br0,media\n")).unwrap_err().to_string();
+        // Each has a name.
+        let e = err("[Advertise]\nHostname=pc\n[Advertise]\nServices=_ssh._tcp:22");
+        assert!(e.contains("line 3") && e.contains("no Hostname="), "{e}");
+        // One name is not on an interface twice; on different ones, or in
+        // different case on none shared, it may be.
+        let e = err("[Advertise]\nHostname=pc\n[Advertise]\nHostname=PC");
+        assert!(e.contains("line 3") && e.contains("same interface"), "{e}");
+        let e = err("[Advertise]\nHostname=pc\nInterface=br0\n[Advertise]\nHostname=pc");
+        assert!(e.contains("same interface"), "{e}");
+        let ok = Config::parse("[Advertise]\nHostname=pc\nInterface=br0\n[Advertise]\nHostname=pc\nInterface=media\n[Segment]\nName=a\nInterfaces=br0,media\n");
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn advertised_services_are_a_type_and_a_port() {
+        let ok = |value: &str| Config::parse(&format!("[Advertise]\nHostname=pc\nServices={value}\n{EXAMPLE}")).map(|c| c.advertise[0].services.clone());
         assert_eq!(ok("_ssh._tcp:22").unwrap(), [("_ssh._tcp".to_string(), 22)]);
         // Lists as elsewhere: spaces or commas, more than one line, none repeated.
         let c = Config::parse(&format!("[Advertise]\nHostname=pc\nServices=_ssh._tcp:22, _http._tcp:8080\nServices=_SSH._tcp:22 _x._udp:9\n{EXAMPLE}")).unwrap();
-        assert_eq!(c.advertise_services.len(), 3);
-        assert_eq!(c.advertise_services[2], ("_x._udp".to_string(), 9));
+        assert_eq!(c.advertise[0].services.len(), 3);
+        assert_eq!(c.advertise[0].services[2], ("_x._udp".to_string(), 9));
         // Empty clears.
         let c = Config::parse(&format!("[Advertise]\nHostname=pc\nServices=_ssh._tcp:22\nServices=\n{EXAMPLE}")).unwrap();
-        assert!(c.advertise_services.is_empty());
+        assert!(c.advertise[0].services.is_empty());
         for bad in ["ssh", "_ssh._tcp", "_ssh._tcp:0", "_ssh._tcp:70000", "ssh._tcp:22", "_ssh._sctp:22", "_ssh:22", "_ssh._tcp.local:22"] {
             let e = ok(bad).unwrap_err().to_string();
             assert!(e.contains("line 3") && e.contains("a type and a port"), "{bad}: {e}");
         }
-        let e = Config::parse(&format!("[Advertise]\nServices=_ssh._tcp:22\n{EXAMPLE}")).unwrap_err().to_string();
-        assert!(e.contains("needs a Hostname="), "{e}");
     }
 
     #[test]
     fn advertising_can_be_limited_to_interfaces_that_are_listened_to() {
         let with = |lines: &str| Config::parse(&format!("[Advertise]\nHostname=pc\n{lines}\n[Segment]\nName=a\nInterfaces=br0,media\n"));
-        assert!(with("").unwrap().advertise_interfaces.is_empty());
-        assert_eq!(with("Interface=br0").unwrap().advertise_interfaces, ["br0"]);
-        assert_eq!(with("Interface=br0, media\nInterface=br0").unwrap().advertise_interfaces, ["br0", "media"]);
-        assert!(with("Interface=br0\nInterface=").unwrap().advertise_interfaces.is_empty());
+        let on = |lines: &str| with(lines).unwrap().advertise[0].interfaces.clone();
+        assert!(on("").is_empty());
+        assert_eq!(on("Interface=br0"), ["br0"]);
+        assert_eq!(on("Interface=br0, media\nInterface=br0"), ["br0", "media"]);
+        assert!(on("Interface=br0\nInterface=").is_empty());
         let e = with("Interface=eth9").unwrap_err().to_string();
         assert!(e.contains("eth9") && e.contains("not in any segment"), "{e}");
-        let e = Config::parse("[Advertise]\nInterface=br0\n[Segment]\nName=a\nInterfaces=br0\n").unwrap_err().to_string();
-        assert!(e.contains("needs a Hostname="), "{e}");
     }
 
     #[test]
     fn advertise_ttl_defaults_to_two_minutes_and_is_bounded() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().advertise_ttl, Duration::from_secs(120));
-
-        let with = |value: &str| Config::parse(&format!("[Advertise]\nTTL={value}\n{EXAMPLE}"));
-        assert_eq!(with("2min").unwrap().advertise_ttl, Duration::from_secs(120));
-        assert_eq!(with("1h").unwrap().advertise_ttl, Duration::from_secs(3600));
-        assert_eq!(with("10").unwrap().advertise_ttl, Duration::from_secs(10));
-        assert_eq!(with("24h").unwrap().advertise_ttl, Duration::from_secs(86400));
+        let ttl = |value: &str| Config::parse(&format!("[Advertise]\nHostname=pc\nTTL={value}\n{EXAMPLE}")).map(|c| c.advertise[0].ttl);
+        assert_eq!(Config::parse(&format!("[Advertise]\nHostname=pc\n{EXAMPLE}")).unwrap().advertise[0].ttl, Duration::from_secs(120));
+        assert_eq!(ttl("2min").unwrap(), Duration::from_secs(120));
+        assert_eq!(ttl("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(ttl("10").unwrap(), Duration::from_secs(10));
+        assert_eq!(ttl("24h").unwrap(), Duration::from_secs(86400));
         for bad in ["9s", "0", "", "off", "infinity", "25h", "soon", "99999999999999s"] {
-            assert!(with(bad).is_err(), "should reject {bad:?}");
+            assert!(ttl(bad).is_err(), "should reject {bad:?}");
         }
     }
 
@@ -1070,8 +1122,8 @@ interfaces=br0,wifi
             assert!(ttl(bad).is_err(), "should reject {bad:?}");
         }
         // It is independent of the advertised name's, and no longer a device setting.
-        let c = Config::parse("[Advertise]\nTTL=1h\n[Segment]\nName=a\nInterfaces=x\nReflectTTL=5min").unwrap();
-        assert_eq!((c.segments[0].reflect_ttl, c.advertise_ttl), (Some(Duration::from_secs(300)), Duration::from_secs(3600)));
+        let c = Config::parse("[Advertise]\nHostname=pc\nTTL=1h\n[Segment]\nName=a\nInterfaces=x\nReflectTTL=5min").unwrap();
+        assert_eq!((c.segments[0].reflect_ttl, c.advertise[0].ttl), (Some(Duration::from_secs(300)), Duration::from_secs(3600)));
         assert!(error_of(&format!("[Devices]\nReflectTTL=5min\n{EXAMPLE}")).contains("unknown setting"));
     }
 

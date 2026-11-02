@@ -16,11 +16,10 @@ use core::net::{IpAddr, SocketAddr};
 
 use rustix::fd::{AsRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
-use core::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
+use crate::config::{AdvertiseConfig, Config};
 use crate::device::{Device, Service};
 use crate::runtime::Why;
 use crate::netlink::{Change, Netlink};
@@ -42,10 +41,8 @@ pub struct Link {
     #[cfg_attr(not(all(target_os = "linux", not(feature = "portable-sockets"))), allow(dead_code))]
     unicast: Vec<Family>,
     segment: Segment,
-    /// The name to advertise with this host's addresses, and its TTL.
-    advertise: Option<(String, Duration)>,
-    /// The services to announce with it, as a type and a port.
-    services: Vec<(String, u16)>,
+    /// The names to advertise with this host's addresses here.
+    advertise: Vec<AdvertiseConfig>,
     /// The interface's index, while it has sockets on it.
     index: Option<u32>,
     /// Whether it was up (and running) when last heard of. Nothing is
@@ -85,10 +82,10 @@ impl Link {
             segment,
             advertise: config
                 .advertise
-                .clone()
-                .filter(|_| config.advertise_interfaces.is_empty() || config.advertise_interfaces.iter().any(|i| i == interface))
-                .map(|name| (name, config.advertise_ttl)),
-            services: config.advertise_services.clone(),
+                .iter()
+                .filter(|a| a.interfaces.is_empty() || a.interfaces.iter().any(|i| i == interface))
+                .cloned()
+                .collect(),
             index: None,
             up: true,
             was_here: false,
@@ -180,13 +177,22 @@ impl Link {
         self.advertise();
     }
 
-    /// Announce the name to advertise with this host's addresses on the
+    /// Announce the names to advertise with this host's addresses on the
     /// interface, one of each family, read afresh: on its own link the
     /// router's link-local address is as good as any, and for IPv6 it is the
-    /// one the kernel picks. With none at all, it is withdrawn.
+    /// one the kernel picks. With none at all, they are withdrawn.
     fn advertise(&self) {
-        let Some((name, ttl)) = &self.advertise else { return };
+        if self.advertise.is_empty() {
+            return;
+        }
         let addrs: Vec<IpAddr> = self.families.iter().filter_map(|&f| socket::local_addr(&self.interface, f).ok()).collect();
+        for block in &self.advertise {
+            self.advertise_one(block, &addrs);
+        }
+    }
+
+    fn advertise_one(&self, block: &AdvertiseConfig, addrs: &[IpAddr]) {
+        let AdvertiseConfig { name, ttl, services, .. } = block;
         if addrs.is_empty() {
             eprintln!("{}: no address to advertise {name} with", self.interface);
             if let Err(e) = self.segment.remove_manual(Owner::Own, name) {
@@ -195,11 +201,10 @@ impl Link {
             return;
         }
         let mut device = Device { hostname: Some(name.clone()), ..Device::default() };
-        device.add_addrs(&addrs);
+        device.add_addrs(addrs);
         // Each is of an instance named for the host, as Avahi's %h is.
         let label = name.split('.').next().unwrap_or(name);
-        device.services = self
-            .services
+        device.services = services
             .iter()
             .map(|(kind, port)| Service {
                 instance: format!("{label}.{kind}.local"),

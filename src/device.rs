@@ -70,8 +70,8 @@ const SERVICE_ENUMERATION: &str = "_services._dns-sd._udp.local";
 const MAX_REVERSE: usize = 8;
 
 /// A reflected device is never announced for less than this, however short a
-/// TTL it announced itself with: it is announced again at 80% of its TTL, and
-/// a few seconds would be a flood.
+/// TTL it announced itself with: where a segment announces again, it is at 80%
+/// of its TTL, and a few seconds would be a flood.
 pub const MIN_REFLECT_TTL: u32 = 10;
 
 /// A DNS-SD service advertised by a device.

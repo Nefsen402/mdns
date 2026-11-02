@@ -178,7 +178,11 @@ has to stay under
 .B MinimumLifetime=
 to keep devices listed, and the daemon warns about it at startup.
 .SS [Advertise]
-Optional.
+Optional, and there may be any number of them: each is a name of this host,
+with its own services, interfaces and TTL.
+Each has a
+.BR Hostname= ;
+one name is not advertised twice on the same interface.
 .TP
 .B Hostname=
 A name under
