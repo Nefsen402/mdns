@@ -707,8 +707,8 @@ impl State {
 /// One mDNS segment (interface) and the two device lists kept for it:
 /// devices discovered on the wire, and devices added by hand, over every
 /// family it serves: one list, whichever family a device was heard over.
-/// Cheap to clone; clones share state, so the receive threads and API
-/// callers can each hold one.
+/// Cheap to clone; clones share state, so its link, the reflectors spanning
+/// it and the control socket can each hold one.
 #[derive(Clone)]
 pub struct Segment {
     interface: Arc<str>,

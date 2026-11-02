@@ -102,8 +102,8 @@ fn main() -> Result<()> {
     // Look for devices right away instead of waiting for them to announce
     // themselves, and then again every `probe_interval`: most devices only
     // answer when asked, so without this a quiet one expires and is withdrawn
-    // from the other networks. The probes run on their own threads, so startup
-    // is not held up; `mdnsctl probe` does the same on demand.
+    // from the other networks. The probes run as rounds in the event loop, so
+    // startup is not held up; `mdnsctl probe` does the same on demand.
     eprintln!("keeping a device for at least {}s after it was last heard from", config.min_lifetime.as_secs());
     for interface in config.interfaces().into_iter().filter(|i| config.reannounce_on(i)) {
         eprintln!("{interface}: announcing reflected devices again at 80% of their TTL, changed or not");
@@ -151,10 +151,12 @@ fn main() -> Result<()> {
     }
 
     let segments = Arc::new(segments);
-    ipc::serve(&config.socket, &segments)?;
+    let mut server = ipc::Server::bind(&config.socket)?;
 
-    let signal = run(&signals, &waker, netlink, &mut tracked, &segments)?;
+    let signal = run(&signals, &waker, netlink, &mut tracked, &segments, &mut server)?;
     eprintln!("received {signal}: withdrawing reflected devices");
+    server.shut_down();
+    drop(server);
     // The loop has stopped, and the upkeep with it, while the goodbyes go out.
     release(segments);
     // With the reflectors gone, what is left in the manual lists is the
@@ -172,17 +174,24 @@ fn main() -> Result<()> {
 
 /// The event loop: read what `links` hear, follow what netlink reports for
 /// them, and run each link's upkeep when it is due, handing what changes to
-/// the reflectors of `groups`, until a shutdown signal comes, whose name is
-/// returned. `waker` cuts a wait short when something comes due sooner.
-/// Should netlink fail, interfaces are no longer followed, and the daemon
-/// goes on as they are.
-fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [Link], groups: &[Group]) -> Result<&'static str> {
+/// the reflectors of `groups`; and serve the control socket's clients through
+/// `server`; until a shutdown signal comes, whose name is returned. `waker`
+/// cuts a wait short when something comes due sooner. Should netlink fail,
+/// interfaces are no longer followed, and the daemon goes on as they are.
+fn run(
+    signals: &signal::Signals,
+    waker: &Waker,
+    netlink: Netlink,
+    links: &mut [Link],
+    groups: &[Group],
+    server: &mut ipc::Server,
+) -> Result<&'static str> {
     let reflectors: Vec<&Reflector> = groups.iter().map(|g| &g.reflector).collect();
     links::ask_neighbours(&netlink);
     let mut netlink = Some(netlink);
     loop {
         let upkeep = links.iter().filter_map(|l| l.segment().next_wake());
-        let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).min();
+        let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).min();
         // The signals, the waker and netlink, then every link's sockets,
         // each with the link it is of.
         let mut fds = vec![poll::readable(signals.fd()), poll::readable(waker.fd())];
@@ -190,6 +199,8 @@ fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [
         let sockets: Vec<(usize, i32)> =
             links.iter().enumerate().flat_map(|(i, l)| l.fds().map(move |fd| (i, fd))).collect();
         fds.extend(sockets.iter().map(|&(_, fd)| poll::readable(fd)));
+        let clients = fds.len();
+        fds.extend(server.fds());
         poll::wait(&mut fds, next.map(|at| at.saturating_duration_since(Instant::now())))
             .context("waiting for something to do")?;
         if let Some(name) = signals.take() {
@@ -199,9 +210,10 @@ fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [
             waker.clear();
         }
         // What was heard first: a change of interfaces may close the sockets.
-        for (&(link, fd), _) in sockets.iter().zip(&fds[3..]).filter(|(_, p)| poll::ready(p)) {
+        for (&(link, fd), _) in sockets.iter().zip(&fds[3..clients]).filter(|(_, p)| poll::ready(p)) {
             links[link].receive(fd);
         }
+        server.ready(&fds[clients..]);
         if let Some(n) = netlink.as_ref().filter(|_| poll::ready(&fds[2])) {
             match n.changes() {
                 Ok(changes) => links::follow(n, links, &changes),
@@ -221,6 +233,7 @@ fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [
         for r in &reflectors {
             r.retry(now);
         }
+        server.tick(groups, now);
     }
 }
 

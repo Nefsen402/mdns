@@ -89,15 +89,12 @@
 
 use std::collections::HashMap;
 use std::fs::{self, Permissions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -105,60 +102,360 @@ use serde_json::{json, Value};
 
 use crate::reflector::Notice;
 use crate::device::{is_type, Device, Origin};
-use crate::segment::{Event, Segment};
+use crate::poll;
+use crate::segment::{Event, Probed, Segment};
 use crate::socket::Family;
 use crate::Group;
 
 /// Longest request line accepted.
 const MAX_LINE: u64 = 4096;
 
-/// Idle connections are closed after this long, so clients can't pile up threads.
-const IDLE: Duration = Duration::from_secs(60);
+/// Connections that send nothing for this long are closed, so that clients
+/// cannot pile up.
+const IDLE: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 60_000 });
 
-/// How often a watch checks that its client is still there, and how
-/// long it lets a write to a client that is not reading take.
-const STREAM_CHECK: Duration = Duration::from_secs(1);
-const STREAM_WRITE: Duration = Duration::from_secs(10);
+/// How long a client may leave what it is to be told waiting, without
+/// taking any of it, and how much of it may wait: past either, it is let go.
+const STREAM_WRITE: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 10_000 });
+const MAX_OUTPUT: usize = 1 << 20;
 
-/// The least a watch's `--interval=` may be: asking takes about four seconds,
-/// and asking more often than this is only noise.
 /// The longest `probe` waits for a probe, which takes a few seconds, to
 /// finish: mdnsctl waits fifteen.
 const PROBE_WAIT: Duration = Duration::from_secs(10);
 
+/// The least a watch's `--interval=` may be: asking takes about four seconds,
+/// and asking more often than this is only noise.
 const MIN_QUERY_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 
-/// Bind the socket and serve it on background threads. Binding happens
-/// before this returns so a bad path or a second instance is reported at
-/// startup. The returned handle is the accept loop.
-///
-/// The server only holds a weak reference, so it never keeps the segments
-/// alive: once the owner drops them, requests are answered "shutting down".
-pub fn serve(path: &Path, groups: &Arc<Vec<Group>>) -> Result<JoinHandle<()>> {
-    let listener = bind(path)?;
-    let groups = Arc::downgrade(groups);
-    let watches = Arc::new(Watches::default());
-    eprintln!("ipc: listening on {}", path.display());
-    Ok(thread::spawn(move || {
-        for conn in listener.incoming() {
-            match conn {
-                Ok(stream) => {
-                    let groups = Weak::clone(&groups);
-                    let watches = Arc::clone(&watches);
-                    thread::spawn(move || match serve_connection(stream, &groups, &watches) {
-                        Err(e) if !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                            eprintln!("ipc: connection ended: {e}");
-                        }
-                        _ => {}
-                    });
+/// The control socket and its clients, served from the event loop: nothing
+/// here waits, and what a client is to be told waits in its buffer until it
+/// takes it.
+pub struct Server {
+    listener: UnixListener,
+    clients: Vec<Client>,
+    next_watch: u64,
+}
+
+/// A connection to the control socket.
+struct Client {
+    stream: UnixStream,
+    peer: Option<Peer>,
+    /// What it has sent that is not yet a whole line.
+    input: Vec<u8>,
+    /// What it is to be told, once it takes more.
+    output: Vec<u8>,
+    /// When it last sent something, for [`IDLE`].
+    active: Instant,
+    /// Since when its output has waited without any of it being taken, for
+    /// [`STREAM_WRITE`].
+    stalled: Option<Instant>,
+    state: State,
+    /// It is closed once its output is written, or at once if it is gone.
+    closing: bool,
+    gone: bool,
+}
+
+enum State {
+    /// Answering requests, a line each.
+    Requests,
+    /// Waiting for the probes it asked for, to reply once they are done, or
+    /// once it has waited `until`.
+    Probing { probes: Vec<(String, Receiver<Probed>, Option<Probed>)>, until: Instant },
+    /// Streaming what happens to a segment's devices.
+    Watching(Streaming),
+}
+
+/// A watch, as it streams.
+struct Streaming {
+    id: u64,
+    name: String,
+    query: Query,
+    events: Receiver<Notice>,
+    /// The devices of the query's types shown, as shown, so that one that
+    /// loses its last service of them is shown to go, and one shown already
+    /// is not shown again unchanged.
+    shown: HashMap<(String, String), Value>,
+    /// When to ask for the query's types again, if ever.
+    next_ask: Option<Instant>,
+    since: Instant,
+}
+
+impl Server {
+    /// Bind the control socket at `path`, before anything else happens, so
+    /// that a bad path or a second instance is reported at startup.
+    pub fn bind(path: &Path) -> Result<Server> {
+        let listener = bind(path)?;
+        listener.set_nonblocking(true).context("making the control socket non-blocking")?;
+        eprintln!("ipc: listening on {}", path.display());
+        Ok(Server { listener, clients: Vec::new(), next_watch: 0 })
+    }
+
+    /// The descriptors to wait on: the listener, readable when someone
+    /// connects, and every client, readable when it sends or hangs up, and
+    /// writable when it can take what waits for it.
+    pub fn fds(&self) -> Vec<libc::pollfd> {
+        let mut fds = vec![poll::readable(self.listener.as_raw_fd())];
+        for c in &self.clients {
+            let mut fd = poll::readable(c.stream.as_raw_fd());
+            if !c.output.is_empty() {
+                fd.events |= libc::POLLOUT;
+            }
+            fds.push(fd);
+        }
+        fds
+    }
+
+    /// Accept, read and write what `fds` (as [`Server::fds`] gave them, after
+    /// waiting) say can be.
+    pub fn ready(&mut self, fds: &[libc::pollfd]) {
+        if fds.first().is_some_and(poll::ready) {
+            self.accept();
+        }
+        for (c, fd) in self.clients.iter_mut().zip(&fds[1..]) {
+            if poll::ready(fd) {
+                c.read();
+            }
+            if fd.revents & libc::POLLOUT != 0 {
+                c.flush(Instant::now());
+            }
+        }
+    }
+
+    fn accept(&mut self) {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    if let Err(e) = stream.set_nonblocking(true) {
+                        eprintln!("ipc: {e}");
+                        continue;
+                    }
+                    let peer = peer_of(&stream);
+                    let now = Instant::now();
+                    let state = State::Requests;
+                    let c = Client { stream, peer, input: Vec::new(), output: Vec::new(), active: now, stalled: None, state, closing: false, gone: false };
+                    self.clients.push(c);
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
+                    // Out of descriptors, say: those who wait are taken next
+                    // time round.
                     eprintln!("ipc: accept failed: {e}");
-                    thread::sleep(Duration::from_millis(100));
+                    return;
                 }
             }
         }
-    }))
+    }
+
+    /// Answer what has come in, finish the probes clients wait for, stream
+    /// what has happened to the watches, write what can be written, and let
+    /// go of clients that are done, gone, idle or not reading.
+    pub fn tick(&mut self, groups: &[Group], now: Instant) {
+        let watching = self.watches();
+        for i in 0..self.clients.len() {
+            let c = &mut self.clients[i];
+            match &mut c.state {
+                State::Requests => {}
+                State::Probing { probes, until } => {
+                    for (_, done, result) in probes.iter_mut().filter(|(_, _, r)| r.is_none()) {
+                        if let Ok(r) = done.try_recv() {
+                            *result = Some(r);
+                        }
+                    }
+                    if probes.iter().all(|(_, _, r)| r.is_some()) || now >= *until {
+                        let results = probes.drain(..).map(|(interface, _, r)| (interface, r)).collect();
+                        push_line(&mut c.output, &probe_reply(results));
+                        c.state = State::Requests;
+                    }
+                }
+                State::Watching(watch) => {
+                    if let Some(at) = watch.next_ask.filter(|&at| at <= now) {
+                        ask_for_types(groups, &watch.name, &watch.query.kinds);
+                        watch.next_ask = watch.query.interval.map(|every| at + every);
+                    }
+                    loop {
+                        match watch.events.try_recv() {
+                            Ok(notice) => {
+                                let line = if watch.query.kinds.is_empty() {
+                                    notice_json(&watch.name, &notice)
+                                } else {
+                                    narrowed(&watch.name, notice, &watch.query.kinds, &mut watch.shown)
+                                };
+                                if let Some(line) = line {
+                                    push_line(&mut c.output, &line);
+                                }
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                push_line(&mut c.output, &error("shutting down"));
+                                c.closing = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if matches!(c.state, State::Requests) {
+                self.next_watch = c.answer(groups, &watching, self.next_watch, now);
+            }
+            let c = &mut self.clients[i];
+            c.flush(now);
+            let idle = matches!(c.state, State::Requests) && c.output.is_empty() && now >= c.active + IDLE;
+            let stuck = c.stalled.is_some_and(|since| now >= since + STREAM_WRITE) || c.output.len() > MAX_OUTPUT;
+            if idle || stuck {
+                c.gone = true;
+            }
+        }
+        self.clients.retain(|c| !c.gone && !(c.closing && c.output.is_empty()));
+    }
+
+    /// When [`Server::tick`] next has something to do of its own accord: a
+    /// client to give up waiting for, a watch to ask again for its types.
+    pub fn next_due(&self) -> Option<Instant> {
+        self.clients
+            .iter()
+            .filter_map(|c| {
+                let own = match &c.state {
+                    State::Requests => Some(c.active + IDLE),
+                    State::Probing { until, .. } => Some(*until),
+                    State::Watching(watch) => watch.next_ask,
+                };
+                [own, c.stalled.map(|since| since + STREAM_WRITE)].into_iter().flatten().min()
+            })
+            .min()
+    }
+
+    /// Tell every watch the daemon is stopping, as far as it takes it now.
+    pub fn shut_down(&mut self) {
+        let now = Instant::now();
+        for c in self.clients.iter_mut().filter(|c| matches!(c.state, State::Watching(_))) {
+            push_line(&mut c.output, &error("shutting down"));
+            c.flush(now);
+        }
+    }
+
+    /// The watches streaming now, as `watchers` lists them.
+    fn watches(&self) -> Watches {
+        let open = self
+            .clients
+            .iter()
+            .filter_map(|c| match &c.state {
+                State::Watching(w) => {
+                    let query = Query { kinds: w.query.kinds.clone(), interval: w.query.interval };
+                    Some(Open { id: w.id, segment: w.name.clone(), query, peer: c.peer, since: w.since })
+                }
+                _ => None,
+            })
+            .collect();
+        Watches { open }
+    }
+}
+
+impl Client {
+    /// Take what it has sent. One that hangs up, or sends anything to a watch,
+    /// which expects nothing, is gone.
+    fn read(&mut self) {
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.stream.read(&mut buf) {
+                Ok(0) => return self.gone = true,
+                Ok(_) if matches!(self.state, State::Watching(_)) => return self.gone = true,
+                Ok(n) => {
+                    self.input.extend_from_slice(&buf[..n]);
+                    self.active = Instant::now();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return self.gone = true,
+            }
+        }
+    }
+
+    /// Write what it can take of its output, minding how long it has not
+    /// taken any.
+    fn flush(&mut self, now: Instant) {
+        let mut wrote = 0;
+        while wrote < self.output.len() {
+            match self.stream.write(&self.output[wrote..]) {
+                Ok(0) => break,
+                Ok(n) => wrote += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    self.gone = true;
+                    break;
+                }
+            }
+        }
+        self.output.drain(..wrote);
+        self.stalled = match (self.output.is_empty(), wrote) {
+            (true, _) => None,
+            (false, 0) => self.stalled.or(Some(now)),
+            (false, _) => Some(now),
+        };
+    }
+
+    /// Answer the whole lines it has sent, until one starts something that
+    /// takes longer than an answer: a probe or a watch. Returns the next
+    /// watch's number.
+    fn answer(&mut self, groups: &[Group], watches: &Watches, mut next_watch: u64, now: Instant) -> u64 {
+        while matches!(self.state, State::Requests) && !self.closing {
+            let Some(end) = self.input.iter().position(|&b| b == b'\n') else {
+                if self.input.len() as u64 >= MAX_LINE {
+                    push_line(&mut self.output, &error("request too long"));
+                    self.closing = true;
+                }
+                break;
+            };
+            let line: Vec<u8> = self.input.drain(..=end).collect();
+            if line.len() as u64 > MAX_LINE {
+                push_line(&mut self.output, &error("request too long"));
+                self.closing = true;
+                break;
+            }
+            let line = String::from_utf8_lossy(&line);
+            let request = line.trim();
+            if let Some(arg) = watch_arg(request) {
+                match follow(groups, arg) {
+                    Ok(watch) => {
+                        next_watch += 1;
+                        self.watch(watch, next_watch, now);
+                    }
+                    Err(reply) => {
+                        push_line(&mut self.output, &reply);
+                        self.closing = true;
+                    }
+                }
+            } else if let Some(arg) = probe_arg(request) {
+                match start_probes(groups, arg) {
+                    Ok(probes) => {
+                        let probes = probes.into_iter().map(|(interface, done)| (interface, done, None)).collect();
+                        self.state = State::Probing { probes, until: now + PROBE_WAIT };
+                    }
+                    Err(reply) => push_line(&mut self.output, &reply),
+                }
+            } else {
+                push_line(&mut self.output, &handle(groups, watches, request));
+            }
+        }
+        next_watch
+    }
+
+    /// Start streaming `watch`: say so, list what is there of its types, and
+    /// ask for them at once.
+    fn watch(&mut self, watch: Watch, id: u64, now: Instant) {
+        let Watch { name, query, events, present } = watch;
+        push_line(&mut self.output, &json!({ "ok": true, "name": name, "watching": true }));
+        let mut shown = HashMap::new();
+        for line in &present {
+            if let (Some(interface), Some(host)) = (line["device"]["interface"].as_str(), line["device"]["hostname"].as_str()) {
+                shown.insert((interface.to_string(), host.to_ascii_lowercase()), line["device"].clone());
+            }
+            push_line(&mut self.output, line);
+        }
+        let next_ask = (!query.kinds.is_empty()).then_some(now);
+        self.state = State::Watching(Streaming { id, name, query, events, shown, next_ask, since: now });
+    }
 }
 
 /// Bind, replacing a stale socket file left by a previous run but never a
@@ -180,51 +477,10 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, watches: &Watches) -> io::Result<()> {
-    stream.set_read_timeout(Some(IDLE))?;
-    let peer = peer_of(&stream);
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = (&mut reader).take(MAX_LINE).read_line(&mut line)?;
-        if n == 0 {
-            return Ok(());
-        }
-        if !line.ends_with('\n') && n as u64 >= MAX_LINE {
-            write_line(&mut writer, &error("request too long"))?;
-            return Ok(());
-        }
-        let request = line.trim();
-        if let Some(arg) = watch_arg(request) {
-            // Hold the segments only long enough to register: a stream that
-            // lasts must not keep the daemon from releasing them at shutdown.
-            let registered = match groups.upgrade() {
-                Some(groups) => follow(&groups, arg),
-                None => Err(error("shutting down")),
-            };
-            return match registered {
-                Ok(watch) => {
-                    let _listed = watches.add(&watch, peer);
-                    stream_events(&mut writer, groups, watch)
-                }
-                Err(reply) => write_line(&mut writer, &reply),
-            };
-        }
-        let reply = match groups.upgrade() {
-            Some(groups) => handle(&groups, watches, request),
-            None => error("shutting down").to_string(),
-        };
-        write_line(&mut writer, &reply)?;
-    }
-}
-
 /// The watches streaming now, for `watchers`.
 #[derive(Default)]
 pub struct Watches {
-    next_id: AtomicU64,
-    open: Mutex<Vec<Open>>,
+    open: Vec<Open>,
 }
 
 /// One watch, as `watchers` lists it.
@@ -243,31 +499,10 @@ struct Peer {
     uid: u32,
 }
 
-/// A watch listed in [`Watches`] for as long as this lives.
-struct Listed<'a> {
-    watches: &'a Watches,
-    id: u64,
-}
-
-impl Drop for Listed<'_> {
-    fn drop(&mut self) {
-        self.watches.open.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.id != self.id);
-    }
-}
-
 impl Watches {
-    /// List `watch`, held by `peer`, until the returned guard is dropped.
-    fn add(&self, watch: &Watch, peer: Option<Peer>) -> Listed<'_> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let query = Query { kinds: watch.query.kinds.clone(), interval: watch.query.interval };
-        let open = Open { id, segment: watch.name.clone(), query, peer, since: Instant::now() };
-        self.open.lock().unwrap_or_else(|e| e.into_inner()).push(open);
-        Listed { watches: self, id }
-    }
-
     fn json(&self) -> Value {
-        let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
-        let list: Vec<Value> = open
+        let list: Vec<Value> = self
+            .open
             .iter()
             .map(|w| {
                 json!({
@@ -304,11 +539,10 @@ fn peer_of(stream: &UnixStream) -> Option<Peer> {
     (rc == 0 && cred.pid > 0).then_some(Peer { pid: cred.pid, uid: cred.uid })
 }
 
-/// Write `line` and a newline to a client in one go: a daemon that stops (or
-/// a write that times out) partway leaves the client no half a line to take
-/// for a whole one.
-fn write_line(writer: &mut impl Write, line: &impl std::fmt::Display) -> io::Result<()> {
-    writer.write_all(format!("{line}\n").as_bytes())
+/// Queue `line` and a newline for a client, to go out whole: it is never
+/// given half a line to take for a whole one.
+fn push_line(output: &mut Vec<u8>, line: &impl std::fmt::Display) {
+    output.extend_from_slice(format!("{line}\n").as_bytes());
 }
 
 /// The arguments of a `watch` request, if it is one.
@@ -417,58 +651,11 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
     Ok(Watch { name: name.to_string(), query, events: rx, present })
 }
 
-/// Ask for the types of `query` on the interfaces of the named segment: the
-/// event loop runs the rounds, while the watch goes on.
-fn ask_for_types(groups: &Weak<Vec<Group>>, name: &str, kinds: &[String]) {
-    if let Some(groups) = groups.upgrade() {
-        for seg in links_of(&groups, name) {
-            seg.query_types(kinds);
-        }
-    }
-}
-
-/// Send what happens to the segment's devices, a line each, until the client
-/// goes away or the daemon stops. With a query, only devices of its types,
-/// asked for at the start and every interval.
-fn stream_events(writer: &mut UnixStream, groups: &Weak<Vec<Group>>, watch: Watch) -> io::Result<()> {
-    let Watch { name, query, events, present } = watch;
-    writer.set_write_timeout(Some(STREAM_WRITE))?;
-    write_line(writer, &json!({ "ok": true, "name": name, "watching": true }))?;
-    // The devices of the query's types shown, as shown, so that one that
-    // loses its last service of them is shown to go, and one shown already
-    // is not shown again unchanged.
-    let mut shown: HashMap<(String, String), Value> = HashMap::new();
-    for line in &present {
-        if let (Some(interface), Some(host)) = (line["device"]["interface"].as_str(), line["device"]["hostname"].as_str()) {
-            shown.insert((interface.to_string(), host.to_ascii_lowercase()), line["device"].clone());
-        }
-        write_line(writer, &line)?;
-    }
-    let mut next_ask = (!query.kinds.is_empty()).then(Instant::now);
-    loop {
-        if let Some(at) = next_ask.filter(|&at| at <= Instant::now()) {
-            ask_for_types(groups, &name, &query.kinds);
-            next_ask = query.interval.map(|every| at + every);
-        }
-        let wait = next_ask.map_or(STREAM_CHECK, |at| at.saturating_duration_since(Instant::now()).min(STREAM_CHECK));
-        match events.recv_timeout(wait) {
-            Ok(notice) => {
-                let line = if query.kinds.is_empty() {
-                    notice_json(&name, &notice)
-                } else {
-                    narrowed(&name, notice, &query.kinds, &mut shown)
-                };
-                if let Some(json) = line {
-                    write_line(writer, &json)?;
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if client_gone(writer)? {
-                    return Ok(());
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => return write_line(writer, &error("shutting down")),
-        }
+/// Ask for the types of a watch's query on the interfaces of the named
+/// segment: the event loop runs the rounds, while the watch goes on.
+fn ask_for_types(groups: &[Group], name: &str, kinds: &[String]) {
+    for seg in links_of(groups, name) {
+        seg.query_types(kinds);
     }
 }
 
@@ -508,24 +695,6 @@ fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashMap
             Some(event_json("removed", segment, &Notice { event: Event::Removed(gone), ttl: Duration::ZERO, ..notice }))
         }
         _ => None,
-    }
-}
-
-/// Has the client hung up (or sent something, which a watch does not
-/// expect)? Looks without consuming or waiting.
-fn client_gone(stream: &UnixStream) -> io::Result<bool> {
-    let mut byte = 0u8;
-    // SAFETY: the descriptor is open for the life of `stream`, and `byte` is
-    // one writable byte.
-    let n = unsafe {
-        libc::recv(stream.as_raw_fd(), (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
-    };
-    if n >= 0 {
-        return Ok(true);
-    }
-    match io::Error::last_os_error() {
-        e if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
-        e => Err(e),
     }
 }
 
@@ -626,29 +795,49 @@ fn devices(groups: &[Group], name: &str) -> Value {
     json!({ "ok": true, "name": name, "devices": list })
 }
 
-/// Probe every interface of the named segment, or of all segments. An
-/// interface shared by several segments is probed once.
-fn probe(groups: &[Group], name: &str) -> Value {
+/// Start probing every interface of the named segment, or of all segments:
+/// each one's name, and where it says how it went once it is done. An
+/// interface shared by several segments is probed once. They run at once, as
+/// they are independent: they take one's time, not one per interface.
+fn start_probes(groups: &[Group], name: &str) -> Result<Vec<(String, Receiver<Probed>)>, Value> {
     let name = segment_arg(name);
     let links = links_of(groups, name);
     if links.is_empty() {
-        return error(&format!("no such segment: {name}"));
+        return Err(error(&format!("no such segment: {name}")));
     }
-    // All at once, as they are independent: it takes one's time, not one per
-    // interface.
-    let running: Vec<_> = links.iter().map(|&seg| (seg, seg.probe())).collect();
-    let probed: Vec<Value> = running
+    Ok(links.into_iter().map(|seg| (seg.interface().to_string(), seg.probe())).collect())
+}
+
+/// The reply to `probe`: how it went on each interface, `None` for one that
+/// did not finish in time.
+fn probe_reply(results: Vec<(String, Option<Probed>)>) -> Value {
+    let probed: Vec<Value> = results
         .into_iter()
-        .map(|(seg, done)| {
-            let result = done.recv_timeout(PROBE_WAIT).unwrap_or_else(|_| Err("the probe did not finish".into()));
-            let (queries, err) = match result {
+        .map(|(interface, result)| {
+            let (queries, err) = match result.unwrap_or_else(|| Err("the probe did not finish".into())) {
                 Ok(n) => (Some(n), None),
                 Err(e) => (None, Some(e)),
             };
-            json!({ "interface": seg.interface(), "queries": queries, "error": err })
+            json!({ "interface": interface, "queries": queries, "error": err })
         })
         .collect();
     json!({ "ok": true, "probed": probed })
+}
+
+/// Probe, waiting for the probes to finish: only for a caller other than the
+/// event loop, which runs their rounds. The server starts them, and replies
+/// once they are done, without waiting.
+fn probe(groups: &[Group], name: &str) -> Value {
+    match start_probes(groups, name) {
+        Ok(probes) => probe_reply(probes.into_iter().map(|(interface, done)| (interface, done.recv_timeout(PROBE_WAIT).ok())).collect()),
+        Err(reply) => reply,
+    }
+}
+
+/// The arguments of a `probe` request, if it is one.
+fn probe_arg(request: &str) -> Option<&str> {
+    let (command, arg) = request.split_once(char::is_whitespace).unwrap_or((request, ""));
+    command.eq_ignore_ascii_case("probe").then(|| arg.trim())
 }
 
 fn timer_list(groups: &[Group]) -> Value {
@@ -730,9 +919,13 @@ fn error(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::{self, JoinHandle};
 
     use super::*;
     use crate::parser::{Header, Message, RData, Record};
@@ -959,6 +1152,48 @@ mod tests {
         path
     }
 
+    /// The server at `path`, with `groups`, run on a thread of its own the
+    /// way the event loop runs it, with the segments' upkeep and the
+    /// reflectors' deliveries, until this is dropped, when it shuts down.
+    struct Serving {
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    fn serving(path: &Path, groups: &Arc<Vec<Group>>) -> Serving {
+        let mut server = Server::bind(path).unwrap();
+        let groups = Arc::clone(groups);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let reflectors: Vec<&Reflector> = groups.iter().map(|g| &g.reflector).collect();
+            while !stopped.load(Ordering::Relaxed) {
+                let mut fds = server.fds();
+                poll::wait(&mut fds, Some(Duration::from_millis(5))).unwrap();
+                server.ready(&fds);
+                let now = Instant::now();
+                for seg in groups.iter().flat_map(|g| g.reflector.segments()) {
+                    if seg.next_due().is_some_and(|at| at <= now) {
+                        seg.upkeep(now);
+                    }
+                }
+                crate::reflector::deliver(&reflectors);
+                server.tick(&groups, now);
+            }
+            server.shut_down();
+        });
+        Serving { stop, thread: Some(thread) }
+    }
+
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
     fn ask(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, request: &str) -> String {
         writeln!(stream, "{request}").unwrap();
         let mut line = String::new();
@@ -972,7 +1207,7 @@ mod tests {
         segs[0].observe(ip("10.0.1.7"));
         let path = temp_socket("serve");
         let groups = Arc::new(vec![g]);
-        serve(&path, &groups).unwrap();
+        let _serving = serving(&path, &groups);
 
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o660);
 
@@ -990,26 +1225,108 @@ mod tests {
         BufReader::new(big).read_line(&mut reply).unwrap();
         assert!(reply.contains("request too long"));
 
-        // Once the owner lets go of the segments, the server does not hold
-        // them alive and says so.
-        drop(groups);
-        assert!(ask(&mut stream, &mut reader, "segments").contains("shutting down"));
+        // Requests that come in pieces, or several in one, are answered a
+        // line each.
+        stream.write_all(b"segm").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        stream.write_all(b"ents\ndevices IoT\n").unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""segments""#), "{line}");
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""devices""#), "{line}");
+
+        // One that says nothing for long enough is let go.
+        let mut idle = BufReader::new(UnixStream::connect(&path).unwrap());
+        idle.get_ref().set_read_timeout(Some(IDLE * 10)).unwrap();
+        let start = Instant::now();
+        assert_eq!(idle.read_line(&mut String::new()).unwrap(), 0, "closed");
+        assert!(start.elapsed() >= IDLE);
         let _ = fs::remove_file(&path);
     }
 
+    /// probe replies once the probes are done, and the server goes on
+    /// meanwhile.
     #[test]
-    fn watch_streams_changes_without_holding_the_segments() {
+    fn probe_is_answered_once_done_while_the_rest_goes_on() {
+        let (seg, _rx) = wired("wifi");
+        let path = temp_socket("probe");
+        let groups = Arc::new(vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }]);
+        let _serving = serving(&path, &groups);
+
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        writeln!(stream, "probe IoT").unwrap();
+        let mut other = UnixStream::connect(&path).unwrap();
+        let mut other_reader = BufReader::new(other.try_clone().unwrap());
+        assert!(ask(&mut other, &mut other_reader, "segments").contains("IoT"), "answered meanwhile");
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), r#"{"ok":true,"probed":[{"interface":"wifi","queries":3,"error":null}]}"#);
+        // And the connection takes requests again.
+        assert!(ask(&mut stream, &mut reader, "segments").contains("IoT"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A client that takes nothing of what it is told for long enough, or
+    /// lets too much pile up, is let go.
+    #[test]
+    fn a_client_that_does_not_read_is_let_go() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let now = Instant::now();
+        let mut c = Client {
+            stream: ours,
+            peer: None,
+            input: Vec::new(),
+            output: vec![b'x'; MAX_OUTPUT / 2],
+            active: now,
+            stalled: None,
+            state: State::Requests,
+            closing: false,
+            gone: false,
+        };
+        c.flush(now);
+        let stalled = c.stalled.expect("the rest waits");
+        c.flush(now + Duration::from_millis(50));
+        assert_eq!(c.stalled, Some(stalled), "nothing taken: still since then");
+        // Taking some starts the wait afresh.
+        let mut buf = vec![0u8; 64 << 10];
+        let mut theirs = theirs;
+        theirs.read_exact(&mut buf).unwrap();
+        c.flush(now + Duration::from_millis(100));
+        assert_eq!(c.stalled, Some(now + Duration::from_millis(100)));
+
+        let mut server = Server { listener: UnixListener::bind(temp_socket("stalled")).unwrap(), clients: vec![c], next_watch: 0 };
+        server.tick(&[], now + Duration::from_millis(150));
+        assert_eq!(server.clients.len(), 1, "not yet");
+        server.tick(&[], now + Duration::from_millis(100) + STREAM_WRITE);
+        assert!(server.clients.is_empty(), "let go");
+
+        // Too much waiting is let go at once.
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let state = State::Requests;
+        let c = Client { stream: ours, peer: None, input: Vec::new(), output: vec![b'x'; MAX_OUTPUT * 2], active: now, stalled: None, state, closing: false, gone: false };
+        server.clients.push(c);
+        server.tick(&[], now);
+        assert!(server.clients.is_empty());
+        let _ = fs::remove_file(temp_socket("stalled"));
+    }
+
+    #[test]
+    fn watch_streams_changes_until_the_daemon_stops() {
         let (g, segs) = group("IoT", Family::V4, &["wifi"]);
         let path = temp_socket("watch");
         let groups = Arc::new(vec![g]);
-        serve(&path, &groups).unwrap();
+        let serving = serving(&path, &groups);
 
         let mut stream = UnixStream::connect(&path).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         assert_eq!(ask(&mut stream, &mut reader, "WATCH IoT"), r#"{"ok":true,"name":"IoT","watching":true}"#);
-        // The stream does not keep the daemon from letting go of the segments.
-        assert_eq!(Arc::strong_count(&groups), 1);
 
         let mut next = || {
             let mut line = String::new();
@@ -1038,6 +1355,12 @@ mod tests {
         let mut other = UnixStream::connect(&path).unwrap();
         let mut other_reader = BufReader::new(other.try_clone().unwrap());
         assert!(ask(&mut other, &mut other_reader, "watch").contains("usage: watch"));
+
+        // When the daemon stops, the watch is told so.
+        drop(serving);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("shutting down"), "{line}");
         let _ = fs::remove_file(&path);
     }
 
@@ -1106,7 +1429,7 @@ mod tests {
         let groups = Arc::new(vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }]);
         announce(&seg, "10.0.1.7", "tv.local", "TV");
         let path = temp_socket("watch-query");
-        serve(&path, &groups).unwrap();
+        let _serving = serving(&path, &groups);
 
         let mut stream = UnixStream::connect(&path).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1197,7 +1520,7 @@ mod tests {
         let (g, _segs) = group("IoT", Family::V4, &["wifi"]);
         let path = temp_socket("watchers");
         let groups = Arc::new(vec![g]);
-        serve(&path, &groups).unwrap();
+        let _serving = serving(&path, &groups);
         let open = |request: &str| {
             let mut stream = UnixStream::connect(&path).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
