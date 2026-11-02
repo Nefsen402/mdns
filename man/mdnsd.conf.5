@@ -98,6 +98,46 @@ Unix socket paths are limited to about 108 bytes.
 The socket is created with mode 0660 (owner and group only).
 A stale socket left by a crashed run is replaced; a live instance, or a file
 that is not a socket, is never overwritten.
+.TP
+.B AvahiSocket=
+A second socket, with the protocol of avahi-daemon's, for what asks Avahi for
+the address of a name:
+.B nss-mdns
+(a build of it that has no other way to look a name up is the one Arch ships),
+which makes
+.B ping pc.local
+work with Avahi gone.
+Set it to
+.IR /run/avahi-daemon/socket ,
+where that looks.
+Off unless set.
+.IP
+It answers
+.BR RESOLVE-HOSTNAME-IPV4 ,
+.B RESOLVE-HOSTNAME-IPV6
+and
+.B RESOLVE-ADDRESS
+of what is known of every segment, and of the names this host advertises, at
+the addresses it has: one address, a routable one before a link-local one.
+A name not known is asked for on every interface, and waited for up to two
+seconds, or a third of one if the name is known at an address of another
+family.
+Only names under
+.B .local
+are answered for.
+The socket is made for anyone to connect to, as Avahi's is, and tells only what
+any host on the links hears.
+.IP
+The directory must exist and be writable by the daemon, and Avahi must not be
+running, or it has the socket.
+With the service of the package, a drop-in makes the directory:
+.IP
+.nf
+# systemctl edit mdnsd
+[Service]
+RuntimeDirectory=avahi-daemon
+RuntimeDirectoryMode=0755
+.fi
 .SS [Probe]
 Optional.
 Both settings are systemd time spans, such as

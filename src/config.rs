@@ -234,6 +234,9 @@ pub struct Config {
     pub ipv6: Listen,
     /// Where the IPC server listens.
     pub socket: String,
+    /// Where to listen as avahi-daemon does, for what asks it for the address
+    /// of a name (`nss-mdns`); nowhere unless set.
+    pub avahi_socket: Option<String>,
     /// The names this host announces and answers for, with its own addresses.
     pub advertise: Vec<AdvertiseConfig>,
     /// How often to probe the interfaces of segments that do not set their
@@ -253,6 +256,7 @@ impl Default for Config {
             ipv4: Listen::default(),
             ipv6: Listen::default(),
             socket: DEFAULT_SOCKET.to_string(),
+            avahi_socket: None,
             advertise: Vec::new(),
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
@@ -466,6 +470,7 @@ impl Config {
                         }
                     }
                     ("advertise", "ttl") => config.advertise.last_mut().unwrap().ttl = parse_host_ttl(&value, lineno, "TTL")?,
+                    ("ipc", "avahisocket") => config.avahi_socket = Some(value).filter(|v| !v.is_empty()),
                     ("ipc", "socket") => {
                         if value.is_empty() {
                             bail!("line {lineno}: Socket= needs a path");
@@ -1012,6 +1017,15 @@ interfaces=br0,wifi
         assert!(parse("Untrusted=media,wifi").is_ok());
         // A segment of one interface reflects nothing anyway.
         assert!(Config::parse("[Segment]\nName=s\nInterfaces=wifi\nUntrusted=wifi\n").is_ok());
+    }
+
+    #[test]
+    fn the_avahi_socket_is_off_unless_set() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().avahi_socket, None);
+        let with = |value: &str| Config::parse(&format!("[Ipc]\nAvahiSocket={value}\n{EXAMPLE}")).unwrap().avahi_socket;
+        assert_eq!(with("/run/avahi-daemon/socket").as_deref(), Some("/run/avahi-daemon/socket"));
+        assert_eq!(with("\"/tmp/a b\"").as_deref(), Some("/tmp/a b"));
+        assert_eq!(with(""), None, "empty is off");
     }
 
     #[test]

@@ -11,6 +11,8 @@ mod runtime;
 // Shared with mdnsctl, whose options take values; the daemon's take none.
 #[allow(dead_code)]
 mod args;
+#[path = "avahi-compat.rs"]
+mod avahi_compat;
 mod config;
 mod device;
 mod ipc;
@@ -212,14 +214,19 @@ fn daemon(args: Vec<String>) -> Result<()> {
     }
 
     let mut server = ipc::Server::bind(&config.socket)?;
+    let mut avahi = match &config.avahi_socket {
+        Some(path) => Some(avahi_compat::Server::bind(path, &config.advertise, &families)?),
+        None => None,
+    };
 
-    let signal = event_loop(&signals, netlink, &hub, &mut tracked, &segments, &mut server)?;
+    let signal = event_loop(&signals, netlink, &hub, &mut tracked, &segments, &mut server, &mut avahi)?;
     eprintln!("received {signal}: withdrawing reflected devices");
     // The loop has stopped, and the upkeep with it, while the goodbyes go
     // out: the watches are told, and dropping the reflectors withdraws all
     // they announced.
     server.shut_down();
     drop(server);
+    drop(avahi);
     drop(segments);
     // With the reflectors gone, what is left in the manual lists is the
     // advertised name: say goodbye to it too.
@@ -263,13 +270,14 @@ fn event_loop(
     links: &mut [Link],
     groups: &[Group],
     server: &mut ipc::Server,
+    avahi: &mut Option<avahi_compat::Server>,
 ) -> Result<&'static str> {
     let reflectors: Vec<&Reflector> = groups.iter().map(|g| &g.reflector).collect();
     links::ask_neighbours(&netlink);
     let mut netlink = Some(netlink);
     loop {
         let upkeep = links.iter().filter_map(|l| l.segment().next_due());
-        let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).min();
+        let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).chain(avahi.as_ref().and_then(|a| a.next_due())).min();
         // The signals and netlink, then every link's sockets, each with the
         // link it is of, then the sockets shared by the interfaces, if there
         // are any, then the control socket and its clients.
@@ -283,6 +291,8 @@ fn event_loop(
         fds.extend(shared.iter().map(|&fd| poll::readable(fd)));
         let clients = fds.len();
         fds.extend(server.fds());
+        let avahi_at = fds.len();
+        fds.extend(avahi.as_ref().map(avahi_compat::Server::fds).unwrap_or_default());
         poll::wait(&mut fds, next.map(|at| at.saturating_duration_since(Instant::now())))
             .context("waiting for something to do")?;
         if let Some(name) = signals.take() {
@@ -301,7 +311,10 @@ fn event_loop(
                 }
             });
         }
-        server.ready(&fds[clients..]);
+        server.ready(&fds[clients..avahi_at]);
+        if let Some(avahi) = avahi.as_mut().filter(|_| avahi_at < fds.len()) {
+            avahi.ready(&fds[avahi_at..]);
+        }
         if let Some(n) = netlink.as_ref().filter(|_| poll::ready(&fds[1])) {
             match n.changes() {
                 Ok(changes) => links::follow(n, links, &changes),
@@ -322,5 +335,8 @@ fn event_loop(
             r.retry(now);
         }
         server.tick(groups, now);
+        if let Some(avahi) = avahi.as_mut() {
+            avahi.tick(groups, now);
+        }
     }
 }

@@ -117,6 +117,9 @@ Untrusted=wifi
   from every network (or those of `Interface=`), with its own address on each, and `Services=_ssh._tcp:22`
   announces that it offers ssh (a service of the host, as Avahi's
   `/etc/avahi/services/ssh.service` does).
+- `[Ipc] AvahiSocket=/run/avahi-daemon/socket` answers the questions `nss-mdns`
+  asks Avahi, so that `ping router.local` works with Avahi gone (see
+  `mdnsd.conf(5)`).
 - Interfaces may come and go: a VLAN that is created after the daemon starts, or
   recreated, is picked up without a restart
   (see `mdnsd(8)`).

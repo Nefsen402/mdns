@@ -185,7 +185,7 @@ impl Server {
     /// Bind the control socket at `path`, before anything else happens, so
     /// that a bad path or a second instance is reported at startup.
     pub fn bind(path: &str) -> Result<Server> {
-        let listener = bind(path)?;
+        let listener = bind(path, 0o660)?;
         eprintln!("ipc: listening on {path}");
         Ok(Server { listener, clients: Vec::new(), next_watch: 0 })
     }
@@ -447,7 +447,9 @@ impl Client {
 
 /// Bind, replacing a stale socket file left by a previous run but never a
 /// live instance and never a file that is not a socket.
-fn bind(path: &str) -> Result<OwnedFd> {
+/// Listen on a Unix socket at `path` with permissions `mode`, replacing a
+/// stale one.
+pub fn bind(path: &str, mode: rustix::fs::RawMode) -> Result<OwnedFd> {
     if let Ok(st) = rustix::fs::lstat(path) {
         if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::Socket {
             bail!("{path} exists and is not a socket");
@@ -461,8 +463,7 @@ fn bind(path: &str) -> Result<OwnedFd> {
     let addr = SocketAddrUnix::new(path).map_err(Why).with_context(|| format!("binding {path}"))?;
     rustix::net::bind(&listener, &addr).map_err(Why).with_context(|| format!("binding {path}"))?;
     rustix::net::listen(&listener, 128).map_err(Why).with_context(|| format!("listening on {path}"))?;
-    // Owner and group only.
-    rustix::fs::chmod(path, rustix::fs::Mode::from_raw_mode(0o660)).map_err(Why).with_context(|| format!("setting permissions on {path}"))?;
+    rustix::fs::chmod(path, rustix::fs::Mode::from_raw_mode(mode)).map_err(Why).with_context(|| format!("setting permissions on {path}"))?;
     Ok(listener)
 }
 
@@ -599,7 +600,7 @@ fn service_type(name: &str) -> Result<String, Value> {
 
 /// The interfaces of the named segment, or of all segments if `name` is
 /// empty, each once.
-fn links_of<'a>(groups: &'a [Group], name: &str) -> Vec<&'a Segment> {
+pub fn links_of<'a>(groups: &'a [Group], name: &str) -> Vec<&'a Segment> {
     let mut links: Vec<&Segment> = Vec::new();
     for seg in groups.iter().filter(|g| name.is_empty() || g.name == name).flat_map(|g| g.reflector.segments()) {
         if !links.iter().any(|l| l.interface() == seg.interface()) {
@@ -1556,13 +1557,13 @@ mod tests {
     fn bind_replaces_stale_sockets_but_not_live_ones_or_files() {
         let path = temp_socket("bind");
         drop(UnixListener::bind(path.to_str().unwrap()).unwrap()); // leaves a dead socket file
-        let live = bind(path.to_str().unwrap()).expect("stale socket is replaced");
-        assert!(bind(path.to_str().unwrap()).is_err(), "live instance is protected");
+        let live = bind(path.to_str().unwrap(), 0o660).expect("stale socket is replaced");
+        assert!(bind(path.to_str().unwrap(), 0o660).is_err(), "live instance is protected");
         drop(live);
         fs::remove_file(&path).unwrap();
 
         fs::write(&path, "precious").unwrap();
-        assert!(bind(path.to_str().unwrap()).is_err());
+        assert!(bind(path.to_str().unwrap(), 0o660).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "precious");
         fs::remove_file(&path).unwrap();
     }
