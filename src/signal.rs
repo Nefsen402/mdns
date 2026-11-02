@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 use rustix::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use crate::errno::{self, Why};
+use crate::runtime::{errno, Why};
 
 /// The pipe's writing end, for the handler: -1 until [`install`]ed.
 static WRITE_END: AtomicI32 = AtomicI32::new(-1);
@@ -35,7 +35,7 @@ pub fn install() -> Result<Signals, Why> {
     let mut fds = [0; 2];
     // SAFETY: `fds` has room for the two descriptors pipe2 fills in.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(Why(errno::last()));
+        return Err(Why(errno()));
     }
     // SAFETY: both were just created, and are owned by nothing else. The
     // writing end lives as long as the process, for the handler.
@@ -52,7 +52,7 @@ pub fn install() -> Result<Signals, Why> {
             libc::sigaction(sig, &action, core::ptr::null_mut())
         };
         if rc != 0 {
-            return Err(Why(errno::last()));
+            return Err(Why(errno()));
         }
     }
     Ok(Signals { read })

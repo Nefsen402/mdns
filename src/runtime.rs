@@ -1,12 +1,15 @@
 //! What std gives a program, for one built without it: print macros, its
 //! start (SIGPIPE ignored, as std has it), its memory and an end to it when
-//! it panics. The crate names itself
-//! with a `PROGRAM` constant, and runs its command line with
-//! `run(args) -> c_int`. Tests are built with std, and use std's.
+//! it panics, and errors from the system worded as std words them. The
+//! crate names itself with a `PROGRAM` constant, and runs its command line
+//! with `run(args) -> c_int`. Tests are built with std, and use std's.
 //!
 //! Declared first in the crate, with `#[macro_use]`, for the macros.
 
-use core::ffi::c_int;
+use core::ffi::{c_int, CStr};
+use core::fmt;
+
+use rustix::io::Errno;
 
 // What std's print macros do, to stdout and stderr: tests use std's, which
 // the test harness captures.
@@ -50,6 +53,45 @@ pub fn write_all(fd: c_int, mut bytes: &[u8]) -> Result<(), rustix::io::Errno> {
 #[cfg_attr(test, allow(dead_code))]
 pub fn write_out(fd: c_int, text: &str) {
     let _ = write_all(fd, text.as_bytes());
+}
+
+/// An error from the system, worded by it, as std would: rustix, without
+/// std, says only "os error 2", where this says "No such file or directory
+/// (os error 2)".
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Why(pub Errno);
+
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut buf = [0u8; 128];
+        // SAFETY: `buf` is writable for its length; the XSI strerror_r writes a
+        // NUL-terminated message into it, or fails and leaves it alone.
+        let ok = unsafe { libc::strerror_r(self.0.raw_os_error(), buf.as_mut_ptr().cast(), buf.len()) } == 0;
+        match CStr::from_bytes_until_nul(&buf).ok().and_then(|m| m.to_str().ok()).filter(|_| ok) {
+            Some(message) => write!(f, "{message} (os error {})", self.0.raw_os_error()),
+            None => write!(f, "os error {}", self.0.raw_os_error()),
+        }
+    }
+}
+
+impl fmt::Debug for Why {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl core::error::Error for Why {}
+
+impl From<Errno> for Why {
+    fn from(e: Errno) -> Why {
+        Why(e)
+    }
+}
+
+/// What the last libc call that failed left in `errno`.
+pub fn errno() -> Errno {
+    // SAFETY: errno is the calling thread's, and always there to read.
+    Errno::from_raw_os_error(unsafe { *libc::__errno_location() })
 }
 
 #[cfg(not(test))]
@@ -166,5 +208,16 @@ mod start {
         let _ = writeln!(Stderr, "{}: {info}", crate::PROGRAM);
         // SAFETY: abort takes nothing, and does not return.
         unsafe { libc::abort() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn words_an_error_as_the_system_does() {
+        assert_eq!(Why(Errno::NOENT).to_string(), "No such file or directory (os error 2)");
+        assert_eq!(alloc::format!("{:?}", Why(Errno::NOENT)), "No such file or directory (os error 2)");
     }
 }

@@ -13,7 +13,6 @@ mod runtime;
 mod args;
 mod config;
 mod device;
-mod errno;
 mod ipc;
 mod links;
 mod netlink;

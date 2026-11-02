@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
 
-use crate::errno::{self, Why};
+use crate::runtime::{errno, Why};
 
 
 pub const MDNS_PORT: u16 = 5353;
@@ -107,7 +107,7 @@ pub fn prefixes(name: &str) -> Result<Vec<Prefix>> {
     let mut list: *mut libc::ifaddrs = core::ptr::null_mut();
     // SAFETY: getifaddrs fills in `list`, freed below.
     if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        return Err(Why(errno::last())).context("listing the interfaces' addresses");
+        return Err(Why(errno())).context("listing the interfaces' addresses");
     }
     let mut out = Vec::new();
     let mut at = list;
@@ -165,7 +165,7 @@ pub fn mtu(name: &str) -> Result<u32> {
     // SAFETY: `req` is a valid ifreq naming the interface; SIOCGIFMTU fills
     // in its MTU.
     if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut req) } != 0 {
-        return Err(Why(errno::last())).with_context(|| format!("reading the MTU of {name}"));
+        return Err(Why(errno())).with_context(|| format!("reading the MTU of {name}"));
     }
     // SAFETY: SIOCGIFMTU set the MTU member of the union.
     let mtu = unsafe { req.ifr_ifru.ifru_mtu };
@@ -241,7 +241,7 @@ fn bind_device(fd: impl AsFd, interface: &str) -> Result<()> {
         libc::setsockopt(fd.as_fd().as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE, name.as_ptr().cast(), name.len() as libc::socklen_t)
     };
     if rc != 0 {
-        return Err(Why(errno::last())).with_context(|| format!("binding to {interface}"));
+        return Err(Why(errno())).with_context(|| format!("binding to {interface}"));
     }
     Ok(())
 }
@@ -260,7 +260,7 @@ fn set_int(fd: impl AsFd, level: libc::c_int, name: libc::c_int, value: libc::c_
         )
     };
     if rc != 0 {
-        return Err(Why(errno::last()).into());
+        return Err(Why(errno()).into());
     }
     Ok(())
 }

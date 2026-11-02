@@ -23,7 +23,7 @@ use crate::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MIN_LIFETIME};
-use crate::errno::Why;
+use crate::runtime::Why;
 use crate::device::{
     addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report,
     DEFAULT_MAX_PACKET, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,

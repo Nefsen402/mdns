@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::device::Device;
-use crate::errno::Why;
+use crate::runtime::Why;
 use crate::netlink::{Change, Netlink};
 use crate::segment::{Owner, Segment};
 use crate::socket::{self, Family};

@@ -6,7 +6,7 @@ use core::time::Duration;
 use rustix::fd::RawFd;
 use rustix::io::Errno;
 
-use crate::errno::{self, Why};
+use crate::runtime::{errno, Why};
 
 /// A descriptor to wait on until it can be read.
 pub fn readable(fd: RawFd) -> libc::pollfd {
@@ -29,7 +29,7 @@ pub fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<(), W
     }
     // SAFETY: `fds` is a valid array of pollfd of the length given.
     if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) } < 0 {
-        let e = errno::last();
+        let e = errno();
         if e != Errno::INTR {
             return Err(Why(e));
         }

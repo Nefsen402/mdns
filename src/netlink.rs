@@ -13,7 +13,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use rustix::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
 
-use crate::errno::{self, Why};
+use crate::runtime::{errno, Why};
 
 use crate::prelude::*;
 
@@ -79,7 +79,7 @@ impl Netlink {
         // SAFETY: plain socket creation; the result is checked.
         let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
         if fd < 0 {
-            return Err(Why(errno::last()));
+            return Err(Why(errno()));
         }
         // SAFETY: `fd` was just created and is owned by nothing else.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -96,7 +96,7 @@ impl Netlink {
             )
         };
         if rc < 0 {
-            return Err(Why(errno::last()));
+            return Err(Why(errno()));
         }
         Ok(Netlink { fd })
     }
@@ -127,7 +127,7 @@ impl Netlink {
                 core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
             )
         };
-        if n < 0 { Err(Why(errno::last())) } else { Ok(()) }
+        if n < 0 { Err(Why(errno())) } else { Ok(()) }
     }
 
     /// The descriptor to wait on: readable when there are changes.
@@ -147,7 +147,7 @@ impl Netlink {
                 changes.extend(parse(&buf[..n as usize]));
                 continue;
             }
-            match errno::last() {
+            match errno() {
                 Errno::INTR => continue,
                 Errno::AGAIN => return Ok(changes),
                 Errno::NOBUFS => changes.push(Change::Lost),

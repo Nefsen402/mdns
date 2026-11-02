@@ -26,7 +26,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, Signal, WaitOptions, WaitStatus};
 use serde_json::Value;
 
-use crate::errno::Why;
+use crate::runtime::{errno, Why};
 
 // First, for its print macros.
 #[macro_use]
@@ -34,8 +34,6 @@ use crate::errno::Why;
 mod runtime;
 #[path = "args.rs"]
 mod args;
-#[path = "errno.rs"]
-mod errno;
 // Shared with the daemon, which waits on more than a subscriber does.
 #[allow(dead_code)]
 #[path = "poll.rs"]
@@ -531,7 +529,7 @@ fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd
     // async-signal-safe calls on what was made above until it runs the
     // program or exits.
     match unsafe { libc::fork() } {
-        -1 => Err(errno::last()),
+        -1 => Err(errno()),
         0 => unsafe {
             if stdin == 0 || libc::dup2(stdin, 0) >= 0 {
                 // A program starts with SIGPIPE as the system has it, whatever
@@ -850,7 +848,7 @@ fn detach(socket: &str, line: &str, log: Option<&OwnedFd>) -> Result<Conn, Failu
     let (report_rx, report_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(failed)?;
     // SAFETY: no other thread has been started, so the child is a full copy.
     match unsafe { libc::fork() } {
-        -1 => Err(failed(errno::last())),
+        -1 => Err(failed(errno())),
         0 => {
             drop(report_rx);
             let opened = settle_in_background(log).and_then(|()| open_watch(socket, line));

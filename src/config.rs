@@ -44,7 +44,7 @@ use core::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::errno::Why;
+use crate::runtime::Why;
 
 use alloc::format;
 use alloc::string::{String, ToString};
