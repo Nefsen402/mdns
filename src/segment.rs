@@ -8,21 +8,22 @@
 //! it.
 
 use core::fmt;
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeSet, VecDeque};
 
 use hashbrown::{HashMap, HashSet};
 use core::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 use rustix::fd::OwnedFd;
 use core::cell::RefCell;
-use alloc::rc::Rc;
+use alloc::boxed::Box;
+use alloc::rc::{Rc, Weak};
 use core::time::Duration;
 
 use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
+use crate::config::{Neighbours, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
 use crate::runtime::Why;
 use crate::device::{
     addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report,
@@ -318,19 +319,128 @@ pub enum Owner {
     Reflector(u32),
 }
 
-/// One owner's wish to have a device announced, with the TTL of its address.
+/// A device discovered on a segment, as another segment holds it: by the id
+/// it has there, and not copied. Reading it gives what it is now, or nothing
+/// if it, or the segment, is gone: what the segments it was given to are told
+/// of that when the reflector hears, which can be a moment after.
+#[derive(Clone, Debug)]
+pub struct Source {
+    state: Weak<RefCell<State>>,
+    id: Id,
+}
+
+impl PartialEq for Source {
+    fn eq(&self, other: &Source) -> bool {
+        Weak::ptr_eq(&self.state, &other.state) && self.id == other.id
+    }
+}
+
+impl Eq for Source {}
+
+impl Source {
+    /// Look at the device, if it is still there.
+    pub fn with<R>(&self, f: impl FnOnce(&Device) -> R) -> Option<R> {
+        let state = self.state.upgrade()?;
+        let state = state.borrow();
+        state.discovered.try_get(self.id).map(|entry| f(&entry.device))
+    }
+}
+
+/// One owner's wish to have a device announced.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Claim {
-    device: Device,
-    host_ttl: u32,
+enum Claim {
+    /// A device made for it, announced as it is, with the TTL of its address.
+    Owned { device: Box<Device>, host_ttl: u32 },
+    /// A device of another segment, announced as it is there now, with the
+    /// addresses it was given from the neighbour table that `neighbours` lets
+    /// through, and with the TTL of its address `host_ttl` if given, or else
+    /// its own.
+    Reflected { source: Source, neighbours: Neighbours, host_ttl: Option<u32> },
+}
+
+impl Claim {
+    /// The device as it is to be announced, and the TTL of its address;
+    /// nothing if it is of another segment and gone.
+    fn resolve(&self) -> Option<(Device, u32)> {
+        match self {
+            Claim::Owned { device, host_ttl } => Some(((**device).clone(), *host_ttl)),
+            Claim::Reflected { source, neighbours, host_ttl } => source.with(|device| {
+                let device = device.with_neighbours_as(*neighbours).for_reflecting();
+                let ttl = host_ttl.unwrap_or_else(|| device.ttl.map_or(HOST_TTL, |ttl| ttl.max(MIN_REFLECT_TTL)));
+                (device, ttl)
+            }),
+        }
+    }
+}
+
+/// Who wants a hostname announced, and what: sorted by owner, so that the first
+/// wins. A few at most, so a list with room for just those, not a tree, which
+/// takes room for eleven for one.
+#[derive(Default)]
+struct Claims(Vec<(Owner, Claim)>);
+
+impl Claims {
+    fn position(&self, owner: &Owner) -> Result<usize, usize> {
+        self.0.binary_search_by(|(other, _)| other.cmp(owner))
+    }
+
+    fn get(&self, owner: &Owner) -> Option<&Claim> {
+        self.position(owner).ok().map(|at| &self.0[at].1)
+    }
+
+    fn contains_key(&self, owner: &Owner) -> bool {
+        self.position(owner).is_ok()
+    }
+
+    /// Put `claim` for `owner`, in place of the one it had. Returns that one.
+    fn insert(&mut self, owner: Owner, claim: Claim) -> Option<Claim> {
+        match self.position(&owner) {
+            Ok(at) => Some(core::mem::replace(&mut self.0[at].1, claim)),
+            Err(at) => {
+                self.0.reserve_exact(1);
+                self.0.insert(at, (owner, claim));
+                None
+            }
+        }
+    }
+
+    fn remove(&mut self, owner: &Owner) -> Option<Claim> {
+        let at = self.position(owner).ok()?;
+        let (_, claim) = self.0.remove(at);
+        if self.0.is_empty() {
+            self.0 = Vec::new();
+        } else {
+            self.0.shrink_to_fit();
+        }
+        Some(claim)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// By owner, the first first.
+    fn iter(&self) -> impl Iterator<Item = (&Owner, &Claim)> {
+        self.0.iter().map(|(owner, claim)| (owner, claim))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &Owner> {
+        self.0.iter().map(|(owner, _)| owner)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Claim> {
+        self.0.iter().map(|(_, claim)| claim)
+    }
 }
 
 /// A hostname announced on behalf of somewhere else, plus the timing needed
 /// to keep it announced.
 struct Manual {
+    /// The hostname, in lowercase: what it is told apart by.
+    host: Box<str>,
     /// Everyone who wants this hostname announced. The first one wins; empty
     /// only while what was shown is still to be withdrawn.
-    claims: BTreeMap<Owner, Claim>,
+    claims: Claims,
     /// What is announced: the winning claim, less what devices on this
     /// segment have themselves (see [`State::wanted`]). `None` while a device
     /// here has the hostname.
@@ -348,12 +458,15 @@ struct Manual {
     /// The TTLs it is announced with: of its address records, and of the rest.
     host_ttl: u32,
     other_ttl: u32,
+    /// What the tables that find it hold of it.
+    held: manuals::Held,
 }
 
 impl Manual {
-    fn new(now: Instant) -> Manual {
+    fn new(host: &str, now: Instant) -> Manual {
         Manual {
-            claims: BTreeMap::new(),
+            host: host.to_ascii_lowercase().into(),
+            claims: Claims::default(),
             shown: None,
             announced: now,
             repeat: false,
@@ -361,6 +474,7 @@ impl Manual {
             retry: None,
             host_ttl: HOST_TTL,
             other_ttl: OTHER_TTL,
+            held: manuals::Held::default(),
         }
     }
 
@@ -636,8 +750,7 @@ impl State {
         for m in self.manual.iter() {
             if let Some(at) = m.reannounce_at(self.reannounce) {
                 // By the name as announced.
-                let device = m.shown.as_ref().or_else(|| m.claims.values().next().map(|c| &c.device));
-                f("re-announce", &device.and_then(|d| d.hostname.as_deref()).unwrap_or_default(), at);
+                f("re-announce", &m.shown.as_ref().and_then(|d| d.hostname.as_deref()).unwrap_or(&m.host), at);
             }
         }
     }
@@ -675,15 +788,16 @@ impl State {
     /// here has the hostname. Announced on top of a device here, a copy would
     /// be a conflict, and the device would rename itself. The advertised name
     /// is ours, and announced whatever is here.
-    fn wanted(&self, key: &str, m: &Manual) -> Option<Claim> {
-        let (owner, claim) = m.claims.iter().next()?;
+    fn wanted(&self, key: &str, m: &Manual) -> Option<(Device, u32)> {
+        let (owner, (device, host_ttl)) =
+            m.claims.iter().find_map(|(owner, claim)| claim.resolve().map(|wanted| (owner, wanted)))?;
         if *owner == Owner::Own {
-            return Some(claim.clone());
+            return Some((device, host_ttl));
         }
         if self.discovered.contains_host(key) {
             return None;
         }
-        Some(Claim { device: claim.device.without(&|instance| self.is_local(instance)), host_ttl: claim.host_ttl })
+        Some((device.without(&|instance| self.is_local(instance)), host_ttl))
     }
 
     /// Bring what is announced as `key` in line with [`State::wanted`], with
@@ -697,7 +811,7 @@ impl State {
         let want = self.wanted(key, m);
         // Each with the TTL its address is announced with.
         let old = m.shown.as_ref().map(|d| Device { ttl: Some(m.host_ttl), ..d.clone() });
-        let new = want.as_ref().map(|c| Device { ttl: Some(c.host_ttl), ..c.device.clone() });
+        let new = want.as_ref().map(|(device, host_ttl)| Device { ttl: Some(*host_ttl), ..device.clone() });
         let host_here = self.discovered.contains_host(key);
         let records = Device::transition(old.as_ref(), new.as_ref(), &|instance| self.is_local(instance), host_here);
         let sent = !records.is_empty();
@@ -714,9 +828,9 @@ impl State {
                 m.retry = None;
             }
             match want {
-                Some(claim) => {
-                    m.shown = Some(claim.device);
-                    m.host_ttl = claim.host_ttl;
+                Some((device, host_ttl)) => {
+                    m.shown = Some(device);
+                    m.host_ttl = host_ttl;
                 }
                 None => m.shown = None,
             }
@@ -1016,24 +1130,55 @@ impl Segment {
         let Some(key) = device.key() else {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
         };
-        let claim = Claim { device, host_ttl };
+        self.claim(owner, &key, Claim::Owned { device: Box::new(device), host_ttl })
+    }
+
+    /// Announce the device of another segment `from` on this one for `owner`,
+    /// as it is there from now on, not as it is now: with the addresses it was
+    /// given from the neighbour table that `neighbours` lets through, and with
+    /// the TTL `host_ttl` for its address records, if given, or else its own.
+    /// It is the reflector's to say when what is announced is to be looked at
+    /// again, as the device changes, or to withdraw it with
+    /// [`remove_manual`](Segment::remove_manual).
+    pub fn reflect(&self, owner: Owner, from: Source, neighbours: Neighbours, host_ttl: Option<Duration>) -> Result<bool> {
+        let Some(Some(host)) = from.with(|device| device.key()) else {
+            return Err(anyhow!("a reflected device needs a hostname to announce"));
+        };
+        let host_ttl = host_ttl.map(|ttl| u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX));
+        if host_ttl == Some(0) {
+            bail!("a TTL of zero would withdraw the device");
+        }
+        self.claim(owner, &host, Claim::Reflected { source: from, neighbours, host_ttl })
+    }
+
+    /// The device discovered here with the hostname `host`, ignoring case, as
+    /// another segment may hold it.
+    pub fn source_of(&self, host: &str) -> Option<Source> {
+        let state = self.state.borrow();
+        state.discovered.find_host(host).map(|id| Source { state: Rc::downgrade(&self.state), id })
+    }
+
+    /// Put `claim` among what `owner` wants announced as `key` (lowercase),
+    /// and settle what is announced. One of a device made for it that `owner`
+    /// has already is left as it is.
+    fn claim(&self, owner: Owner, key: &str, claim: Claim) -> Result<bool> {
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let previous = match state.manual.get(&key) {
-            Some(m) if m.claims.get(&owner) == Some(&claim) => return Ok(false),
-            Some(_) => state.manual.edit(&key, |m| m.claims.insert(owner, claim)).flatten(),
+        let previous = match state.manual.get(key) {
+            Some(m) if matches!(claim, Claim::Owned { .. }) && m.claims.get(&owner) == Some(&claim) => return Ok(false),
+            Some(_) => state.manual.edit(key, |m| m.claims.insert(owner, claim)).flatten(),
             None => {
-                let mut m = Manual::new(now);
+                let mut m = Manual::new(key, now);
                 m.claims.insert(owner, claim);
                 state.manual.insert(m);
                 None
             }
         };
-        if let Err(e) = state.settle(&key, now) {
+        if let Err(e) = state.settle(key, now) {
             // Nothing is recorded: put back what was there, which leaves
             // nothing if nothing was.
-            state.manual.edit(&key, |m| match previous {
+            state.manual.edit(key, |m| match previous {
                 Some(previous) => m.claims.insert(owner, previous),
                 None => m.claims.remove(&owner),
             });
@@ -1060,6 +1205,23 @@ impl Segment {
         }
         drop(guard);
         Ok(true)
+    }
+
+    /// Forget everything `owner` wanted announced, with goodbyes for what is
+    /// then no longer announced. Every one is tried; the first error is
+    /// returned.
+    pub fn withdraw_all(&self, owner: Owner) -> Result<()> {
+        let hosts: Vec<String> = {
+            let state = self.state.borrow();
+            state.manual.iter().filter(|m| m.claims.contains_key(&owner)).map(|m| m.host.to_string()).collect()
+        };
+        let mut first_err = None;
+        for host in hosts {
+            if let Err(e) = self.remove_manual(owner, &host) {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// Let go of every way to send, as when the interface is gone: what is
@@ -1749,6 +1911,12 @@ impl Segment {
 #[cfg(test)]
 thread_local! {
     static CHECKING: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+}
+
+/// Have tests check the tables that find things after each change, or not.
+#[cfg(test)]
+pub fn set_checking(on: bool) {
+    CHECKING.with(|checking| checking.set(on));
 }
 
 /// The discovered devices an `apply` touched, as they were before, so that
@@ -4066,6 +4234,133 @@ mod tests {
         assert!(recv(&rx).is_some());
     }
 
+    // A device of another segment, announced by a handle to it.
+
+    /// `tv.local` with a service, heard on a segment.
+    fn tv_on(seg: &Segment) {
+        hear(seg, "10.0.1.5", vec![a_record("tv.local", "10.0.1.5"), srv("TV._http._tcp.local", 80, "tv.local")]);
+    }
+
+    /// `tv.local` saying goodbye to its address.
+    fn tv_leaves(seg: &Segment) {
+        hear(seg, "10.0.1.5", vec![record("tv.local".into(), true, 0, RData::A(ip("10.0.1.5").to_string().parse().unwrap()))]);
+    }
+
+    #[test]
+    fn a_device_of_another_segment_is_announced_as_it_is_not_as_it_was() {
+        let (a, _arx) = wired();
+        let (b, rx) = wired();
+        tv_on(&a);
+        let source = a.source_of("TV.LOCAL").expect("it is there");
+        assert!(a.source_of("nas.local").is_none());
+        assert_eq!(source.with(|d| d.services.len()), Some(1));
+
+        assert!(b.reflect(Owner::Reflector(0), source.clone(), Neighbours::default(), None).unwrap());
+        assert_eq!(b.manual_devices().len(), 1);
+        let m = recv(&rx).expect("announced");
+        assert!(m.answers.iter().any(|r| r.name == "tv.local" && r.ttl > 0));
+
+        // It changes where it is; what is announced is looked at again when the reflector says.
+        hear(&a, "10.0.1.5", vec![srv("Web._http._tcp.local", 81, "tv.local")]);
+        assert_eq!(source.with(|d| d.services.len()), Some(2), "read as it is now");
+        assert_eq!(b.manual_devices()[0].services.len(), 1, "announced as last settled");
+        assert!(b.reflect(Owner::Reflector(0), source.clone(), Neighbours::default(), None).unwrap());
+        assert_eq!(b.manual_devices()[0].services.len(), 2);
+        assert!(recv(&rx).is_some(), "the change is announced");
+        b.state.borrow().manual.check();
+
+        // Settled again with nothing changed, it says nothing more.
+        age(&b, 2);
+        b.reflect(Owner::Reflector(0), source, Neighbours::default(), None).unwrap();
+        assert!(recv(&rx).is_none() || recv(&rx).is_none());
+    }
+
+    #[test]
+    fn a_handle_reads_nothing_once_its_device_or_its_segment_is_gone() {
+        let (a, _arx) = wired();
+        tv_on(&a);
+        let source = a.source_of("tv.local").unwrap();
+        assert!(source.with(|d| d.hostname.clone()).flatten().is_some());
+
+        tv_leaves(&a);
+        assert!(a.devices().is_empty());
+        assert!(source.with(|d| d.clone()).is_none(), "the device is gone");
+        // Another device in the slot is not the one it was of.
+        hear(&a, "10.0.1.6", vec![a_record("other.local", "10.0.1.6")]);
+        assert!(source.with(|d| d.clone()).is_none(), "and the next is not it");
+
+        let (c, _crx) = wired();
+        tv_on(&c);
+        let of_c = c.source_of("tv.local").unwrap();
+        assert!(of_c.with(|d| d.clone()).is_some());
+        drop(c);
+        assert!(of_c.with(|d| d.clone()).is_none(), "the segment is gone");
+        assert!(a.reflect(Owner::Reflector(0), of_c, Neighbours::default(), None).is_err(), "nothing to announce");
+    }
+
+    /// A segment that acts before the reflector hears that the device is gone
+    /// does not announce what is not there: it withdraws, and the reflector's
+    /// word, when it comes, finds nothing left to withdraw.
+    #[test]
+    fn a_reflected_device_that_has_gone_is_withdrawn_by_whoever_notices_first() {
+        let (a, _arx) = wired();
+        let (b, rx) = wired();
+        tv_on(&a);
+        b.reflect(Owner::Reflector(0), a.source_of("tv.local").unwrap(), Neighbours::default(), None).unwrap();
+        recv(&rx).unwrap();
+        b.set_reannounce(true);
+
+        tv_leaves(&a);
+        assert_eq!(b.manual_devices().len(), 1, "still shown: nobody has said");
+        b.reannounce(Instant::now() + Duration::from_secs(100_000)).unwrap();
+        assert!(b.manual_devices().is_empty(), "not announced any more");
+        let bye = recv(&rx).expect("goodbyes");
+        assert!(bye.answers.iter().all(|r| r.ttl == 0), "{bye:?}");
+
+        // Its claim is all that is left, until the reflector says.
+        assert!(!b.state.borrow().manual.is_empty());
+        assert!(b.remove_manual(Owner::Reflector(0), "TV.local").unwrap());
+        assert!(b.state.borrow().manual.is_empty());
+        assert!(!b.remove_manual(Owner::Reflector(0), "tv.local").unwrap(), "nothing left");
+    }
+
+    #[test]
+    fn what_an_owner_wanted_is_withdrawn_all_at_once_and_the_others_kept() {
+        let (a, _arx) = wired();
+        let (b, _brx) = wired();
+        tv_on(&a);
+        hear(&a, "10.0.1.6", vec![a_record("nas.local", "10.0.1.6"), srv("NAS._smb._tcp.local", 445, "nas.local")]);
+        for host in ["tv.local", "nas.local"] {
+            b.reflect(Owner::Reflector(0), a.source_of(host).unwrap(), Neighbours::default(), None).unwrap();
+        }
+        b.add_manual(Owner::Reflector(1), tv("10.0.9.9", &["Other"])).unwrap();
+        assert_eq!(b.manual_devices().len(), 2, "tv.local has two who want it, the first one's is announced");
+
+        b.withdraw_all(Owner::Reflector(0)).unwrap();
+        let left = b.manual_devices();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].hostname.as_deref(), Some("tv.local"), "the other owner's is announced instead");
+        assert!(left[0].addrs().any(|addr| addr == ip("10.0.9.9")));
+        b.state.borrow().manual.check();
+    }
+
+    #[test]
+    fn a_device_without_a_hostname_or_a_ttl_of_zero_is_not_reflected() {
+        let (a, _arx) = wired();
+        let (b, _brx) = wired();
+        hear(&a, "10.0.1.5", vec![ptr("_http._tcp.local", "Bare._http._tcp.local")]);
+        tv_on(&a);
+        let bare = a.state.borrow().discovered.find_nameless(&ip("10.0.1.5"));
+        assert!(bare.is_none(), "heard from the address of a named device");
+        let named = a.source_of("tv.local").unwrap();
+        let err = b.reflect(Owner::Reflector(0), named.clone(), Neighbours::default(), Some(Duration::ZERO)).unwrap_err();
+        assert!(format!("{err}").contains("zero"));
+        assert!(b.manual_devices().is_empty());
+        // The TTL it is given is the one its address is announced with.
+        b.reflect(Owner::Reflector(0), named, Neighbours::default(), Some(Duration::from_secs(900))).unwrap();
+        assert_eq!(b.state.borrow().manual["tv.local"].host_ttl, 900);
+    }
+
     // What a full segment costs. Not a test: run it with
     // `cargo test --release scale -- --ignored --nocapture`.
 
@@ -4116,12 +4411,17 @@ mod tests {
     /// (a sender may describe only so many), with an address that runs out
     /// before the device does, as a host's address does against its services.
     fn crowded(n: usize) -> Segment {
+        crowded_named(n, "host", 1)
+    }
+
+    /// Like [`crowded`], with hosts called `{prefix}{i}.local`, on 10.`net`.x.y.
+    fn crowded_named(n: usize, prefix: &str, net: usize) -> Segment {
         let (seg, _rx) = wired();
         seg.set_refresh_before(Some(Duration::from_secs(30)));
         seg.set_max_devices(n + 1);
         for i in 0..n {
-            let (host, instance) = (format!("host{i}.local"), format!("Dev{i}._http._tcp.local"));
-            let from = format!("10.1.{}.{}", i / 250, i % 250 + 1);
+            let (host, instance) = (format!("{prefix}{i}.local"), format!("Dev{i}._http._tcp.local"));
+            let from = format!("10.{net}.{}.{}", i / 250, i % 250 + 1);
             hear(&seg, &from, vec![
                 ptr("_http._tcp.local", &instance),
                 srv(&instance, 80, &host),
@@ -4224,14 +4524,17 @@ mod tests {
             let seg = crowded(n);
             seg.set_max_devices(n + 1000);
             seg.set_reannounce(true);
+            // The devices of another segment, which this one announces by handles
+            // to them.
+            let other = crowded_named(n, "m", 2);
+            let (reflected_from, _) = heap();
             for i in 0..n {
-                let mut device = tv(&format!("10.2.{}.{}", i / 250, i % 250 + 1), &[&format!("M{i}")]);
-                device.hostname = Some(format!("m{i}.local"));
-                device.services[0].instance = format!("M{i}._http._tcp.local");
-                seg.add_manual(Owner::Reflector(0), device).unwrap();
+                let source = other.source_of(&format!("m{i}.local")).unwrap();
+                seg.reflect(Owner::Reflector(0), source, Neighbours::default(), None).unwrap();
             }
             seg.take_events();
             let (b, _) = heap();
+            println!("   reflected by a handle: {} B/dev", (b - reflected_from) / n.max(1));
 
             // A client asking for the name of one of them, each time another.
             let mut asked = 0;

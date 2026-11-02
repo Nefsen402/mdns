@@ -11,7 +11,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use hashbrown::{HashMap, HashSet};
 use core::net::IpAddr;
 
-use crate::config::DEFAULT_MAX_ADDRS;
+use crate::config::{Neighbours, DEFAULT_MAX_ADDRS};
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_SERVICES;
 use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
@@ -91,6 +91,15 @@ pub struct Service {
     /// The TTL its records were last announced with, in seconds: that of the
     /// SRV record, or else of the PTR or TXT; 0 if not known.
     pub ttl: u32,
+}
+
+impl Service {
+    /// Whether it is known where it is, by its SRV record: a host and a port.
+    /// One known only by name from a browse answer or a TXT record is not,
+    /// and a copy of it would have to make up the rest.
+    pub fn is_resolved(&self) -> bool {
+        self.target.is_some() && self.port != 0
+    }
 }
 
 /// A device on a segment. Once it has announced a hostname it is known by
@@ -494,6 +503,26 @@ impl Device {
         let mut device = self.clone();
         device.addresses.retain(|a| a.origin == Origin::Announced || if a.ip.is_ipv4() { v4 } else { v6 });
         device
+    }
+
+    /// This device with the addresses it was given from the neighbour table
+    /// that `neighbours` lets through: without them, one whose only routable
+    /// address was given so has none.
+    pub fn with_neighbours_as(&self, neighbours: Neighbours) -> Device {
+        match neighbours {
+            Neighbours::Always => self.clone(),
+            Neighbours::LinkLocal => self.with_neighbours_of_link_local_families(),
+            Neighbours::Never => self.without_neighbours(),
+        }
+    }
+
+    /// This device as it is announced on another network: a link-local
+    /// address only means something on the link the device is on, and on any
+    /// other it names nobody, and a service whose host and port are not known
+    /// would have a copy make up the rest.
+    pub fn for_reflecting(&self) -> Device {
+        let services = self.services.iter().filter(|s| s.is_resolved()).cloned().collect();
+        Device { services, ..self.without_link_local() }
     }
 
     /// What identifies it in the manual list and to the reflector: its

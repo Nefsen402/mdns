@@ -1,29 +1,31 @@
 //! Reflects devices between segments, over every address family they serve.
 //!
 //! Every device discovered on a segment is announced on all the *other*
-//! segments, and withdrawn again when it goes away. The reflector owns the
-//! reflected copies: it works out what each segment should be announcing and
-//! reconciles toward that, so a failed send is simply retried and no copy
-//! can outlive its source. Dropping the reflector withdraws everything.
+//! segments, and withdrawn again when it goes away. A segment that announces
+//! the device of another does not keep a copy of it: it is given a handle to
+//! the device, to read it as it is, and the reflector says when to look at it
+//! again, as it changes, or to withdraw it. What the reflector knows is which
+//! hostnames it could not reflect, to try again; a failed send is simply
+//! retried, and no copy can outlive its source, as there is none to outlive.
+//! Dropping the reflector withdraws everything.
 //!
 //! Every segment reflects to every other one in the same reflector; which
 //! interfaces share a reflector is the caller's policy. A reflector with a
 //! single segment only tracks and reflects nothing.
 
-use alloc::collections::BTreeMap;
-
-use hashbrown::HashMap;
 use core::cell::{RefCell, RefMut};
 use alloc::rc::Rc;
 use core::time::Duration;
+
+use hashbrown::HashSet;
 
 use crate::time::Instant;
 
 use anyhow::{bail, Result};
 
 use crate::config::{Forward, Neighbours, ReflectedWhen};
-use crate::device::{Device, Service};
-use crate::segment::{Asked, Event, Owner, Segment};
+use crate::device::Device;
+use crate::segment::{Asked, Event, Owner, Segment, Source};
 
 use crate::prelude::*;
 
@@ -72,13 +74,10 @@ struct Inner {
 
 #[derive(Default)]
 struct Book {
-    /// Reflectable devices currently discovered on each source segment,
-    /// keyed by (segment index, lowercase hostname).
-    sources: BTreeMap<(usize, String), Device>,
-    /// What each target segment has been told, as last sent successfully,
-    /// keyed by (segment index, lowercase hostname).
-    pushed: HashMap<(usize, String), Device>,
-    /// When to reconcile again, as a send failed.
+    /// The hostnames, in lowercase, that could not be reflected to every
+    /// segment, to be tried again.
+    failed: Vec<String>,
+    /// When to try again, as a send failed.
     retry: Option<Instant>,
 }
 
@@ -147,15 +146,14 @@ impl Reflector {
 
         // What is known already; what changes from now on is handed in by
         // the event loop ([`deliver`]). A device seen both ways is harmless:
-        // tracking is idempotent.
+        // reflecting is idempotent.
         {
             let mut book = inner.book();
-            for (src, seg) in inner.segments.iter().enumerate() {
-                for device in seg.devices() {
-                    track(&mut book, src, device, inner.neighbours, inner.when);
-                }
+            let hosts: HashSet<String> =
+                inner.segments.iter().flat_map(|seg| seg.devices()).filter_map(|device| device.key()).collect();
+            for host in hosts {
+                inner.sync(&mut book, &host);
             }
-            inner.reconcile(&mut book);
         }
 
         #[cfg(test)]
@@ -279,10 +277,12 @@ pub fn retry_made(now: Instant) {
 
 impl Drop for Reflector {
     fn drop(&mut self) {
-        // Nothing is wanted any more, so reconciling sends the goodbyes.
-        let mut book = self.inner.book();
-        book.sources.clear();
-        self.inner.reconcile(&mut book);
+        // Nothing is wanted any more: what it announced is withdrawn.
+        for seg in &self.inner.segments {
+            if let Err(e) = seg.withdraw_all(self.inner.owner) {
+                eprintln!("{}: withdrawing what was reflected failed: {e:#}", seg.interface());
+            }
+        }
     }
 }
 
@@ -316,19 +316,13 @@ impl Inner {
             return self.forward(src, questions);
         }
         self.notify(src, &event);
-        let mut book = self.book();
-        match event {
-            Event::Added(device) | Event::Updated(device) => track(&mut book, src, device, self.neighbours, self.when),
-            Event::Removed(device) => {
-                // A device that never had a name was never tracked.
-                if let Some(key) = device.key() {
-                    book.sources.remove(&(src, key));
-                }
-            }
-            // Forwarded above.
-            Event::Question(_) => {}
+        let (Event::Added(device) | Event::Updated(device) | Event::Removed(device)) = &event else { return };
+        // A device that never had a name was never reflected. What the event
+        // says of the device is not looked at: the segments are, as they are
+        // now, which is where it is reflected from.
+        if let Some(host) = device.key() {
+            self.sync(&mut self.book(), &host);
         }
-        self.reconcile(&mut book);
     }
 
     /// Put the questions asked on `src`, those [`Forward`] lets through, to
@@ -361,75 +355,59 @@ impl Inner {
         }
     }
 
-    /// What `target` should be announcing: every reflectable device from the
-    /// other segments (nothing, if it is untrusted), by hostname. If two devices announce the same hostname
-    /// (the cache-flush bit would make them overwrite each other), the one from
+    /// Bring what every segment announces as `host` (in lowercase) in line
+    /// with the segments' devices: every reflectable device with that
+    /// hostname, from the other segments, is announced, nothing if the
+    /// segment is untrusted. If two segments have a device with it (the
+    /// cache-flush bit would make them overwrite each other), the one from
     /// the lowest-numbered segment wins; the other takes over when it goes.
     /// Different hostnames never clash, even on one address: a device may have
     /// several names, each with services of its own.
     ///
-    /// A device's link-local address is dropped: it only means something on
-    /// the link the device is on, and on any other it names nobody.
-    fn desired(&self, book: &Book, target: usize) -> HashMap<String, Device> {
-        let mut out: HashMap<String, Device> = HashMap::new();
-        if self.untrusted[target] {
-            return out;
-        }
-        for ((src, key), device) in &book.sources {
-            if *src == target || out.contains_key(key) {
-                continue;
-            }
-            let services = device.services.iter().filter(|s| resolved(s)).cloned().collect();
-            out.insert(key.clone(), Device { services, ..device.without_link_local() });
-        }
-        out
-    }
+    /// Failures are logged and left as a difference, so the next call
+    /// retries them.
+    fn sync(&self, book: &mut Book, host: &str) {
+        let sources: Vec<Option<Source>> = self
+            .segments
+            .iter()
+            .map(|seg| {
+                let source = seg.source_of(host)?;
+                let reflectable = source.with(|device| reflectable(&device.with_neighbours_as(self.neighbours), self.when));
+                reflectable.unwrap_or(false).then_some(source)
+            })
+            .collect();
 
-    /// Bring every target in line with [`Inner::desired`]. Failures are
-    /// logged and left as a difference, so the next call retries them.
-    fn reconcile(&self, book: &mut Book) {
         let mut failed = false;
         for (target, seg) in self.segments.iter().enumerate() {
-            let desired = self.desired(book, target);
-
-            let stale: Vec<String> = book
-                .pushed
-                .keys()
-                .filter(|(t, key)| *t == target && !desired.contains_key(key))
-                .map(|(_, key)| key.clone())
-                .collect();
-            for key in stale {
-                match seg.remove_manual(self.owner, &key) {
-                    Ok(_) => {
-                        book.pushed.remove(&(target, key));
-                    }
-                    Err(e) => {
-                        eprintln!("{}: withdrawing {key} failed: {e:#}", seg.interface());
-                        failed = true;
-                    }
+            let winner = sources.iter().enumerate().find(|(src, source)| *src != target && source.is_some());
+            let result = match winner {
+                Some((_, Some(source))) if !self.untrusted[target] => {
+                    seg.reflect(self.owner, source.clone(), self.neighbours, self.reflect_ttl)
                 }
-            }
-
-            for (key, device) in desired {
-                if book.pushed.get(&(target, key.clone())) == Some(&device) {
-                    continue;
-                }
-                let added = match self.reflect_ttl {
-                    Some(ttl) => seg.add_manual_ttl(self.owner, device.clone(), ttl),
-                    None => seg.add_manual(self.owner, device.clone()),
-                };
-                match added {
-                    Ok(_) => {
-                        book.pushed.insert((target, key), device);
-                    }
-                    Err(e) => {
-                        eprintln!("{}: announcing {key} failed: {e:#}", seg.interface());
-                        failed = true;
-                    }
-                }
+                _ => seg.remove_manual(self.owner, host),
+            };
+            if let Err(e) = result {
+                eprintln!("{}: reflecting {host} failed: {e:#}", seg.interface());
+                failed = true;
             }
         }
-        book.retry = failed.then(|| Instant::now() + RETRY);
+
+        book.failed.retain(|other| other != host);
+        if failed {
+            book.failed.push(host.to_string());
+        }
+        book.retry = match (book.failed.is_empty(), book.retry) {
+            (true, _) => None,
+            (false, Some(at)) if !failed => Some(at),
+            (false, _) => Some(Instant::now() + RETRY),
+        };
+    }
+
+    /// Try again every hostname that could not be reflected to every segment.
+    fn reconcile(&self, book: &mut Book) {
+        for host in core::mem::take(&mut book.failed) {
+            self.sync(book, &host);
+        }
     }
 }
 
@@ -441,34 +419,7 @@ impl Inner {
 fn reflectable(device: &Device, when: ReflectedWhen) -> bool {
     (!when.hostname || device.hostname.is_some())
         && (!when.address || device.routable().next().is_some())
-        && (!when.service || device.services.iter().any(resolved))
-}
-
-/// Whether it is known where `svc` is, by its SRV record: a host and a port.
-/// One known only by name from a browse answer or a TXT record is not
-/// reflected, since a copy would have to make up the rest.
-fn resolved(svc: &Service) -> bool {
-    svc.target.is_some() && svc.port != 0
-}
-
-/// Keep `device`, discovered on segment `src`, among those to reflect, if it
-/// is reflectable, with the addresses it was given from the neighbour table
-/// that `neighbours` lets through: without them, one whose only routable
-/// address was given so is not.
-fn track(book: &mut Book, src: usize, device: Device, neighbours: Neighbours, when: ReflectedWhen) {
-    // Without a name there is nothing to key it by, and it is not reflectable.
-    let Some(key) = device.key() else { return };
-    let key = (src, key);
-    let device = match neighbours {
-        Neighbours::Always => device,
-        Neighbours::LinkLocal => device.with_neighbours_of_link_local_families(),
-        Neighbours::Never => device.without_neighbours(),
-    };
-    if reflectable(&device, when) {
-        book.sources.insert(key, device);
-    } else {
-        book.sources.remove(&key);
-    }
+        && (!when.service || device.services.iter().any(|s| s.is_resolved()))
 }
 
 #[cfg(test)]
@@ -571,6 +522,41 @@ mod tests {
     }
 
     /// Make `seg` hear `host` at `from` announcing one service per instance.
+    /// What reflecting one more device, and withdrawing it, costs as more are
+    /// reflected already. Not a test: run it with
+    /// `cargo test --release reflecting_one_more -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn reflecting_one_more_device_costs() {
+        crate::segment::set_checking(false);
+        println!("{:>8} {:>14} {:>16}", "devices", "one more us", "its goodbye us");
+        for n in [10usize, 100, 400, 1000, 4000] {
+            let (a, _arx) = wired("a");
+            let (b, _brx) = wired("b");
+            a.set_max_devices(n + 100);
+            let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
+            for i in 0..n {
+                announce(&a, &format!("10.1.{}.{}", i / 250, i % 250 + 1), &format!("h{i}.local"), &[&format!("S{i}")]);
+                deliver_made();
+            }
+            assert_eq!(b.manual_devices().len(), n);
+            let runs = 20;
+            let start = std::time::Instant::now();
+            for i in 0..runs {
+                announce(&a, &format!("10.9.0.{}", i + 1), &format!("x{i}.local"), &[&format!("X{i}")]);
+                deliver_made();
+            }
+            let add = start.elapsed().as_secs_f64() * 1e6 / runs as f64;
+            let start = std::time::Instant::now();
+            for i in 0..runs {
+                announce_ttl(&a, &format!("10.9.0.{}", i + 1), &format!("x{i}.local"), &[&format!("X{i}")], 0, 0);
+                deliver_made();
+            }
+            let del = start.elapsed().as_secs_f64() * 1e6 / runs as f64;
+            println!("{n:>8} {add:>14.0} {del:>16.0}");
+        }
+    }
+
     fn announce(seg: &Segment, from: &str, host: &str, instances: &[&str]) {
         announce_ttl(seg, from, host, instances, 120, 120);
     }
