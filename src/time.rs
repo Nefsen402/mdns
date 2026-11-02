@@ -10,6 +10,9 @@ use core::time::Duration;
 pub struct Instant(Duration);
 
 impl Instant {
+    /// The start of the clock: before anything that has happened.
+    pub const START: Instant = Instant(Duration::ZERO);
+
     /// Now.
     pub fn now() -> Instant {
         let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);

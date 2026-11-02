@@ -34,8 +34,11 @@ use crate::parser::{Message, Question, RData, Record};
 use crate::prelude::*;
 
 mod devices;
+mod manuals;
 mod neighbours;
-use devices::{Devices, Indexed};
+mod table;
+use devices::{Devices, Id, Indexed};
+use manuals::Manuals;
 use neighbours::NeighbourTable;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
@@ -133,14 +136,6 @@ pub struct Pending {
     pub at: Instant,
 }
 
-/// How a discovered device is told apart: by hostname once it has one,
-/// otherwise by the address it was heard from.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Key {
-    Host(String),
-    Source(IpAddr),
-}
-
 /// A discovered device, and when to drop it or ask it again.
 #[derive(Debug)]
 struct Entry {
@@ -161,23 +156,11 @@ struct Entry {
 }
 
 impl Entry {
-    /// A device heard from `from`, told apart as `key` says: by the hostname
-    /// (spelt as in the key, to be spelt as announced when it is) or by `from`.
-    fn of(key: &Key, now: Instant, from: IpAddr) -> Entry {
-        let hostname = match key {
-            Key::Host(host) => Some(host.clone()),
-            Key::Source(_) => None,
-        };
-        let device = Device { hostname, ..Device::default() };
+    /// A device first heard from `from`, with the hostname it has, if it has
+    /// one.
+    fn new(now: Instant, from: IpAddr, hostname: Option<&str>) -> Entry {
+        let device = Device { hostname: hostname.map(String::from), ..Device::default() };
         Entry { device, from, expires: now, addr_expires: HashMap::new(), refreshed: None, nudged: None }
-    }
-
-    /// How it is told apart.
-    fn key(&self) -> Key {
-        match &self.device.hostname {
-            Some(host) => host_key(host),
-            None => Key::Source(self.from),
-        }
     }
 
     /// Its records that answer `q`, each with the time it has left here as
@@ -456,7 +439,7 @@ struct State {
     discovered: Devices,
     /// Devices we announce on this segment on behalf of somewhere else, by
     /// lowercase hostname.
-    manual: HashMap<String, Manual>,
+    manual: Manuals,
     /// Changes not yet taken by the event loop ([`Segment::take_events`]).
     outbox: Vec<Event>,
     /// The probes and queries for types under way, the number of the last
@@ -505,7 +488,12 @@ impl State {
     fn check(&self) {
         if CHECKING.with(|checking| checking.get()) && self.discovered.len() <= 1100 {
             self.discovered.check();
+            self.manual.check();
             self.neighbours.check();
+            // What is due next is what a look at every device says.
+            let mut scan: Option<Instant> = None;
+            self.for_each_deadline(Instant::now(), &mut |_, _, at| scan = Some(scan.map_or(at, |n| n.min(at))));
+            assert_eq!(self.next_due(Instant::now()), scan);
         }
     }
 
@@ -518,9 +506,9 @@ impl State {
     /// ([`Device::take_neighbours`]). A device with a link-local IPv6 address
     /// the table has not got yet, and no routable one, is asked a question on
     /// it, for the kernel to look up its link-layer address.
-    fn learn_neighbours(&mut self, keys: &[Key], touched: &mut Touched, now: Instant) {
-        for key in keys {
-            let Some(entry) = self.discovered.get(key) else { continue };
+    fn learn_neighbours(&mut self, ids: &[Id], touched: &mut Touched, now: Instant) {
+        for &id in ids {
+            let Some(entry) = self.discovered.try_get(id) else { continue };
             // Its link-layer address, by any address it announced.
             let announced = entry.device.addresses.iter().filter(|a| a.origin == Origin::Announced);
             let mut macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
@@ -538,13 +526,13 @@ impl State {
             let due = entry.nudged.is_none_or(|t| now.saturating_duration_since(t) >= NUDGE_GAP);
             if let Some(ll) = unresolved.filter(|_| !has_v6 && due) {
                 nudge(&self.outbound, ll, &Device::refresh_queries(core::slice::from_ref(&entry.device), self.max_packet));
-                self.discovered.get_mut(key).expect("looked up above").nudged = Some(now);
+                self.discovered.get_mut(id).nudged = Some(now);
             }
 
-            let mut device = self.discovered[key].device.clone();
+            let mut device = self.discovered.get(id).device.clone();
             if device.take_neighbours(&learned, self.max_addrs) {
-                touched.note(&self.discovered, key);
-                self.discovered.get_mut(key).expect("looked up above").device = device;
+                touched.note(&self.discovered, id);
+                self.discovered.get_mut(id).device = device;
             }
         }
     }
@@ -553,20 +541,21 @@ impl State {
     /// date, as the interface's networks changed, and tell of those that
     /// changed.
     fn relearn_neighbours(&mut self, now: Instant) {
-        let keys: Vec<Key> =
-            self.discovered.iter().filter(|e| !e.device.addresses.is_empty()).map(Entry::key).collect();
-        self.relearn(&keys, now);
+        let ids: Vec<Id> =
+            self.discovered.ids().filter(|&id| !self.discovered.get(id).device.addresses.is_empty()).collect();
+        self.relearn(&ids, now);
     }
 
-    /// Bring the learned addresses of the devices of `keys` up to date, and
+    /// Bring the learned addresses of the devices of `ids` up to date, and
     /// tell of those that changed.
-    fn relearn(&mut self, keys: &[Key], now: Instant) {
+    fn relearn(&mut self, ids: &[Id], now: Instant) {
         let mut touched = Touched::default();
-        self.learn_neighbours(keys, &mut touched, now);
+        self.learn_neighbours(ids, &mut touched, now);
         touched.sync(&mut self.discovered);
+        let names = touched.names(&self.discovered);
         let events = touched.events(&self.discovered);
         if !events.is_empty() {
-            self.settle_all(now);
+            self.settle_for(&names, now);
         }
         for event in events {
             self.notify(event);
@@ -583,10 +572,26 @@ impl State {
     /// [`Segment::reannounce`] has something to do, or `None` if never. A time
     /// in the past means it is due now. Every time returned is one at which
     /// one of them acts, so that running them moves it on.
-    fn next_due(&self, now: Instant) -> Option<Instant> {
-        let mut next: Option<Instant> = None;
-        self.for_each_deadline(now, &mut |_, _, at| next = Some(next.map_or(at, |n| n.min(at))));
+    fn next_due(&self, _now: Instant) -> Option<Instant> {
+        let mut next = self.discovered.next_due();
+        let mut see = |at: Instant| next = Some(next.map_or(at, |n| n.min(at)));
+        for p in &self.probing {
+            see(p.next);
+        }
+        if let Some(at) = self.next_routine {
+            see(at);
+        }
+        if let Some(at) = self.manual.next_due() {
+            see(at);
+        }
         next
+    }
+
+    /// Have the devices go by how long before they run out they are asked to
+    /// answer again, when that, or whether there is a way to ask, changed.
+    fn sync_refresh(&mut self) {
+        let before = self.upkeep.before.filter(|_| !self.outbound.is_empty());
+        self.discovered.set_refresh(before);
     }
 
     /// Every time something is due, as what is to be done (`expire`,
@@ -628,12 +633,11 @@ impl State {
         if let Some(at) = self.next_routine {
             f("probe", &"every type, as configured", at);
         }
-        for (key, m) in &self.manual {
+        for m in self.manual.iter() {
             if let Some(at) = m.reannounce_at(self.reannounce) {
-                // By the name as announced, not the key, which is lowercase.
+                // By the name as announced.
                 let device = m.shown.as_ref().or_else(|| m.claims.values().next().map(|c| &c.device));
-                let name = device.and_then(|d| d.hostname.as_deref()).unwrap_or(key);
-                f("re-announce", &name, at);
+                f("re-announce", &device.and_then(|d| d.hostname.as_deref()).unwrap_or_default(), at);
             }
         }
     }
@@ -641,12 +645,12 @@ impl State {
     /// How much longer the daemon keeps `device` if it is not heard from, to
     /// the second.
     fn lifetime_left(&self, device: &Device) -> Duration {
-        let key = match (&device.hostname, device.addrs().next()) {
-            (Some(host), _) => host_key(host),
-            (None, Some(addr)) => Key::Source(addr),
+        let id = match (&device.hostname, device.addrs().next()) {
+            (Some(host), _) => self.discovered.find_host(host),
+            (None, Some(addr)) => self.discovered.find_nameless(&addr),
             (None, None) => return Duration::ZERO,
         };
-        self.discovered.get(&key).map_or(Duration::ZERO, |entry| {
+        id.map(|id| self.discovered.get(id)).map_or(Duration::ZERO, |entry| {
             let left = entry.expires.saturating_duration_since(Instant::now());
             // To the nearest second, a half up.
             Duration::from_secs(left.saturating_add(Duration::from_millis(500)).as_secs())
@@ -657,68 +661,66 @@ impl State {
     /// fewer than it is set to remember, and `src` first described fewer than
     /// [`MAX_PER_SENDER`] of them.
     fn room_for(&self, src: IpAddr) -> bool {
-        let named = |e: &&Entry| e.from == src && e.device.hostname.is_some();
-        self.discovered.len() < self.max_devices && self.discovered.iter().filter(named).count() < MAX_PER_SENDER
+        self.discovered.len() < self.max_devices && self.discovered.described_by(&src) < MAX_PER_SENDER
     }
 
-    /// The instance names, in lowercase, of the services that devices on this
-    /// segment offer themselves.
-    fn local_instances(&self) -> HashSet<String> {
-        self.discovered.iter().flat_map(|e| &e.device.services).map(|s| s.instance.to_ascii_lowercase()).collect()
+    /// Whether a device on this segment offers a service called `instance`,
+    /// ignoring case.
+    fn is_local(&self, instance: &str) -> bool {
+        self.discovered.with_name(instance).any(|e| e.device.service(instance).is_some())
     }
 
     /// What should be announced as `key`: the winning claim, less the
-    /// services whose instance names devices here have (`local`), or nothing
-    /// if a device here has the hostname. Announced on top of a device here,
-    /// a copy would be a conflict, and the device would rename itself. The
-    /// advertised name is ours, and announced whatever is here.
-    fn wanted(&self, key: &str, m: &Manual, local: &HashSet<String>) -> Option<Claim> {
+    /// services whose instance names devices here have, or nothing if a device
+    /// here has the hostname. Announced on top of a device here, a copy would
+    /// be a conflict, and the device would rename itself. The advertised name
+    /// is ours, and announced whatever is here.
+    fn wanted(&self, key: &str, m: &Manual) -> Option<Claim> {
         let (owner, claim) = m.claims.iter().next()?;
         if *owner == Owner::Own {
             return Some(claim.clone());
         }
-        if self.discovered.contains_key(&Key::Host(key.to_string())) {
+        if self.discovered.contains_host(key) {
             return None;
         }
-        Some(Claim { device: claim.device.without(local), host_ttl: claim.host_ttl })
+        Some(Claim { device: claim.device.without(&|instance| self.is_local(instance)), host_ttl: claim.host_ttl })
     }
 
     /// Bring what is announced as `key` in line with [`State::wanted`], with
     /// goodbyes for what is no longer to be, and forget it once nobody wants
     /// it and nothing of it is shown. Returns whether anything was sent. If
     /// sending fails, nothing changes.
-    fn settle(&mut self, key: &str, local: &HashSet<String>, now: Instant) -> Result<bool> {
+    fn settle(&mut self, key: &str, now: Instant) -> Result<bool> {
         let Some(m) = self.manual.get(key) else {
             return Ok(false);
         };
-        let want = self.wanted(key, m, local);
+        let want = self.wanted(key, m);
         // Each with the TTL its address is announced with.
         let old = m.shown.as_ref().map(|d| Device { ttl: Some(m.host_ttl), ..d.clone() });
         let new = want.as_ref().map(|c| Device { ttl: Some(c.host_ttl), ..c.device.clone() });
-        let host_here = self.discovered.contains_key(&Key::Host(key.to_string()));
-        let records = Device::transition(old.as_ref(), new.as_ref(), local, host_here);
+        let host_here = self.discovered.contains_host(key);
+        let records = Device::transition(old.as_ref(), new.as_ref(), &|instance| self.is_local(instance), host_here);
         let sent = !records.is_empty();
         if sent {
             send(&self.outbound, self.max_packet, &records)?;
         }
 
-        let m = self.manual.get_mut(key).expect("looked up above");
-        if sent {
-            m.announced = now;
-            m.repeat = true;
-            m.last_sent = Sent::both(now);
-            m.retry = None;
-        }
-        match want {
-            Some(claim) => {
-                m.shown = Some(claim.device);
-                m.host_ttl = claim.host_ttl;
+        // Gone, if nobody wants it and nothing of it is shown.
+        self.manual.edit(key, |m| {
+            if sent {
+                m.announced = now;
+                m.repeat = true;
+                m.last_sent = Sent::both(now);
+                m.retry = None;
             }
-            None => m.shown = None,
-        }
-        if m.claims.is_empty() && m.shown.is_none() {
-            self.manual.remove(key);
-        }
+            match want {
+                Some(claim) => {
+                    m.shown = Some(claim.device);
+                    m.host_ttl = claim.host_ttl;
+                }
+                None => m.shown = None,
+            }
+        });
         Ok(sent)
     }
 
@@ -730,16 +732,14 @@ impl State {
         if !query.authorities.is_empty() {
             return Vec::new();
         }
-        let local = self.local_instances();
-        let shown: Vec<&Device> = self.manual.values().filter_map(|m| m.shown.as_ref()).collect();
         query
             .questions
             .iter()
-            .filter(|q| {
-                let name = q.name.to_ascii_lowercase();
-                !(local.contains(&name) || self.discovered.contains_key(&Key::Host(name)))
+            .filter(|q| !(self.is_local(&q.name) || self.discovered.contains_host(&q.name)))
+            .map(|q| {
+                let answered = self.manual.with_shown_name(&q.name).any(|m| m.shown.as_ref().is_some_and(|d| d.knows(q)));
+                Asked { question: q.clone(), answered }
             })
-            .map(|q| Asked { question: q.clone(), answered: shown.iter().any(|d| d.knows(q)) })
             .collect()
     }
 
@@ -751,9 +751,14 @@ impl State {
     /// take them for a conflict, and once it announces, the copy gives way.
     /// The daemon's own name answers a probe however recently it went out:
     /// that answer defends it, which section 6 exempts from the wait.
-    fn answering(&self, now: Instant, legacy: bool, probing: bool, family: Family) -> Vec<(String, Device)> {
+    fn answering(&self, query: &Message, now: Instant, legacy: bool, probing: bool, family: Family) -> Vec<(String, Device)> {
+        // Only those with records under a name asked for can answer.
+        let mut keys: Vec<String> = query.questions.iter().flat_map(|q| self.manual.hosts_showing(&q.name)).collect();
+        keys.sort_unstable();
+        keys.dedup();
         let mut out = Vec::new();
-        for (key, m) in &self.manual {
+        for key in keys {
+            let Some(m) = self.manual.get(&key) else { continue };
             let Some(device) = &m.shown else { continue };
             if probing && m.claims.keys().next() != Some(&Owner::Own) {
                 continue;
@@ -761,22 +766,23 @@ impl State {
             if !legacy && !probing && now.saturating_duration_since(m.last_sent.over(family)) < MIN_MULTICAST_GAP {
                 continue;
             }
-            out.push((key.clone(), Device { ttl: Some(m.host_ttl), ..device.clone() }));
+            out.push((key, Device { ttl: Some(m.host_ttl), ..device.clone() }));
         }
         out
     }
 
-    /// [Settle](State::settle) every announced hostname, after the devices
-    /// on this segment changed. One that fails to send is tried again by
-    /// [`Segment::reannounce`], which reports it if it fails again.
-    fn settle_all(&mut self, now: Instant) {
-        let local = self.local_instances();
-        let keys: Vec<String> = self.manual.keys().cloned().collect();
+    /// [Settle](State::settle) the announced hostnames that someone wants
+    /// records under one of `names` for, after the devices on this segment
+    /// that had them changed: the others are as they were. One that fails to
+    /// send is tried again by [`Segment::reannounce`], which reports it if it
+    /// fails again.
+    fn settle_for(&mut self, names: &[String], now: Instant) {
+        let mut keys: Vec<String> = names.iter().flat_map(|name| self.manual.hosts_claiming(name)).collect();
+        keys.sort_unstable();
+        keys.dedup();
         for key in keys {
-            if self.settle(&key, &local, now).is_err()
-                && let Some(m) = self.manual.get_mut(&key)
-            {
-                m.retry = Some(now + ANNOUNCE_RETRY);
+            if self.settle(&key, now).is_err() {
+                self.manual.edit(&key, |m| m.retry = Some(now + ANNOUNCE_RETRY));
             }
         }
     }
@@ -855,13 +861,17 @@ impl Segment {
     /// though it has not changed; by default it is not. What changes is
     /// announced twice, a second apart, either way.
     pub fn set_reannounce(&self, unchanged: bool) {
-        self.state.borrow_mut().reannounce = unchanged;
+        let mut state = self.state.borrow_mut();
+        state.reannounce = unchanged;
+        state.manual.set_unchanged(unchanged);
     }
 
     /// Ask devices to answer again `before` ahead of expiring, from now on;
     /// `None` (the default) does not.
     pub fn set_refresh_before(&self, before: Option<Duration>) {
-        self.state.borrow_mut().upkeep.before = before;
+        let mut state = self.state.borrow_mut();
+        state.upkeep.before = before;
+        state.sync_refresh();
     }
 
     /// When [`Segment::upkeep`] next has something to do, or `None` if never;
@@ -923,6 +933,7 @@ impl Segment {
         let mut state = self.state.borrow_mut();
         state.outbound.retain(|o| o.family != family);
         state.outbound.push(Outbound { family, socket, dest });
+        state.sync_refresh();
     }
 
     // 1. Discovered devices.
@@ -1009,23 +1020,23 @@ impl Segment {
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let m = state.manual.entry(key.clone()).or_insert_with(|| Manual::new(now));
-        if m.claims.get(&owner) == Some(&claim) {
-            return Ok(false);
-        }
-        let previous = m.claims.insert(owner, claim);
-        let local = state.local_instances();
-        if let Err(e) = state.settle(&key, &local, now) {
-            // Nothing is recorded: put back what was there.
-            if let Some(m) = state.manual.get_mut(&key) {
-                match previous {
-                    Some(previous) => m.claims.insert(owner, previous),
-                    None => m.claims.remove(&owner),
-                };
-                if m.claims.is_empty() && m.shown.is_none() {
-                    state.manual.remove(&key);
-                }
+        let previous = match state.manual.get(&key) {
+            Some(m) if m.claims.get(&owner) == Some(&claim) => return Ok(false),
+            Some(_) => state.manual.edit(&key, |m| m.claims.insert(owner, claim)).flatten(),
+            None => {
+                let mut m = Manual::new(now);
+                m.claims.insert(owner, claim);
+                state.manual.insert(m);
+                None
             }
+        };
+        if let Err(e) = state.settle(&key, now) {
+            // Nothing is recorded: put back what was there, which leaves
+            // nothing if nothing was.
+            state.manual.edit(&key, |m| match previous {
+                Some(previous) => m.claims.insert(owner, previous),
+                None => m.claims.remove(&owner),
+            });
             return Err(e);
         }
         drop(guard);
@@ -1040,14 +1051,11 @@ impl Segment {
         let key = hostname.to_ascii_lowercase();
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let Some(previous) = state.manual.get_mut(&key).and_then(|m| m.claims.remove(&owner)) else {
+        let Some(previous) = state.manual.edit(&key, |m| m.claims.remove(&owner)).flatten() else {
             return Ok(false);
         };
-        let local = state.local_instances();
-        if let Err(e) = state.settle(&key, &local, Instant::now()) {
-            if let Some(m) = state.manual.get_mut(&key) {
-                m.claims.insert(owner, previous);
-            }
+        if let Err(e) = state.settle(&key, Instant::now()) {
+            state.manual.edit(&key, |m| m.claims.insert(owner, previous));
             return Err(e);
         }
         drop(guard);
@@ -1057,7 +1065,9 @@ impl Segment {
     /// Let go of every way to send, as when the interface is gone: what is
     /// announced here is kept, to announce again once it is back.
     pub fn detach_all(&self) {
-        self.state.borrow_mut().outbound.clear();
+        let mut state = self.state.borrow_mut();
+        state.outbound.clear();
+        state.sync_refresh();
     }
 
     /// Announce again everything announced here, as when the interface has
@@ -1068,17 +1078,20 @@ impl Segment {
         let mut guard = self.state.borrow_mut();
         let State { manual, outbound, max_packet, .. } = &mut *guard;
         let mut first_err = None;
-        for m in manual.values_mut() {
+        for key in manual.hosts_all() {
+            let Some(m) = manual.get(&key) else { continue };
             let Some(device) = &m.shown else { continue };
             match send(outbound, *max_packet, &device.announcement(m.host_ttl, m.other_ttl)) {
                 Ok(()) => {
-                    m.announced = now;
-                    m.repeat = true;
-                    m.last_sent = Sent::both(now);
-                    m.retry = None;
+                    manual.edit(&key, |m| {
+                        m.announced = now;
+                        m.repeat = true;
+                        m.last_sent = Sent::both(now);
+                        m.retry = None;
+                    });
                 }
                 Err(e) => {
-                    m.retry = Some(now + ANNOUNCE_RETRY);
+                    manual.edit(&key, |m| m.retry = Some(now + ANNOUNCE_RETRY));
                     first_err.get_or_insert(e);
                 }
             }
@@ -1092,20 +1105,25 @@ impl Segment {
     /// withdrawn. They are found again once it is back.
     pub fn forget_discovered(&self) {
         let mut state = self.state.borrow_mut();
-        let keys: Vec<Key> = state.discovered.iter().map(Entry::key).collect();
-        for key in keys {
-            if let Some(entry) = state.discovered.remove(&key) {
+        let ids: Vec<Id> = state.discovered.ids().collect();
+        let mut touched = Touched::default();
+        for &id in &ids {
+            touched.note(&state.discovered, id);
+        }
+        for id in ids {
+            if let Some(entry) = state.discovered.remove(id) {
                 state.notify(Event::Removed(entry.device));
             }
         }
-        state.settle_all(Instant::now());
+        let names = touched.names(&state.discovered);
+        state.settle_for(&names, Instant::now());
     }
 
     /// The devices announced on this segment: for each hostname, what is
     /// shown of the one that won.
     pub fn manual_devices(&self) -> Vec<Device> {
         let state = self.state.borrow_mut();
-        state.manual.values().filter_map(|m| m.shown.clone()).collect()
+        state.manual.iter().filter_map(|m| m.shown.clone()).collect()
     }
 
     /// Announce a second time what changed a second ago ([`ANNOUNCE_REPEAT`]),
@@ -1117,33 +1135,32 @@ impl Segment {
     pub fn reannounce(&self, now: Instant) -> Result<()> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let local = state.local_instances();
-        let due: Vec<String> = state
-            .manual
-            .iter()
-            .filter(|(_, m)| m.reannounce_at(state.reannounce).is_some_and(|at| at <= now))
-            .map(|(key, _)| key.clone())
-            .collect();
         let mut first_err = None;
-        for key in due {
+        for key in state.manual.due(now) {
             // What is out of line is settled first, which announces it.
-            let result = state.settle(&key, &local, now).and_then(|sent| {
-                let Some(m) = state.manual.get_mut(&key).filter(|_| !sent) else {
+            let result = state.settle(&key, now).and_then(|sent| {
+                let Some(m) = state.manual.get(&key).filter(|_| !sent) else {
                     return Ok(());
                 };
-                if let Some(device) = &m.shown {
-                    send(&state.outbound, state.max_packet, &device.announcement(m.host_ttl, m.other_ttl))?;
-                    m.announced = now;
-                    m.repeat = false;
-                    m.last_sent = Sent::both(now);
-                }
-                m.retry = None;
+                let announced = match &m.shown {
+                    Some(device) => {
+                        send(&state.outbound, state.max_packet, &device.announcement(m.host_ttl, m.other_ttl))?;
+                        true
+                    }
+                    None => false,
+                };
+                state.manual.edit(&key, |m| {
+                    if announced {
+                        m.announced = now;
+                        m.repeat = false;
+                        m.last_sent = Sent::both(now);
+                    }
+                    m.retry = None;
+                });
                 Ok(())
             });
             if let Err(e) = result {
-                if let Some(m) = state.manual.get_mut(&key) {
-                    m.retry = Some(now + ANNOUNCE_RETRY);
-                }
+                state.manual.edit(&key, |m| m.retry = Some(now + ANNOUNCE_RETRY));
                 first_err.get_or_insert(e);
             }
         }
@@ -1179,7 +1196,7 @@ impl Segment {
             state.notify(Event::Question(asked));
         }
         let probing = !query.authorities.is_empty();
-        let (keys, devices): (Vec<String>, Vec<Device>) = state.answering(now, legacy, probing, family).into_iter().unzip();
+        let (keys, devices): (Vec<String>, Vec<Device>) = state.answering(query, now, legacy, probing, family).into_iter().unzip();
         let Some((msgs, answered)) = Device::query_response(&devices, query, legacy, state.max_packet) else {
             return Ok(());
         };
@@ -1189,9 +1206,7 @@ impl Segment {
 
         if !legacy {
             for i in answered {
-                if let Some(m) = state.manual.get_mut(&keys[i]) {
-                    m.last_sent.set(family, now);
-                }
+                state.manual.edit(&keys[i], |m| m.last_sent.set(family, now));
             }
         }
         Ok(())
@@ -1267,18 +1282,22 @@ impl Segment {
         // address giving way to the next) is not; it only loses the one.
         let records = || msg.into_iter().flat_map(|m| m.records());
         let still = |name: &str| records().any(|r| r.ttl > 0 && addr_of(&r.data).is_some() && r.name.eq_ignore_ascii_case(name));
-        let leaving: Vec<Key> = records()
+        let leaving: Vec<&str> = records()
             .filter(|r| r.ttl == 0 && addr_of(&r.data) == Some(src) && !still(&r.name))
-            .map(|r| host_key(&r.name))
+            .map(|r| r.name.as_str())
             .collect();
         if !leaving.is_empty() {
-            for key in leaving.iter().chain([&Key::Source(src)]) {
-                touched.note(&state.discovered, key);
-                state.discovered.remove(key);
+            let mut gone: Vec<Id> = leaving.iter().filter_map(|name| state.discovered.find_host(name)).collect();
+            gone.extend(state.discovered.find_nameless(&src));
+            gone.dedup();
+            for id in gone {
+                touched.note(&state.discovered, id);
+                state.discovered.remove(id);
             }
+            let names = touched.names(&state.discovered);
             let events = touched.events(&state.discovered);
             if !events.is_empty() {
-                state.settle_all(now);
+                state.settle_for(&names, now);
             }
             for event in events {
                 state.notify(event);
@@ -1311,18 +1330,18 @@ impl Segment {
         // The host that turns out to be the sender, if any: the one that
         // announced the address the packet came from, or the only one
         // described when it announced no address at all.
-        let mut sender: Option<Key> = None;
-        let mut resolved: Vec<(Key, String)> = Vec::new();
+        let mut sender: Option<Id> = None;
+        let mut resolved: Vec<(Id, String)> = Vec::new();
 
         for report in &reports {
-            let key = host_key(&report.host);
-            if !state.discovered.contains_key(&key) && !state.room_for(src) {
+            let known = state.discovered.find_host(&report.host);
+            if known.is_none() && !state.room_for(src) {
                 continue;
             }
             // Goodbyes alone for a device not known here (one that already
             // left by its other family's goodbye) leave nothing to forget, and
             // are not to bring it back.
-            if report.addrs.is_empty() && !report.gone.is_empty() && !state.discovered.contains_key(&key) {
+            if report.addrs.is_empty() && !report.gone.is_empty() && known.is_none() {
                 continue;
             }
             // The sender, if it announced the address the packet came from, or
@@ -1342,15 +1361,24 @@ impl Segment {
             }
 
             // A device first heard only by address becomes the named device.
-            let earlier = if is_sender {
-                touched.note(&state.discovered, &Key::Source(src));
-                state.discovered.remove(&Key::Source(src))
-            } else {
-                None
-            };
+            let nameless = state.discovered.find_nameless(&src).filter(|_| is_sender);
+            let earlier = nameless.and_then(|id| {
+                touched.note(&state.discovered, id);
+                state.discovered.remove(id)
+            });
 
-            touched.note(&state.discovered, &key);
-            let entry = state.discovered.get_or_insert_with(&key, || Entry::of(&key, now, src));
+            let id = match known {
+                Some(id) => {
+                    touched.note(&state.discovered, id);
+                    id
+                }
+                None => {
+                    let id = state.discovered.create(Entry::new(now, src, Some(&report.host)));
+                    touched.note_new(id);
+                    id
+                }
+            };
+            let entry = state.discovered.get_mut(id);
             if let Some(earlier) = earlier {
                 entry.absorb(earlier, max_services);
             }
@@ -1360,9 +1388,9 @@ impl Segment {
             entry.device.learn(report, &addrs, max_addrs, max_services);
             entry.renew_addrs(&addrs, &report.ttls, now, floor);
 
-            resolved.extend(report.resolved().map(|instance| (key.clone(), instance.to_string())));
+            resolved.extend(report.resolved().map(|instance| (id, instance.to_string())));
             if is_sender && sender.is_none() {
-                sender = Some(key);
+                sender = Some(id);
             }
         }
 
@@ -1374,13 +1402,24 @@ impl Segment {
         // known at all.
         let usable = is_usable(src);
         touched.sync(&mut state.discovered);
-        let key = sender
-            .or_else(|| state.discovered.holder_of(&src).map(Entry::key))
-            .or_else(|| usable.then_some(Key::Source(src)));
-        let room = key.as_ref().is_some_and(|k| state.discovered.contains_key(k)) || state.discovered.len() < state.max_devices;
-        if let Some(key) = key.filter(|_| (reports.is_empty() || !rest.is_empty()) && room) {
-            touched.note(&state.discovered, &key);
-            let entry = state.discovered.get_or_insert_with(&key, || Entry::of(&key, now, src));
+        let known = sender
+            .or_else(|| state.discovered.holder_of(&src))
+            .or_else(|| state.discovered.find_nameless(&src).filter(|_| usable));
+        // One heard by its address if it is not known at all, and there is room.
+        let room = known.is_some() || (usable && state.discovered.len() < state.max_devices);
+        if (known.is_some() || usable) && room && (reports.is_empty() || !rest.is_empty()) {
+            let id = match known {
+                Some(id) => {
+                    touched.note(&state.discovered, id);
+                    id
+                }
+                None => {
+                    let id = state.discovered.create(Entry::new(now, src, None));
+                    touched.note_new(id);
+                    id
+                }
+            };
+            let entry = state.discovered.get_mut(id);
             let ttl = rest.iter().map(|r| r.ttl).max().unwrap_or(0);
             let ttl = Duration::from_secs(ttl as u64);
             entry.expires = entry.expires.max(now + ttl.max(floor));
@@ -1396,18 +1435,15 @@ impl Segment {
         // the unresolved copy learned from a bare browse answer.
         touched.sync(&mut state.discovered);
         for (owner, instance) in resolved {
-            let others: Vec<Key> = state
+            let others: Vec<Id> = state
                 .discovered
                 .with_unresolved()
-                .filter(|e| e.device.service(&instance).is_some_and(|s| s.target.is_none()))
-                .map(Entry::key)
-                .filter(|key| *key != owner)
+                .filter(|&(id, e)| id != owner && e.device.service(&instance).is_some_and(|s| s.target.is_none()))
+                .map(|(id, _)| id)
                 .collect();
-            for k in others {
-                touched.note(&state.discovered, &k);
-                if let Some(e) = state.discovered.get_mut(&k) {
-                    e.device.forget_service(&instance);
-                }
+            for id in others {
+                touched.note(&state.discovered, id);
+                state.discovered.get_mut(id).device.forget_service(&instance);
             }
             touched.sync(&mut state.discovered);
         }
@@ -1417,9 +1453,10 @@ impl Segment {
         state.learn_neighbours(&heard, &mut touched, now);
 
         touched.sync(&mut state.discovered);
+        let names = touched.names(&state.discovered);
         let events = touched.events(&state.discovered);
         if !events.is_empty() {
-            state.settle_all(now);
+            state.settle_for(&names, now);
         }
         for event in events {
             state.notify(event);
@@ -1464,13 +1501,9 @@ impl Segment {
                 ips.extend(state.neighbours.with_mac(mac));
             }
             let mut seen = HashSet::new();
-            let keys: Vec<Key> = ips
-                .iter()
-                .flat_map(|ip| state.discovered.with_addr(ip))
-                .map(Entry::key)
-                .filter(|key| seen.insert(key.clone()))
-                .collect();
-            state.relearn(&keys, Instant::now());
+            let ids: Vec<Id> =
+                ips.iter().flat_map(|ip| state.discovered.ids_with_addr(ip)).filter(|id| seen.insert(*id)).collect();
+            state.relearn(&ids, Instant::now());
         }
     }
 
@@ -1655,19 +1688,18 @@ impl Segment {
         }
         let gap = refresh_gap(before);
 
+        // Due when it, or one of its addresses, is about to run out. Not what
+        // has already run out: it is about to be dropped. A margin too long to
+        // add to a time reaches past every expiry.
         let mut asking = Vec::new();
-        for entry in discovered.iter_mut() {
-            // Due when it, or one of its addresses, is about to run out. Not
-            // what has already run out: it is about to be dropped. A margin
-            // too long to add to a time reaches past every expiry.
-            let soonest = entry.soonest();
-            let due = soonest > now && now.checked_add(before).is_none_or(|limit| soonest <= limit);
+        for id in discovered.about_to_run_out(now, before) {
+            let entry = discovered.get(id);
             let recent = entry.refreshed.is_some_and(|t| now.saturating_duration_since(t) < gap);
-            if !entry.askable() || !due || recent {
+            if !entry.askable() || recent {
                 continue;
             }
-            entry.refreshed = Some(now);
             asking.push(entry.device.clone());
+            discovered.edit(id, |entry| entry.refreshed = Some(now));
         }
         ask(outbound, &Device::refresh_queries(&asking, *max_packet))
     }
@@ -1676,38 +1708,37 @@ impl Segment {
     pub fn expire(&self, now: Instant) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let stale: Vec<Key> = state.discovered.iter().filter(|e| e.expires <= now).map(Entry::key).collect();
-        // Of the others, the addresses that ran out on their own.
-        let due: Vec<Key> = state
-            .discovered
-            .iter()
-            .filter(|e| e.expires > now && e.addr_expires.values().any(|at| *at <= now))
-            .map(Entry::key)
-            .collect();
+        // Those of which something has run out: the devices themselves, and
+        // of the others, the addresses that ran out on their own.
+        let (stale, running): (Vec<Id>, Vec<Id>) =
+            state.discovered.running_out(now).into_iter().partition(|&id| state.discovered.get(id).expires <= now);
         let mut lost = Vec::new();
-        for key in due {
-            let was = state.discovered.indexed_of(&key).expect("found a moment ago");
-            if state.discovered.get_mut(&key).is_some_and(|entry| entry.expire_addrs(now)) {
-                state.discovered.reindex(&key, &was);
-                lost.push(key);
+        for id in running {
+            if state.discovered.edit(id, |entry| entry.expire_addrs(now)) == Some(true) {
+                lost.push(id);
             }
         }
         if stale.is_empty() && lost.is_empty() {
             return;
         }
-        for key in &stale {
-            if let Some(entry) = state.discovered.remove(key) {
+        let mut touched = Touched::default();
+        for &id in &stale {
+            touched.note(&state.discovered, id);
+        }
+        for id in stale {
+            if let Some(entry) = state.discovered.remove(id) {
                 state.notify(Event::Removed(entry.device));
             }
         }
-        for key in lost {
-            if let Some(device) = state.discovered.get(&key).map(|e| e.device.clone()) {
+        for id in lost {
+            if let Some(device) = state.discovered.try_get(id).map(|e| e.device.clone()) {
                 state.notify(Event::Updated(device));
             }
         }
         // What they had here may be shown again. `now` may be ahead of the
         // clock, but what is announced is announced now.
-        state.settle_all(Instant::now());
+        let names = touched.names(&state.discovered);
+        state.settle_for(&names, Instant::now());
         #[cfg(test)]
         state.check();
     }
@@ -1720,46 +1751,65 @@ thread_local! {
     static CHECKING: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
 }
 
-fn host_key(name: &str) -> Key {
-    Key::Host(name.to_ascii_lowercase())
-}
-
 /// The discovered devices an `apply` touched, as they were before, so that
 /// what changed can be reported once, however many devices a packet affects.
 #[derive(Default)]
 struct Touched {
-    order: Vec<Key>,
-    before: HashMap<Key, Option<Device>>,
+    order: Vec<Id>,
+    before: HashMap<Id, Option<Device>>,
     /// What the tables that find devices hold of each, as of when they were
     /// last made to follow it: what it was before, until then.
-    indexed: HashMap<Key, Indexed>,
+    indexed: HashMap<Id, Indexed>,
 }
 
 impl Touched {
-    /// A device is about to be changed (or was made, or is to go): say so
-    /// before it is, once.
-    fn note(&mut self, discovered: &Devices, key: &Key) {
-        if !self.before.contains_key(key) {
-            self.order.push(key.clone());
-            self.before.insert(key.clone(), discovered.get(key).map(|e| e.device.clone()));
-            self.indexed.insert(key.clone(), discovered.indexed_of(key).unwrap_or_default());
+    /// A device is about to be changed, or to go: say so before it is, once.
+    fn note(&mut self, discovered: &Devices, id: Id) {
+        if !self.before.contains_key(&id) {
+            self.order.push(id);
+            self.before.insert(id, discovered.try_get(id).map(|e| e.device.clone()));
+            self.indexed.insert(id, discovered.indexed_of(id));
         }
+    }
+
+    /// A device was just made.
+    fn note_new(&mut self, id: Id) {
+        self.order.push(id);
+        self.before.insert(id, None);
+        self.indexed.insert(id, Indexed::default());
     }
 
     /// Have the tables that find devices follow the changes made so far.
     fn sync(&mut self, discovered: &mut Devices) {
-        for key in &self.order {
-            let was = self.indexed.get(key).cloned().unwrap_or_default();
-            self.indexed.insert(key.clone(), discovered.reindex(key, &was));
+        for id in &self.order {
+            let was = self.indexed.get(id).cloned().unwrap_or_default();
+            self.indexed.insert(*id, discovered.reindex(*id, &was));
         }
+    }
+
+    /// The hostnames and instance names, in lowercase, of the devices as they
+    /// were and as they are: those that whoever is announcing the same may
+    /// have to give way to.
+    fn names(&self, discovered: &Devices) -> Vec<String> {
+        let mut names = Vec::new();
+        for id in &self.order {
+            let now = discovered.try_get(*id).map(|e| &e.device);
+            for device in self.before[id].iter().chain(now) {
+                names.extend(device.hostname.iter().map(|host| host.to_ascii_lowercase()));
+                names.extend(device.services.iter().map(|svc| svc.instance.to_ascii_lowercase()));
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     fn events(self, discovered: &Devices) -> Vec<Event> {
         let Touched { order, mut before, .. } = self;
         let mut events = Vec::new();
-        for key in order {
-            let was = before.remove(&key).flatten();
-            let now = discovered.get(&key).map(|e| e.device.clone());
+        for id in order {
+            let was = before.remove(&id).flatten();
+            let now = discovered.try_get(id).map(|e| e.device.clone());
             match (was, now) {
                 (None, Some(now)) => events.push(Event::Added(now)),
                 (Some(was), Some(now)) if was != now => events.push(Event::Updated(now)),
@@ -1876,6 +1926,11 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// Which device has this hostname.
+    fn host_id(state: &State, host: &str) -> Id {
+        state.discovered.find_host(host).expect("no such device")
     }
 
     fn sa(s: &str) -> SocketAddr {
@@ -2261,11 +2316,12 @@ mod tests {
         let now = Instant::now();
         {
             let mut state = seg.state.borrow_mut();
-            let tv = state.discovered.get_mut(&host_key("tv.local")).unwrap();
-            tv.addr_expires.insert(ip("10.0.1.7"), now + Duration::from_secs(50));
-            tv.expires = now + Duration::from_secs(70);
-            let nas = state.discovered.get_mut(&host_key("nas.local")).unwrap();
-            nas.expires = now;
+            let (tv, nas) = (host_id(&state, "tv.local"), host_id(&state, "nas.local"));
+            state.discovered.edit(tv, |tv| {
+                tv.addr_expires.insert(ip("10.0.1.7"), now + Duration::from_secs(50));
+                tv.expires = now + Duration::from_secs(70);
+            });
+            state.discovered.edit(nas, |nas| nas.expires = now);
         }
 
         let questions = [question("_http._tcp.local", rtype::PTR), question("tv.local", rtype::A)];
@@ -2583,7 +2639,10 @@ mod tests {
         assert_eq!(learned(&seg), [ip("2001:db8:2::73"), ip("fd00:0:2::73")]);
         assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.has_addr(&ip("2001:db8:2::73"))));
         // A packet from a learned address is the device's.
-        assert_eq!(seg.state.borrow_mut().discovered.holder_of(&ip("2001:db8:2::73")).map(Entry::key), Some(host_key("speakers.local")));
+        let state = seg.state.borrow();
+        let holder = state.discovered.holder_of(&ip("2001:db8:2::73")).map(|id| state.discovered.get(id).device.hostname.clone());
+        assert_eq!(holder, Some(Some("speakers.local".to_string())));
+        drop(state);
 
         // An entry that goes takes its address with it.
         seg.neighbour(ip("2001:db8:2::73"), None);
@@ -2645,7 +2704,10 @@ mod tests {
         let rx = UdpSocket::bind("[::1]:0").unwrap();
         let seg = Segment::new("test", &[Family::V6]);
         seg.attach(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap());
-        let nudged = |seg: &Segment| seg.state.borrow_mut().discovered[&host_key("speakers.local")].nudged;
+        let nudged = |seg: &Segment| {
+            let state = seg.state.borrow();
+            state.discovered.get(host_id(&state, "speakers.local")).nudged
+        };
         hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9")]);
         let first = nudged(&seg).expect("nudged");
         hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9")]);
@@ -2978,10 +3040,12 @@ mod tests {
     /// Pretend the last multicast of every reflected device was `secs` ago.
     fn age(seg: &Segment, secs: u64) {
         let mut state = seg.state.borrow_mut();
-        for m in state.manual.values_mut() {
-            m.announced -= Duration::from_secs(secs);
-            m.last_sent.v4 -= Duration::from_secs(secs);
-            m.last_sent.v6 -= Duration::from_secs(secs);
+        for host in state.manual.hosts_all() {
+            state.manual.edit(&host, |m| {
+                m.announced -= Duration::from_secs(secs);
+                m.last_sent.v4 -= Duration::from_secs(secs);
+                m.last_sent.v6 -= Duration::from_secs(secs);
+            });
         }
     }
 
@@ -3697,9 +3761,11 @@ mod tests {
         let longer = Instant::now() + Duration::from_secs(10_000);
         {
             let mut state = seg.state.borrow_mut();
-            let entry = state.discovered.get_mut(&host_key(keep)).unwrap();
-            entry.expires = longer;
-            entry.addr_expires.values_mut().for_each(|at| *at = longer);
+            let kept = host_id(&state, keep);
+            state.discovered.edit(kept, |entry| {
+                entry.expires = longer;
+                entry.addr_expires.values_mut().for_each(|at| *at = longer);
+            });
         }
         seg.expire(Instant::now() + Duration::from_secs(2 * 3600));
         let left = seg.devices();
@@ -3732,11 +3798,16 @@ mod tests {
     /// would make them.
     fn set_expiry(seg: &Segment, host: &str, at: Instant) {
         let mut state = seg.state.borrow_mut();
-        let entry = state.discovered.get_mut(&host_key(host)).expect("no such device");
-        entry.expires = at;
-        for expiry in entry.addr_expires.values_mut() {
-            *expiry = at;
-        }
+        let id = host_id(&state, host);
+        state
+            .discovered
+            .edit(id, |entry| {
+                entry.expires = at;
+                for expiry in entry.addr_expires.values_mut() {
+                    *expiry = at;
+                }
+            })
+            .expect("no such device");
     }
 
     /// printer.local lives only for the 5 minute floor (all its TTLs are 120);
@@ -4137,10 +4208,75 @@ mod tests {
         }
     }
 
+    /// What reflecting costs: a segment that has heard `n` devices and is
+    /// made to announce `n` more, from other segments, answering queries and
+    /// hearing new devices. Run it like the other.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn scale_of_what_a_full_segment_costs_to_reflect_with() {
+        CHECKING.with(|checking| checking.set(false));
+        println!(
+            "{:>7} {:>10} {:>12} {:>12} {:>13} {:>14} {:>10}",
+            "devices", "heap MiB", "query us", "new host us", "add manual us", "reannounce us", "next_due us"
+        );
+        for n in [1, 128, DEFAULT_MAX_DEVICES - 1, 4096] {
+            let (bytes, _) = heap();
+            let seg = crowded(n);
+            seg.set_max_devices(n + 1000);
+            seg.set_reannounce(true);
+            for i in 0..n {
+                let mut device = tv(&format!("10.2.{}.{}", i / 250, i % 250 + 1), &[&format!("M{i}")]);
+                device.hostname = Some(format!("m{i}.local"));
+                device.services[0].instance = format!("M{i}._http._tcp.local");
+                seg.add_manual(Owner::Reflector(0), device).unwrap();
+            }
+            seg.take_events();
+            let (b, _) = heap();
+
+            // A client asking for the name of one of them, each time another.
+            let mut asked = 0;
+            let query_us = micros(100, || {
+                asked += 1;
+                seg.handle(sa("10.0.0.50"), &query(&format!("m{}.local", asked % n.max(1)), rtype::A, vec![])).unwrap();
+            });
+            seg.take_events();
+
+            // A device heard for the first time.
+            let mut heard = 0;
+            let new_host = micros(100, || {
+                heard += 1;
+                let (host, from) = (format!("new{heard}.local"), format!("10.3.0.{}", heard % 250 + 1));
+                hear(&seg, &from, vec![a_record(&host, &from)]);
+            });
+            seg.take_events();
+
+            // Another to announce.
+            let mut added = 0;
+            let add = micros(100, || {
+                added += 1;
+                let mut device = tv("10.4.0.1", &["X"]);
+                device.hostname = Some(format!("x{added}.local"));
+                device.services[0].instance = format!("X{added}._http._tcp.local");
+                seg.add_manual(Owner::Reflector(0), device).unwrap();
+            });
+
+            // The upkeep when nothing is due.
+            let upkeep = micros(50, || seg.upkeep(Instant::now()));
+            let next_due = micros(200, || {
+                std::hint::black_box(seg.next_due());
+            });
+            println!(
+                "{n:>7} {:>10.2} {query_us:>12.1} {new_host:>12.1} {add:>13.1} {upkeep:>14.1} {next_due:>10.1}",
+                (b - bytes) as f64 / 1_048_576.0,
+            );
+        }
+    }
+
     // The timer-driven upkeep.
 
     fn expiry_of(seg: &Segment, host: &str) -> Instant {
-        seg.state.borrow_mut().discovered[&host_key(host)].expires
+        let state = seg.state.borrow();
+        state.discovered.get(host_id(&state, host)).expires
     }
 
     fn next_due(seg: &Segment) -> Option<Instant> {
@@ -4168,7 +4304,7 @@ mod tests {
         seg.add_manual(Owner::Own, tv("10.0.9.9", &["TV"])).unwrap();
         let announced = seg.state.borrow_mut().manual["tv.local"].announced;
         assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + ANNOUNCE_REPEAT)));
-        seg.state.borrow_mut().manual.get_mut("tv.local").unwrap().retry = Some(announced + Duration::from_secs(500));
+        seg.state.borrow_mut().manual.edit("tv.local", |m| m.retry = Some(announced + Duration::from_secs(500)));
         assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)));
     }
 

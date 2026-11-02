@@ -724,11 +724,11 @@ impl Device {
         at
     }
 
-    /// This device without the services whose instance names are in `taken`
-    /// (lowercase).
-    pub fn without(&self, taken: &HashSet<String>) -> Device {
+    /// This device without the services whose instance names `taken` says
+    /// are taken.
+    pub fn without(&self, taken: &dyn Fn(&str) -> bool) -> Device {
         let mut device = self.clone();
-        device.services.retain(|s| !taken.contains(&s.instance.to_ascii_lowercase()));
+        device.services.retain(|s| !taken(&s.instance));
         device
     }
 
@@ -989,11 +989,11 @@ impl Device {
     /// what of `old` it does not have.
     ///
     /// What devices on the segment have themselves is theirs. No goodbye is
-    /// sent for a service whose instance name one has (`local`, lowercase),
+    /// sent for a service whose instance name one has (`local` says),
     /// nor, if one has the hostname (`host_here`), for the NSEC, which may say
     /// just what theirs does. And no goodbye carries the cache-flush bit,
     /// which would flush their records of the name too.
-    pub fn transition(old: Option<&Device>, new: Option<&Device>, local: &HashSet<String>, host_here: bool) -> Vec<Record> {
+    pub fn transition(old: Option<&Device>, new: Option<&Device>, local: &dyn Fn(&str) -> bool, host_here: bool) -> Vec<Record> {
         let ttl = |d: &Device| d.ttl.unwrap_or(HOST_TTL);
         let mut records = match (old, new) {
             (Some(old), Some(new)) if old == new => Vec::new(),
@@ -1789,7 +1789,7 @@ mod tests {
 
     #[test]
     fn a_transition_announces_the_new_and_takes_back_only_what_is_ours() {
-        let none = HashSet::new();
+        let none = |_: &str| false;
         let mut old = tv("10.0.1.9", &["Kitchen", "Den"]);
         old.ttl = Some(300);
         old.nsec = Some(vec![rtype::A]);
@@ -1816,7 +1816,7 @@ mod tests {
 
         // But not what a device on the segment has: a service of the same
         // instance name, or, if one has the hostname, the NSEC.
-        let local = HashSet::from(["kitchen._http._tcp.local".to_string()]);
+        let local = |name: &str| name.eq_ignore_ascii_case("kitchen._http._tcp.local");
         let bye = goodbyes(&Device::transition(Some(&old), None, &local, true));
         assert!(!bye.iter().any(|r| r.name.starts_with("Kitchen.") || r.data == RData::Ptr("Kitchen._http._tcp.local".into())));
         assert!(!bye.iter().any(|r| matches!(r.data, RData::Nsec { .. })));

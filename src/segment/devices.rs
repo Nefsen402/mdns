@@ -1,423 +1,308 @@
 //! The discovered devices of a segment, each held in one place, and how they
 //! are found.
 //!
-//! A device lives in a slot of a list and is called by the slot's number, an
-//! [`Id`]. The tables that find a device quickly hold nothing but ids: they
-//! are given the hash of what is looked for, and tell the ids they hold apart
-//! by looking into the device itself. So nothing is kept twice, and a table
-//! can be made again from the devices alone.
+//! A device is [kept](Table) and called by its [`Id`]; nothing about it tells
+//! it apart from another. It is found by its hostname, or if it has none by
+//! the address it was first heard from, and by the addresses it has, the
+//! names it answers for, whether it has a service whose host is not known,
+//! and when it next needs something done: when something of it runs out, and
+//! when it is to be asked again. There is at most one device to a hostname:
+//! those that look for one find it before they make one.
 //!
-//! What a device is told apart by, its identity, is its hostname (without
-//! regard to case) or, until it has one, the address it was first heard from.
-//! It must not change while the device is here.
-//!
-//! Devices are found by other things too: the addresses they have, the names
-//! they answer for, and whether they have a service whose host is not known.
-//! The tables for those hold a hash and an id, and confirm by looking into
-//! the device, as the one for identity does, so they too can be made again
-//! from the devices alone ([`Devices::check`] does, and compares). A table
-//! follows a device when it is told that it changed ([`Devices::reindex`]),
-//! given what the tables held of it before ([`Indexed`]), and when it goes.
+//! The tables hold a hash or a time and an id, and confirm by looking into
+//! the device, so they can be made again from the devices alone
+//! ([`Devices::check`] does, and compares). A table follows a device when it
+//! is told that it changed ([`Devices::reindex`]), given what the tables held
+//! of it before ([`Indexed`]), or when it is changed by [`Devices::edit`],
+//! and when it goes.
 
-use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
-use core::hash::{BuildHasher, Hash, Hasher};
 use core::net::IpAddr;
-use core::ops::Index;
+use core::ops::Bound;
+use core::time::Duration;
 
-use hashbrown::{hash_map::Entry as Slot2, DefaultHashBuilder, HashMap, HashSet, HashTable};
+use hashbrown::{DefaultHashBuilder, HashSet};
 
-use super::{Entry, Key};
-use crate::device::Device;
-
-/// Where a device is kept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Id(u32);
+pub(super) use super::table::Id;
+use super::table::{hash_addr, hash_name, Multi, Table};
+use super::{refresh_gap, Entry};
+use crate::time::Instant;
 
 /// What the tables hold of a device: the hashes of its addresses and of the
-/// names it answers for, each once, in order.
+/// names it answers for, each once, in order, and the times it is held under.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(super) struct Indexed {
     addrs: Vec<u64>,
     names: Vec<u64>,
-}
-
-enum Slot {
-    Taken(Entry),
-    /// Empty, and the next empty one.
-    Free(Option<u32>),
-}
-
-/// What tells a device apart, as lent by the device or by a [`Key`].
-enum Ident<'a> {
-    Host(&'a str),
-    Source(IpAddr),
-}
-
-impl Ident<'_> {
-    fn same(&self, other: &Ident<'_>) -> bool {
-        match (self, other) {
-            (Ident::Host(a), Ident::Host(b)) => a.eq_ignore_ascii_case(b),
-            (Ident::Source(a), Ident::Source(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl Entry {
-    fn ident(&self) -> Ident<'_> {
-        match &self.device.hostname {
-            Some(host) => Ident::Host(host),
-            None => Ident::Source(self.from),
-        }
-    }
-}
-
-impl Key {
-    fn ident(&self) -> Ident<'_> {
-        match self {
-            Key::Host(host) => Ident::Host(host),
-            Key::Source(addr) => Ident::Source(*addr),
-        }
-    }
-}
-
-/// The hash of `ident`: a name hashes as it does in lowercase, whatever its
-/// case, and without being copied whole.
-fn hash_of(hasher: &DefaultHashBuilder, ident: &Ident<'_>) -> u64 {
-    let mut h = hasher.build_hasher();
-    match ident {
-        Ident::Host(name) => hash_name(&mut h, name),
-        Ident::Source(addr) => {
-            h.write_u8(1);
-            addr.hash(&mut h);
-        }
-    }
-    h.finish()
-}
-
-/// Feed `name` to `h` as it is in lowercase, and not copied whole.
-fn hash_name(h: &mut impl Hasher, name: &str) {
-    let mut lower = [0u8; 64];
-    for chunk in name.as_bytes().chunks(lower.len()) {
-        let part = &mut lower[..chunk.len()];
-        part.copy_from_slice(chunk);
-        part.make_ascii_lowercase();
-        h.write(part);
-    }
-    h.write_u8(0);
-}
-
-fn hash_of_name(hasher: &DefaultHashBuilder, name: &str) -> u64 {
-    let mut h = hasher.build_hasher();
-    hash_name(&mut h, name);
-    h.finish()
-}
-
-fn hash_of_addr(hasher: &DefaultHashBuilder, addr: &IpAddr) -> u64 {
-    hasher.hash_one(addr)
-}
-
-/// The devices under one hash: usually one, but a name that many devices
-/// answer for (a service type, the type enumeration) has them all under one,
-/// and a device is taken from among them without looking at the others.
-enum Holders {
-    One(Id),
-    Many(Box<HashSet<Id>>),
-}
-
-/// Devices by hash, each under every hash it has, as many as have it.
-#[derive(Default)]
-struct Multi {
-    by_hash: HashMap<u64, Holders>,
-    /// How many (hash, device) pairs it holds.
-    pairs: usize,
-}
-
-impl Multi {
-    fn add(&mut self, hash: u64, id: Id) {
-        match self.by_hash.entry(hash) {
-            Slot2::Vacant(vacant) => {
-                vacant.insert(Holders::One(id));
-            }
-            Slot2::Occupied(mut occupied) => match occupied.get_mut() {
-                Holders::One(first) if *first == id => return,
-                Holders::One(first) => {
-                    let both = HashSet::from_iter([*first, id]);
-                    *occupied.get_mut() = Holders::Many(Box::new(both));
-                }
-                Holders::Many(set) => {
-                    if !set.insert(id) {
-                        return;
-                    }
-                }
-            },
-        }
-        self.pairs += 1;
-    }
-
-    fn remove(&mut self, hash: u64, id: Id) {
-        let Slot2::Occupied(mut occupied) = self.by_hash.entry(hash) else { return };
-        match occupied.get_mut() {
-            Holders::One(only) if *only == id => {
-                occupied.remove();
-            }
-            Holders::One(_) => return,
-            Holders::Many(set) => {
-                if !set.remove(&id) {
-                    return;
-                }
-                if let Some(&last) = set.iter().next().filter(|_| set.len() == 1) {
-                    *occupied.get_mut() = Holders::One(last);
-                }
-            }
-        }
-        self.pairs -= 1;
-    }
-
-    /// The devices under `hash`: those that have what hashes to it, and any
-    /// that has something else that does.
-    fn under(&self, hash: u64) -> impl Iterator<Item = Id> + '_ {
-        let (one, many) = match self.by_hash.get(&hash) {
-            None => (None, None),
-            Some(Holders::One(id)) => (Some(*id), None),
-            Some(Holders::Many(set)) => (None, Some(set.iter().copied())),
-        };
-        one.into_iter().chain(many.into_iter().flatten())
-    }
-
-    #[cfg(test)]
-    fn holds(&self, hash: u64, id: Id) -> bool {
-        self.under(hash).any(|held| held == id)
-    }
-
-    /// Put `id` under each hash in `new` that is not in `was`, and take it
-    /// from under each in `was` that is not in `new`. Both are in order.
-    fn move_between(&mut self, id: Id, was: &[u64], new: &[u64]) {
-        for &hash in was.iter().filter(|h| new.binary_search(h).is_err()) {
-            self.remove(hash, id);
-        }
-        for &hash in new.iter().filter(|h| was.binary_search(h).is_err()) {
-            self.add(hash, id);
-        }
-    }
-}
-
-fn entry_at(slots: &[Slot], id: Id) -> &Entry {
-    match &slots[id.0 as usize] {
-        Slot::Taken(entry) => entry,
-        Slot::Free(_) => unreachable!("a table holds an id whose device is gone"),
-    }
+    soonest: Option<Instant>,
+    refresh_at: Option<Instant>,
 }
 
 #[derive(Default)]
 pub(super) struct Devices {
-    slots: Vec<Slot>,
-    /// The first empty slot.
-    free: Option<u32>,
-    len: usize,
-    /// The devices by identity: ids only, found by what the devices say.
-    by_ident: HashTable<Id>,
+    table: Table<Entry>,
     /// Each address a device has, and the device, by the hash of the address.
     by_addr: Multi,
-    /// Each name a device answers for, and the device, by the hash of the name.
+    /// Each name a device answers for, and the device, by the hash of the name:
+    /// its hostname among them.
     by_name: Multi,
+    /// Every device, by the hash of the address that first described it: what
+    /// finds one with no hostname, and what a sender may describe only so
+    /// many of.
+    by_from: Multi,
     /// The devices with a service whose host is not known yet (a bare browse
     /// answer): the ones to look at when it is, rather than all of them.
     unresolved: HashSet<Id>,
+    /// The devices by the soonest that they, or one of their addresses, runs
+    /// out.
+    by_soonest: BTreeSet<(Instant, Id)>,
+    /// The devices by when they are due to be asked to answer again, if
+    /// [`Devices::refresh`] says they are.
+    by_refresh: BTreeSet<(Instant, Id)>,
+    /// How long before one would run out they are asked to answer again; none
+    /// if they are not.
+    refresh: Option<Duration>,
     hasher: DefaultHashBuilder,
 }
 
 impl Devices {
     pub fn len(&self) -> usize {
-        self.len
+        self.table.len()
     }
 
-    fn find(&self, key: &Key) -> Option<Id> {
-        let want = key.ident();
-        let hash = hash_of(&self.hasher, &want);
-        self.by_ident.find(hash, |&id| entry_at(&self.slots, id).ident().same(&want)).copied()
+    pub fn try_get(&self, id: Id) -> Option<&Entry> {
+        self.table.try_get(id)
     }
 
-    pub fn contains_key(&self, key: &Key) -> bool {
-        self.find(key).is_some()
+    pub fn get(&self, id: Id) -> &Entry {
+        self.table.get(id)
     }
 
-    pub fn get(&self, key: &Key) -> Option<&Entry> {
-        self.find(key).map(|id| entry_at(&self.slots, id))
+    /// The device, to be changed but not in when it runs out or is asked
+    /// again, nor in what it has, unless its changes are then
+    /// [indexed](Devices::reindex).
+    pub fn get_mut(&mut self, id: Id) -> &mut Entry {
+        self.table.get_mut(id)
     }
 
-    /// The device, to be changed but not in what tells it apart.
-    pub fn get_mut(&mut self, key: &Key) -> Option<&mut Entry> {
-        let id = self.find(key)?;
-        match &mut self.slots[id.0 as usize] {
-            Slot::Taken(entry) => Some(entry),
-            Slot::Free(_) => unreachable!("found a device that is gone"),
-        }
+    /// Change the device with `f`, and have the tables follow. Nothing if it
+    /// is gone.
+    pub fn edit<R>(&mut self, id: Id, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
+        let was = self.indexed(self.table.try_get(id)?);
+        let out = f(self.table.get_mut(id));
+        self.reindex_id(id, &was);
+        Some(out)
     }
 
-    /// The device for `key`, made by `make` and kept if it is not here. It
-    /// must be told apart as `key` says.
-    pub fn get_or_insert_with(&mut self, key: &Key, make: impl FnOnce() -> Entry) -> &mut Entry {
-        let id = match self.find(key) {
-            Some(id) => id,
-            None => {
-                let entry = make();
-                debug_assert!(entry.ident().same(&key.ident()), "a device is made as it is looked up");
-                self.insert(entry)
-            }
+    /// The device with the hostname `host`, ignoring case.
+    pub fn find_host(&self, host: &str) -> Option<Id> {
+        let hash = hash_name(&self.hasher, host);
+        let named = |id: &Id| self.table.get(*id).device.hostname.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(host));
+        self.by_name.under(hash).find(named)
+    }
+
+    pub fn contains_host(&self, host: &str) -> bool {
+        self.find_host(host).is_some()
+    }
+
+    /// The device with no hostname that was first heard from `from`.
+    pub fn find_nameless(&self, from: &IpAddr) -> Option<Id> {
+        let hash = hash_addr(&self.hasher, from);
+        let first = |id: &Id| {
+            let entry = self.table.get(*id);
+            entry.device.hostname.is_none() && entry.from == *from
         };
-        match &mut self.slots[id.0 as usize] {
-            Slot::Taken(entry) => entry,
-            Slot::Free(_) => unreachable!("an id that was just found or made"),
-        }
+        self.by_from.under(hash).find(first)
     }
 
-    /// Keep a device that is not here yet.
-    fn insert(&mut self, entry: Entry) -> Id {
-        let hash = hash_of(&self.hasher, &entry.ident());
-        let id = match self.free {
-            Some(at) => {
-                let Slot::Free(next) = self.slots[at as usize] else { unreachable!("the list of empty slots") };
-                self.free = next;
-                self.slots[at as usize] = Slot::Taken(entry);
-                Id(at)
-            }
-            None => {
-                self.slots.push(Slot::Taken(entry));
-                Id(u32::try_from(self.slots.len() - 1).expect("fewer than 2^32 devices"))
-            }
-        };
-        let (slots, hasher) = (&self.slots, &self.hasher);
-        self.by_ident.insert_unique(hash, id, |&id| hash_of(hasher, &entry_at(slots, id).ident()));
-        self.len += 1;
+    /// Keep a device that is not here yet, and no other with its hostname if
+    /// it has one. It is found by its hostname at once, and by the rest of
+    /// what the tables hold when it is [indexed](Devices::reindex), with
+    /// nothing for what they held.
+    pub fn create(&mut self, entry: Entry) -> Id {
+        debug_assert!(entry.device.hostname.as_deref().is_none_or(|host| !self.contains_host(host)), "a hostname is had once");
+        let from = hash_addr(&self.hasher, &entry.from);
+        let host = entry.device.hostname.as_deref().map(|host| hash_name(&self.hasher, host));
+        let id = self.table.insert(entry);
+        self.by_from.add(from, id);
+        if let Some(host) = host {
+            self.by_name.add(host, id);
+        }
         id
     }
 
-    pub fn remove(&mut self, key: &Key) -> Option<Entry> {
-        let want = key.ident();
-        let hash = hash_of(&self.hasher, &want);
-        let slots = &self.slots;
-        let found = self.by_ident.find_entry(hash, |&id| entry_at(slots, id).ident().same(&want)).ok()?;
-        let (id, _) = found.remove();
-        let Slot::Taken(entry) = core::mem::replace(&mut self.slots[id.0 as usize], Slot::Free(self.free)) else {
-            unreachable!("removed a device that is gone")
-        };
+    pub fn remove(&mut self, id: Id) -> Option<Entry> {
         // From the other tables, by what it was given to them as: what the
         // tables hold is what it was when it was last indexed, the device
         // as it is now, unless it was changed and not reindexed.
-        let held = self.indexed(&entry.device);
+        let held = self.indexed(self.table.try_get(id)?);
+        let entry = self.table.remove(id);
         self.by_addr.move_between(id, &held.addrs, &[]);
         self.by_name.move_between(id, &held.names, &[]);
+        self.by_from.remove(hash_addr(&self.hasher, &entry.from), id);
         self.unresolved.remove(&id);
-        self.free = Some(id.0);
-        self.len -= 1;
+        self.by_soonest.remove(&(entry.soonest(), id));
+        if let Some(at) = held.refresh_at {
+            self.by_refresh.remove(&(at, id));
+        }
         Some(entry)
     }
 
-    /// What the tables would hold of `device`.
-    pub fn indexed(&self, device: &Device) -> Indexed {
-        let mut addrs: Vec<u64> = device.addrs().map(|addr| hash_of_addr(&self.hasher, &addr)).collect();
+    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
+        self.table.iter()
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = Id> + '_ {
+        self.table.ids()
+    }
+
+    /// When `entry` is next due to be asked to answer again, if it is: before
+    /// the soonest it or one of its addresses runs out, and not again until
+    /// the gap has passed since it was last asked. Not if it is to be
+    /// dropped by then, nor if there is nothing to ask it.
+    fn refresh_at(&self, entry: &Entry) -> Option<Instant> {
+        let before = self.refresh?;
+        if !entry.askable() {
+            return None;
+        }
+        let soonest = entry.soonest();
+        let at = soonest.checked_sub(before).unwrap_or(Instant::START);
+        let at = match entry.refreshed.map(|t| t.checked_add(refresh_gap(before))) {
+            Some(Some(again)) => at.max(again),
+            Some(None) => return None, // never again
+            None => at,
+        };
+        (at < soonest).then_some(at)
+    }
+
+    /// What the tables would hold of `entry`.
+    pub fn indexed(&self, entry: &Entry) -> Indexed {
+        let mut addrs: Vec<u64> = entry.device.addrs().map(|addr| hash_addr(&self.hasher, &addr)).collect();
         let mut names = Vec::new();
-        device.for_each_name(|name| names.push(hash_of_name(&self.hasher, name)));
+        entry.device.for_each_name(|name| names.push(hash_name(&self.hasher, name)));
         for hashes in [&mut addrs, &mut names] {
             hashes.sort_unstable();
             hashes.dedup();
         }
-        Indexed { addrs, names }
+        Indexed { addrs, names, soonest: Some(entry.soonest()), refresh_at: self.refresh_at(entry) }
     }
 
-    /// What the tables hold of the device for `key`, as of now, if it is here.
-    pub fn indexed_of(&self, key: &Key) -> Option<Indexed> {
-        self.get(key).map(|entry| self.indexed(&entry.device))
+    /// What the tables hold of the device, as of now; nothing if it is gone.
+    pub fn indexed_of(&self, id: Id) -> Indexed {
+        self.table.try_get(id).map(|entry| self.indexed(entry)).unwrap_or_default()
     }
 
-    /// The device for `key` was changed from what the tables held of it,
-    /// `was`: have them follow. Returns what they hold now, which is what to
-    /// give the next time. Nothing if it is not here: they were told when it
-    /// went.
-    pub fn reindex(&mut self, key: &Key, was: &Indexed) -> Indexed {
-        let Some(id) = self.find(key) else { return Indexed::default() };
-        let device = &entry_at(&self.slots, id).device;
-        let now = self.indexed(device);
+    /// The device was changed from what the tables held of it, `was`: have
+    /// them follow. Returns what they hold now, which is what to give the
+    /// next time. Nothing if it is gone: they were told when it went.
+    pub fn reindex(&mut self, id: Id, was: &Indexed) -> Indexed {
+        if self.table.has(id) { self.reindex_id(id, was) } else { Indexed::default() }
+    }
+
+    fn reindex_id(&mut self, id: Id, was: &Indexed) -> Indexed {
+        let entry = self.table.get(id);
+        let now = self.indexed(entry);
         self.by_addr.move_between(id, &was.addrs, &now.addrs);
         self.by_name.move_between(id, &was.names, &now.names);
-        if device.services.iter().any(|s| s.target.is_none()) {
+        if entry.device.services.iter().any(|s| s.target.is_none()) {
             self.unresolved.insert(id);
         } else {
             self.unresolved.remove(&id);
         }
+        for (table, was, now) in [
+            (&mut self.by_soonest, was.soonest, now.soonest),
+            (&mut self.by_refresh, was.refresh_at, now.refresh_at),
+        ] {
+            if was != now {
+                if let Some(at) = was {
+                    table.remove(&(at, id));
+                }
+                if let Some(at) = now {
+                    table.insert((at, id));
+                }
+            }
+        }
         now
     }
 
+    /// Set how long before they run out devices are asked to answer again, or
+    /// that they are not. It is what [`Devices::refresh_at`] goes by, so the
+    /// times they are held under are made again.
+    pub fn set_refresh(&mut self, before: Option<Duration>) {
+        if self.refresh == before {
+            return;
+        }
+        self.refresh = before;
+        self.by_refresh.clear();
+        for id in self.table.ids().collect::<Vec<_>>() {
+            if let Some(at) = self.refresh_at(self.table.get(id)) {
+                self.by_refresh.insert((at, id));
+            }
+        }
+    }
+
     /// The devices that have `addr`.
-    pub fn with_addr<'a>(&'a self, addr: &'a IpAddr) -> impl Iterator<Item = &'a Entry> + 'a {
-        let hash = hash_of_addr(&self.hasher, addr);
-        self.by_addr
-            .under(hash)
-            .map(|id| entry_at(&self.slots, id))
-            .filter(move |entry| entry.device.has_addr(addr))
+    pub fn ids_with_addr<'a>(&'a self, addr: &'a IpAddr) -> impl Iterator<Item = Id> + 'a {
+        let hash = hash_addr(&self.hasher, addr);
+        self.by_addr.under(hash).filter(move |&id| self.table.get(id).device.has_addr(addr))
     }
 
     /// The device that has `addr` and was heard of last, if any does.
-    pub fn holder_of<'a>(&'a self, addr: &'a IpAddr) -> Option<&'a Entry> {
-        self.with_addr(addr).max_by_key(|entry| entry.expires)
+    pub fn holder_of(&self, addr: &IpAddr) -> Option<Id> {
+        self.ids_with_addr(addr).max_by_key(|&id| (self.table.get(id).expires, id))
     }
 
     /// The devices that answer for `name`, ignoring case.
     pub fn with_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
-        let hash = hash_of_name(&self.hasher, name);
-        self.by_name
-            .under(hash)
-            .map(|id| entry_at(&self.slots, id))
-            .filter(move |entry| entry.device.has_name(name))
+        let hash = hash_name(&self.hasher, name);
+        self.by_name.under(hash).map(|id| self.table.get(id)).filter(move |entry| entry.device.has_name(name))
     }
 
     /// The devices with a service whose host is not known yet.
-    pub fn with_unresolved(&self) -> impl Iterator<Item = &Entry> {
-        self.unresolved.iter().map(|&id| entry_at(&self.slots, id))
+    pub fn with_unresolved(&self) -> impl Iterator<Item = (Id, &Entry)> {
+        self.unresolved.iter().map(|&id| (id, self.table.get(id)))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
-        self.slots.iter().filter_map(|slot| match slot {
-            Slot::Taken(entry) => Some(entry),
-            Slot::Free(_) => None,
-        })
+    /// How many devices with a hostname `sender` first described.
+    pub fn described_by(&self, sender: &IpAddr) -> usize {
+        let hash = hash_addr(&self.hasher, sender);
+        let first = |id: &Id| {
+            let entry = self.table.get(*id);
+            entry.from == *sender && entry.device.hostname.is_some()
+        };
+        self.by_from.under(hash).filter(first).count()
     }
 
-    /// The devices, to be changed but not in what tells them apart.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Entry> {
-        self.slots.iter_mut().filter_map(|slot| match slot {
-            Slot::Taken(entry) => Some(entry),
-            Slot::Free(_) => None,
-        })
+    /// The soonest anything of a device is due: when something of one runs
+    /// out, or one is to be asked again. Never if none is.
+    pub fn next_due(&self) -> Option<Instant> {
+        let soonest = self.by_soonest.first().map(|&(at, _)| at);
+        let refresh = self.by_refresh.first().map(|&(at, _)| at);
+        soonest.into_iter().chain(refresh).min()
     }
 
-    /// Whether the tables find each device by what it says, and only the
-    /// devices that are here: for tests, which change things without the
-    /// segment's own care.
+    /// The devices of which something has run out as of `now`.
+    pub fn running_out(&self, now: Instant) -> Vec<Id> {
+        self.by_soonest.range(..=(now, Id::LAST)).map(|&(_, id)| id).collect()
+    }
+
+    /// The devices that run out after `now`, and no later than `before`
+    /// after it: those to ask to answer again.
+    pub fn about_to_run_out(&self, now: Instant, before: Duration) -> Vec<Id> {
+        let to = now.checked_add(before).map_or(Bound::Unbounded, |limit| Bound::Included((limit, Id::LAST)));
+        self.by_soonest.range((Bound::Excluded((now, Id::LAST)), to)).map(|&(_, id)| id).collect()
+    }
+
+    /// Whether the tables hold what the devices have, and nothing else: for
+    /// tests, which change things without the segment's own care.
     #[cfg(test)]
     pub fn check(&self) {
-        let taken = self.slots.iter().filter(|s| matches!(s, Slot::Taken(_))).count();
-        assert_eq!((self.len, self.by_ident.len()), (taken, taken));
-        for entry in self.iter() {
-            let found = self.get(&entry.key());
-            assert!(found.is_some_and(|f| core::ptr::eq(f, entry)), "a device is found by what it says");
-        }
-        let mut free = self.free;
-        let mut empty = 0;
-        while let Some(at) = free {
-            let Slot::Free(next) = self.slots[at as usize] else { panic!("a taken slot is listed as empty") };
-            (free, empty) = (next, empty + 1);
-        }
-        assert_eq!(empty, self.slots.len() - taken);
-
-        // What the other tables hold is what the devices have.
-        let (mut addrs, mut names) = (0, 0);
-        let mut unresolved = 0;
-        for entry in self.iter() {
-            let id = self.find(&entry.key()).expect("found above");
-            let indexed = self.indexed(&entry.device);
+        self.table.check();
+        let (mut addrs, mut names, mut unresolved, mut froms, mut refreshed) = (0, 0, 0, 0, 0);
+        for id in self.table.ids() {
+            let entry = self.table.get(id);
+            let indexed = self.indexed(entry);
             addrs += indexed.addrs.len();
             names += indexed.names.len();
             assert!(indexed.addrs.iter().all(|&h| self.by_addr.holds(h, id)), "an address is indexed: {entry:?}");
@@ -426,24 +311,28 @@ impl Devices {
             assert_eq!(self.unresolved.contains(&id), unresolved_here, "unresolved: {entry:?}");
             unresolved += usize::from(unresolved_here);
             for addr in entry.device.addrs() {
-                assert!(self.with_addr(&addr).any(|e| core::ptr::eq(e, entry)), "{addr} finds it");
+                assert!(self.ids_with_addr(&addr).any(|found| found == id), "{addr} finds it");
+            }
+            froms += 1;
+            assert!(self.by_from.holds(hash_addr(&self.hasher, &entry.from), id), "by where from: {entry:?}");
+            match entry.device.hostname.as_deref() {
+                Some(host) => assert_eq!(self.find_host(host), Some(id), "a hostname is had once: {entry:?}"),
+                None => assert_eq!(self.find_nameless(&entry.from), Some(id), "one with no hostname per address: {entry:?}"),
+            }
+            assert!(self.by_soonest.contains(&(entry.soonest(), id)), "by when it runs out: {entry:?}");
+            if let Some(at) = self.refresh_at(entry) {
+                refreshed += 1;
+                assert!(self.by_refresh.contains(&(at, id)), "by when it is asked again: {entry:?}");
             }
         }
         assert_eq!((self.by_addr.pairs, self.by_name.pairs, self.unresolved.len()), (addrs, names, unresolved));
+        assert_eq!((self.by_from.pairs, self.by_soonest.len(), self.by_refresh.len()), (froms, self.len(), refreshed));
     }
 
     /// How many (address, device) pairs the tables hold.
     #[cfg(test)]
     pub fn addrs_held(&self) -> usize {
         self.by_addr.pairs
-    }
-}
-
-impl Index<&Key> for Devices {
-    type Output = Entry;
-
-    fn index(&self, key: &Key) -> &Entry {
-        self.get(key).expect("no such device")
     }
 }
 
@@ -454,53 +343,57 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::device::Service;
     use crate::time::Instant;
 
-    /// A device told apart as `key` says.
-    fn made(key: &Key) -> Entry {
-        let from = match key {
-            Key::Source(addr) => *addr,
-            Key::Host(_) => "10.0.0.1".parse().unwrap(),
-        };
-        Entry::of(key, Instant::now(), from)
-    }
-
-    fn host(name: &str) -> Key {
-        Key::Host(name.to_ascii_lowercase())
+    fn named(host: &str, from: &str) -> Entry {
+        Entry::new(Instant::now(), from.parse().unwrap(), Some(host))
     }
 
     #[test]
     fn a_device_is_found_by_its_hostname_whatever_the_case_and_by_address_until_it_has_one() {
         let mut devices = Devices::default();
-        let named = host("tv.local");
-        devices.get_or_insert_with(&named, || made(&named)).device.hostname = Some("TV.local".into());
-        devices.reindex(&named, &Indexed::default());
-        let by_address = Key::Source("10.0.0.9".parse().unwrap());
-        devices.get_or_insert_with(&by_address, || made(&by_address));
-        devices.reindex(&by_address, &Indexed::default());
+        let tv = devices.create(named("TV.local", "10.0.0.1"));
+        devices.reindex(tv, &Indexed::default());
+        let from: IpAddr = "10.0.0.9".parse().unwrap();
+        let bare = devices.create(Entry::new(Instant::now(), from, None));
+        devices.reindex(bare, &Indexed::default());
         devices.check();
 
         assert_eq!(devices.len(), 2);
-        assert!(devices.contains_key(&named) && devices.contains_key(&by_address));
-        assert_eq!(devices[&named].device.hostname.as_deref(), Some("TV.local"), "spelt as it was announced");
-        assert!(!devices.contains_key(&host("other.local")));
-        assert!(!devices.contains_key(&Key::Source("10.0.0.8".parse().unwrap())));
+        assert_eq!((devices.find_host("tv.LOCAL"), devices.find_nameless(&from)), (Some(tv), Some(bare)));
+        assert_eq!(devices.get(tv).device.hostname.as_deref(), Some("TV.local"), "spelt as it was announced");
+        assert!(!devices.contains_host("other.local"));
+        assert_eq!(devices.find_nameless(&"10.0.0.8".parse().unwrap()), None);
+        assert_eq!(devices.find_nameless(&"10.0.0.1".parse().unwrap()), None, "it has a name");
+        assert_eq!(devices.described_by(&"10.0.0.1".parse().unwrap()), 1);
+        assert_eq!(devices.described_by(&from), 0, "it has none");
 
-        // Told apart the same way a second time: it is the one that is here.
-        devices.get_or_insert_with(&named, || unreachable!("it is here")).expires = Instant::now();
-        assert_eq!(devices.len(), 2);
+        // Given a hostname, it is found by it, and no longer by where from.
+        let was = devices.indexed_of(bare);
+        devices.edit(bare, |entry| entry.device.hostname = Some("Bare.local".into()));
+        devices.reindex(bare, &was);
+        assert_eq!((devices.find_host("bare.local"), devices.find_nameless(&from)), (Some(bare), None));
+        devices.check();
 
-        assert!(devices.remove(&named).is_some() && devices.remove(&named).is_none());
-        assert_eq!((devices.len(), devices.iter().count()), (1, 1));
+        assert!(devices.remove(tv).is_some() && devices.remove(tv).is_none());
+        assert_eq!((devices.len(), devices.iter().count(), devices.find_host("tv.local")), (1, 1, None));
+        // The slot is another device's now, which the old id does not find.
+        let other = devices.create(named("other.local", "10.0.0.2"));
+        assert_ne!(tv, other);
+        assert!(devices.try_get(tv).is_none());
+        devices.reindex(other, &Indexed::default());
         devices.check();
     }
 
-    /// Whatever is put in and taken out, in any order, with the slots of those
-    /// taken out used again, it holds what a map holds.
+    /// Whatever is put in and taken out, in any order, and changed in what it
+    /// has, with the slots of those taken out used again, the tables find what
+    /// a scan of the devices does.
     #[test]
-    fn it_holds_what_a_map_holds_through_any_mix_of_inserting_and_removing() {
+    fn the_tables_find_what_a_scan_of_the_devices_does_through_any_mix_of_changes() {
         let mut devices = Devices::default();
-        let mut model: HashMap<String, u64> = HashMap::new();
+        devices.set_refresh(Some(Duration::from_secs(30)));
+        let mut model: HashMap<String, Id> = HashMap::new();
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
             state ^= state << 13;
@@ -508,88 +401,92 @@ mod tests {
             state ^= state << 17;
             state
         };
-        // Names of mixed case, and addresses, from a small set, so that the same come again.
-        let key = |n: u64| -> (Key, String) {
-            if n % 5 == 0 {
-                let addr: IpAddr = format!("10.9.{}.{}", n % 7, n % 11).parse().unwrap();
-                (Key::Source(addr), format!("source {addr}"))
-            } else {
-                let name = format!("Host{}.local", n % 300);
-                (host(&name), name.to_ascii_lowercase())
-            }
-        };
+        let start = Instant::now();
         for step in 0..20_000u64 {
-            let (key, id) = key(next() % 1000);
-            let pick = next();
+            let (n, pick) = (next() % 300, next());
+            // A name of mixed case, as announced, spelt differently each time.
+            let spelt = |step: u64| -> String {
+                format!("Host{n}.local").chars().enumerate().map(|(i, c)| if (i as u64 + step) % 3 == 0 { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() }).collect()
+            };
+            let key = format!("host{n}.local");
             match pick % 4 {
                 0 | 1 => {
-                    let was = devices.indexed_of(&key).unwrap_or_default();
-                    let entry = devices.get_or_insert_with(&key, || made(&key));
-                    entry.expires = Instant::now();
-                    if let Key::Host(name) = &key {
-                        // Spelt as announced, in no particular case.
-                        let spelt: String = name.chars().enumerate().map(|(i, c)| if (i + step as usize) % 3 == 0 { c.to_ascii_uppercase() } else { c }).collect();
-                        entry.device.hostname = Some(spelt);
-                    }
-                    // What it has changes: an address more or fewer, a service
-                    // more (its host known or not) or fewer.
-                    let addr: IpAddr = format!("10.5.{}.{}", pick >> 8 & 7, pick >> 16 & 7).parse().unwrap();
-                    match pick >> 24 & 7 {
-                        0 | 1 => entry.device.add_addrs(&[addr]),
-                        2 => entry.device.addresses.retain(|a| a.ip != addr),
-                        3 | 4 => {
-                            let instance = format!("S{}._x{}._tcp.local", pick >> 32 & 3, pick >> 40 & 1);
-                            let kind = format!("_x{}._tcp.local", pick >> 40 & 1);
-                            let target = (pick >> 48 & 1 == 0).then(|| "somewhere.local".to_string());
-                            if !entry.device.services.iter().any(|s| s.instance == instance) {
-                                entry.device.services.push(crate::device::Service { instance, kind, target, ..Default::default() });
+                    let id = match devices.find_host(&spelt(step)) {
+                        Some(id) => id,
+                        None => devices.create(named(&spelt(step), &format!("10.9.{}.{}", n % 7, n % 5))),
+                    };
+                    assert_eq!(*model.entry(key).or_insert(id), id, "found as it was made");
+                    let was = devices.indexed_of(id);
+                    devices.edit(id, |entry| {
+                        entry.expires = start + Duration::from_secs(pick >> 8 & 255);
+                        // What it has changes: an address more or fewer, a service more
+                        // (its host known or not) or fewer, asked again or not.
+                        let addr: IpAddr = format!("10.5.{}.{}", pick >> 16 & 7, pick >> 24 & 7).parse().unwrap();
+                        match pick >> 32 & 7 {
+                            0 | 1 => entry.device.add_addrs(&[addr]),
+                            2 => entry.device.addresses.retain(|a| a.ip != addr),
+                            3 | 4 => {
+                                let instance = format!("S{}._x{}._tcp.local", pick >> 40 & 3, pick >> 44 & 1);
+                                let kind = format!("_x{}._tcp.local", pick >> 44 & 1);
+                                let target = (pick >> 48 & 1 == 0).then(|| "somewhere.local".to_string());
+                                if !entry.device.services.iter().any(|s| s.instance == instance) {
+                                    entry.device.services.push(Service { instance, kind, target, ..Default::default() });
+                                }
                             }
+                            5 => entry.device.services.clear(),
+                            6 => entry.refreshed = Some(start + Duration::from_secs(pick >> 8 & 63)),
+                            _ => entry.device.services.retain(|s| s.target.is_none()),
                         }
-                        5 => entry.device.services.clear(),
-                        6 => entry.device.services.retain(|s| s.target.is_none()),
-                        _ => {}
-                    }
-                    devices.reindex(&key, &was);
-                    model.entry(id.clone()).or_insert(step);
+                    });
+                    devices.reindex(id, &was);
                 }
-                _ => assert_eq!(devices.remove(&key).is_some(), model.remove(&id).is_some()),
+                _ => {
+                    let gone = devices.find_host(&key).map(|id| devices.remove(id).is_some());
+                    assert_eq!(gone, model.remove(&key).map(|_| true));
+                }
             }
             assert_eq!(devices.len(), model.len());
-            assert_eq!(devices.contains_key(&key), model.contains_key(&id));
             if step % 500 == 0 {
                 devices.check();
             }
         }
         devices.check();
+
         // The tables find what a scan of the devices does.
-        let same = |found: Vec<&Entry>, scan: Vec<&Entry>| {
-            let mut found: Vec<*const Entry> = found.into_iter().map(|e| e as *const Entry).collect();
-            let mut scan: Vec<*const Entry> = scan.into_iter().map(|e| e as *const Entry).collect();
+        let same = |found: Vec<*const Entry>, scan: Vec<*const Entry>| {
+            let (mut found, mut scan) = (found, scan);
             (found.sort(), scan.sort());
             assert_eq!(found, scan);
         };
+        let ptrs = |entries: Vec<&Entry>| entries.into_iter().map(|e| e as *const Entry).collect::<Vec<_>>();
         for a in 0..8 {
             for b in 0..8 {
                 let addr: IpAddr = format!("10.5.{a}.{b}").parse().unwrap();
-                same(devices.with_addr(&addr).collect(), devices.iter().filter(|e| e.device.has_addr(&addr)).collect());
+                let found = devices.ids_with_addr(&addr).map(|id| devices.get(id)).collect();
+                same(ptrs(found), ptrs(devices.iter().filter(|e| e.device.has_addr(&addr)).collect()));
             }
         }
         for name in ["_x0._tcp.local", "_X1._tcp.LOCAL", "S1._x0._tcp.local", "host7.local", "HOST12.local", "_services._dns-sd._udp.local", "none"] {
-            same(devices.with_name(name).collect(), devices.iter().filter(|e| e.device.has_name(name)).collect());
+            same(ptrs(devices.with_name(name).collect()), ptrs(devices.iter().filter(|e| e.device.has_name(name)).collect()));
         }
         same(
-            devices.with_unresolved().collect(),
-            devices.iter().filter(|e| e.device.services.iter().any(|s| s.target.is_none())).collect(),
+            ptrs(devices.with_unresolved().map(|(_, e)| e).collect()),
+            ptrs(devices.iter().filter(|e| e.device.services.iter().any(|s| s.target.is_none())).collect()),
         );
         assert!(devices.with_name("_services._dns-sd._udp.local").count() > 0, "the test finds some");
-        assert!(devices.with_unresolved().count() > 0 && devices.with_addr(&"10.5.1.1".parse().unwrap()).count() > 0);
+        assert!(devices.with_unresolved().count() > 0 && devices.ids_with_addr(&"10.5.1.1".parse().unwrap()).count() > 0);
         assert_eq!(devices.iter().count(), model.len());
-        for entry in devices.iter() {
-            let key = entry.key();
-            assert!(model.contains_key(&match &key {
-                Key::Host(name) => name.clone(),
-                Key::Source(addr) => format!("source {addr}"),
-            }));
-        }
+
+        // And the times: what runs out first, and what is due to be asked again.
+        let soonest = devices.iter().map(|e| e.soonest());
+        let asked_again = devices.iter().filter_map(|e| devices.indexed(e).refresh_at);
+        assert_eq!(devices.next_due(), soonest.chain(asked_again).min());
+        let running: Vec<Id> = devices.running_out(start + Duration::from_secs(100));
+        assert_eq!(running.len(), devices.iter().filter(|e| e.soonest() <= start + Duration::from_secs(100)).count());
+        let before = Duration::from_secs(50);
+        let about = devices.about_to_run_out(start + Duration::from_secs(100), before);
+        let scan = devices.iter().filter(|e| e.soonest() > start + Duration::from_secs(100) && e.soonest() <= start + Duration::from_secs(150)).count();
+        assert_eq!(about.len(), scan);
+        assert!(devices.next_due().is_some());
     }
 }
