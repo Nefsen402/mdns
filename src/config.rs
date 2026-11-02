@@ -39,11 +39,11 @@
 //! and values may be quoted. Interface lists are separated by commas or
 //! whitespace.
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::errno::Why;
 use crate::reflector::{Forward, Neighbours};
 use crate::unit::{self, Entry};
 
@@ -103,7 +103,7 @@ pub struct Config {
     pub ipv4: bool,
     pub ipv6: bool,
     /// Where the IPC server listens.
-    pub socket: PathBuf,
+    pub socket: String,
     /// A `.local` name to announce and answer for with this host's own
     /// addresses on every interface.
     pub advertise: Option<String>,
@@ -130,7 +130,7 @@ impl Default for Config {
             segments: Vec::new(),
             ipv4: true,
             ipv6: true,
-            socket: PathBuf::from(DEFAULT_SOCKET),
+            socket: DEFAULT_SOCKET.to_string(),
             advertise: None,
             advertise_ttl: DEFAULT_ADVERTISE_TTL,
             probe_interval: None,
@@ -142,10 +142,9 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Config> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("parsing {}", path.display()))
+    pub fn load(path: &str) -> Result<Config> {
+        let text = read_to_string(path).with_context(|| format!("reading {path}"))?;
+        Self::parse(&text).with_context(|| format!("parsing {path}"))
     }
 
     /// Every interface named by any segment, once each, in first-seen order.
@@ -264,7 +263,7 @@ impl Config {
                         if value.is_empty() {
                             bail!("line {lineno}: Socket= needs a path");
                         }
-                        config.socket = PathBuf::from(value);
+                        config.socket = value;
                     }
                     (s, k) => bail!("line {lineno}: unknown setting {k:?} in [{s}]"),
                 }
@@ -438,6 +437,19 @@ fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
     }
 }
 
+/// All of the file at `path`, as text.
+fn read_to_string(path: &str) -> Result<String> {
+    let fd = rustix::fs::open(path, rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC, rustix::fs::Mode::empty()).map_err(Why)?;
+    let (mut bytes, mut buf) = (Vec::new(), [0u8; 4096]);
+    loop {
+        match rustix::io::retry_on_intr(|| rustix::io::read(&fd, &mut buf)).map_err(Why)? {
+            0 => break,
+            n => bytes.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow!("not UTF-8 text"))
+}
+
 /// A systemd boolean: `1`/`yes`/`true`/`on` or `0`/`no`/`false`/`off`.
 fn parse_bool(entry: &Entry, lineno: usize) -> Result<bool> {
     entry.as_bool().ok_or_else(|| anyhow!("line {lineno}: invalid boolean {:?}", entry.unquoted()))
@@ -591,9 +603,9 @@ interfaces=br0,wifi
     #[test]
     fn ipc_socket_defaults_and_overrides() {
         let c = Config::parse(EXAMPLE).unwrap();
-        assert_eq!(c.socket, PathBuf::from(DEFAULT_SOCKET));
+        assert_eq!(c.socket, DEFAULT_SOCKET);
         let c = Config::parse(&format!("[Ipc]\nSocket=\"/tmp/x.sock\"\n{EXAMPLE}")).unwrap();
-        assert_eq!(c.socket, PathBuf::from("/tmp/x.sock"));
+        assert_eq!(c.socket, "/tmp/x.sock");
         assert!(Config::parse(&format!("[Ipc]\nSocket=\n{EXAMPLE}")).is_err());
     }
 
@@ -675,17 +687,17 @@ interfaces=br0,wifi
     #[test]
     fn a_config_is_loaded_from_its_file() {
         std::fs::create_dir_all("target").unwrap();
-        let path = PathBuf::from(format!("target/config-test-{}.conf", std::process::id()));
+        let path = format!("target/config-test-{}.conf", std::process::id());
         std::fs::write(&path, "[Segment]\nName=lan\nInterfaces=eth0\n").unwrap();
         assert_eq!(Config::load(&path).unwrap().segments[0].interfaces, ["eth0"]);
 
         std::fs::write(&path, "[Segment]\nName=lan\nInterfaces=eth0\nBogus=1\n").unwrap();
         let err = format!("{:#}", Config::load(&path).unwrap_err());
-        assert!(err.contains(&format!("parsing {}", path.display())) && err.contains("line 4"), "{err}");
+        assert!(err.contains(&format!("parsing {path}")) && err.contains("line 4"), "{err}");
         std::fs::remove_file(&path).unwrap();
 
         let err = format!("{:#}", Config::load(&path).unwrap_err());
-        assert!(err.contains(&format!("reading {}", path.display())), "{err}");
+        assert!(err.contains(&format!("reading {path}")), "{err}");
     }
 
     /// A hostname to advertise is at most 253 bytes, as a DNS name is, even

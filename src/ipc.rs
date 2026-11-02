@@ -88,13 +88,11 @@
 //! with them, unless the configuration says otherwise.
 
 use hashbrown::HashMap;
-use std::fs::{self, Permissions};
-use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
 use std::time::Duration;
+
+use rustix::fd::{AsRawFd, OwnedFd};
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
 use crate::time::Instant;
 
@@ -103,6 +101,7 @@ use serde_json::{json, Value};
 
 use crate::reflector::Notice;
 use crate::device::{is_type, Device, Origin};
+use crate::errno::Why;
 use crate::poll;
 use crate::segment::{Event, Probed, Segment};
 use crate::socket::Family;
@@ -132,14 +131,14 @@ const MIN_QUERY_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } els
 /// here waits, and what a client is to be told waits in its buffer until it
 /// takes it.
 pub struct Server {
-    listener: UnixListener,
+    listener: OwnedFd,
     clients: Vec<Client>,
     next_watch: u64,
 }
 
 /// A connection to the control socket.
 struct Client {
-    stream: UnixStream,
+    stream: OwnedFd,
     peer: Option<Peer>,
     /// What it has sent that is not yet a whole line.
     input: Vec<u8>,
@@ -183,10 +182,9 @@ struct Streaming {
 impl Server {
     /// Bind the control socket at `path`, before anything else happens, so
     /// that a bad path or a second instance is reported at startup.
-    pub fn bind(path: &Path) -> Result<Server> {
+    pub fn bind(path: &str) -> Result<Server> {
         let listener = bind(path)?;
-        listener.set_nonblocking(true).context("making the control socket non-blocking")?;
-        eprintln!("ipc: listening on {}", path.display());
+        eprintln!("ipc: listening on {path}");
         Ok(Server { listener, clients: Vec::new(), next_watch: 0 })
     }
 
@@ -223,24 +221,20 @@ impl Server {
 
     fn accept(&mut self) {
         loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    if let Err(e) = stream.set_nonblocking(true) {
-                        eprintln!("ipc: {e}");
-                        continue;
-                    }
+            match rustix::net::accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
+                Ok(stream) => {
                     let peer = peer_of(&stream);
                     let now = Instant::now();
                     let state = State::Requests;
                     let c = Client { stream, peer, input: Vec::new(), output: Vec::new(), active: now, stalled: None, state, closing: false, gone: false };
                     self.clients.push(c);
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(Errno::AGAIN) => return,
+                Err(Errno::INTR) => {}
                 Err(e) => {
                     // Out of descriptors, say: those who wait are taken next
                     // time round.
-                    eprintln!("ipc: accept failed: {e}");
+                    eprintln!("ipc: accept failed: {}", Why(e));
                     return;
                 }
             }
@@ -348,15 +342,15 @@ impl Client {
     fn read(&mut self) {
         let mut buf = [0u8; 4096];
         loop {
-            match self.stream.read(&mut buf) {
+            match rustix::io::read(&self.stream, &mut buf) {
                 Ok(0) => return self.gone = true,
                 Ok(_) if matches!(self.state, State::Watching(_)) => return self.gone = true,
                 Ok(n) => {
                     self.input.extend_from_slice(&buf[..n]);
                     self.active = Instant::now();
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(Errno::AGAIN) => return,
+                Err(Errno::INTR) => {}
                 Err(_) => return self.gone = true,
             }
         }
@@ -367,11 +361,11 @@ impl Client {
     fn flush(&mut self, now: Instant) {
         let mut wrote = 0;
         while wrote < self.output.len() {
-            match self.stream.write(&self.output[wrote..]) {
+            match rustix::io::write(&self.stream, &self.output[wrote..]) {
                 Ok(0) => break,
                 Ok(n) => wrote += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(Errno::AGAIN) => break,
+                Err(Errno::INTR) => {}
                 Err(_) => {
                     self.gone = true;
                     break;
@@ -451,21 +445,33 @@ impl Client {
 
 /// Bind, replacing a stale socket file left by a previous run but never a
 /// live instance and never a file that is not a socket.
-fn bind(path: &Path) -> Result<UnixListener> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if !meta.file_type().is_socket() {
-            bail!("{} exists and is not a socket", path.display());
+fn bind(path: &str) -> Result<OwnedFd> {
+    if let Ok(st) = rustix::fs::lstat(path) {
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::Socket {
+            bail!("{path} exists and is not a socket");
         }
-        if UnixStream::connect(path).is_ok() {
-            bail!("{} is in use by a running instance", path.display());
+        if unix_socket(SocketFlags::CLOEXEC).and_then(|fd| connect(&fd, path)).is_ok() {
+            bail!("{path} is in use by a running instance");
         }
-        fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
+        rustix::fs::unlink(path).map_err(Why).with_context(|| format!("removing stale {path}"))?;
     }
-    let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    let listener = unix_socket(SocketFlags::CLOEXEC | SocketFlags::NONBLOCK).map_err(Why).context("making the control socket")?;
+    let addr = SocketAddrUnix::new(path).map_err(Why).with_context(|| format!("binding {path}"))?;
+    rustix::net::bind(&listener, &addr).map_err(Why).with_context(|| format!("binding {path}"))?;
+    rustix::net::listen(&listener, 128).map_err(Why).with_context(|| format!("listening on {path}"))?;
     // Owner and group only.
-    fs::set_permissions(path, Permissions::from_mode(0o660))
-        .with_context(|| format!("setting permissions on {}", path.display()))?;
+    rustix::fs::chmod(path, rustix::fs::Mode::from_raw_mode(0o660)).map_err(Why).with_context(|| format!("setting permissions on {path}"))?;
     Ok(listener)
+}
+
+/// A stream socket of the Unix family, with `flags`.
+fn unix_socket(flags: SocketFlags) -> rustix::io::Result<OwnedFd> {
+    rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None)
+}
+
+/// Connect `fd` to the Unix socket at `path`.
+fn connect(fd: &OwnedFd, path: &str) -> rustix::io::Result<()> {
+    rustix::io::retry_on_intr(|| rustix::net::connect(fd, &SocketAddrUnix::new(path)?))
 }
 
 /// The watches streaming now, for `watchers`.
@@ -512,27 +518,14 @@ impl Watches {
 }
 
 /// Who is at the other end of `stream`, or `None` if the kernel will not say.
-fn peer_of(stream: &UnixStream) -> Option<Peer> {
-    // SAFETY: an all-zero ucred is valid, and `len` is its size.
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: the descriptor is open for the life of `stream`, and `cred` is
-    // writable for `len` bytes.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    (rc == 0 && cred.pid > 0).then_some(Peer { pid: cred.pid, uid: cred.uid })
+fn peer_of(stream: &OwnedFd) -> Option<Peer> {
+    let cred = rustix::net::sockopt::socket_peercred(stream).ok()?;
+    Some(Peer { pid: cred.pid.as_raw_pid(), uid: cred.uid.as_raw() })
 }
 
 /// Queue `line` and a newline for a client, to go out whole: it is never
 /// given half a line to take for a whole one.
-fn push_line(output: &mut Vec<u8>, line: &impl std::fmt::Display) {
+fn push_line(output: &mut Vec<u8>, line: &impl core::fmt::Display) {
     output.extend_from_slice(format!("{line}\n").as_bytes());
 }
 
@@ -909,16 +902,17 @@ fn error(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader};
+    use std::fs;
+    use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::os::unix::fs::MetadataExt;
-    use std::path::PathBuf;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
-    /// `socket` as the segment takes a socket.
-    fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
-        use std::os::fd::IntoRawFd;
+    /// `socket` as the daemon takes a socket.
+    fn fd(socket: impl std::os::fd::IntoRawFd) -> rustix::fd::OwnedFd {
         // SAFETY: a descriptor just given up by its owner.
         unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
     }
@@ -1156,7 +1150,7 @@ mod tests {
 
     impl Harness {
         fn new(path: &Path, groups: Vec<Group>) -> Harness {
-            Harness { server: Server::bind(path).unwrap(), groups }
+            Harness { server: Server::bind(path.to_str().unwrap()).unwrap(), groups }
         }
 
         /// One turn of the loop.
@@ -1273,7 +1267,7 @@ mod tests {
         ours.set_nonblocking(true).unwrap();
         let now = Instant::now();
         let mut c = Client {
-            stream: ours,
+            stream: fd(ours),
             peer: None,
             input: Vec::new(),
             output: vec![b'x'; MAX_OUTPUT / 2],
@@ -1294,7 +1288,7 @@ mod tests {
         c.flush(now + Duration::from_millis(100));
         assert_eq!(c.stalled, Some(now + Duration::from_millis(100)));
 
-        let mut server = Server { listener: UnixListener::bind(temp_socket("stalled")).unwrap(), clients: vec![c], next_watch: 0 };
+        let mut server = Server { listener: fd(UnixListener::bind(temp_socket("stalled")).unwrap()), clients: vec![c], next_watch: 0 };
         server.tick(&[], now + Duration::from_millis(150));
         assert_eq!(server.clients.len(), 1, "not yet");
         server.tick(&[], now + Duration::from_millis(100) + STREAM_WRITE);
@@ -1304,7 +1298,7 @@ mod tests {
         let (ours, _theirs) = UnixStream::pair().unwrap();
         ours.set_nonblocking(true).unwrap();
         let state = State::Requests;
-        let c = Client { stream: ours, peer: None, input: Vec::new(), output: vec![b'x'; MAX_OUTPUT * 2], active: now, stalled: None, state, closing: false, gone: false };
+        let c = Client { stream: fd(ours), peer: None, input: Vec::new(), output: vec![b'x'; MAX_OUTPUT * 2], active: now, stalled: None, state, closing: false, gone: false };
         server.clients.push(c);
         server.tick(&[], now);
         assert!(server.clients.is_empty());
@@ -1548,14 +1542,14 @@ mod tests {
     #[test]
     fn bind_replaces_stale_sockets_but_not_live_ones_or_files() {
         let path = temp_socket("bind");
-        drop(UnixListener::bind(&path).unwrap()); // leaves a dead socket file
-        let live = bind(&path).expect("stale socket is replaced");
-        assert!(bind(&path).is_err(), "live instance is protected");
+        drop(UnixListener::bind(path.to_str().unwrap()).unwrap()); // leaves a dead socket file
+        let live = bind(path.to_str().unwrap()).expect("stale socket is replaced");
+        assert!(bind(path.to_str().unwrap()).is_err(), "live instance is protected");
         drop(live);
         fs::remove_file(&path).unwrap();
 
         fs::write(&path, "precious").unwrap();
-        assert!(bind(&path).is_err());
+        assert!(bind(path.to_str().unwrap()).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "precious");
         fs::remove_file(&path).unwrap();
     }

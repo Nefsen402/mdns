@@ -20,7 +20,6 @@ mod timespan;
 mod unit;
 
 use hashbrown::HashMap;
-use std::path::PathBuf;
 use time::Instant;
 
 use anyhow::{Context, Result};
@@ -174,23 +173,23 @@ fn main() -> Result<()> {
             }
         }
     }
-    let _ = std::fs::remove_file(&config.socket);
+    let _ = rustix::fs::unlink(config.socket.as_str());
     Ok(())
 }
 
 /// The configuration file the command line names, or the default; `None` if
 /// it asks for help.
-fn config_path(args: Vec<String>) -> Result<Option<PathBuf>, args::Error> {
+fn config_path(args: Vec<String>) -> Result<Option<String>, args::Error> {
     let mut parser = args::Parser::new(args);
     let mut path = None;
     while let Some(arg) = parser.next()? {
         match arg {
             args::Arg::Short('h') | args::Arg::Long("help") => return Ok(None),
-            args::Arg::Value(word) if path.is_none() => path = Some(PathBuf::from(word)),
+            args::Arg::Value(word) if path.is_none() => path = Some(word),
             arg => return Err(arg.unexpected()),
         }
     }
-    Ok(Some(path.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH))))
+    Ok(Some(path.unwrap_or_else(|| config::DEFAULT_PATH.to_string())))
 }
 
 /// The event loop: read what `links` hear, follow what netlink reports for
