@@ -2,9 +2,14 @@
 
 An mDNS (Bonjour/Avahi-style) daemon for Linux routers and hosts. It keeps track
 of the devices on each network it is told to watch, makes chosen ones visible on
-other networks, and lets scripts ask it what is there.
+other networks, lets scripts ask it what is there, and announces the host's own
+name and services.
 
-It has two uses, which are the same daemon with a different configuration:
+It has three uses, which are the same daemon with a different configuration,
+and **any combination of them runs at once**, from one config file, on the same
+interfaces or on different ones: a router that reflects between two networks,
+tracks a third and advertises itself on the first is one daemon (see
+[all three at once](#all-three-at-once)).
 
 - **[A reflector](#reflecting-between-networks)** for a router with several
   networks (VLANs, a guest or IoT Wi-Fi): your phone on the LAN finds the
@@ -14,6 +19,9 @@ It has two uses, which are the same daemon with a different configuration:
   daemon watches a network all the time, so a short-lived script can ask it what
   is there in one call, smart plugs that only answer when asked included, or
   follow devices as they come and go.
+- **[An advertiser](#advertising-this-host)** of the host it runs on: its name
+  and the services it offers (ssh, say), announced and answered for as Avahi's
+  own publishing does, so that Avahi is not needed for it.
 
 ## How it works: devices, not packets
 
@@ -89,9 +97,6 @@ media VLAN and an IoT Wi-Fi:
 #   br0   <-  wifi  : br0 sees the IoT devices, wifi sees nothing of br0
 #   media  x  wifi  : never see each other
 
-[Advertise]
-Hostname=router.local
-
 [Segment]
 Name=media_stuff
 Interfaces=br0,media
@@ -113,13 +118,6 @@ Untrusted=wifi
 - A question a client asks on one interface is asked on the others of the
   segment too (`ForwardQuestions=`), so a
   device that only answers when asked is found the moment someone looks for it.
-- `[Advertise] Hostname=router.local` makes the router itself reachable by name
-  from every network (or those of `Interface=`), with its own address on each, and `Services=_ssh._tcp:22`
-  announces that it offers ssh (a service of the host, as Avahi's
-  `/etc/avahi/services/ssh.service` does).
-- `[Ipc] AvahiSocket=/run/avahi-daemon/socket` answers the questions `nss-mdns`
-  asks Avahi, so that `ping router.local` works with Avahi gone (see
-  `mdnsd.conf(5)`).
 - Interfaces may come and go: a VLAN that is created after the daemon starts, or
   recreated, is picked up without a restart
   (see `mdnsd(8)`).
@@ -240,6 +238,78 @@ Things to know when using it this way:
 - Interfaces are named, there is no "every interface". A host on several
   networks lists each, as a segment of its own (a segment of two or more
   interfaces would reflect between them).
+
+## Advertising this host
+
+The daemon can announce the machine it runs on: its name under `.local`, with
+its addresses, and the services it offers. That is what Avahi does when it
+publishes a host and its service files, and it is the part of Avahi that a
+desktop or a router usually wants, so with this, nothing else need run for it.
+
+```ini
+# /etc/mdnsd.conf
+[Advertise]
+Hostname=alexdesktop
+Interface=br
+Services=_ssh._tcp:22 _http._tcp:8080
+
+# The interface it is advertised on is one the daemon listens to: a segment of
+# one interface reflects nothing.
+[Segment]
+Name=lan
+Interfaces=br
+```
+
+- `Hostname=` is announced and answered for with **all** of the interface's
+  addresses, of both families (global, ULA and link-local), and kept to them as
+  they change: one that goes is withdrawn with a goodbye. It is withdrawn
+  entirely when the daemon stops.
+- `Services=` are each a type and a port, `_ssh._tcp:22`, of an instance named
+  for the host (`alexdesktop._ssh._tcp.local`, as Avahi's `%h`). Like Avahi's
+  service files, they are announced whether or not anything listens there.
+- `Interface=` limits where it is advertised and answered for, to some of the
+  interfaces in the segments (all of them if it is left out). There may be any
+  number of `[Advertise]` sections, each with its own name, services,
+  interfaces and TTL: a name for the LAN with ssh, another for a VLAN with a
+  file share.
+- It is among the devices `mdnsctl devices` lists, as itself, so that a query
+  for `_ssh._tcp` finds it too.
+- `[Ipc] AvahiSocket=/run/avahi-daemon/socket` answers the questions
+  `nss-mdns` asks Avahi, so that `ping router.local` works with Avahi gone
+  (see `mdnsd.conf(5)`).
+
+No conflict detection is done: the name is taken to be yours alone.
+
+### All three at once
+
+Reflecting, tracking and advertising are settings of one config, and none
+gets in the way of another. A router that lets its LAN see the media VLAN,
+tracks the IoT Wi-Fi for scripts and offers ssh on the LAN:
+
+```ini
+# /etc/mdnsd.conf
+[Advertise]
+Hostname=router.local
+Interface=br0
+Services=_ssh._tcp:22
+
+# Reflecting: br0 and media see each other's devices.
+[Segment]
+Name=media_stuff
+Interfaces=br0,media
+Untrusted=media
+
+# Tracking: one interface, so nothing is reflected, and `mdnsctl devices IoT`
+# says what is there.
+[Segment]
+Name=IoT
+Interfaces=wifi
+```
+
+An interface can serve all three: `br0` here is reflected to, and advertised
+on, and could be tracked too. Which of them is wanted is what is written; a
+daemon with only `[Advertise]` and a one-interface `[Segment]` is only an
+advertiser, and one with only a one-interface `[Segment]` only a tracker.
 
 ## Building and running
 
