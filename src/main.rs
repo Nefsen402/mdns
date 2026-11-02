@@ -14,11 +14,12 @@ mod reflector;
 mod segment;
 mod signal;
 mod socket;
+mod time;
 mod timespan;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use time::Instant;
 
 use anyhow::{Context, Result};
 

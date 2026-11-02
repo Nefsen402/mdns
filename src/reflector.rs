@@ -13,7 +13,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::Instant;
 
 use anyhow::{bail, Result};
 

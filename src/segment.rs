@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
