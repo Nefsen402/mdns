@@ -15,8 +15,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::Value;
 
 #[path = "timespan.rs"]
@@ -117,88 +115,139 @@ struct Options {
     command: Command,
 }
 
-/// The command line, as clap reads it. Options may come anywhere, before
-/// the command or after it; a segment's name is the words left over, so it
-/// needs no quoting even with spaces in it. [`parse_args`] turns it into
-/// [`Options`].
-#[derive(Debug, Parser)]
-#[command(name = "mdnsctl", version, about = "Query the mdnsd daemon over its control socket", disable_help_subcommand = true)]
-struct Cli {
-    /// The control socket
-    #[arg(short, long, value_name = "PATH", default_value = DEFAULT_SOCKET, global = true)]
-    socket: PathBuf,
-    /// List devices with all details (addresses, services)
-    #[arg(short, long, global = true)]
-    verbose: bool,
-    /// Print the daemon's reply unchanged
-    #[arg(long, global = true)]
-    json: bool,
-    /// With devices: print each device as a line of JSON of its own
-    #[arg(long, global = true, conflicts_with = "json")]
-    segmented_json: bool,
-    #[command(subcommand)]
-    command: Cmd,
+/// What each command is called, what it does, what it takes after its
+/// options, and the options of its own, as `--help` shows them.
+struct CommandInfo {
+    name: &'static str,
+    about: &'static str,
+    args: &'static str,
+    arguments: &'static [(&'static str, &'static str)],
+    options: &'static [(&'static str, &'static str)],
 }
 
-#[derive(Debug, Subcommand)]
-enum Cmd {
-    /// List the configured segments
-    Segments,
-    /// List the devices discovered in a segment
-    Devices {
-        /// Ask for this service type by name, and list only devices of it
-        #[arg(long = "query", value_name = "TYPE", value_parser = service_type)]
-        query: Vec<String>,
-        /// How long to take what answers a --query [default: 4s]
-        #[arg(long, value_name = "SPAN", value_parser = wait_span, requires = "query")]
-        wait: Option<Duration>,
-        /// The segment
-        #[arg(value_name = "NAME", required = true)]
-        name: Vec<String>,
+const QUERY_HELP: &str = "Ask for this service type by name, and list only devices of it";
+const INTERVAL_HELP: &str = "Ask for the --query types again this often (at least 10s)";
+const SEGMENT: (&str, &str) = ("<NAME>...", "The segment");
+
+const COMMANDS: &[CommandInfo] = &[
+    CommandInfo { name: "segments", about: "List the configured segments", args: "", arguments: &[], options: &[] },
+    CommandInfo {
+        name: "devices",
+        about: "List the devices discovered in a segment",
+        args: " <NAME>...",
+        arguments: &[SEGMENT],
+        options: &[("--query <TYPE>", QUERY_HELP), ("--wait <SPAN>", "How long to take what answers a --query [default: 4s]")],
     },
-    /// Actively query for devices (all segments, or one)
-    Probe {
-        /// The segment; all of them if left out
-        #[arg(value_name = "NAME")]
-        name: Vec<String>,
+    CommandInfo {
+        name: "probe",
+        about: "Actively query for devices (all segments, or one)",
+        args: " [NAME]...",
+        arguments: &[("[NAME]...", "The segment; all of them if left out")],
+        options: &[],
     },
-    /// Print the devices of a segment as they appear and go
-    Watch {
-        /// Ask for this service type by name, and show only devices of it
-        #[arg(long = "query", value_name = "TYPE", value_parser = service_type)]
-        query: Vec<String>,
-        /// Ask for the --query types again this often (at least 10s)
-        #[arg(long, value_name = "SPAN", value_parser = interval_span, requires = "query")]
-        interval: Option<Duration>,
-        /// The segment
-        #[arg(value_name = "NAME", required = true)]
-        name: Vec<String>,
+    CommandInfo {
+        name: "watch",
+        about: "Print the devices of a segment as they appear and go",
+        args: " <NAME>...",
+        arguments: &[SEGMENT],
+        options: &[("--query <TYPE>", "Ask for this service type by name, and show only devices of it"), ("--interval <SPAN>", INTERVAL_HELP)],
     },
-    /// Run SCRIPT for each change in a segment, in the background
-    Subscribe {
-        /// Ask for this service type by name, and run SCRIPT only for devices of it
-        #[arg(long = "query", value_name = "TYPE", value_parser = service_type)]
-        query: Vec<String>,
-        /// Ask for the --query types again this often (at least 10s)
-        #[arg(long, value_name = "SPAN", value_parser = interval_span, requires = "query")]
-        interval: Option<Duration>,
-        /// Stay attached instead of going into the background
-        #[arg(long)]
-        foreground: bool,
-        /// Append what the subscriber has to say, and SCRIPT's output, to FILE
-        #[arg(long, value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-        log: Option<String>,
-        /// The segment
-        #[arg(value_name = "NAME", required = true)]
-        name: Vec<String>,
-        /// The script to run for each change, and its arguments, after --
-        #[arg(last = true, required = true, value_name = "SCRIPT")]
-        script: Vec<String>,
+    CommandInfo {
+        name: "subscribe",
+        about: "Run SCRIPT for each change in a segment, in the background",
+        args: " <NAME>... -- <SCRIPT>...",
+        arguments: &[SEGMENT, ("<SCRIPT>...", "The script to run for each change, and its arguments, after --")],
+        options: &[
+            ("--query <TYPE>", "Ask for this service type by name, and run SCRIPT only for devices of it"),
+            ("--interval <SPAN>", INTERVAL_HELP),
+            ("--foreground", "Stay attached instead of going into the background"),
+            ("--log <FILE>", "Append what the subscriber has to say, and SCRIPT's output, to FILE"),
+        ],
     },
-    /// List the watches open on the daemon, and who holds them
-    Watchers,
-    /// List the timers the daemon has scheduled
-    Timers,
+    CommandInfo { name: "watchers", about: "List the watches open on the daemon, and who holds them", args: "", arguments: &[], options: &[] },
+    CommandInfo { name: "timers", about: "List the timers the daemon has scheduled", args: "", arguments: &[], options: &[] },
+];
+
+const GLOBAL_OPTIONS: &[(&str, &str)] = &[
+    ("-s, --socket <PATH>", "The control socket [default: /run/mdnsd/mdnsd.sock]"),
+    ("-v, --verbose", "List devices with all details (addresses, services)"),
+    ("--json", "Print the daemon's reply unchanged"),
+    ("--segmented-json", "With devices: print each device as a line of JSON of its own"),
+    ("-h, --help", "Print help"),
+];
+
+/// What the command line asks for instead of a command: help or the version,
+/// printed to stdout, or a usage error, printed to stderr with how to use it;
+/// with no command at all, the help, to stderr.
+#[derive(Debug, PartialEq, Eq)]
+enum Early {
+    Help(String),
+    Version,
+    Usage { message: String, usage: String },
+    NoCommand,
+}
+
+impl Early {
+    fn usage(command: Option<&CommandInfo>, message: impl Into<String>) -> Early {
+        Early::Usage { message: message.into(), usage: usage_line(command) }
+    }
+
+    /// Print it as it is for, and the exit code that goes with it.
+    fn exit(self) -> ExitCode {
+        match self {
+            Early::Help(text) => print!("{text}"),
+            Early::Version => println!("mdnsctl {}", env!("CARGO_PKG_VERSION")),
+            Early::Usage { message, usage } => {
+                eprintln!("error: {message}\n\nUsage: {usage}\n\nFor more information, try '--help'.");
+                return ExitCode::from(2);
+            }
+            Early::NoCommand => {
+                eprint!("{}", help(None));
+                return ExitCode::from(2);
+            }
+        }
+        ExitCode::SUCCESS
+    }
+}
+
+fn usage_line(command: Option<&CommandInfo>) -> String {
+    match command {
+        Some(c) => format!("mdnsctl {} [OPTIONS]{}", c.name, c.args),
+        None => "mdnsctl [OPTIONS] <COMMAND>".to_string(),
+    }
+}
+
+/// Lines of `rows` as a column of names and one of what they are, under
+/// `title`, as `--help` lists them.
+fn help_section(out: &mut String, title: &str, rows: &[(&str, &str)]) {
+    // A long option alone lines up with those that have a short one.
+    let indent = |name: &str| if name.starts_with("--") { 6 } else { 2 };
+    let column = rows.iter().map(|(name, _)| indent(name) + name.len()).max().unwrap_or(0) + 2;
+    out.push_str(&format!("\n{title}:\n"));
+    for (name, about) in rows {
+        out.push_str(&format!("{:indent$}{name:<width$}{about}\n", "", indent = indent(name), width = column - indent(name)));
+    }
+}
+
+/// `--help`, for `command` or for mdnsctl as a whole.
+fn help(command: Option<&CommandInfo>) -> String {
+    let mut out = format!("{}\n\nUsage: {}\n", command.map_or("Query the mdnsd daemon over its control socket", |c| c.about), usage_line(command));
+    match command {
+        Some(c) => {
+            if !c.arguments.is_empty() {
+                help_section(&mut out, "Arguments", c.arguments);
+            }
+            let options: Vec<(&str, &str)> = c.options.iter().chain(GLOBAL_OPTIONS).copied().collect();
+            help_section(&mut out, "Options", &options);
+        }
+        None => {
+            let commands: Vec<(&str, &str)> = COMMANDS.iter().map(|c| (c.name, c.about)).collect();
+            help_section(&mut out, "Commands", &commands);
+            let options: Vec<(&str, &str)> = GLOBAL_OPTIONS.iter().copied().chain([("-V, --version", "Print version")]).collect();
+            help_section(&mut out, "Options", &options);
+        }
+    }
+    out
 }
 
 /// A `--query` service type, as given: the daemon checks it is one.
@@ -229,44 +278,118 @@ fn interval_span(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(span.as_secs() + u64::from(span.subsec_nanos() > 0)))
 }
 
-/// Read the command line into [`Options`]. A usage error, `--help` and
-/// `--version` come back as clap's error, which prints itself and exits.
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, clap::Error> {
-    let cli = Cli::try_parse_from(std::iter::once("mdnsctl".to_string()).chain(args))?;
-    let usage = |kind, message: &str| Cli::command().error(kind, message);
-    // The protocol is one request per line.
-    let segment = |words: Vec<String>| {
-        let name = words.join(" ");
-        match name.contains(['\n', '\r']) {
-            true => Err(usage(ErrorKind::InvalidValue, "a segment's name cannot hold a line break")),
-            false => Ok(name),
-        }
-    };
-    let target = |query, interval, wait, name| {
-        let segment = segment(name)?;
-        if segment.trim().is_empty() {
-            return Err(usage(ErrorKind::MissingRequiredArgument, "the segment's name is blank"));
-        }
-        Ok(Target { segment, query, interval, wait })
-    };
-    let command = match cli.command {
-        Cmd::Segments => Command::Segments,
-        Cmd::Devices { query, wait, name } => Command::Devices(target(query, None, wait, name)?),
-        Cmd::Probe { name } => Command::Probe(Some(segment(name)?).filter(|n| !n.trim().is_empty())),
-        Cmd::Watch { query, interval, name } => Command::Watch(target(query, interval, None, name)?),
-        Cmd::Subscribe { query, interval, foreground, log, name, script } => Command::Subscribe(Subscription {
-            target: target(query, interval, None, name)?,
-            script,
-            foreground,
-            log: log.map(PathBuf::from),
-        }),
-        Cmd::Watchers => Command::Watchers,
-        Cmd::Timers => Command::Timers,
-    };
-    if cli.segmented_json && !matches!(command, Command::Devices(_)) {
-        return Err(usage(ErrorKind::ArgumentConflict, "--segmented-json is for devices"));
+/// Read the command line into [`Options`]. Options may come anywhere, before
+/// the command or after it; a segment's name is the words left over, so it
+/// needs no quoting even with spaces in it; `subscribe`'s script is what
+/// comes after `--`. Help, the version and usage errors come back as
+/// [`Early`].
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> {
+    use lexopt::prelude::*;
+
+    fn value_of(parser: &mut lexopt::Parser) -> Result<String, lexopt::Error> {
+        parser.value()?.string()
     }
-    Ok(Options { socket: cli.socket, json: cli.json, segmented: cli.segmented_json, verbose: cli.verbose, command })
+
+    let mut args: Vec<String> = args.into_iter().collect();
+    let after_dashes = args.iter().position(|a| a == "--").map(|at| args.split_off(at).split_off(1));
+    let mut parser = lexopt::Parser::from_args(args);
+    let (mut socket, mut verbose, mut json, mut segmented, mut asked_help) = (PathBuf::from(DEFAULT_SOCKET), false, false, false, false);
+    let mut command: Option<&CommandInfo> = None;
+    let (mut words, mut query, mut interval, mut wait, mut foreground, mut log) = (Vec::new(), Vec::new(), None, None, false, None);
+    let takes = |command: Option<&CommandInfo>, option: &str| command.is_some_and(|c| c.options.iter().any(|(o, _)| o.starts_with(option)));
+    let bad = |command, e: lexopt::Error| Early::usage(command, e.to_string());
+    loop {
+        let arg = match parser.next() {
+            Ok(Some(arg)) => arg,
+            Ok(None) => break,
+            Err(e) => return Err(bad(command, e)),
+        };
+        let invalid = |name: &str, value: &str, e: String| Early::usage(command, format!("invalid value '{value}' for '--{name}': {e}"));
+        match arg {
+            Short('s') | Long("socket") => socket = PathBuf::from(value_of(&mut parser).map_err(|e| bad(command, e))?),
+            Short('v') | Long("verbose") => verbose = true,
+            Long("json") => json = true,
+            Long("segmented-json") => segmented = true,
+            Short('h') | Long("help") => asked_help = true,
+            Short('V') | Long("version") => return Err(Early::Version),
+            Long("query") if takes(command, "--query") => {
+                let v = value_of(&mut parser).map_err(|e| bad(command, e))?;
+                query.push(service_type(&v).map_err(|e| invalid("query", &v, e))?);
+            }
+            Long("wait") if takes(command, "--wait") => {
+                let v = value_of(&mut parser).map_err(|e| bad(command, e))?;
+                wait = Some(wait_span(&v).map_err(|e| invalid("wait", &v, e))?);
+            }
+            Long("interval") if takes(command, "--interval") => {
+                let v = value_of(&mut parser).map_err(|e| bad(command, e))?;
+                interval = Some(interval_span(&v).map_err(|e| invalid("interval", &v, e))?);
+            }
+            Long("foreground") if takes(command, "--foreground") => foreground = true,
+            Long("log") if takes(command, "--log") => {
+                let v = value_of(&mut parser).map_err(|e| bad(command, e))?;
+                if v.is_empty() {
+                    return Err(invalid("log", &v, "a file is needed".into()));
+                }
+                log = Some(PathBuf::from(v));
+            }
+            Value(word) => {
+                let word = word.string().map_err(|e| bad(command, e))?;
+                match command {
+                    Some(_) => words.push(word),
+                    None => match COMMANDS.iter().find(|c| c.name == word) {
+                        Some(c) => command = Some(c),
+                        None => return Err(Early::usage(None, format!("unrecognized subcommand '{word}'"))),
+                    },
+                }
+            }
+            arg => return Err(bad(command, arg.unexpected())),
+        }
+    }
+    if asked_help {
+        return Err(Early::Help(help(command)));
+    }
+    let Some(info) = command else {
+        return Err(Early::NoCommand);
+    };
+    let usage = |message: &str| Early::usage(command, message);
+    let script = match (info.name, after_dashes) {
+        ("subscribe", Some(script)) if !script.is_empty() => script,
+        ("subscribe", _) => return Err(usage("a script to run is needed, after --")),
+        (_, rest) => {
+            words.extend(rest.unwrap_or_default());
+            Vec::new()
+        }
+    };
+    if (wait.is_some() || interval.is_some()) && query.is_empty() {
+        return Err(usage(&format!("--{} is for --query", if wait.is_some() { "wait" } else { "interval" })));
+    }
+    if segmented && info.name != "devices" {
+        return Err(usage("--segmented-json is for devices"));
+    }
+    if segmented && json {
+        return Err(usage("--segmented-json and --json are one or the other"));
+    }
+    // The protocol is one request per line.
+    let name = words.join(" ");
+    if name.contains(['\n', '\r']) {
+        return Err(usage("a segment's name cannot hold a line break"));
+    }
+    let target = |interval, wait| match name.trim().is_empty() {
+        true if words.is_empty() => Err(usage("the segment's name is needed")),
+        true => Err(usage("the segment's name is blank")),
+        false => Ok(Target { segment: name.clone(), query: query.clone(), interval, wait }),
+    };
+    let command = match info.name {
+        "devices" => Command::Devices(target(None, wait)?),
+        "probe" => Command::Probe(Some(name.clone()).filter(|n| !n.trim().is_empty())),
+        "watch" => Command::Watch(target(interval, None)?),
+        "subscribe" => Command::Subscribe(Subscription { target: target(interval, None)?, script, foreground, log }),
+        _ if !words.is_empty() => return Err(usage(&format!("unexpected argument '{}' found", words[0]))),
+        "segments" => Command::Segments,
+        "watchers" => Command::Watchers,
+        _ => Command::Timers,
+    };
+    Ok(Options { socket, json, segmented, verbose, command })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1220,7 +1343,7 @@ fn main() -> ExitCode {
     let opts = match parse_args(std::env::args().skip(1)) {
         Ok(opts) => opts,
         // Help and version to stdout with 0, usage errors to stderr with 2.
-        Err(e) => e.exit(),
+        Err(early) => return early.exit(),
     };
 
     let result = match &opts.command {
@@ -1249,12 +1372,12 @@ mod tests {
 
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<Options, clap::Error> {
+    fn parse(args: &[&str]) -> Result<Options, Early> {
         parse_args(args.iter().map(|s| s.to_string()))
     }
 
     fn opts(args: &[&str]) -> Options {
-        parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
+        parse(args).unwrap_or_else(|e| panic!("{args:?}: {e:?}"))
     }
 
     #[test]
@@ -1286,9 +1409,10 @@ mod tests {
         assert_eq!(opts(&["watchers"]).command, Command::Watchers);
         assert_eq!(opts(&["watch", "IoT", "to", "br0"]).command, Command::Watch("IoT to br0".into()));
         for help in [&["--help"][..], &["segments", "-h"], &["devices", "--help"]] {
-            assert_eq!(parse(help).unwrap_err().kind(), ErrorKind::DisplayHelp, "{help:?}");
+            assert!(matches!(parse(help), Err(Early::Help(_))), "{help:?}");
         }
-        assert_eq!(parse(&["--version"]).unwrap_err().kind(), ErrorKind::DisplayVersion);
+        assert_eq!(parse(&["--version"]), Err(Early::Version));
+        assert_eq!(parse(&["-v"]), Err(Early::NoCommand), "the help, as an error");
     }
 
     /// `--query` and `--interval` may come anywhere, with their value as the
@@ -1345,8 +1469,7 @@ mod tests {
     #[test]
     fn man_page_covers_every_command_and_option() {
         let man = include_str!("../man/mdnsctl.1");
-        for command in Cli::command().get_subcommands() {
-            let name = command.get_name();
+        for CommandInfo { name, .. } in COMMANDS {
             assert!(man.contains(&format!(".B {name}")) || man.contains(&format!("\\fB{name}\\fR")), "{name}");
         }
         for option in ["\\-\\-json", "\\-\\-segmented\\-json", "\\-\\-socket", "\\-\\-help", "\\-\\-verbose"] {
@@ -1357,13 +1480,42 @@ mod tests {
 
     #[test]
     fn usage_lists_every_command() {
-        Cli::command().debug_assert();
-        let mut cli = Cli::command();
-        let text = cli.render_help().to_string();
-        for command in cli.get_subcommands() {
-            let about = command.get_about().expect("every command says what it does").to_string();
-            assert!(text.contains(command.get_name()) && text.contains(&about), "{}", command.get_name());
+        let text = help(None);
+        for command in COMMANDS {
+            assert!(text.contains(&format!("  {:<11}{}\n", command.name, command.about)), "{}: {text}", command.name);
         }
+    }
+
+    /// Each command's help lists what it takes, its own options and the
+    /// others, in two columns; a long option alone lines up with those that
+    /// have a short one.
+    #[test]
+    fn a_commands_help_lists_its_arguments_and_options() {
+        let Err(Early::Help(text)) = parse(&["subscribe", "--help"]) else { panic!() };
+        assert_eq!(
+            text,
+            "Run SCRIPT for each change in a segment, in the background\n\
+             \n\
+             Usage: mdnsctl subscribe [OPTIONS] <NAME>... -- <SCRIPT>...\n\
+             \n\
+             Arguments:\n\
+             \x20 <NAME>...    The segment\n\
+             \x20 <SCRIPT>...  The script to run for each change, and its arguments, after --\n\
+             \n\
+             Options:\n\
+             \x20     --query <TYPE>     Ask for this service type by name, and run SCRIPT only for devices of it\n\
+             \x20     --interval <SPAN>  Ask for the --query types again this often (at least 10s)\n\
+             \x20     --foreground       Stay attached instead of going into the background\n\
+             \x20     --log <FILE>       Append what the subscriber has to say, and SCRIPT's output, to FILE\n\
+             \x20 -s, --socket <PATH>    The control socket [default: /run/mdnsd/mdnsd.sock]\n\
+             \x20 -v, --verbose          List devices with all details (addresses, services)\n\
+             \x20     --json             Print the daemon's reply unchanged\n\
+             \x20     --segmented-json   With devices: print each device as a line of JSON of its own\n\
+             \x20 -h, --help             Print help\n"
+        );
+        // A usage error says how to use the command it was about.
+        let Err(Early::Usage { usage, .. }) = parse(&["devices"]) else { panic!() };
+        assert_eq!(usage, "mdnsctl devices [OPTIONS] <NAME>...");
     }
 
     const SEGMENTS: &str = r#"{"ok":true,"segments":[{"name":"media_stuff","interfaces":["br0","media"],"families":["v4","v6"]},{"name":"IoT","interfaces":["wifi"],"families":["v4"]}]}"#;
