@@ -1292,6 +1292,21 @@ impl Segment {
         state.settle_for(&names, Instant::now());
     }
 
+    /// The devices this daemon advertises as its own here (`[Advertise]`), as
+    /// they are announced: the host itself, which it never hears of from the
+    /// network, each with the TTL of its address records.
+    pub fn own_devices(&self) -> Vec<(Device, Duration)> {
+        let state = self.state.borrow();
+        state
+            .manual
+            .iter()
+            .filter_map(|m| match m.claims.get(&Owner::Own) {
+                Some(Claim::Owned { device, host_ttl }) => Some(((**device).clone(), Duration::from_secs(u64::from(*host_ttl)))),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The devices announced on this segment: for each hostname, what is
     /// shown of the one that won.
     pub fn manual_devices(&self) -> Vec<Device> {

@@ -77,6 +77,12 @@ in
 Only devices discovered on the segment's own interfaces are listed.
 Devices that the daemon reflected onto those interfaces from other segments are
 not.
+This host is, as the daemon has it announce itself (see
+.B [Advertise]
+in
+.BR mdnsd.conf (5)),
+with the services it advertises: nothing is heard of it, as it does not hear
+itself.
 .IP
 The name needs no quoting, even if it contains spaces:
 .B mdnsctl devices IoT to br0

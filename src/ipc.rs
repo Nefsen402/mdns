@@ -28,7 +28,8 @@
 //!
 //! Errors are `{"ok":false,"error":"..."}`. `devices` lists what was
 //! discovered on the segment's own interfaces, not reflected copies from
-//! other segments. `probe` actively queries the interfaces of the segment
+//! other segments, and this host as `[Advertise]` has it announce itself (with
+//! `"own":true`: nothing is heard of it, as it does not hear itself). `probe` actively queries the interfaces of the segment
 //! (of all segments if no name is given) and replies after about four
 //! seconds, once the answers have been processed; list what was found with
 //! `devices`.
@@ -639,6 +640,12 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
                 let notice = Notice { interface: seg.interface().to_string(), event: Event::Added(device), ttl };
                 present.push(event_json("present", name, &notice));
             }
+            // Nothing is heard of this host: it is here as it advertises itself.
+            for (device, ttl) in seg.own_devices().iter().filter_map(|(d, ttl)| Some((d.only_kinds(&query.kinds)?, *ttl))) {
+                let mut line = event_json("present", name, &Notice { interface: seg.interface().to_string(), event: Event::Added(device), ttl });
+                line["device"]["own"] = Value::Bool(true);
+                present.push(line);
+            }
         }
     }
     Ok(Watch { name: name.to_string(), query, present })
@@ -783,6 +790,8 @@ fn devices(groups: &[Group], name: &str) -> Value {
             let mut found = seg.devices();
             found.sort_by_key(|d| (d.key(), d.addrs().collect::<Vec<_>>()));
             list.extend(found.iter().map(|d| device_json(seg.interface(), d)));
+            // This host, as it advertises itself, is among them.
+            list.extend(seg.own_devices().iter().map(|(d, ttl)| own_json(seg.interface(), d, *ttl)));
         }
     }
     json!({ "ok": true, "name": name, "devices": list })
@@ -901,6 +910,14 @@ fn device_json(interface: &str, d: &Device) -> Value {
         "address_ttl": d.ttl,
         "services": services,
     })
+}
+
+/// This host's own device, as it advertises itself on `interface`.
+fn own_json(interface: &str, d: &Device, ttl: Duration) -> Value {
+    let mut json = device_json(interface, d);
+    json["own"] = Value::Bool(true);
+    json["address_ttl"] = json!(ttl.as_secs());
+    json
 }
 
 fn family_name(family: Family) -> &'static str {
@@ -1073,6 +1090,58 @@ mod tests {
         assert!(!segs[1].manual_devices().is_empty(), "precondition: reflected onto b");
         let out = handle(&[g], &Watches::default(), "devices media");
         assert_eq!(out.matches("\"addresses\"").count(), 1, "{out}");
+    }
+
+    /// This host, with an ssh service, as `[Advertise]` makes it.
+    fn advertise_self(seg: &Segment) {
+        let mut pc = Device {
+            hostname: Some("pc.local".into()),
+            services: vec![crate::device::Service {
+                instance: "pc._ssh._tcp.local".into(),
+                kind: "_ssh._tcp.local".into(),
+                port: 22,
+                target: Some("pc.local".into()),
+                ..Default::default()
+            }],
+            ..Device::default()
+        };
+        pc.add_addrs(&[ip("10.0.0.5")]);
+        seg.add_manual_ttl(crate::segment::Owner::Own, pc, Duration::from_secs(120)).unwrap();
+    }
+
+    /// Nothing is heard of this host, so it is listed as it advertises itself,
+    /// and a reflected copy of another's device still is not.
+    #[test]
+    fn the_host_is_listed_as_it_advertises_itself() {
+        let (g, segs) = group("lan", Family::V4, &["a", "b"]);
+        advertise_self(&segs[0]);
+        announce(&segs[1], "10.0.1.5", "tv.local", "TV");
+        deliver_made();
+        let reply: Value = serde_json::from_str(&handle(&[g], &Watches::default(), "devices lan")).unwrap();
+        let devices = reply["devices"].as_array().unwrap();
+        let own: Vec<&Value> = devices.iter().filter(|d| d["own"] == true).collect();
+        assert_eq!(own.len(), 1, "{reply}");
+        assert_eq!((own[0]["interface"].as_str(), own[0]["hostname"].as_str()), (Some("a"), Some("pc.local")));
+        assert_eq!(own[0]["addresses"], json!(["10.0.0.5"]));
+        assert_eq!(own[0]["address_ttl"], 120);
+        assert_eq!(own[0]["services"][0]["type"], "_ssh._tcp.local");
+        // The tv is heard of, once, and not as one of the host's own; the copy of it on a is not listed.
+        assert_eq!(devices.iter().filter(|d| d["hostname"] == "tv.local").count(), 1, "{reply}");
+        assert_eq!(devices.len(), 2, "{reply}");
+    }
+
+    #[test]
+    fn a_watch_for_a_type_the_host_offers_shows_it_present_and_for_another_does_not() {
+        let (seg, _rx) = wired("a");
+        advertise_self(&seg);
+        let groups = vec![Group { name: "lan".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }];
+        let present = |arg: &str| follow(&groups, arg).ok().unwrap().present;
+        let lines = present("--query=_ssh._tcp lan");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!((lines[0]["event"].as_str(), lines[0]["device"]["hostname"].as_str()), (Some("present"), Some("pc.local")));
+        assert_eq!((lines[0]["ttl"].as_u64(), lines[0]["device"]["own"].as_bool()), (Some(120), Some(true)));
+        assert_eq!(lines[0]["device"]["services"][0]["port"], 22);
+        assert!(present("--query=_http._tcp lan").is_empty());
     }
 
     #[test]
