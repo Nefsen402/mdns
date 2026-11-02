@@ -61,15 +61,15 @@
 //! holding it, as the kernel reports the other end of its connection (`null`
 //! if it cannot).
 //!
-//! `timers` lists what the daemon's timer has scheduled, soonest first, for
-//! debugging. `due_in_ms` is 0 for one that is overdue (its callback is queued
-//! behind another) and `null` for one that is running now or never due;
-//! `last_run_ago_ms` and `last_took_us` are `null` until it has run. A link's
-//! `upkeep` timer is set for the first of its `pending` list: everything it is
-//! waiting to do, soonest first, as `what` (`expire`, `refresh` or
-//! `re-announce`), to `who` (a hostname, or the address of a device that has
-//! none, or a hostname and one of its addresses, for that address running out
-//! on its own), and `due_in_ms` from now (0 if it is due).
+//! `timers` lists each link's upkeep, which the event loop runs when it is
+//! due, soonest first, for debugging. `due_in_ms` is 0 for one that is due
+//! and `null` for one that is running now or never due; `last_run_ago_ms` and
+//! `last_took_us` are `null` until it has run. It is due at the first of its
+//! `pending` list: everything it is waiting to do, soonest first, as `what`
+//! (`expire`, `refresh` or `re-announce`), to `who` (a hostname, or the
+//! address of a device that has none, or a hostname and one of its
+//! addresses, for that address running out on its own), and `due_in_ms` from
+//! now (0 if it is due).
 //! 
 //!
 //! A device is listed once, whichever family it was heard over, with its
@@ -107,7 +107,6 @@ use crate::reflector::Notice;
 use crate::device::{is_type, Device, Origin};
 use crate::segment::{Event, Segment};
 use crate::socket::Family;
-use crate::timer::Watcher;
 use crate::Group;
 
 /// Longest request line accepted.
@@ -131,7 +130,7 @@ const MIN_QUERY_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } els
 ///
 /// The server only holds a weak reference, so it never keeps the segments
 /// alive: once the owner drops them, requests are answered "shutting down".
-pub fn serve(path: &Path, groups: &Arc<Vec<Group>>, timers: Watcher) -> Result<JoinHandle<()>> {
+pub fn serve(path: &Path, groups: &Arc<Vec<Group>>) -> Result<JoinHandle<()>> {
     let listener = bind(path)?;
     let groups = Arc::downgrade(groups);
     let watches = Arc::new(Watches::default());
@@ -141,9 +140,8 @@ pub fn serve(path: &Path, groups: &Arc<Vec<Group>>, timers: Watcher) -> Result<J
             match conn {
                 Ok(stream) => {
                     let groups = Weak::clone(&groups);
-                    let timers = timers.clone();
                     let watches = Arc::clone(&watches);
-                    thread::spawn(move || match serve_connection(stream, &groups, &timers, &watches) {
+                    thread::spawn(move || match serve_connection(stream, &groups, &watches) {
                         Err(e) if !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                             eprintln!("ipc: connection ended: {e}");
                         }
@@ -178,7 +176,7 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watcher, watches: &Watches) -> io::Result<()> {
+fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, watches: &Watches) -> io::Result<()> {
     stream.set_read_timeout(Some(IDLE))?;
     let peer = peer_of(&stream);
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -211,7 +209,7 @@ fn serve_connection(stream: UnixStream, groups: &Weak<Vec<Group>>, timers: &Watc
             };
         }
         let reply = match groups.upgrade() {
-            Some(groups) => handle(&groups, timers, watches, request),
+            Some(groups) => handle(&groups, watches, request),
             None => error("shutting down").to_string(),
         };
         write_line(&mut writer, &reply)?;
@@ -570,7 +568,7 @@ fn event_json(event: &str, segment: &str, notice: &Notice) -> Value {
 }
 
 /// Answer one request line with one line of JSON.
-pub fn handle(groups: &[Group], timers: &Watcher, watches: &Watches, request: &str) -> String {
+pub fn handle(groups: &[Group], watches: &Watches, request: &str) -> String {
     let (command, arg) = match request.split_once(char::is_whitespace) {
         Some((command, arg)) => (command, arg.trim()),
         None => (request, ""),
@@ -579,7 +577,7 @@ pub fn handle(groups: &[Group], timers: &Watcher, watches: &Watches, request: &s
         "segments" => segments(groups),
         "devices" => devices(groups, arg),
         "probe" => probe(groups, arg),
-        "timers" => timer_list(groups, timers),
+        "timers" => timer_list(groups),
         "watchers" => watches.json(),
         "watch" => error("watch streams events: it needs a connection of its own"),
         "" => error("empty request"),
@@ -657,48 +655,44 @@ fn probe(groups: &[Group], name: &str) -> Value {
     json!({ "ok": true, "probed": on_each(&links, Segment::probe) })
 }
 
-fn timer_list(groups: &[Group], timers: &Watcher) -> Value {
-    let Some(all) = timers.snapshot() else {
-        return error("the timer is not running");
-    };
+fn timer_list(groups: &[Group]) -> Value {
     let now = Instant::now();
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
 
-    // What each link's timer is waiting for, by the id of its entry. A link
-    // that is in several segments is asked once.
+    // Each link's upkeep, and what it is waiting to do. A link that is in
+    // several segments is listed once.
     let mut links: Vec<&Segment> = Vec::new();
     for seg in groups.iter().flat_map(|g| g.reflector.segments()) {
         if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);
         }
     }
-    let mut pending: HashMap<u64, Vec<Value>> = links
-        .into_iter()
-        .filter_map(|seg| {
-            let waiting = seg
+    let mut list: Vec<(Option<Instant>, Value)> = (1..)
+        .zip(links)
+        .map(|(id, seg)| {
+            let info = seg.upkeep_info();
+            let pending: Vec<Value> = seg
                 .pending()
                 .into_iter()
                 .map(|p| json!({ "what": p.what, "who": p.who, "due_in_ms": ms(p.at.saturating_duration_since(now)) }))
                 .collect();
-            Some((seg.timer_id()?, waiting))
+            let due = info.due.filter(|_| !info.running);
+            let timer = json!({
+                "id": id,
+                "name": format!("upkeep {}", seg.interface()),
+                "running": info.running,
+                "due_in_ms": due.map(|at| ms(at.saturating_duration_since(now))),
+                "runs": info.runs,
+                "last_run_ago_ms": info.last_run.map(|at| ms(now.saturating_duration_since(at))),
+                "last_took_us": info.last_took.map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+                "pending": pending,
+            });
+            (due, timer)
         })
         .collect();
-    let list: Vec<Value> = all
-        .iter()
-        .map(|t| {
-            json!({
-                "id": t.id,
-                "name": t.name,
-                "running": t.running,
-                "due_in_ms": t.due.map(|at| ms(at.saturating_duration_since(now))),
-                "runs": t.runs,
-                "last_run_ago_ms": t.last_run.map(|at| ms(now.saturating_duration_since(at))),
-                "last_took_us": t.last_took.map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
-                "pending": pending.remove(&t.id).unwrap_or_default(),
-            })
-        })
-        .collect();
-    json!({ "ok": true, "timers": list })
+    // Soonest first; what is never due, last.
+    list.sort_by_key(|(due, _)| (due.is_none(), *due));
+    json!({ "ok": true, "timers": list.into_iter().map(|(_, t)| t).collect::<Vec<_>>() })
 }
 
 fn device_json(interface: &str, d: &Device) -> Value {
@@ -785,52 +779,47 @@ mod tests {
 
     #[test]
     fn lists_the_timers_soonest_first() {
-        let timer = crate::timer::Timer::new().unwrap();
-        let _later = timer.schedule("later", Duration::from_secs(600), || crate::timer::Next::Stop);
-        let _sooner = timer.schedule("sooner", Duration::from_secs(60), || crate::timer::Next::Stop);
-        let _never = timer.schedule("never", Duration::MAX, || crate::timer::Next::Stop);
+        let (g, segs) = group("IoT", Family::V4, &["later", "sooner", "never"]);
+        segs[0].observe(ip("10.0.1.7"));
+        segs[1].set_min_lifetime(Duration::from_secs(60));
+        segs[1].observe(ip("10.0.2.7"));
 
-        let reply: Value = serde_json::from_str(&handle(&[], &timer.watcher(), &Watches::default(), "timers")).unwrap();
+        let reply: Value = serde_json::from_str(&handle(&[g], &Watches::default(), "timers")).unwrap();
         assert_eq!(reply["ok"], true);
         let list = reply["timers"].as_array().unwrap();
         let names: Vec<&str> = list.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["sooner", "later", "never"]);
+        assert_eq!(names, ["upkeep sooner", "upkeep later", "upkeep never"]);
 
         let due = list[0]["due_in_ms"].as_u64().unwrap();
         assert!((59_000..=60_000).contains(&due), "{due}");
         assert_eq!(list[0]["running"], false);
         assert_eq!(list[0]["runs"], 0);
         assert!(list[0]["last_run_ago_ms"].is_null() && list[0]["last_took_us"].is_null());
-        assert!(list[2]["due_in_ms"].is_null());
+        assert!(list[2]["due_in_ms"].is_null(), "nothing known, never due");
         assert!(list[0]["id"].is_u64());
     }
 
     #[test]
     fn timers_say_what_each_one_is_waiting_for() {
-        let timer = crate::timer::Timer::new().unwrap();
         let (g, segs) = group("IoT", Family::V4, &["wifi"]);
-        let (g2, _) = group("other", Family::V4, &["eth"]);
-        segs[0].schedule(&timer, Some(Duration::from_secs(30)));
+        let (g2, _) = group("other", Family::V4, &["eth", "wifi"]);
+        segs[0].set_refresh_before(Some(Duration::from_secs(30)));
         segs[0].observe(ip("10.0.1.7"));
+        segs[0].upkeep(Instant::now());
 
-        let reply: Value = serde_json::from_str(&handle(&[g, g2], &timer.watcher(), &Watches::default(), "timers")).unwrap();
+        let reply: Value = serde_json::from_str(&handle(&[g, g2], &Watches::default(), "timers")).unwrap();
         let list = reply["timers"].as_array().unwrap();
-        assert_eq!(list.len(), 1, "only wifi was scheduled");
-        assert_eq!(list[0]["name"], "upkeep wifi");
-        let pending = list[0]["pending"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "wifi, in two segments, once: {list:?}");
+        let wifi = list.iter().find(|t| t["name"] == "upkeep wifi").unwrap();
+        let pending = wifi["pending"].as_array().unwrap();
         assert_eq!(pending.len(), 1, "an unnamed device is only expired");
         assert_eq!((pending[0]["what"].as_str(), pending[0]["who"].as_str()), (Some("expire"), Some("10.0.1.7")));
         let due = pending[0]["due_in_ms"].as_u64().unwrap();
         assert!((299_000..=300_000).contains(&due), "{due}");
-        // The timer is set for it.
-        assert!(list[0]["due_in_ms"].as_u64().unwrap().abs_diff(due) < 1000);
-    }
-
-    #[test]
-    fn timers_reports_a_timer_that_is_gone() {
-        let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), &Watches::default(), "timers")).unwrap();
-        assert_eq!(reply["ok"], false);
-        assert!(reply["error"].as_str().unwrap().contains("timer"));
+        // The upkeep is due for it, and has run once.
+        assert!(wifi["due_in_ms"].as_u64().unwrap().abs_diff(due) < 1000);
+        assert_eq!(wifi["runs"], 1);
+        assert!(wifi["last_run_ago_ms"].is_u64() && wifi["last_took_us"].is_u64());
     }
 
     #[test]
@@ -840,7 +829,7 @@ mod tests {
         let (iot, _) = group("iot", Family::V4, &["c"]);
         let groups = [m4, m6, iot];
         assert_eq!(
-            handle(&groups, &Watcher::default(), &Watches::default(), "segments"),
+            handle(&groups, &Watches::default(), "segments"),
             r#"{"ok":true,"segments":[{"name":"media","interfaces":["a","b"],"untrusted":[],"families":["v4","v6"]},{"name":"iot","interfaces":["c"],"untrusted":[],"families":["v4"]}]}"#
         );
     }
@@ -851,7 +840,7 @@ mod tests {
         let reflector = Reflector::with_untrusted(0, segs, &["wifi".to_string()]).unwrap();
         let groups = [Group { name: "IoT to br0".into(), reflector }];
         assert_eq!(
-            handle(&groups, &Watcher::default(), &Watches::default(), "segments"),
+            handle(&groups, &Watches::default(), "segments"),
             r#"{"ok":true,"segments":[{"name":"IoT to br0","interfaces":["br0","wifi"],"untrusted":["wifi"],"families":["v4"]}]}"#
         );
     }
@@ -861,7 +850,7 @@ mod tests {
         let (iot, segs) = group("IoT to br0", Family::V4, &["c"]);
         segs[0].observe(ip("10.0.3.9"));
         assert_eq!(
-            handle(&[iot], &Watcher::default(), &Watches::default(), r#"devices "IoT to br0""#),
+            handle(&[iot], &Watches::default(), r#"devices "IoT to br0""#),
             r#"{"ok":true,"name":"IoT to br0","devices":[{"interface":"c","hostname":null,"addresses":["10.0.3.9"],"neighbour_addresses":[],"address_ttl":null,"services":[]}]}"#
         );
     }
@@ -871,7 +860,7 @@ mod tests {
         let (g, segs) = group("media", Family::V4, &["a", "b"]);
         announce(&segs[0], "10.0.1.5", "tv.local", r#"My "TV""#);
         segs[1].observe(ip("10.0.2.1"));
-        let out = handle(&[g], &Watcher::default(), &Watches::default(), "DEVICES media");
+        let out = handle(&[g], &Watches::default(), "DEVICES media");
         assert!(
             out.contains(r#""interface":"a","hostname":"tv.local","addresses":["10.0.1.5"],"neighbour_addresses":[],"address_ttl":120"#),
             "{out}"
@@ -891,7 +880,7 @@ mod tests {
         announce(&segs[0], "10.0.1.5", "tv.local", "TV");
         std::thread::sleep(Duration::from_millis(150));
         assert!(!segs[1].manual_devices().is_empty(), "precondition: reflected onto b");
-        let out = handle(&[g], &Watcher::default(), &Watches::default(), "devices media");
+        let out = handle(&[g], &Watches::default(), "devices media");
         assert_eq!(out.matches("\"addresses\"").count(), 1, "{out}");
     }
 
@@ -907,7 +896,7 @@ mod tests {
             Group { name: "y".into(), reflector: Reflector::new(1, vec![a, c]).unwrap() },
         ];
         let interfaces = |request: &str| -> Vec<String> {
-            let reply: Value = serde_json::from_str(&handle(&groups, &Watcher::default(), &Watches::default(), request)).unwrap();
+            let reply: Value = serde_json::from_str(&handle(&groups, &Watches::default(), request)).unwrap();
             assert_eq!(reply["ok"], true, "{reply}");
             reply["probed"]
                 .as_array()
@@ -926,7 +915,7 @@ mod tests {
         let (g, _segs) = group("media", Family::V4, &["a"]);
         // No sender is attached in tests, so nothing is sent.
         assert_eq!(
-            handle(&[g], &Watcher::default(), &Watches::default(), "probe media"),
+            handle(&[g], &Watches::default(), "probe media"),
             r#"{"ok":true,"probed":[{"interface":"a","queries":0,"error":null}]}"#
         );
     }
@@ -942,7 +931,7 @@ mod tests {
             ("", "empty request"),
             ("frobnicate", "unknown command"),
         ] {
-            let out = handle(&groups, &Watcher::default(), &Watches::default(), request);
+            let out = handle(&groups, &Watches::default(), request);
             assert!(out.starts_with(r#"{"ok":false,"error":""#) && out.contains(expect), "{request}: {out}");
         }
     }
@@ -956,7 +945,7 @@ mod tests {
         // is quotes and backslashes.
         // A backslash in a label is `\\` in the escaped form names are kept in.
         announce(&segs[0], "10.0.1.5", "tv.local", "My \"TV\" \\\\ back");
-        let out = handle(&[g], &Watcher::default(), &Watches::default(), "devices media");
+        let out = handle(&[g], &Watches::default(), "devices media");
         assert!(!out.contains('\n'), "{out}");
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
@@ -987,7 +976,7 @@ mod tests {
         segs[0].observe(ip("10.0.1.7"));
         let path = temp_socket("serve");
         let groups = Arc::new(vec![g]);
-        serve(&path, &groups, Watcher::default()).unwrap();
+        serve(&path, &groups).unwrap();
 
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o660);
 
@@ -1017,7 +1006,7 @@ mod tests {
         let (g, segs) = group("IoT", Family::V4, &["wifi"]);
         let path = temp_socket("watch");
         let groups = Arc::new(vec![g]);
-        serve(&path, &groups, Watcher::default()).unwrap();
+        serve(&path, &groups).unwrap();
 
         let mut stream = UnixStream::connect(&path).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1101,7 +1090,7 @@ mod tests {
         let (a, a_rx) = wired("a");
         let groups = [Group { name: "IoT".into(), reflector: Reflector::new(0, vec![a.clone()]).unwrap() }];
         announce(&a, "10.0.1.7", "tv.local", "TV");
-        let ask = |request: &str| handle(&groups, &Watcher::default(), &Watches::default(), request);
+        let ask = |request: &str| handle(&groups, &Watches::default(), request);
         let reply: Value = serde_json::from_str(&ask("devices IoT")).unwrap();
         assert_eq!(reply["devices"][0]["hostname"], "tv.local");
         for request in ["devices --query=_http._tcp IoT", "devices --interval=30 IoT"] {
@@ -1119,7 +1108,7 @@ mod tests {
         let groups = Arc::new(vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }]);
         announce(&seg, "10.0.1.7", "tv.local", "TV");
         let path = temp_socket("watch-query");
-        serve(&path, &groups, Watcher::default()).unwrap();
+        serve(&path, &groups).unwrap();
 
         let mut stream = UnixStream::connect(&path).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1205,7 +1194,7 @@ mod tests {
         let (g, _segs) = group("IoT", Family::V4, &["wifi"]);
         let path = temp_socket("watchers");
         let groups = Arc::new(vec![g]);
-        serve(&path, &groups, Watcher::default()).unwrap();
+        serve(&path, &groups).unwrap();
         let open = |request: &str| {
             let mut stream = UnixStream::connect(&path).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1270,7 +1259,7 @@ mod tests {
 
     #[test]
     fn watch_is_refused_where_it_cannot_stream() {
-        let reply: Value = serde_json::from_str(&handle(&[], &Watcher::default(), &Watches::default(), "watch IoT")).unwrap();
+        let reply: Value = serde_json::from_str(&handle(&[], &Watches::default(), "watch IoT")).unwrap();
         assert_eq!(reply["ok"], false);
     }
 

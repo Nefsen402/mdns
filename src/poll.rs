@@ -2,7 +2,7 @@
 //! descriptors the daemon has, nothing more elaborate is called for.
 
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 /// A descriptor to wait on until it can be read.
@@ -34,10 +34,45 @@ pub fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<(
     Ok(())
 }
 
+/// A way for other threads to cut the event loop's wait short: a pipe, whose
+/// reading end the loop waits on.
+pub struct Waker {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+impl Waker {
+    pub fn new() -> io::Result<Waker> {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe2 fills in.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both were just created, and are owned by nothing else.
+        unsafe { Ok(Waker { read: OwnedFd::from_raw_fd(fds[0]), write: OwnedFd::from_raw_fd(fds[1]) }) }
+    }
+
+    /// Make the loop look again. A full pipe already says so.
+    pub fn wake(&self) {
+        // SAFETY: one byte from a valid buffer.
+        unsafe { libc::write(self.write.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.read.as_raw_fd()
+    }
+
+    /// Take what woke the loop, so that it waits again.
+    pub fn clear(&self) {
+        let mut buf = [0u8; 64];
+        // SAFETY: `buf` is writable for its whole length.
+        while unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixDatagram;
     use std::time::Instant;
 
@@ -52,5 +87,18 @@ mod tests {
         a.send(b"x").unwrap();
         wait(&mut fds, None).unwrap();
         assert!(ready(&fds[0]));
+    }
+
+    #[test]
+    fn a_waker_wakes_the_wait_until_cleared() {
+        let waker = Waker::new().unwrap();
+        let mut fds = [readable(waker.fd())];
+        waker.wake();
+        waker.wake();
+        wait(&mut fds, None).unwrap();
+        assert!(ready(&fds[0]));
+        waker.clear();
+        wait(&mut fds, Some(Duration::ZERO)).unwrap();
+        assert!(!ready(&fds[0]), "cleared");
     }
 }

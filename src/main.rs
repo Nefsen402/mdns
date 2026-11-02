@@ -9,7 +9,6 @@ mod reflector;
 mod segment;
 mod signal;
 mod socket;
-mod timer;
 mod timespan;
 
 use std::collections::HashMap;
@@ -26,7 +25,7 @@ use netlink::Netlink;
 use reflector::{Forward, Neighbours, Reflector};
 use segment::{Owner, Segment};
 use socket::Family;
-use timer::Timer;
+use poll::Waker;
 
 /// One configured segment, over every family the daemon listens on.
 pub struct Group {
@@ -42,7 +41,7 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
     let config = Config::load(&path)?;
-    let timer = Timer::new().context("starting the timer")?;
+    let waker = Arc::new(Waker::new().context("making the event loop's waker")?);
 
     let families: Vec<Family> = [(config.ipv4, Family::V4), (config.ipv6, Family::V6)]
         .into_iter()
@@ -60,7 +59,7 @@ fn main() -> Result<()> {
     let mut tracked = Vec::new();
     let mut links: HashMap<&str, Segment> = HashMap::new();
     for interface in config.interfaces() {
-        let mut link = Link::new(interface, &families, &config, &timer);
+        let mut link = Link::new(interface, &families, &config, &waker);
         if !link.open()? {
             eprintln!("{interface}: not there yet; waiting for it");
         }
@@ -170,12 +169,11 @@ fn main() -> Result<()> {
     }
 
     let segments = Arc::new(segments);
-    ipc::serve(&config.socket, &segments, timer.watcher())?;
+    ipc::serve(&config.socket, &segments)?;
 
-    let signal = run(&signals, netlink, &mut tracked)?;
+    let signal = run(&signals, &waker, netlink, &mut tracked)?;
     eprintln!("received {signal}: withdrawing reflected devices");
-    // No more upkeep while the goodbyes go out.
-    drop(timer);
+    // The loop has stopped, and the upkeep with it, while the goodbyes go out.
     release(segments);
     // With the reflectors gone, what is left in the manual lists is the
     // advertised name: say goodbye to it too.
@@ -190,26 +188,39 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The event loop: follow what netlink reports for `links`, until a shutdown
-/// signal comes, whose name is returned. Should netlink fail, interfaces are
-/// no longer followed, and the daemon goes on as they are.
-fn run(signals: &signal::Signals, netlink: Netlink, links: &mut [Link]) -> Result<&'static str> {
+/// The event loop: follow what netlink reports for `links`, and run each
+/// link's upkeep when it is due, until a shutdown signal comes, whose name is
+/// returned. `waker` cuts a wait short when something comes due sooner.
+/// Should netlink fail, interfaces are no longer followed, and the daemon
+/// goes on as they are.
+fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [Link]) -> Result<&'static str> {
     links::ask_neighbours(&netlink);
     let mut netlink = Some(netlink);
     loop {
-        let mut fds = vec![poll::readable(signals.fd())];
+        let next = links.iter().filter_map(|l| l.segment().next_wake()).min();
+        let mut fds = vec![poll::readable(signals.fd()), poll::readable(waker.fd())];
         fds.extend(netlink.as_ref().map(|n| poll::readable(n.fd())));
-        poll::wait(&mut fds, None).context("waiting for something to do")?;
+        poll::wait(&mut fds, next.map(|at| at.saturating_duration_since(Instant::now())))
+            .context("waiting for something to do")?;
         if let Some(name) = signals.take() {
             return Ok(name);
         }
-        if let Some(n) = netlink.as_ref().filter(|_| fds.get(1).is_some_and(poll::ready)) {
+        if poll::ready(&fds[1]) {
+            waker.clear();
+        }
+        if let Some(n) = netlink.as_ref().filter(|_| fds.get(2).is_some_and(poll::ready)) {
             match n.changes() {
                 Ok(changes) => links::follow(n, links, &changes),
                 Err(e) => {
                     eprintln!("netlink: {e}; no longer following interfaces as they come and go");
                     netlink = None;
                 }
+            }
+        }
+        let now = Instant::now();
+        for link in links.iter() {
+            if link.segment().next_due().is_some_and(|at| at <= now) {
+                link.segment().upkeep(now);
             }
         }
     }

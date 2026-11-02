@@ -22,9 +22,9 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 use crate::device::Device;
 use crate::netlink::{Change, Netlink};
+use crate::poll::Waker;
 use crate::segment::{Owner, Segment};
 use crate::socket::{self, Family, MdnsSocket};
-use crate::timer::Timer;
 
 /// How often a receive loop looks up from waiting to see whether it is to
 /// stop: a socket whose interface is gone may never hear anything again.
@@ -54,14 +54,15 @@ pub struct Link {
 
 impl Link {
     /// The link for `interface`, over `families`, configured by `config`,
-    /// with its upkeep on `timer`. It has no sockets until
-    /// [`open`](Link::open).
-    pub fn new(interface: &str, families: &[Family], config: &Config, timer: &Timer) -> Link {
+    /// poking `waker` when its upkeep comes due sooner than the event loop
+    /// was told. It has no sockets until [`open`](Link::open).
+    pub fn new(interface: &str, families: &[Family], config: &Config, waker: &Arc<Waker>) -> Link {
         let segment = Segment::new(interface, families);
         segment.set_min_lifetime(config.min_lifetime);
         segment.set_max_addrs(config.max_addrs);
         segment.set_reannounce(config.reannounce_on(interface));
-        segment.schedule(timer, config.refresh_before);
+        segment.set_refresh_before(config.refresh_before);
+        segment.set_waker(Arc::clone(waker));
 
         Link {
             interface: interface.to_string(),
