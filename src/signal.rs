@@ -17,10 +17,10 @@ extern "C" fn on_signal(sig: libc::c_int) {
     // async-signal-safe, runs between saving and restoring it. A full pipe
     // already says a signal came: losing this byte loses nothing.
     unsafe {
-        let errno = *libc::__errno_location();
+        let errno = *crate::runtime::errno_location();
         let byte = sig as u8;
         libc::write(WRITE_END.load(Ordering::Relaxed), (&byte as *const u8).cast(), 1);
-        *libc::__errno_location() = errno;
+        *crate::runtime::errno_location() = errno;
     }
 }
 

@@ -88,10 +88,32 @@ impl From<Errno> for Why {
     }
 }
 
+/// Where this thread's `errno` is: libc keeps it behind a function whose name
+/// is the system's own.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "dragonfly"))]
+pub fn errno_location() -> *mut libc::c_int {
+    // SAFETY: the function only returns the address of the thread's errno.
+    unsafe { libc::__errno_location() }
+}
+
+/// Where this thread's `errno` is.
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
+pub fn errno_location() -> *mut libc::c_int {
+    // SAFETY: the function only returns the address of the thread's errno.
+    unsafe { libc::__error() }
+}
+
+/// Where this thread's `errno` is.
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+pub fn errno_location() -> *mut libc::c_int {
+    // SAFETY: the function only returns the address of the thread's errno.
+    unsafe { libc::__errno() }
+}
+
 /// What the last libc call that failed left in `errno`.
 pub fn errno() -> Errno {
     // SAFETY: errno is the calling thread's, and always there to read.
-    Errno::from_raw_os_error(unsafe { *libc::__errno_location() })
+    Errno::from_raw_os_error(unsafe { *errno_location() })
 }
 
 #[cfg(not(test))]

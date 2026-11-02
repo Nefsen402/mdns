@@ -23,7 +23,9 @@ use core::time::Duration;
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::Errno;
-use rustix::process::{Pid, PidfdFlags, Signal, WaitOptions, WaitStatus};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use rustix::process::PidfdFlags;
+use rustix::process::{Pid, Signal, WaitOptions, WaitStatus};
 use serde_json::Value;
 
 use crate::runtime::{errno, Why};
@@ -537,7 +539,7 @@ fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
             }
-            let errno = (*libc::__errno_location()).to_ne_bytes();
+            let errno = (*crate::runtime::errno_location()).to_ne_bytes();
             libc::write(report, errno.as_ptr().cast(), errno.len());
             libc::_exit(127)
         },
@@ -1096,7 +1098,11 @@ impl Subscriber {
         drop(stdin_rx);
         // A script that does not read its input must not hold the subscriber up.
         let stdin = set_nonblocking(&stdin_tx).is_ok().then(|| (stdin_tx, format!("{event}\n").into_bytes()));
+        // Where there is no pidfd, whether it has exited is looked at every so often.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let pidfd = rustix::process::pidfd_open(pid, PidfdFlags::empty()).ok();
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let pidfd = None;
         let mut running = Running { pid, pidfd, stdin, event };
         running.feed();
         self.running = Some(running);

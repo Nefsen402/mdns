@@ -5,6 +5,10 @@
 //! stays bound to the old index, and its group memberships went with it. So
 //! the daemon listens for link and address changes, and acts on those to the
 //! interfaces it serves. Only the few fields it needs are read.
+//!
+//! Only Linux has netlink. Elsewhere [`Netlink`] hears of nothing, and what
+//! reads the messages, with the constants of their format, is not used.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -70,10 +74,12 @@ const NDMSG_LEN: usize = 12;
 const RTA_HDRLEN: usize = 4;
 
 /// A socket that hears of link and address changes.
+#[cfg(target_os = "linux")]
 pub struct Netlink {
     fd: OwnedFd,
 }
 
+#[cfg(target_os = "linux")]
 impl Netlink {
     pub fn open() -> Result<Netlink, Why> {
         // SAFETY: plain socket creation; the result is checked.
@@ -154,6 +160,34 @@ impl Netlink {
                 e => return Err(Why(e)),
             }
         }
+    }
+}
+
+/// Where there is no netlink, nothing is heard of links, addresses or
+/// neighbours coming and going: interfaces are those there when the daemon
+/// starts, and what the neighbour table knows of the devices is not learned.
+/// The routing socket of the BSDs says the same things in another way, which
+/// this does not read yet.
+#[cfg(not(target_os = "linux"))]
+pub struct Netlink;
+
+#[cfg(not(target_os = "linux"))]
+impl Netlink {
+    pub fn open() -> Result<Netlink, Why> {
+        Ok(Netlink)
+    }
+
+    pub fn request_neighbours(&self) -> Result<(), Why> {
+        Ok(())
+    }
+
+    /// No descriptor: waiting on a negative one waits for nothing.
+    pub fn fd(&self) -> RawFd {
+        -1
+    }
+
+    pub fn changes(&self) -> Result<Vec<Change>, Why> {
+        Ok(Vec::new())
     }
 }
 

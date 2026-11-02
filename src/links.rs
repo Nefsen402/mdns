@@ -11,6 +11,7 @@
 //! probed, and one whose addresses change has the advertised name updated.
 //! An interface that is not there when the daemon starts is waited for.
 
+use alloc::rc::Rc;
 use core::net::{IpAddr, SocketAddr};
 
 use rustix::fd::{AsRawFd, OwnedFd, RawFd};
@@ -24,13 +25,13 @@ use crate::device::Device;
 use crate::runtime::Why;
 use crate::netlink::{Change, Netlink};
 use crate::segment::{Owner, Segment};
-use crate::socket::{self, Family};
+use crate::socket::{self, Family, Hub};
 
 use crate::prelude::*;
 
 /// The most a datagram read from an mDNS socket may hold: mDNS's own limit
 /// (RFC 6762 section 17).
-const MAX_DATAGRAM: usize = 9000;
+pub const MAX_DATAGRAM: usize = 9000;
 
 /// One interface the daemon serves, and the sockets it has on it while it is
 /// there.
@@ -51,14 +52,18 @@ pub struct Link {
     /// Its MTU, once known: what a packet sent on it may hold follows it.
     mtu: Option<u32>,
     /// The sockets it hears on while the interface is there, one per family,
-    /// for the event loop to read when they are readable.
+    /// for the event loop to read when they are readable. None where one socket
+    /// per family is shared by every interface: it is the hub's, which joins
+    /// the group on this interface for as long as it is there.
     sockets: Vec<OwnedFd>,
+    #[cfg_attr(all(target_os = "linux", not(feature = "portable-sockets")), allow(dead_code))]
+    hub: Rc<Hub>,
 }
 
 impl Link {
     /// The link for `interface`, over `families`, configured by `config`. It
     /// has no sockets until [`open`](Link::open).
-    pub fn new(interface: &str, families: &[Family], config: &Config) -> Link {
+    pub fn new(interface: &str, families: &[Family], config: &Config, hub: Rc<Hub>) -> Link {
         let segment = Segment::new(interface, families);
         segment.set_min_lifetime(config.min_lifetime_of(interface));
         segment.set_max_addrs(config.max_addrs_of(interface));
@@ -77,6 +82,7 @@ impl Link {
             was_here: false,
             mtu: None,
             sockets: Vec::new(),
+            hub,
         }
     }
 
@@ -92,6 +98,18 @@ impl Link {
             return Ok(false);
         };
         self.take_mtu(socket::mtu(&self.interface).ok());
+        self.open_sockets()?;
+        self.index = Some(index);
+        self.was_here = true;
+        if self.up {
+            self.addresses_changed();
+        }
+        Ok(true)
+    }
+
+    /// A socket of its own for each family, pinned to the interface.
+    #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
+    fn open_sockets(&mut self) -> Result<()> {
         let mut sockets = Vec::new();
         for &family in &self.families {
             let sock = socket::open(&self.interface, family)
@@ -109,17 +127,32 @@ impl Link {
             receivers.push(sock.socket);
         }
         self.sockets = receivers;
-        self.index = Some(index);
-        self.was_here = true;
-        if self.up {
-            self.addresses_changed();
+        Ok(())
+    }
+
+    /// The shared sockets, joined to the group on this interface.
+    #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
+    fn open_sockets(&mut self) -> Result<()> {
+        for &family in &self.families {
+            let (tx, dest) = self
+                .hub
+                .join(&self.interface, family)
+                .with_context(|| format!("joining the group over {family:?} on {}", self.interface))?;
+            self.segment.attach(family, tx, dest);
+            eprintln!("listening on {} ({:?})", self.interface, family);
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Close the sockets, as the interface is gone: nothing is heard or sent
     /// until it is back.
     fn close(&mut self) {
+        #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
+        if self.index.is_some() {
+            for &family in &self.families {
+                self.hub.leave(&self.interface, family);
+            }
+        }
         self.sockets.clear();
         self.segment.detach_all();
         self.index = None;
@@ -241,19 +274,30 @@ impl Link {
         self.sockets.iter().map(|s| s.as_raw_fd())
     }
 
+    /// The interface's index, while it has sockets on it: what a datagram of a
+    /// socket that every interface shares is told apart by.
+    pub fn index(&self) -> Option<u32> {
+        self.index
+    }
+
+    /// Handle a datagram that came in on this interface.
+    pub fn heard(&self, from: SocketAddr, datagram: &[u8]) {
+        if let Err(e) = self.segment.handle(from, datagram) {
+            eprintln!("{}: reply failed: {e:#}", self.interface);
+        }
+    }
+
     /// Handle everything the socket `fd` has heard, if it is one of this
     /// link's: the event loop found it readable.
     pub fn receive(&self, fd: RawFd) {
         let Some(sock) = self.sockets.iter().find(|s| s.as_raw_fd() == fd) else { return };
         let mut buf = [0u8; MAX_DATAGRAM];
         loop {
-            match rustix::net::recvfrom(sock, &mut buf, rustix::net::RecvFlags::empty()) {
-                Ok((len, _, from)) => {
+            match socket::recv(sock, &mut buf) {
+                Ok(datagram) => {
                     // A datagram from an IP address, as on a UDP socket.
-                    let Some(from) = from.and_then(|a| SocketAddr::try_from(a).ok()) else { continue };
-                    if let Err(e) = self.segment.handle(from, &buf[..len]) {
-                        eprintln!("{}: reply failed: {e:#}", self.interface);
-                    }
+                    let Some(from) = datagram.from else { continue };
+                    self.heard(from, &buf[..datagram.len]);
                 }
                 Err(Errno::AGAIN) => return,
                 Err(Errno::INTR) => {}

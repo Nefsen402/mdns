@@ -520,9 +520,20 @@ impl Watches {
 }
 
 /// Who is at the other end of `stream`, or `None` if the kernel will not say.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn peer_of(stream: &OwnedFd) -> Option<Peer> {
     let cred = rustix::net::sockopt::socket_peercred(stream).ok()?;
     Some(Peer { pid: cred.pid.as_raw_pid(), uid: cred.uid.as_raw() })
+}
+
+/// Who is at the other end of `stream`, or `None` if the system will not say.
+/// The BSDs say whose user it is, and not which process.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_of(stream: &OwnedFd) -> Option<Peer> {
+    use rustix::fd::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: the descriptor is open, and the two are valid to write to.
+    (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(Peer { pid: 0, uid })
 }
 
 /// Queue `line` and a newline for a client, to go out whole: it is never

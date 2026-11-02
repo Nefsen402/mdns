@@ -11,6 +11,13 @@ default-run = "mdnsd"
 name = "mdnsctl"
 path = "src/ipc_client.rs"
 
+[features]
+# One socket for each family, shared by every interface, as the BSDs have: bound
+# to the wildcard address, with each datagram handed in the daemon to the
+# interface it came in on. Linux pins a socket to each interface; this is to
+# test the other on it.
+portable-sockets = []
+
 [dependencies]
 anyhow = { version = "1.0.104", default-features = false }
 hashbrown = { version = "0.17", default-features = false, features = ["default-hasher"] }

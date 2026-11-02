@@ -13,7 +13,6 @@ use alloc::collections::{BTreeSet, VecDeque};
 use hashbrown::{HashMap, HashSet};
 use core::net::{IpAddr, SocketAddr, SocketAddrV6};
 
-use rustix::fd::OwnedFd;
 use core::cell::RefCell;
 use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak};
@@ -29,7 +28,7 @@ use crate::device::{
     addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report,
     DEFAULT_MAX_PACKET, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
 };
-use crate::socket::{Family, Prefix, MDNS_PORT};
+use crate::socket::{Family, Prefix, Sender, MDNS_PORT};
 use crate::parser::{Message, Question, RData, Record};
 
 use crate::prelude::*;
@@ -271,7 +270,7 @@ impl fmt::Display for Labelled<'_> {
 /// A way to send over one family: a socket, and the group to send to.
 struct Outbound {
     family: Family,
-    socket: OwnedFd,
+    socket: Sender,
     dest: SocketAddr,
 }
 
@@ -1043,10 +1042,10 @@ impl Segment {
     /// Give the segment a way to send over `family`: `socket`, to the group
     /// at `dest`. Replaces an earlier one of the family. Without any (as in
     /// unit tests), manual changes are recorded but nothing goes on the wire.
-    pub fn attach(&self, family: Family, socket: OwnedFd, dest: SocketAddr) {
+    pub fn attach(&self, family: Family, socket: impl Into<Sender>, dest: SocketAddr) {
         let mut state = self.state.borrow_mut();
         state.outbound.retain(|o| o.family != family);
-        state.outbound.push(Outbound { family, socket, dest });
+        state.outbound.push(Outbound { family, socket: socket.into(), dest });
         state.sync_refresh();
     }
 
@@ -2055,8 +2054,8 @@ fn transmit(outbound: &[Outbound], family: Family, msg: &Message, dest: Option<S
 }
 
 /// Send the datagram `bytes` to `dest` on `socket`.
-fn send_to(socket: &OwnedFd, bytes: &[u8], dest: SocketAddr) -> Result<(), Why> {
-    rustix::net::sendto(socket, bytes, rustix::net::SendFlags::empty(), &dest).map(drop).map_err(Why)
+fn send_to(socket: &Sender, bytes: &[u8], dest: SocketAddr) -> Result<(), Why> {
+    socket.send_to(bytes, dest).map_err(Why)
 }
 
 #[cfg(test)]
@@ -2076,7 +2075,9 @@ mod tests {
     }
     use crate::device::{record, Service, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
     use crate::parser::{self, rtype, Header};
-    use crate::socket::{open, prefix};
+    use crate::socket::prefix;
+    #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
+    use crate::socket::open;
 
     /// Its first routable IPv4 or IPv6 address, and link-local one.
     fn v4(d: &Device) -> Option<IpAddr> {
@@ -4986,6 +4987,7 @@ mod tests {
 
     /// Manual check of the real send path: `MDNS_TEST_IFACE=br cargo test
     /// live_announce -- --ignored --nocapture`, with a listener on the group.
+    #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
     #[test]
     #[ignore]
     fn live_announce() {
@@ -5012,6 +5014,7 @@ mod tests {
 
     /// Manual check of query handling over the real network: announces a
     /// device on `MDNS_TEST_IFACE` (IPv4), then answers queries for 4s.
+    #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
     #[test]
     #[ignore]
     fn live_respond() {

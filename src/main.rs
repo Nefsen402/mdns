@@ -24,6 +24,7 @@ mod signal;
 mod socket;
 mod time;
 
+use alloc::rc::Rc;
 use core::ffi::c_int;
 
 use hashbrown::HashMap;
@@ -93,10 +94,11 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // for each family and one list of devices for both: mDNS records do not
     // belong to the transport they come over. One that is not there yet is
     // waited for.
+    let hub = Rc::new(socket::Hub::new(&families).context("opening the sockets")?);
     let mut tracked = Vec::new();
     let mut links: HashMap<&str, Segment> = HashMap::new();
     for interface in config.interfaces() {
-        let mut link = Link::new(interface, &families, &config);
+        let mut link = Link::new(interface, &families, &config, hub.clone());
         if !link.open()? {
             eprintln!("{interface}: not there yet; waiting for it");
         }
@@ -207,7 +209,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
 
     let mut server = ipc::Server::bind(&config.socket)?;
 
-    let signal = event_loop(&signals, netlink, &mut tracked, &segments, &mut server)?;
+    let signal = event_loop(&signals, netlink, &hub, &mut tracked, &segments, &mut server)?;
     eprintln!("received {signal}: withdrawing reflected devices");
     // The loop has stopped, and the upkeep with it, while the goodbyes go
     // out: the watches are told, and dropping the reflectors withdraws all
@@ -253,6 +255,7 @@ fn config_path(args: Vec<String>) -> Result<Option<String>, args::Error> {
 fn event_loop(
     signals: &signal::Signals,
     netlink: Netlink,
+    hub: &socket::Hub,
     links: &mut [Link],
     groups: &[Group],
     server: &mut ipc::Server,
@@ -264,12 +267,16 @@ fn event_loop(
         let upkeep = links.iter().filter_map(|l| l.segment().next_due());
         let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).min();
         // The signals and netlink, then every link's sockets, each with the
-        // link it is of, then the control socket and its clients.
+        // link it is of, then the sockets shared by the interfaces, if there
+        // are any, then the control socket and its clients.
         let mut fds = vec![poll::readable(signals.fd())];
         fds.push(poll::readable(netlink.as_ref().map_or(-1, Netlink::fd)));
         let sockets: Vec<(usize, i32)> =
             links.iter().enumerate().flat_map(|(i, l)| l.fds().map(move |fd| (i, fd))).collect();
         fds.extend(sockets.iter().map(|&(_, fd)| poll::readable(fd)));
+        let shared: Vec<i32> = hub.fds().collect();
+        let shared_at = fds.len();
+        fds.extend(shared.iter().map(|&fd| poll::readable(fd)));
         let clients = fds.len();
         fds.extend(server.fds());
         poll::wait(&mut fds, next.map(|at| at.saturating_duration_since(Instant::now())))
@@ -278,8 +285,17 @@ fn event_loop(
             return Ok(name);
         }
         // What was heard first: a change of interfaces may close the sockets.
-        for (&(link, fd), _) in sockets.iter().zip(&fds[2..clients]).filter(|(_, p)| poll::ready(p)) {
+        for (&(link, fd), _) in sockets.iter().zip(&fds[2..shared_at]).filter(|(_, p)| poll::ready(p)) {
             links[link].receive(fd);
+        }
+        // A datagram of a shared socket goes to the link of the interface it came
+        // in on, and to none if that is not one of ours.
+        for (&fd, _) in shared.iter().zip(&fds[shared_at..clients]).filter(|(_, p)| poll::ready(p)) {
+            hub.receive(fd, |index, from, datagram| {
+                if let Some(link) = links.iter().find(|l| l.index() == Some(index)) {
+                    link.heard(from, datagram);
+                }
+            });
         }
         server.ready(&fds[clients..]);
         if let Some(n) = netlink.as_ref().filter(|_| poll::ready(&fds[1])) {

@@ -253,6 +253,37 @@ that is there cannot be opened. One that is not there yet is waited for. The
 daemon stops cleanly on `SIGTERM` or `SIGINT`, withdrawing what it reflected
 with goodbyes (see `mdnsd(8)`).
 
+## Other systems
+
+Linux is what it is made for and tested on. The code also builds for FreeBSD,
+NetBSD, OpenBSD and DragonFly, but has not been run on any of them: what is
+known is that it compiles there, and that the part that differs has been run on
+Linux (`cargo build --features portable-sockets`).
+
+What differs is the sockets. Linux pins a socket to each interface
+(`SO_BINDTODEVICE`), so each hears nothing from another. The BSDs cannot, so
+there is one socket for each family, bound to the wildcard address and joined to
+the group on every interface as it is opened. It asks the system which
+interface each datagram came in on (`IPV6_PKTINFO`, and `IP_RECVIF` for IPv4),
+and the daemon hands the datagram to that interface, in userspace; one that
+came in on an interface it does not serve is dropped. Sending says which
+interface it goes out of, each time. A datagram is read once, whichever
+interface it came in on, so what is sent to port 5353 itself, not to the group,
+is not lost to a socket for another.
+
+Where it does less than on Linux:
+
+- Interfaces that come and go, and the addresses the neighbour table has for
+  devices, are learned from netlink, which only Linux has. Elsewhere an
+  interface has to be there when the daemon starts, and a device's other
+  addresses are not learned. The routing socket would say the same things; it is
+  not read yet.
+- An IPv4 group is joined by the interface's address, which is the first it
+  has when the socket is opened.
+- `mdnsctl watchers` cannot say which process holds a watch, only its user, and
+  `mdnsctl subscribe` looks at whether its script has finished, where Linux
+  tells it.
+
 ## Installing (Arch Linux)
 
 The `PKGBUILD` in `packaging/arch/` builds a package from the working tree:
