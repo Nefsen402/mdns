@@ -140,7 +140,9 @@ IN, hostnames not under
 or with a dot, space, control character or invalid UTF-8 in a label, malformed
 service types and instance names, SRV port 0, and addresses no device can be
 reached at.
-Each interface remembers at most 1024 devices, at most 64 hosts first described
+Each interface remembers at most 1024 devices (\fBMaxDevices=\fR in
+.BR mdnsd.conf (5)),
+at most 64 hosts first described
 by any one sender, and at most 64 services a device.
 A reflected device is announced when it appears or changes, twice, a second
 apart, and with goodbye packets when it goes.

@@ -22,7 +22,7 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MIN_LIFETIME};
+use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MIN_LIFETIME};
 use crate::runtime::Why;
 use crate::device::{
     addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report,
@@ -61,12 +61,10 @@ const MAX_PROBED: usize = 64;
 /// without bound by announcing endless made-up types.
 const MAX_TYPES: usize = 256;
 
-/// Devices remembered per segment, and of them, hosts first described by any
-/// one sender: one sender inventing endless devices (or many forged ones)
-/// must neither fill the other segments nor grow the list without bound. A
-/// sleep proxy or Thread border router speaks for several hosts, but not
-/// for this many.
-const MAX_DEVICES: usize = 1024;
+/// Hosts first described by any one sender, so that one inventing endless
+/// devices (or many forged ones) cannot fill the segment, which has room for
+/// [`DEFAULT_MAX_DEVICES`] unless set otherwise. A sleep proxy or Thread
+/// border router speaks for several hosts, but not for this many.
 const MAX_PER_SENDER: usize = 64;
 
 /// A record may not be multicast more than once a second (RFC 6762 section 6).
@@ -464,6 +462,8 @@ struct State {
     reannounce: bool,
     /// How many addresses of a family a discovered device is kept with.
     max_addrs: usize,
+    /// How many devices it remembers, at most.
+    max_devices: usize,
     /// The most a packet sent here may hold: what the interface's MTU leaves.
     max_packet: usize,
     upkeep: Upkeep,
@@ -625,11 +625,11 @@ impl State {
     }
 
     /// Whether a new host may be learned of from `src`: the segment has
-    /// fewer than [`MAX_DEVICES`], and `src` first described fewer than
+    /// fewer than it is set to remember, and `src` first described fewer than
     /// [`MAX_PER_SENDER`] of them.
     fn room_for(&self, src: IpAddr) -> bool {
         let named = |e: &&Entry| e.from == src && e.device.hostname.is_some();
-        self.discovered.len() < MAX_DEVICES && self.discovered.values().filter(named).count() < MAX_PER_SENDER
+        self.discovered.len() < self.max_devices && self.discovered.values().filter(named).count() < MAX_PER_SENDER
     }
 
     /// The instance names, in lowercase, of the services that devices on this
@@ -775,6 +775,7 @@ impl Segment {
             state: Rc::new(RefCell::new(State {
                 min_lifetime: DEFAULT_MIN_LIFETIME,
                 max_addrs: DEFAULT_MAX_ADDRS,
+                max_devices: DEFAULT_MAX_DEVICES,
                 max_packet: DEFAULT_MAX_PACKET,
                 ..State::default()
             })),
@@ -795,6 +796,12 @@ impl Segment {
     /// Applies to what is heard from now on.
     pub fn set_max_addrs(&self, max_addrs: usize) {
         self.state.borrow_mut().max_addrs = max_addrs.max(1);
+    }
+
+    /// How many devices it remembers, at most: a host beyond that is not
+    /// learned of. The default is [`DEFAULT_MAX_DEVICES`].
+    pub fn set_max_devices(&self, max_devices: usize) {
+        self.state.borrow_mut().max_devices = max_devices.max(1);
     }
 
     /// Take the interface's MTU: no packet sent here is bigger than it leaves
@@ -1332,7 +1339,7 @@ impl Segment {
         // known at all.
         let usable = is_usable(src);
         let key = sender.or_else(|| state.by_addr.get(&src).cloned()).or_else(|| usable.then_some(Key::Source(src)));
-        let room = key.as_ref().is_some_and(|k| state.discovered.contains_key(k)) || state.discovered.len() < MAX_DEVICES;
+        let room = key.as_ref().is_some_and(|k| state.discovered.contains_key(k)) || state.discovered.len() < state.max_devices;
         if let Some(key) = key.filter(|_| (reports.is_empty() || !rest.is_empty()) && room) {
             touched.note(&state.discovered, &key);
             let entry = state.discovered.entry(key.clone()).or_insert_with(|| Entry::new(now, src));
@@ -2654,10 +2661,30 @@ mod tests {
     #[test]
     fn a_segment_remembers_only_so_many_devices() {
         let seg = Segment::new("test", &[Family::V4]);
-        for i in 0..MAX_DEVICES + 20 {
+        for i in 0..DEFAULT_MAX_DEVICES + 20 {
             seg.observe(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i as u32 + 1)));
         }
-        assert_eq!(seg.devices().len(), MAX_DEVICES);
+        assert_eq!(seg.devices().len(), DEFAULT_MAX_DEVICES);
+    }
+
+    #[test]
+    fn the_number_of_devices_a_segment_remembers_can_be_set() {
+        let seg = Segment::new("test", &[Family::V4]);
+        seg.set_max_devices(10);
+        let host = |i: usize| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i as u32 + 1));
+        for i in 0..30 {
+            seg.observe(host(i));
+        }
+        assert_eq!(seg.devices().len(), 10);
+
+        // One it has is kept up to date, and room made by one that is gone is taken.
+        seg.observe(host(0));
+        assert_eq!(seg.devices().len(), 10);
+        seg.set_max_devices(20);
+        for i in 0..30 {
+            seg.observe(host(i));
+        }
+        assert_eq!(seg.devices().len(), 20, "raised while running");
     }
 
     /// A host that announced only an address no one can be reached at is not
@@ -3823,12 +3850,56 @@ mod tests {
     // What a full segment costs. Not a test: run it with
     // `cargo test --release scale -- --ignored --nocapture`.
 
+    /// Counts the heap the tests hold, for what a device costs in memory.
+    struct Counting;
+
+    static LIVE_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static LIVE_BLOCKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    // SAFETY: everything is the system allocator's; only counts are kept.
+    unsafe impl std::alloc::GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            use core::sync::atomic::Ordering::Relaxed;
+            let p = unsafe { std::alloc::System.alloc(layout) };
+            if !p.is_null() {
+                LIVE_BYTES.fetch_add(layout.size(), Relaxed);
+                LIVE_BLOCKS.fetch_add(1, Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            use core::sync::atomic::Ordering::Relaxed;
+            unsafe { std::alloc::System.dealloc(ptr, layout) };
+            LIVE_BYTES.fetch_sub(layout.size(), Relaxed);
+            LIVE_BLOCKS.fetch_sub(1, Relaxed);
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+            use core::sync::atomic::Ordering::Relaxed;
+            let p = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+            if !p.is_null() {
+                LIVE_BYTES.fetch_add(new_size, Relaxed);
+                LIVE_BYTES.fetch_sub(layout.size(), Relaxed);
+            }
+            p
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// The heap held now, in bytes and in blocks.
+    fn heap() -> (usize, usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (LIVE_BYTES.load(Relaxed), LIVE_BLOCKS.load(Relaxed))
+    }
+
     /// A segment that has heard `n` devices, each from an address of its own
     /// (a sender may describe only so many), with an address that runs out
     /// before the device does, as a host's address does against its services.
     fn crowded(n: usize) -> Segment {
         let (seg, _rx) = wired();
         seg.set_refresh_before(Some(Duration::from_secs(30)));
+        seg.set_max_devices(n + 1);
         for i in 0..n {
             let (host, instance) = (format!("host{i}.local"), format!("Dev{i}._http._tcp.local"));
             let from = format!("10.1.{}.{}", i / 250, i % 250 + 1);
@@ -3839,6 +3910,8 @@ mod tests {
                 a_record(&host, &from),
             ]);
         }
+        // What the event loop would have taken.
+        seg.take_events();
         assert_eq!(seg.devices().len(), n);
         seg
     }
@@ -3854,23 +3927,43 @@ mod tests {
 
     #[test]
     #[ignore = "a measurement, not a check"]
-    fn scale_of_the_work_a_full_segment_does_each_time_the_loop_wakes() {
-        println!("{:>8} {:>12} {:>12} {:>12} {:>12}", "devices", "next_due us", "upkeep us", "room_for us", "handle us");
-        for n in [1, 16, 128, 512, MAX_DEVICES - 1] {
+    fn scale_of_what_a_full_segment_costs() {
+        println!(
+            "{:>7} {:>11} {:>11} {:>9} {:>12} {:>12} {:>10} {:>9}",
+            "devices", "heap MiB", "bytes/dev", "blocks/d", "next_due us", "upkeep us", "handle us", "expire ms"
+        );
+        for n in [1, 128, DEFAULT_MAX_DEVICES - 1, 4096, 10_000] {
+            let (bytes, blocks) = heap();
             let seg = crowded(n);
-            let next_due = micros(2000, || {
+            let (b, k) = heap();
+            let (held, blocks_held) = (b - bytes, k - blocks);
+
+            let next_due = micros(500, || {
                 std::hint::black_box(seg.next_due());
             });
-            let upkeep = micros(200, || seg.upkeep(Instant::now()));
-            let src = ip("10.9.9.9");
-            let room_for = micros(2000, || {
-                std::hint::black_box(seg.state.borrow().room_for(src));
-            });
+            let upkeep = micros(50, || seg.upkeep(Instant::now()));
             // A device that is already known announcing itself again: what a
             // packet costs from a device that has been heard before.
             let again = announcement(120);
-            let handle = micros(2000, || seg.handle(sa("10.0.1.7"), &again).unwrap());
-            println!("{n:>8} {next_due:>12.1} {upkeep:>12.1} {room_for:>12.1} {handle:>12.1}");
+            seg.handle(sa("10.0.1.7"), &again).unwrap();
+            let handle = micros(500, || seg.handle(sa("10.0.1.7"), &again).unwrap());
+
+            // Every device running out at once, as when all go quiet together.
+            let start = std::time::Instant::now();
+            seg.expire(Instant::now() + Duration::from_secs(2 * 3600));
+            let expire = start.elapsed().as_secs_f64() * 1e3;
+            assert!(seg.devices().is_empty());
+            seg.take_events();
+            drop(seg);
+            let (b, _) = heap();
+
+            println!(
+                "{n:>7} {:>11.2} {:>11} {:>9.1} {next_due:>12.1} {upkeep:>12.1} {handle:>10.1} {expire:>9.1}  (heap after: {} B over the start)",
+                held as f64 / 1_048_576.0,
+                held / n,
+                blocks_held as f64 / n as f64,
+                b.saturating_sub(bytes),
+            );
         }
     }
 

@@ -417,6 +417,22 @@ At least 1; there is no upper bound, and
 lifts the limit altogether, at the cost of letting one device announce as many
 addresses as it likes.
 .TP
+.B MaxDevices=
+How many devices the interface remembers at most; a host beyond that is not
+learned of, until room is made by one that expires or says goodbye.
+Default
+.BR 1024 ,
+which a sleep proxy or Thread border router speaking for several hosts does not
+come near.
+At least 1, or
+.B infinity
+for no limit, at the cost of letting a flood of invented devices grow the list
+as far as memory allows.
+A device takes about 1.6 KiB, and what the daemon does each time it wakes grows
+with the number of devices it has, so a larger limit is for a network that
+needs it.
+At most 64 hosts are learned of from any one sender, whatever this is.
+.TP
 .B MinimumLifetime=
 Optional.
 The least a device heard on this interface is kept after it was last heard from,
@@ -502,6 +518,7 @@ Untrusted=wifi
 # For every interface.
 [Interface]
 MaxAddresses=8
+MaxDevices=1024
 
 # Some IoT devices sleep and ignore multicast: keep them listed for an hour.
 [Interface]

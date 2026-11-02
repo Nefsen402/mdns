@@ -28,6 +28,7 @@
 //!
 //! [Interface]         ; optional: without a Name=, for every interface
 //! MaxAddresses=8      ; 8 unless set
+//! MaxDevices=1024     ; 1024 unless set
 //!
 //! [Interface]         ; optional, for each interface that needs its own
 //! Name=wifi
@@ -90,6 +91,12 @@ pub const DEFAULT_MIN_LIFETIME: Duration = Duration::from_secs(300);
 /// enough for a global and a ULA address, a few temporary ones, and a
 /// link-local one. See `[Interface] MaxAddresses=`.
 pub const DEFAULT_MAX_ADDRS: usize = 8;
+
+/// The default for how many devices an interface remembers: one sender
+/// inventing endless devices, or many forged ones, must not grow the list
+/// without bound. A sleep proxy or Thread border router speaks for several
+/// hosts, but not for this many. See `[Interface] MaxDevices=`.
+pub const DEFAULT_MAX_DEVICES: usize = 1024;
 
 /// Which of the questions asked on one of a reflector's segments it puts to
 /// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
@@ -177,6 +184,9 @@ pub struct InterfaceConfig {
     /// How many addresses of a family a device heard on it is kept with, at
     /// most: the default is [`DEFAULT_MAX_ADDRS`].
     pub max_addrs: Option<usize>,
+    /// How many devices it remembers, at most: the default is
+    /// [`DEFAULT_MAX_DEVICES`]. A host beyond that is not learned of.
+    pub max_devices: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -253,6 +263,12 @@ impl Config {
         let all = |i: &&InterfaceConfig| i.name.is_none();
         let own = self.interface_settings.iter().find(named).and_then(&get);
         own.or_else(|| self.interface_settings.iter().find(all).and_then(&get))
+    }
+
+    /// How many devices `interface` remembers, at most: its `MaxDevices=`, or
+    /// else [`DEFAULT_MAX_DEVICES`].
+    pub fn max_devices_of(&self, interface: &str) -> usize {
+        self.setting_of(interface, |i| i.max_devices).unwrap_or(DEFAULT_MAX_DEVICES)
     }
 
     /// The least a device heard on `interface` is kept after it was last
@@ -333,8 +349,12 @@ impl Config {
                     ("interface", "name") => {
                         config.interface_settings.last_mut().unwrap().name = Some(value).filter(|v| !v.is_empty());
                     }
+                    ("interface", "maxdevices") => {
+                        config.interface_settings.last_mut().unwrap().max_devices =
+                            Some(parse_limit(&value, lineno, "MaxDevices")?);
+                    }
                     ("interface", "maxaddresses") => {
-                        config.interface_settings.last_mut().unwrap().max_addrs = Some(parse_max_addrs(&value, lineno)?);
+                        config.interface_settings.last_mut().unwrap().max_addrs = Some(parse_limit(&value, lineno, "MaxAddresses")?);
                     }
                     ("interface", "minimumlifetime") => {
                         config.interface_settings.last_mut().unwrap().min_lifetime = Some(parse_lifetime(&value, lineno)?);
@@ -495,9 +515,9 @@ fn timespan(value: &str, lineno: usize, key: &str) -> Result<Duration> {
     parse_timespan(value).map_err(|e| anyhow!("line {lineno}: invalid {key} {value:?}: {e}"))
 }
 
-/// How many addresses of a family a device is kept with: a number, at least
-/// one, or `infinity` for no limit at all.
-fn parse_max_addrs(value: &str, lineno: usize) -> Result<usize> {
+/// A limit on how many of something are kept: a number, at least one, or
+/// `infinity` for no limit at all.
+fn parse_limit(value: &str, lineno: usize, key: &str) -> Result<usize> {
     if value.eq_ignore_ascii_case("infinity") {
         return Ok(usize::MAX);
     }
@@ -505,7 +525,7 @@ fn parse_max_addrs(value: &str, lineno: usize) -> Result<usize> {
         .parse()
         .ok()
         .filter(|&n| n >= 1)
-        .ok_or_else(|| anyhow!("line {lineno}: MaxAddresses= must be a number of at least 1, or infinity, not {value:?}"))
+        .ok_or_else(|| anyhow!("line {lineno}: {key}= must be a number of at least 1, or infinity, not {value:?}"))
 }
 
 /// The minimum lifetime of a device: a time span, where zero means no minimum.
@@ -916,7 +936,7 @@ interfaces=br0,wifi
         let man = include_str!("../man/mdnsd.conf.5");
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
-            "ReflectTTL=", "MaxAddresses=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
+            "ReflectTTL=", "MaxAddresses=", "MaxDevices=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
             "Reannounce=", "ReflectedWhen=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
@@ -1241,6 +1261,17 @@ ProbeInterval=off
         for bad in ["0", "-1", "many", ""] {
             let err = error_of(&format!("{EXAMPLE}\n[Interface]\nMaxAddresses={bad}"));
             assert!(err.contains("MaxAddresses="), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn max_devices_defaults_to_1024_and_is_an_interfaces_setting_like_max_addresses() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().max_devices_of("br0"), DEFAULT_MAX_DEVICES);
+        let c = Config::parse(&format!("{EXAMPLE}\n[Interface]\nMaxDevices=5000\n[Interface]\nName=wifi\nMaxDevices=infinity")).unwrap();
+        assert_eq!((c.max_devices_of("br0"), c.max_devices_of("wifi")), (5000, usize::MAX));
+        for bad in ["0", "-1", "many", ""] {
+            let err = error_of(&format!("{EXAMPLE}\n[Interface]\nMaxDevices={bad}"));
+            assert!(err.contains("MaxDevices="), "{bad:?}: {err}");
         }
     }
 
