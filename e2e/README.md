@@ -44,13 +44,19 @@ waits a second and a half: keep those few.
 
 ## Coverage
 
-The daemon can be built with coverage instrumentation, and its profile data
-collected as it runs here, along with the unit tests':
+`coverage.py` measures what the unit tests and these tests cover together: it
+builds the daemon and `mdnsctl` with coverage instrumentation, runs the unit
+tests and then this suite against the instrumented binaries (the profile is
+written as each daemon exits), and merges them.
 
 ```
-RUSTFLAGS="-C instrument-coverage" cargo build
-LLVM_PROFILE_FILE=/tmp/prof/%p-%m.profraw python3 e2e/e2e.py target/debug/mdnsd
+rustup component add llvm-tools-preview
+python3 e2e/coverage.py
 ```
 
-The environment is passed on to the daemon. Merge with `llvm-profdata` and
-report with `llvm-cov`.
+It writes `target/coverage/report/`: `summary.md` (a table by file),
+`summary.json`, `lcov.info`, and `html/`, the source line by line. With
+`--baseline summary.json` the table says how the figures moved. CI runs it as
+the `coverage` job: the table is in the job's summary, on a pull request in a
+comment that is kept up to date and compares with the last run on `master`, and
+the report is an artifact.
