@@ -677,6 +677,8 @@ impl State {
     /// the reply is to go to a `legacy` resolver alone, and, for a device
     /// `probing` for names it is about to take, the reflected copies: it would
     /// take them for a conflict, and once it announces, the copy gives way.
+    /// The daemon's own name answers a probe however recently it went out:
+    /// that answer defends it, which section 6 exempts from the wait.
     fn answering(&self, now: Instant, legacy: bool, probing: bool, family: Family) -> Vec<(String, Device)> {
         let mut out = Vec::new();
         for (key, m) in &self.manual {
@@ -684,7 +686,7 @@ impl State {
             if probing && m.claims.keys().next() != Some(&Owner::Own) {
                 continue;
             }
-            if !legacy && now.saturating_duration_since(m.last_sent.over(family)) < MIN_MULTICAST_GAP {
+            if !legacy && !probing && now.saturating_duration_since(m.last_sent.over(family)) < MIN_MULTICAST_GAP {
                 continue;
             }
             out.push((key.clone(), Device { ttl: Some(m.host_ttl), ..device.clone() }));
@@ -2030,6 +2032,14 @@ mod tests {
         // An ordinary query is answered as ever.
         seg.handle(sa("10.0.1.50"), &query("tv.local", rtype::ANY, vec![])).unwrap();
         assert!(recv(&rx).is_some());
+
+        // The name went out just now, answering the probe: within a second
+        // of that a query waits, and another probe is answered all the same,
+        // or the prober would take the name.
+        seg.handle(sa("10.0.1.50"), &query("router.local", rtype::A, vec![])).unwrap();
+        assert!(recv(&rx).is_none(), "multicast less than a second ago");
+        seg.handle(sa("10.0.1.5"), &probe("router.local")).unwrap();
+        assert_eq!(recv(&rx).expect("defended").answers[0].data, RData::A("10.0.1.1".parse().unwrap()));
     }
 
     /// A question is passed on for the reflector to ask elsewhere, marked
