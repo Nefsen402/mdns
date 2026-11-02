@@ -22,7 +22,6 @@ use crate::device::{
 };
 use crate::socket::{Family, Prefix, MDNS_PORT};
 use crate::parser::{Message, Question, RData, Record};
-use crate::poll::Waker;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
 /// on a segment that re-announces what has not changed.
@@ -339,10 +338,6 @@ impl Manual {
 struct Upkeep {
     /// How long before expiry devices are asked to answer again, if at all.
     before: Option<Duration>,
-    /// Pokes the event loop when something comes due sooner than it was told.
-    waker: Option<Arc<Waker>>,
-    /// When the loop was last told it is due ([`Segment::next_wake`]).
-    told: Option<Instant>,
     running: bool,
     runs: u64,
     last_run: Option<Instant>,
@@ -489,12 +484,6 @@ impl State {
     }
 
     fn notify(&mut self, event: Event) {
-        // A change made while the loop waits has it look.
-        if self.outbox.is_empty()
-            && let Some(waker) = &self.upkeep.waker
-        {
-            waker.wake();
-        }
         self.outbox.push(event);
     }
 
@@ -770,14 +759,6 @@ impl Segment {
     /// `None` (the default) does not.
     pub fn set_refresh_before(&self, before: Option<Duration>) {
         self.state.lock().unwrap().upkeep.before = before;
-        self.rearm();
-    }
-
-    /// Poke `waker` whenever something comes due sooner than the event loop
-    /// was last told ([`Segment::next_wake`]): something heard or added, while
-    /// it waits.
-    pub fn set_waker(&self, waker: Arc<Waker>) {
-        self.state.lock().unwrap().upkeep.waker = Some(waker);
     }
 
     /// When [`Segment::upkeep`] next has something to do, or `None` if never;
@@ -786,36 +767,9 @@ impl Segment {
         self.state.lock().unwrap().next_due(Instant::now())
     }
 
-    /// Like [`Segment::next_due`], for the event loop to wait until: the
-    /// loop is poked again only if something comes due sooner.
-    pub fn next_wake(&self) -> Option<Instant> {
-        let mut state = self.state.lock().unwrap();
-        let at = state.next_due(Instant::now());
-        state.upkeep.told = at;
-        at
-    }
-
-    /// Poke the event loop if something is now due sooner than it was told.
-    /// Call after anything that can make something due sooner: a device
-    /// heard or added.
-    fn rearm(&self) {
-        let mut state = self.state.lock().unwrap();
-        let at = state.next_due(Instant::now());
-        let sooner = match (at, state.upkeep.told) {
-            (Some(at), Some(told)) => at < told,
-            (at, told) => at.is_some() && told.is_none(),
-        };
-        if sooner {
-            state.upkeep.told = at;
-            if let Some(waker) = &state.upkeep.waker {
-                waker.wake();
-            }
-        }
-    }
-
     /// Do what is due at `now`: drop what has run out, ask the devices about
     /// to expire to answer again, and re-announce. Run by the event loop when
-    /// [`Segment::next_wake`] says.
+    /// [`Segment::next_due`] says.
     pub fn upkeep(&self, now: Instant) {
         let started = Instant::now();
         let before = {
@@ -976,7 +930,6 @@ impl Segment {
             return Err(e);
         }
         drop(guard);
-        self.rearm();
         Ok(true)
     }
 
@@ -999,7 +952,6 @@ impl Segment {
             return Err(e);
         }
         drop(guard);
-        self.rearm();
         Ok(true)
     }
 
@@ -1033,7 +985,6 @@ impl Segment {
             }
         }
         drop(guard);
-        self.rearm();
         first_err.map_or(Ok(()), Err)
     }
 
@@ -1187,8 +1138,7 @@ impl Segment {
         match Message::parse(packet) {
             Ok(msg) => {
                 self.apply(from.ip(), Instant::now(), Some(&msg));
-                self.rearm();
-                self.respond(from, &msg)
+                        self.respond(from, &msg)
             }
             Err(_) => {
                 self.observe(from.ip());
@@ -1200,7 +1150,6 @@ impl Segment {
     /// Record that `addr` was heard on this segment, without any record data.
     pub fn observe(&self, addr: IpAddr) {
         self.apply(addr, Instant::now(), None);
-        self.rearm();
     }
 
     fn apply(&self, src: IpAddr, now: Instant, msg: Option<&Message>) {
@@ -1431,7 +1380,6 @@ impl Segment {
         state.probe_interval = every;
         state.next_routine = every.and_then(|every| Instant::now().checked_add(every));
         drop(state);
-        self.rearm();
     }
 
     /// Ask for the service types `kinds` by name, in three rounds like a
@@ -1461,7 +1409,6 @@ impl Segment {
         let probing = Probing { kinds, why, round: 0, next: Instant::now(), sent: 0, done: done.into_iter().collect() };
         state.probing.push(probing);
         drop(state);
-        self.rearm();
     }
 
     /// Run the rounds of the probes and queries that are due at `now`, and
@@ -3940,31 +3887,17 @@ mod tests {
         assert_eq!(next_due(&seg), Some(expiry_of(&seg, "printer.local")));
     }
 
-    /// Whether `waker` was poked, and taken if so.
-    fn woken(waker: &Waker) -> bool {
-        let mut fds = [crate::poll::readable(waker.fd())];
-        crate::poll::wait(&mut fds, Some(Duration::ZERO)).unwrap();
-        waker.clear();
-        crate::poll::ready(&fds[0])
-    }
-
     #[test]
     fn a_device_is_dropped_the_moment_it_expires() {
         let (seg, _rx) = wired();
-        let waker = Arc::new(Waker::new().unwrap());
-        seg.set_waker(waker.clone());
         let events = seg.subscribe();
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
-        let told = seg.next_wake();
-        woken(&waker);
 
-        // Not on a tick: the loop, told five minutes, is poked when it is due
-        // in 150 ms, and the upkeep then drops it.
+        // Not on a tick: due in 150 ms, it is due then, and the upkeep then
+        // drops it.
         let at = Instant::now() + Duration::from_millis(150);
         set_expiry(&seg, "printer.local", at);
-        seg.rearm();
-        assert!(woken(&waker), "told {told:?}, due sooner");
-        assert_eq!(seg.next_wake(), Some(at));
+        assert_eq!(seg.next_due(), Some(at));
         seg.upkeep(at);
         assert!(matches!(events.try_iter().last(), Some(Event::Removed(_))));
         assert!(seg.devices().is_empty());
@@ -3972,18 +3905,14 @@ mod tests {
     }
 
     #[test]
-    fn a_device_heard_after_the_loop_was_told_can_be_due_sooner() {
+    fn a_device_heard_is_due_when_it_runs_out() {
         let (seg, _rx) = wired();
         seg.set_min_lifetime(Duration::ZERO);
-        let waker = Arc::new(Waker::new().unwrap());
-        seg.set_waker(waker.clone());
-        assert_eq!(seg.next_wake(), None, "nothing known: never");
+        assert_eq!(seg.next_due(), None, "nothing known: never");
+        let before = Instant::now();
         hear_a_device_with_ttl(&seg, 1);
-        assert!(woken(&waker));
-        // Due later than it was told, it does not poke it again.
-        seg.next_wake();
-        hear_a_device_with_ttl(&seg, 1);
-        assert!(!woken(&waker));
+        let due = seg.next_due().expect("due");
+        assert!(due >= before + Duration::from_secs(1) && due <= Instant::now() + Duration::from_secs(1));
     }
 
     #[test]
@@ -4020,13 +3949,10 @@ mod tests {
     }
 
     #[test]
-    fn events_wait_to_be_taken_and_poke_the_loop() {
+    fn events_wait_to_be_taken() {
         let seg = Segment::new("test", &[Family::V4]);
-        let waker = Arc::new(Waker::new().unwrap());
-        seg.set_waker(waker.clone());
         seg.observe(ip("10.0.1.5"));
         seg.observe(ip("10.0.1.6"));
-        assert!(woken(&waker), "the first one pokes it");
         assert_eq!(seg.take_events().len(), 2);
         assert!(seg.take_events().is_empty(), "taken");
         assert!(seg.is(&seg.clone()) && !seg.is(&Segment::new("test", &[Family::V4])));

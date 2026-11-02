@@ -25,7 +25,6 @@ use netlink::Netlink;
 use reflector::{Forward, Neighbours, Reflector};
 use segment::{Owner, Segment};
 use socket::Family;
-use poll::Waker;
 
 /// One configured segment, over every family the daemon listens on.
 pub struct Group {
@@ -41,7 +40,6 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
     let config = Config::load(&path)?;
-    let waker = Arc::new(Waker::new().context("making the event loop's waker")?);
 
     let families: Vec<Family> = [(config.ipv4, Family::V4), (config.ipv6, Family::V6)]
         .into_iter()
@@ -59,7 +57,7 @@ fn main() -> Result<()> {
     let mut tracked = Vec::new();
     let mut links: HashMap<&str, Segment> = HashMap::new();
     for interface in config.interfaces() {
-        let mut link = Link::new(interface, &families, &config, &waker);
+        let mut link = Link::new(interface, &families, &config);
         if !link.open()? {
             eprintln!("{interface}: not there yet; waiting for it");
         }
@@ -153,7 +151,7 @@ fn main() -> Result<()> {
     let segments = Arc::new(segments);
     let mut server = ipc::Server::bind(&config.socket)?;
 
-    let signal = run(&signals, &waker, netlink, &mut tracked, &segments, &mut server)?;
+    let signal = run(&signals, netlink, &mut tracked, &segments, &mut server)?;
     eprintln!("received {signal}: withdrawing reflected devices");
     server.shut_down();
     drop(server);
@@ -175,12 +173,12 @@ fn main() -> Result<()> {
 /// The event loop: read what `links` hear, follow what netlink reports for
 /// them, and run each link's upkeep when it is due, handing what changes to
 /// the reflectors of `groups`; and serve the control socket's clients through
-/// `server`; until a shutdown signal comes, whose name is returned. `waker`
-/// cuts a wait short when something comes due sooner. Should netlink fail,
-/// interfaces are no longer followed, and the daemon goes on as they are.
+/// `server`; until a shutdown signal comes, whose name is returned. Should
+/// netlink fail, interfaces are no longer followed, and the daemon goes on
+/// as they are. Nothing changes but what the loop does, so what it is to
+/// wait for is worked out afresh each time round.
 fn run(
     signals: &signal::Signals,
-    waker: &Waker,
     netlink: Netlink,
     links: &mut [Link],
     groups: &[Group],
@@ -190,11 +188,11 @@ fn run(
     links::ask_neighbours(&netlink);
     let mut netlink = Some(netlink);
     loop {
-        let upkeep = links.iter().filter_map(|l| l.segment().next_wake());
+        let upkeep = links.iter().filter_map(|l| l.segment().next_due());
         let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).min();
-        // The signals, the waker and netlink, then every link's sockets,
-        // each with the link it is of.
-        let mut fds = vec![poll::readable(signals.fd()), poll::readable(waker.fd())];
+        // The signals and netlink, then every link's sockets, each with the
+        // link it is of, then the control socket and its clients.
+        let mut fds = vec![poll::readable(signals.fd())];
         fds.push(poll::readable(netlink.as_ref().map_or(-1, Netlink::fd)));
         let sockets: Vec<(usize, i32)> =
             links.iter().enumerate().flat_map(|(i, l)| l.fds().map(move |fd| (i, fd))).collect();
@@ -206,15 +204,12 @@ fn run(
         if let Some(name) = signals.take() {
             return Ok(name);
         }
-        if poll::ready(&fds[1]) {
-            waker.clear();
-        }
         // What was heard first: a change of interfaces may close the sockets.
-        for (&(link, fd), _) in sockets.iter().zip(&fds[3..clients]).filter(|(_, p)| poll::ready(p)) {
+        for (&(link, fd), _) in sockets.iter().zip(&fds[2..clients]).filter(|(_, p)| poll::ready(p)) {
             links[link].receive(fd);
         }
         server.ready(&fds[clients..]);
-        if let Some(n) = netlink.as_ref().filter(|_| poll::ready(&fds[2])) {
+        if let Some(n) = netlink.as_ref().filter(|_| poll::ready(&fds[1])) {
             match n.changes() {
                 Ok(changes) => links::follow(n, links, &changes),
                 Err(e) => {
