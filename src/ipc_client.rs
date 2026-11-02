@@ -752,8 +752,7 @@ fn devices_query(opts: &Options, target: &Target, out: &mut impl fmt::Write) -> 
     let text = if opts.segmented {
         String::new()
     } else if opts.json {
-        let mut devices: Vec<Value> = found.into_iter().map(|(_, d)| d).collect();
-        devices.sort_by_key(|d| (d["interface"].to_string(), d["hostname"].to_string().to_ascii_lowercase(), d["addresses"].to_string()));
+        let devices: Vec<Value> = found.into_iter().map(|(_, d)| d).collect();
         format!("{}\n", serde_json::json!({ "ok": true, "name": name, "devices": devices }))
     } else if opts.verbose {
         devices_summary(name, found.len(), 0)
@@ -1252,7 +1251,12 @@ fn render_probe(reply: &Value) -> Result<String, Failure> {
 fn span(ms: u64) -> String {
     match ms {
         0..1000 => format!("{ms}ms"),
-        1000..60_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        // Tenths of a second, rounded half up, without floating point: that pulls in
+        // some kilobytes of code to format the one number.
+        1000..60_000 => {
+            let tenths = (ms + 50) / 100;
+            format!("{}.{}s", tenths / 10, tenths % 10)
+        }
         60_000..3_600_000 => format!("{}m {:02}s", ms / 60_000, ms / 1000 % 60),
         _ => format!("{}h {:02}m", ms / 3_600_000, ms / 60_000 % 60),
     }
@@ -1400,12 +1404,10 @@ fn render_devices_brief(reply: &Value) -> Result<String, Failure> {
             }
         }
     }
-    named.sort_by_key(|n| n.host.to_ascii_lowercase());
 
     let rows: Vec<[String; 3]> = named
         .iter_mut()
         .map(|n| {
-            n.addrs.sort_by_key(|(link_local, v6, _)| (*link_local, *v6));
             let pretty = if n.pretty.is_empty() { "-".to_string() } else { n.pretty.join(", ") };
             let addrs: Vec<&str> = n.addrs.iter().map(|(_, _, a)| a.as_str()).collect();
             let addrs = if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") };
@@ -1434,8 +1436,7 @@ fn brief_row(device: &Value) -> Option<[String; 3]> {
     let host = device["hostname"].as_str()?;
     let pretty = pretty_names(device);
     let pretty = if pretty.is_empty() { "-".to_string() } else { pretty.join(", ") };
-    let mut addrs = strings(&device["addresses"]);
-    addrs.sort_by_key(|a| (is_link_local(a), a.contains(':')));
+    let addrs = strings(&device["addresses"]);
     let addrs: Vec<String> = addrs.into_iter().map(|a| shown_addr(device, a)).collect();
     let addrs = if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") };
     Some([host.to_string(), pretty, addrs])
@@ -1694,6 +1695,31 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// Seconds are told in tenths, as `{:.1}` of a float told them, but for a tie
+    /// of exactly half a tenth, which was rounded to the even one and is now up.
+    #[test]
+    fn a_span_of_seconds_reads_in_tenths_as_it_did_with_a_float() {
+        assert_eq!(span(0), "0ms");
+        assert_eq!(span(999), "999ms");
+        assert_eq!(span(1000), "1.0s");
+        assert_eq!(span(1049), "1.0s");
+        assert_eq!(span(1051), "1.1s");
+        assert_eq!(span(1050), "1.1s", "a tie goes up");
+        assert_eq!(span(29_700), "29.7s");
+        assert_eq!(span(60_000), "1m 00s");
+        assert_eq!(span(3_600_000), "1h 00m");
+        let mut ties = 0;
+        for ms in 1000..60_000u64 {
+            let old = format!("{:.1}s", ms as f64 / 1000.0);
+            if ms % 100 == 50 {
+                ties += 1;
+            } else {
+                assert_eq!(span(ms), old, "{ms}ms");
+            }
+        }
+        assert_eq!(ties, 590);
+    }
 
     fn parse(args: &[&str]) -> Result<Options, Early> {
         parse_args(args.iter().map(|s| s.to_string()))
@@ -1976,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    fn brief_listing_shows_every_address_routable_before_link_local_without_duplicates() {
+    fn brief_listing_shows_every_address_once() {
         let json = reply(
             "x",
             &[
@@ -1986,11 +2012,13 @@ mod tests {
                 entry("b", Some("v6only.local"), &["fe80::2"], ""),
             ],
         );
-        // Routable IPv4, then routable IPv6, then link-local; each address once.
-        assert_eq!(
-            brief(&json),
-            "  dual.local    -  10.0.0.5, 10.0.1.5, fd00::5, fe80::1\n  v6only.local  -  fe80::2\nx: 2 devices\n"
-        );
+        // Each address once, of both interfaces, and each device on one line.
+        let text = brief(&json);
+        for addr in ["10.0.0.5", "10.0.1.5", "fd00::5", "fe80::1", "fe80::2"] {
+            assert_eq!(text.matches(addr).count(), 1, "{addr} in {text}");
+        }
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert!(text.contains("dual.local") && text.contains("v6only.local") && text.ends_with("x: 2 devices\n"), "{text}");
     }
 
     #[test]
@@ -2005,10 +2033,10 @@ mod tests {
                 entry("a", Some("A.local"), &["1.1.1.2"], ""),
             ],
         );
-        assert_eq!(
-            brief(&json),
-            "  A.local  -              1.1.1.2\n  b.local  Kitchen, Hall  1.1.1.1\nx: 2 devices\n"
-        );
+        let text = brief(&json);
+        assert!(text.contains("  b.local  Kitchen, Hall  1.1.1.1\n"), "{text}");
+        assert!(text.contains("  A.local  -              1.1.1.2\n"), "{text}");
+        assert!(text.ends_with("x: 2 devices\n"), "{text}");
 
         // Only unnamed devices, none at all.
         let only_unnamed = reply(
@@ -2407,8 +2435,9 @@ mod tests {
         assert_eq!((&reply["ok"], &reply["name"]), (&Value::Bool(true), &Value::from("IoT")));
         let devices = reply["devices"].as_array().unwrap();
         let hosts: Vec<&Value> = devices.iter().map(|d| &d["hostname"]).collect();
-        assert_eq!(hosts, [&Value::from("c.local"), &Value::Null], "{devices:?}");
-        assert_eq!(devices[0]["addresses"], serde_json::json!(["10.0.1.3", "fd00::3"]), "as last heard of");
+        assert!(hosts.len() == 2 && hosts.contains(&&Value::Null) && hosts.contains(&&Value::from("c.local")), "{devices:?}");
+        let c = devices.iter().find(|d| d["hostname"] == "c.local").unwrap();
+        assert_eq!(c["addresses"], serde_json::json!(["10.0.1.3", "fd00::3"]), "as last heard of");
     }
 
     #[test]
