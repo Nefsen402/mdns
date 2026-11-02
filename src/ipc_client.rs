@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+#[path = "args.rs"]
+mod args;
 #[path = "timespan.rs"]
 mod timespan;
 
@@ -284,20 +286,16 @@ fn interval_span(value: &str) -> Result<Duration, String> {
 /// comes after `--`. Help, the version and usage errors come back as
 /// [`Early`].
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> {
-    use lexopt::prelude::*;
-
-    fn value_of(parser: &mut lexopt::Parser) -> Result<String, lexopt::Error> {
-        parser.value()?.string()
-    }
+    use args::Arg::{Long, Short, Value};
 
     let mut args: Vec<String> = args.into_iter().collect();
     let after_dashes = args.iter().position(|a| a == "--").map(|at| args.split_off(at).split_off(1));
-    let mut parser = lexopt::Parser::from_args(args);
+    let mut parser = args::Parser::new(args);
     let (mut socket, mut verbose, mut json, mut segmented, mut asked_help) = (PathBuf::from(DEFAULT_SOCKET), false, false, false, false);
     let mut command: Option<&CommandInfo> = None;
     let (mut words, mut query, mut interval, mut wait, mut foreground, mut log) = (Vec::new(), Vec::new(), None, None, false, None);
     let takes = |command: Option<&CommandInfo>, option: &str| command.is_some_and(|c| c.options.iter().any(|(o, _)| o.starts_with(option)));
-    let bad = |command, e: lexopt::Error| Early::usage(command, e.to_string());
+    let bad = |command, e: args::Error| Early::usage(command, e.to_string());
     loop {
         let arg = match parser.next() {
             Ok(Some(arg)) => arg,
@@ -306,34 +304,33 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
         };
         let invalid = |name: &str, value: &str, e: String| Early::usage(command, format!("invalid value '{value}' for '--{name}': {e}"));
         match arg {
-            Short('s') | Long("socket") => socket = PathBuf::from(value_of(&mut parser).map_err(|e| bad(command, e))?),
+            Short('s') | Long("socket") => socket = PathBuf::from(parser.value().map_err(|e| bad(command, e))?),
             Short('v') | Long("verbose") => verbose = true,
             Long("json") => json = true,
             Long("segmented-json") => segmented = true,
             Short('h') | Long("help") => asked_help = true,
             Short('V') | Long("version") => return Err(Early::Version),
             Long("query") if takes(command, "--query") => {
-                let v = value_of(&mut parser).map_err(|e| bad(command, e))?;
+                let v = parser.value().map_err(|e| bad(command, e))?;
                 query.push(service_type(&v).map_err(|e| invalid("query", &v, e))?);
             }
             Long("wait") if takes(command, "--wait") => {
-                let v = value_of(&mut parser).map_err(|e| bad(command, e))?;
+                let v = parser.value().map_err(|e| bad(command, e))?;
                 wait = Some(wait_span(&v).map_err(|e| invalid("wait", &v, e))?);
             }
             Long("interval") if takes(command, "--interval") => {
-                let v = value_of(&mut parser).map_err(|e| bad(command, e))?;
+                let v = parser.value().map_err(|e| bad(command, e))?;
                 interval = Some(interval_span(&v).map_err(|e| invalid("interval", &v, e))?);
             }
             Long("foreground") if takes(command, "--foreground") => foreground = true,
             Long("log") if takes(command, "--log") => {
-                let v = value_of(&mut parser).map_err(|e| bad(command, e))?;
+                let v = parser.value().map_err(|e| bad(command, e))?;
                 if v.is_empty() {
                     return Err(invalid("log", &v, "a file is needed".into()));
                 }
                 log = Some(PathBuf::from(v));
             }
             Value(word) => {
-                let word = word.string().map_err(|e| bad(command, e))?;
                 match command {
                     Some(_) => words.push(word),
                     None => match COMMANDS.iter().find(|c| c.name == word) {
@@ -1340,7 +1337,8 @@ fn table(rows: &[Vec<String>]) -> String {
 }
 
 fn main() -> ExitCode {
-    let opts = match parse_args(std::env::args().skip(1)) {
+    let parsed = args::from_env().map_err(|e| Early::usage(None, e.to_string())).and_then(parse_args);
+    let opts = match parsed {
         Ok(opts) => opts,
         // Help and version to stdout with 0, usage errors to stderr with 2.
         Err(early) => return early.exit(),

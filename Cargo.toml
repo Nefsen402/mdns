@@ -13,7 +13,6 @@ path = "src/ipc_client.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-lexopt = "0.3.2"
 libc = "0.2.191"
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 socket2 = { version = "0.6.5", features = ["all"] }
