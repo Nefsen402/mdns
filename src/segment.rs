@@ -34,7 +34,9 @@ use crate::parser::{Message, Question, RData, Record};
 use crate::prelude::*;
 
 mod devices;
-use devices::Devices;
+mod neighbours;
+use devices::{Devices, Indexed};
+use neighbours::NeighbourTable;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
 /// on a segment that re-announces what has not changed.
@@ -140,6 +142,7 @@ enum Key {
 }
 
 /// A discovered device, and when to drop it or ask it again.
+#[derive(Debug)]
 struct Entry {
     device: Device,
     /// The address of the packet it was first heard of in.
@@ -451,9 +454,6 @@ fn refresh_gap(before: Duration) -> Duration {
 #[derive(Default)]
 struct State {
     discovered: Devices,
-    /// Which discovered device each address belongs to, so a packet that does
-    /// not name its sender can still be attributed.
-    by_addr: HashMap<IpAddr, Key>,
     /// Devices we announce on this segment on behalf of somewhere else, by
     /// lowercase hostname.
     manual: HashMap<String, Manual>,
@@ -469,11 +469,6 @@ struct State {
     next_routine: Option<Instant>,
     /// How to send, over each family the segment has a socket of.
     outbound: Vec<Outbound>,
-    /// The discovered devices with a service whose host is not known yet (a
-    /// bare browse answer): the ones to look at when it is, rather than all
-    /// of them. Kept up to date by [`State::track_unresolved`] for the
-    /// devices a packet touched, the only ones whose services change.
-    unresolved: HashSet<Key>,
     /// Service types devices on this segment have said they offer, learned
     /// from answers to the type enumeration query.
     types: BTreeSet<String>,
@@ -497,13 +492,23 @@ struct State {
     forwarded: HashMap<(String, u16), Instant>,
     /// The kernel's neighbour table for the interface: each address it has a
     /// link-layer address for, and that link-layer address.
-    neighbours: HashMap<IpAddr, Vec<u8>>,
+    neighbours: NeighbourTable,
     /// The networks the interface is on: of the neighbour table, only
     /// addresses in one of them are learned.
     prefixes: Vec<Prefix>,
 }
 
 impl State {
+    /// Whether the tables that find things are what the devices and the
+    /// neighbour table are, for tests to ask after anything that changes them.
+    #[cfg(test)]
+    fn check(&self) {
+        if CHECKING.with(|checking| checking.get()) && self.discovered.len() <= 1100 {
+            self.discovered.check();
+            self.neighbours.check();
+        }
+    }
+
     /// Bring the addresses learned from the neighbour table up to date for
     /// the devices of `keys`, noting in `touched` those that change: the
     /// routable addresses listed under the link-layer address of one it
@@ -518,13 +523,14 @@ impl State {
             let Some(entry) = self.discovered.get(key) else { continue };
             // Its link-layer address, by any address it announced.
             let announced = entry.device.addresses.iter().filter(|a| a.origin == Origin::Announced);
-            let macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
+            let mut macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
+            macs.sort_unstable();
+            macs.dedup();
             let on_link = |ip: &IpAddr| self.prefixes.iter().any(|p| p.contains(ip));
-            let learned: Vec<IpAddr> = self
-                .neighbours
+            let learned: Vec<IpAddr> = macs
                 .iter()
-                .filter(|(ip, mac)| !is_link_local(ip) && on_link(ip) && macs.contains(mac))
-                .map(|(ip, _)| *ip)
+                .flat_map(|mac| self.neighbours.with_mac(mac))
+                .filter(|ip| !is_link_local(ip) && on_link(ip))
                 .collect();
 
             let unresolved = entry.device.link_local().find(|ll| ll.is_ipv6() && !self.neighbours.contains_key(ll));
@@ -538,24 +544,26 @@ impl State {
             let mut device = self.discovered[key].device.clone();
             if device.take_neighbours(&learned, self.max_addrs) {
                 touched.note(&self.discovered, key);
-                // A packet from an address it no longer has is not its.
-                self.by_addr.retain(|ip, k| k != key || device.has_addr(ip));
-                for ip in device.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip) {
-                    self.by_addr.entry(ip).or_insert_with(|| key.clone());
-                }
                 self.discovered.get_mut(key).expect("looked up above").device = device;
             }
         }
     }
 
     /// Bring the learned addresses of every device with an address up to
-    /// date, as the neighbour table or the interface's networks changed, and
-    /// tell of those that changed.
+    /// date, as the interface's networks changed, and tell of those that
+    /// changed.
     fn relearn_neighbours(&mut self, now: Instant) {
         let keys: Vec<Key> =
             self.discovered.iter().filter(|e| !e.device.addresses.is_empty()).map(Entry::key).collect();
+        self.relearn(&keys, now);
+    }
+
+    /// Bring the learned addresses of the devices of `keys` up to date, and
+    /// tell of those that changed.
+    fn relearn(&mut self, keys: &[Key], now: Instant) {
         let mut touched = Touched::default();
-        self.learn_neighbours(&keys, &mut touched, now);
+        self.learn_neighbours(keys, &mut touched, now);
+        touched.sync(&mut self.discovered);
         let events = touched.events(&self.discovered);
         if !events.is_empty() {
             self.settle_all(now);
@@ -563,6 +571,8 @@ impl State {
         for event in events {
             self.notify(event);
         }
+        #[cfg(test)]
+        self.check();
     }
 
     fn notify(&mut self, event: Event) {
@@ -641,38 +651,6 @@ impl State {
             // To the nearest second, a half up.
             Duration::from_secs(left.saturating_add(Duration::from_millis(500)).as_secs())
         })
-    }
-
-    /// Drop a discovered device and the addresses that pointed at it.
-    fn forget(&mut self, key: &Key) -> Option<Entry> {
-        self.by_addr.retain(|_, k| k != key);
-        self.unresolved.remove(key);
-        self.discovered.remove(key)
-    }
-
-    /// Drop discovered devices, and the addresses that pointed at them: as
-    /// [`State::forget`] for each, but passing over the addresses once, not
-    /// once for each device, which many going together would make quadratic.
-    fn forget_all(&mut self, keys: &[Key]) -> Vec<Entry> {
-        let gone: HashSet<&Key> = keys.iter().collect();
-        self.by_addr.retain(|_, k| !gone.contains(k));
-        self.unresolved.retain(|k| !gone.contains(k));
-        keys.iter().filter_map(|key| self.discovered.remove(key)).collect()
-    }
-
-    /// Note which of `keys` have a service whose host is not known yet, from
-    /// what they have now: those are what [`State::unresolved`] must hold.
-    fn track_unresolved(&mut self, keys: &[Key]) {
-        for key in keys {
-            match self.discovered.get(key) {
-                Some(entry) if entry.device.services.iter().any(|s| s.target.is_none()) => {
-                    self.unresolved.insert(key.clone());
-                }
-                _ => {
-                    self.unresolved.remove(key);
-                }
-            }
-        }
     }
 
     /// Whether a new host may be learned of from `src`: the segment has
@@ -1115,8 +1093,10 @@ impl Segment {
     pub fn forget_discovered(&self) {
         let mut state = self.state.borrow_mut();
         let keys: Vec<Key> = state.discovered.iter().map(Entry::key).collect();
-        for entry in state.forget_all(&keys) {
-            state.notify(Event::Removed(entry.device));
+        for key in keys {
+            if let Some(entry) = state.discovered.remove(&key) {
+                state.notify(Event::Removed(entry.device));
+            }
         }
         state.settle_all(Instant::now());
     }
@@ -1244,7 +1224,7 @@ impl Segment {
                 fresh.push(q);
             }
         }
-        let known = |q: &Question| state.discovered.iter().flat_map(|e| e.known_answers(q, now)).collect();
+        let known = |q: &Question| state.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
         ask(&state.outbound, &Device::forward_queries(fresh, known, state.max_packet))
     }
 
@@ -1294,7 +1274,7 @@ impl Segment {
         if !leaving.is_empty() {
             for key in leaving.iter().chain([&Key::Source(src)]) {
                 touched.note(&state.discovered, key);
-                state.forget(key);
+                state.discovered.remove(key);
             }
             let events = touched.events(&state.discovered);
             if !events.is_empty() {
@@ -1303,6 +1283,8 @@ impl Segment {
             for event in events {
                 state.notify(event);
             }
+            #[cfg(test)]
+            state.check();
             return;
         }
 
@@ -1378,9 +1360,6 @@ impl Segment {
             entry.device.learn(report, &addrs, max_addrs, max_services);
             entry.renew_addrs(&addrs, &report.ttls, now, floor);
 
-            for addr in addrs {
-                state.by_addr.insert(addr, key.clone());
-            }
             resolved.extend(report.resolved().map(|instance| (key.clone(), instance.to_string())));
             if is_sender && sender.is_none() {
                 sender = Some(key);
@@ -1394,7 +1373,10 @@ impl Segment {
         // One known only by an address no device can be reached at is not
         // known at all.
         let usable = is_usable(src);
-        let key = sender.or_else(|| state.by_addr.get(&src).cloned()).or_else(|| usable.then_some(Key::Source(src)));
+        touched.sync(&mut state.discovered);
+        let key = sender
+            .or_else(|| state.discovered.holder_of(&src).map(Entry::key))
+            .or_else(|| usable.then_some(Key::Source(src)));
         let room = key.as_ref().is_some_and(|k| state.discovered.contains_key(k)) || state.discovered.len() < state.max_devices;
         if let Some(key) = key.filter(|_| (reports.is_empty() || !rest.is_empty()) && room) {
             touched.note(&state.discovered, &key);
@@ -1408,40 +1390,33 @@ impl Segment {
                 entry.renew_addrs(&[src], &HashMap::new(), now, floor);
             }
             entry.device.learn_records(rest.iter().copied(), max_services);
-            if usable {
-                state.by_addr.insert(src, key);
-            }
         }
 
         // An instance that has now been resolved to its host no longer needs
         // the unresolved copy learned from a bare browse answer.
-        state.track_unresolved(&touched.order);
+        touched.sync(&mut state.discovered);
         for (owner, instance) in resolved {
             let others: Vec<Key> = state
-                .unresolved
-                .iter()
-                .filter(|k| {
-                    **k != owner
-                        && state
-                            .discovered
-                            .get(*k)
-                            .is_some_and(|e| e.device.service(&instance).is_some_and(|s| s.target.is_none()))
-                })
-                .cloned()
+                .discovered
+                .with_unresolved()
+                .filter(|e| e.device.service(&instance).is_some_and(|s| s.target.is_none()))
+                .map(Entry::key)
+                .filter(|key| *key != owner)
                 .collect();
             for k in others {
                 touched.note(&state.discovered, &k);
                 if let Some(e) = state.discovered.get_mut(&k) {
                     e.device.forget_service(&instance);
                 }
-                state.track_unresolved(core::slice::from_ref(&k));
             }
+            touched.sync(&mut state.discovered);
         }
 
         // What the neighbour table knows of the devices just heard of.
         let heard = touched.order.clone();
         state.learn_neighbours(&heard, &mut touched, now);
 
+        touched.sync(&mut state.discovered);
         let events = touched.events(&state.discovered);
         if !events.is_empty() {
             state.settle_all(now);
@@ -1449,6 +1424,8 @@ impl Segment {
         for event in events {
             state.notify(event);
         }
+        #[cfg(test)]
+        state.check();
     }
 
     /// Take the networks the interface is on, as its addresses change: of the
@@ -1472,12 +1449,28 @@ impl Segment {
     pub fn neighbour(&self, ip: IpAddr, mac: Option<Vec<u8>>) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let changed = match mac {
-            Some(mac) => state.neighbours.insert(ip, mac.clone()).as_ref() != Some(&mac),
+        let was = state.neighbours.get(&ip).cloned();
+        let changed = match &mac {
+            Some(mac) => state.neighbours.insert(ip, mac.clone()).as_ref() != Some(mac),
             None => state.neighbours.remove(&ip).is_some(),
         };
         if changed {
-            state.relearn_neighbours(Instant::now());
+            // What it learns of a device follows the addresses that share a
+            // link-layer address with one it announced: the devices to bring up
+            // to date are those with the address, or with one at the link-layer
+            // address it was at, or is at now.
+            let mut ips = vec![ip];
+            for mac in was.iter().chain(&mac) {
+                ips.extend(state.neighbours.with_mac(mac));
+            }
+            let mut seen = HashSet::new();
+            let keys: Vec<Key> = ips
+                .iter()
+                .flat_map(|ip| state.discovered.with_addr(ip))
+                .map(Entry::key)
+                .filter(|key| seen.insert(key.clone()))
+                .collect();
+            state.relearn(&keys, Instant::now());
         }
     }
 
@@ -1635,7 +1628,7 @@ impl Segment {
         }
         let now = Instant::now();
         let devices: Vec<Device> = state.discovered.iter().map(|e| e.device.clone()).collect();
-        let known = |q: &Question| state.discovered.iter().flat_map(|e| e.known_answers(q, now)).collect();
+        let known = |q: &Question| state.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
         ask(&state.outbound, &Device::type_queries(&devices, kinds, known, state.max_packet))
     }
 
@@ -1685,20 +1678,28 @@ impl Segment {
         let state = &mut *guard;
         let stale: Vec<Key> = state.discovered.iter().filter(|e| e.expires <= now).map(Entry::key).collect();
         // Of the others, the addresses that ran out on their own.
+        let due: Vec<Key> = state
+            .discovered
+            .iter()
+            .filter(|e| e.expires > now && e.addr_expires.values().any(|at| *at <= now))
+            .map(Entry::key)
+            .collect();
         let mut lost = Vec::new();
-        for entry in state.discovered.iter_mut().filter(|e| e.expires > now) {
-            if entry.expire_addrs(now) {
-                lost.push(entry.key());
+        for key in due {
+            let was = state.discovered.indexed_of(&key).expect("found a moment ago");
+            if state.discovered.get_mut(&key).is_some_and(|entry| entry.expire_addrs(now)) {
+                state.discovered.reindex(&key, &was);
+                lost.push(key);
             }
         }
         if stale.is_empty() && lost.is_empty() {
             return;
         }
-        for entry in state.forget_all(&stale) {
-            state.notify(Event::Removed(entry.device));
+        for key in &stale {
+            if let Some(entry) = state.discovered.remove(key) {
+                state.notify(Event::Removed(entry.device));
+            }
         }
-        let discovered = &state.discovered;
-        state.by_addr.retain(|addr, key| matches!(key, Key::Source(_)) || discovered.get(key).is_some_and(|e| e.device.has_addr(addr)));
         for key in lost {
             if let Some(device) = state.discovered.get(&key).map(|e| e.device.clone()) {
                 state.notify(Event::Updated(device));
@@ -1707,7 +1708,16 @@ impl Segment {
         // What they had here may be shown again. `now` may be ahead of the
         // clock, but what is announced is announced now.
         state.settle_all(Instant::now());
+        #[cfg(test)]
+        state.check();
     }
+}
+
+// Whether tests check the tables that find things after each change; the
+// measurement of what a full segment costs turns it off.
+#[cfg(test)]
+thread_local! {
+    static CHECKING: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
 }
 
 fn host_key(name: &str) -> Key {
@@ -1720,18 +1730,32 @@ fn host_key(name: &str) -> Key {
 struct Touched {
     order: Vec<Key>,
     before: HashMap<Key, Option<Device>>,
+    /// What the tables that find devices hold of each, as of when they were
+    /// last made to follow it: what it was before, until then.
+    indexed: HashMap<Key, Indexed>,
 }
 
 impl Touched {
+    /// A device is about to be changed (or was made, or is to go): say so
+    /// before it is, once.
     fn note(&mut self, discovered: &Devices, key: &Key) {
         if !self.before.contains_key(key) {
             self.order.push(key.clone());
             self.before.insert(key.clone(), discovered.get(key).map(|e| e.device.clone()));
+            self.indexed.insert(key.clone(), discovered.indexed_of(key).unwrap_or_default());
+        }
+    }
+
+    /// Have the tables that find devices follow the changes made so far.
+    fn sync(&mut self, discovered: &mut Devices) {
+        for key in &self.order {
+            let was = self.indexed.get(key).cloned().unwrap_or_default();
+            self.indexed.insert(key.clone(), discovered.reindex(key, &was));
         }
     }
 
     fn events(self, discovered: &Devices) -> Vec<Event> {
-        let Touched { order, mut before } = self;
+        let Touched { order, mut before, .. } = self;
         let mut events = Vec::new();
         for key in order {
             let was = before.remove(&key).flatten();
@@ -2525,7 +2549,7 @@ mod tests {
         // A mere query from it makes no device of it.
         seg.handle(sa("0.0.0.0"), &query("tv.local", rtype::A, vec![])).unwrap();
         assert_eq!(seg.devices().len(), 1);
-        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("0.0.0.0")));
+        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("0.0.0.0")).is_some());
     }
 
     const MAC: [u8; 6] = [0x04, 0x09, 0x86, 0x43, 0xe3, 0xf6];
@@ -2559,12 +2583,12 @@ mod tests {
         assert_eq!(learned(&seg), [ip("2001:db8:2::73"), ip("fd00:0:2::73")]);
         assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.has_addr(&ip("2001:db8:2::73"))));
         // A packet from a learned address is the device's.
-        assert_eq!(seg.state.borrow_mut().by_addr.get(&ip("2001:db8:2::73")), Some(&host_key("speakers.local")));
+        assert_eq!(seg.state.borrow_mut().discovered.holder_of(&ip("2001:db8:2::73")).map(Entry::key), Some(host_key("speakers.local")));
 
         // An entry that goes takes its address with it.
         seg.neighbour(ip("2001:db8:2::73"), None);
         assert_eq!(learned(&seg), [ip("fd00:0:2::73")]);
-        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("2001:db8:2::73")));
+        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("2001:db8:2::73")).is_some());
         assert!(matches!(events.try_recv(), Ok(Event::Updated(_))));
         // The same entry again changes nothing, and says nothing.
         seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
@@ -2602,12 +2626,12 @@ mod tests {
         seg.neighbour(ip("2001:db8:1::73"), Some(MAC.to_vec())); // the old prefix
         hear(&seg, "10.0.2.73", vec![a_record("tv.local", "10.0.2.73"), aaaa("tv.local", "fe80::73")]);
         assert_eq!(learned(&seg), [ip("2001:db8:2::73")]);
-        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("2001:db8:1::73")));
+        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("2001:db8:1::73")).is_some());
 
         // The interface moves to the other prefix: so do its devices.
         seg.set_prefixes(vec![prefix("10.0.2.0/24"), prefix("2001:db8:1::/64")]);
         assert_eq!(learned(&seg), [ip("2001:db8:1::73")]);
-        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("2001:db8:2::73")));
+        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("2001:db8:2::73")).is_some());
         // With no network known, nothing is.
         seg.set_prefixes(vec![]);
         assert_eq!(learned(&seg), Vec::<IpAddr>::new());
@@ -2677,7 +2701,7 @@ mod tests {
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still there");
         assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("fd00::7")]);
         assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.addrs().eq([ip("fd00::7")])));
-        assert!(!seg.state.borrow_mut().by_addr.contains_key(&ip("10.0.1.7")), "nor found by it");
+        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("10.0.1.7")).is_some(), "nor found by it");
     }
 
     /// A device whose services live long is still asked again before its
@@ -3638,7 +3662,7 @@ mod tests {
         let seg = Segment::new("test", &[Family::V4]);
         hear(&seg, "10.0.0.1", vec![ptr("_x._tcp.local", "A._x._tcp.local")]);
         hear(&seg, "10.0.0.5", vec![ptr("_x._tcp.local", "C._x._tcp.local")]);
-        assert_eq!(seg.state.borrow().unresolved.len(), 2);
+        assert_eq!(seg.state.borrow().discovered.with_unresolved().count(), 2);
 
         // The host announces itself, and the first sender's copy goes; the other's stays.
         hear(&seg, "10.0.0.2", vec![srv("A._x._tcp.local", 1, "a.local"), a_record("a.local", "10.0.0.2")]);
@@ -3647,15 +3671,15 @@ mod tests {
         let by_addr = |addr: &str| devices.iter().find(|d| d.hostname.is_none() && v4(d) == Some(ip(addr))).unwrap().clone();
         assert!(by_addr("10.0.0.1").services.is_empty(), "{:?}", by_addr("10.0.0.1"));
         assert_eq!(by_addr("10.0.0.5").services.len(), 1);
-        assert_eq!(seg.state.borrow().unresolved.len(), 1, "the one that has none is no longer listed");
+        assert_eq!(seg.state.borrow().discovered.with_unresolved().count(), 1, "the one that has none is no longer listed");
 
         // One that goes is not kept listed.
         seg.expire(Instant::now() + Duration::from_secs(2 * 3600));
         assert!(seg.devices().is_empty());
-        assert!(seg.state.borrow().unresolved.is_empty());
+        assert_eq!(seg.state.borrow().discovered.with_unresolved().count(), 0);
         hear(&seg, "10.0.0.5", vec![ptr("_x._tcp.local", "C._x._tcp.local")]);
         seg.forget_discovered();
-        assert!(seg.state.borrow().unresolved.is_empty() && seg.state.borrow().by_addr.is_empty());
+        assert!(seg.state.borrow().discovered.with_unresolved().count() == 0 && seg.state.borrow().discovered.addrs_held() == 0);
         seg.state.borrow().discovered.check();
     }
 
@@ -3682,7 +3706,7 @@ mod tests {
         assert_eq!(left.len(), 1, "{left:?}");
         assert_eq!(left[0].hostname.as_deref(), Some(keep));
         assert!(matches!(seg.take_events().last(), Some(Event::Updated(_) | Event::Removed(_))));
-        assert_eq!(seg.state.borrow().by_addr.len(), 1, "only the survivor's address is still attributed");
+        assert_eq!(seg.state.borrow().discovered.addrs_held(), 1, "only the survivor's address is still attributed");
         seg.state.borrow().discovered.check();
     }
 
@@ -4052,6 +4076,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement, not a check"]
     fn scale_of_what_a_full_segment_costs() {
+        CHECKING.with(|checking| checking.set(false));
         println!(
             "{:>7} {:>9} {:>9} {:>8} {:>11} {:>10} {:>10} {:>11} {:>12} {:>9}",
             "devices", "heap MiB", "bytes/dev", "blocks/d", "next_due us", "upkeep us", "handle us", "forward us", "neighbour us", "expire ms"
@@ -4080,6 +4105,12 @@ mod tests {
                 asked += 1;
                 seg.query_question(&[question(&format!("_t{asked}._tcp.local"), rtype::PTR)]).unwrap();
             });
+            // The one question that every device with a service answers: which types
+            // there are. Once, as it is asked at most once a second.
+            let start = std::time::Instant::now();
+            seg.query_question(&[question("_services._dns-sd._udp.local", rtype::PTR)]).unwrap();
+            let enumeration = start.elapsed().as_secs_f64() * 1e6;
+            println!("   asking for the types there are: {enumeration:.0} us");
             // The kernel's neighbour table changing: an address at another link-layer address.
             let mut moved = 0u8;
             let neighbour = micros(200, || {

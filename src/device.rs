@@ -64,6 +64,9 @@ const KNOWN_SUBTYPES: [&str; 4] = [
 /// What one device may have, however much it announces: more would be a
 /// flood, not a device. (Its services are limited by `MaxServices=`.)
 const MAX_SUBTYPES: usize = 16;
+
+/// The name that DNS-SD service type enumeration asks for (RFC 6763 section 9).
+const SERVICE_ENUMERATION: &str = "_services._dns-sd._udp.local";
 const MAX_REVERSE: usize = 8;
 
 /// A reflected device is never announced for less than this, however short a
@@ -729,6 +732,37 @@ impl Device {
         device
     }
 
+    /// The names its [announcement](Device::announcement) has records under,
+    /// in the case it has them: the hostname, the reverse names it announced,
+    /// and for each service its type, its instance and its subtypes, and the
+    /// type enumeration if it has any. None if it has no hostname, and so no
+    /// records. A name may come twice.
+    pub fn for_each_name(&self, mut f: impl FnMut(&str)) {
+        let Some(host) = &self.hostname else { return };
+        f(host);
+        for addr in self.addrs().filter(|addr| self.reverse.contains(addr)) {
+            f(&parser::reverse_name(addr));
+        }
+        for svc in &self.services {
+            f(&svc.kind);
+            f(&svc.instance);
+            for sub in &svc.subtypes {
+                f(sub);
+            }
+        }
+        if !self.services.is_empty() {
+            f(SERVICE_ENUMERATION);
+        }
+    }
+
+    /// Whether its announcement has records under `name`, ignoring case:
+    /// whether it can answer a question asking for that name.
+    pub fn has_name(&self, name: &str) -> bool {
+        let mut found = false;
+        self.for_each_name(|own| found |= own.eq_ignore_ascii_case(name));
+        found
+    }
+
     /// The records that announce it. A TTL of 0 turns them into goodbyes.
     /// Callers must have checked that it has a hostname.
     pub fn announcement(&self, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
@@ -745,7 +779,7 @@ impl Device {
         let kinds: BTreeMap<String, &String> =
             self.services.iter().map(|s| (s.kind.to_ascii_lowercase(), &s.kind)).collect();
         for kind in kinds.into_values() {
-            records.push(record("_services._dns-sd._udp.local".into(), false, other_ttl, RData::Ptr(kind.clone())));
+            records.push(record(SERVICE_ENUMERATION.into(), false, other_ttl, RData::Ptr(kind.clone())));
         }
         records
     }
@@ -1927,6 +1961,34 @@ mod tests {
         assert!(!knows(&device, "printer.local", rtype::A));
         device.nsec = Some(vec![rtype::A]);
         assert!(knows(&device, "tv.local", rtype::AAAA), "it said it has none");
+    }
+
+    /// The names a device is indexed by are those its announcement has records
+    /// under, no more and no fewer: a device is asked about nothing else.
+    #[test]
+    fn a_device_has_the_names_of_the_records_it_announces() {
+        use std::collections::BTreeSet;
+        let lower = |names: &mut BTreeSet<String>, name: &str| {
+            names.insert(name.to_ascii_lowercase());
+        };
+        let mut device = tv("10.0.1.9", &["TV", "Other"]);
+        device.add_addrs(&[ip("fd00::9")]);
+        device.reverse = vec![ip("10.0.1.9"), ip("fd00::9")];
+        device.services[0].subtypes = vec!["_printer._sub._http._tcp.local".into()];
+        device.nsec = Some(vec![rtype::A]);
+        device.services[1].kind = "_Other._tcp.local".into();
+        for device in [device.clone(), Device { services: vec![], ..device.clone() }, Device { hostname: None, ..device }] {
+            let (mut own, mut announced) = (BTreeSet::new(), BTreeSet::new());
+            device.for_each_name(|name| lower(&mut own, name));
+            if device.hostname.is_some() {
+                for rec in device.announcement(120, 120) {
+                    lower(&mut announced, &rec.name);
+                }
+            }
+            assert_eq!(own, announced);
+            assert!(own.iter().all(|name| device.has_name(&name.to_ascii_uppercase())));
+            assert!(!device.has_name("nothing.local"));
+        }
     }
 
     #[test]
