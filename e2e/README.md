@@ -44,19 +44,27 @@ waits a second and a half: keep those few.
 
 ## Coverage
 
-`coverage.py` measures what the unit tests and these tests cover together: it
-builds the daemon and `mdnsctl` with coverage instrumentation, runs the unit
-tests and then this suite against the instrumented binaries (the profile is
-written as each daemon exits), and merges them.
+`coverage.py` measures what the unit tests and these tests cover together. A
+profile says what ran of the binary that wrote it, so the binaries are built
+once, with coverage instrumentation, and everything else runs those:
 
 ```
 rustup component add llvm-tools-preview
-python3 e2e/coverage.py
+python3 e2e/coverage.py                                   # all of it, here
+
+python3 e2e/coverage.py build  --out bin                  # or one step at a time
+python3 e2e/coverage.py unit   --binaries bin --out prof-unit
+python3 e2e/coverage.py e2e    --binaries bin --out prof-e2e
+python3 e2e/coverage.py report --binaries bin --profiles prof-unit prof-e2e --out report
 ```
 
-It writes `target/coverage/report/`: `summary.md` (a table by file),
-`summary.json`, `lcov.info`, and `html/`, the source line by line. With
-`--baseline summary.json` the table says how the figures moved. CI runs it as
-the `coverage` job: the table is in the job's summary, on a pull request in a
+`report` merges the profiles of any number of runs, and writes `summary.md` (a
+table by file), `summary.json`, `lcov.info`, and `html/`, the source line by
+line. With `--baseline summary.json` the table says how the figures moved.
+Report from a checkout of the source that was built, at the same path.
+
+CI runs the steps as jobs: `build` once, `test` and `e2e` in parallel on its
+binaries, each keeping its profile, then `coverage`, which runs no test but
+merges the profiles. The table is in the job's summary, on a pull request in a
 comment that is kept up to date and compares with the last run on `master`, and
 the report is an artifact.

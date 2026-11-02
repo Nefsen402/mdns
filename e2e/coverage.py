@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """Measure what the unit tests and the end-to-end tests cover of the daemon.
 
-    coverage.py [--out DIR] [--baseline SUMMARY.json] [--no-slow]
+The steps, which CI runs as jobs of their own, one after another:
 
-Builds the daemon and `mdnsctl` with coverage instrumentation, runs the unit
-tests and then the end-to-end tests (e2e.py) against the instrumented
-binaries, merges what they recorded, and writes to DIR (default
-target/coverage/report):
+    coverage.py build  --out BIN                  build, with instrumentation
+    coverage.py unit   --binaries BIN --out PROF  run the unit tests from it
+    coverage.py e2e    --binaries BIN --out PROF  run the end-to-end tests on it
+                       [--logs DIR] [--no-slow]
+    coverage.py report --binaries BIN --profiles PROF... --out REPORT
+                                                  merge the profiles, report
+
+`build` makes the daemon, `mdnsctl` and the unit tests' executables, once, for
+everything after it to use: what a profile says is about the binary that wrote
+it. `unit` and `e2e` run those, and keep what they recorded. `report` merges
+the profiles of any number of runs, and writes to REPORT:
 
     summary.md    a table by file, to read; with --baseline, how it moved
     summary.json  the same figures, to compare against later
     lcov.info     for tools that read lcov
     html/         the source, line by line
 
-Needs the LLVM tools of the compiler: `rustup component add llvm-tools-preview`
-(or `llvm-cov` and `llvm-profdata` on the PATH, or LLVM_COV and LLVM_PROFDATA).
-In a GitHub Actions job, the summary is also written to the job's summary.
+With no step, `all` does them in turn here, in target/coverage.
+
+Needs the LLVM tools of the compiler to report: `rustup component add
+llvm-tools-preview` (or `llvm-cov` and `llvm-profdata` on the PATH, or LLVM_COV
+and LLVM_PROFDATA). Report from a checkout of the source that was built, at the
+same path: the source is read from where it was when it was built. In a GitHub
+Actions job, the summary is also written to the job's summary.
 
 The test code in each file counts, as covered: read the figures as a little
 flattering.
@@ -58,24 +69,23 @@ def pct(x):
     return f"{x:.1f}%"
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--out", default=os.path.join(ROOT, "target", "coverage", "report"))
-    p.add_argument("--baseline", help="a summary.json of before, to say how the figures moved")
-    p.add_argument("--no-slow", action="store_true", help="leave out the end-to-end tests that wait on a timer")
-    args = p.parse_args()
+def absolute(path):
+    return os.path.abspath(path)
 
-    profdata, cov = llvm_tool("llvm-profdata"), llvm_tool("llvm-cov")
+
+def make_executable(paths):
+    # An artifact does not keep what a file may do.
+    for p in paths:
+        os.chmod(p, os.stat(p).st_mode | 0o111)
+
+
+# ---------------------------------------------------------------- the steps
+
+def build(out):
+    """The binaries everything else uses, built to record what they run."""
     target = os.path.join(ROOT, "target", "coverage")
-    prof = os.path.join(target, "prof")
-    shutil.rmtree(prof, ignore_errors=True)
-    os.makedirs(prof)
-    env = dict(os.environ)
-    env["CARGO_TARGET_DIR"] = target
+    env = dict(os.environ, CARGO_TARGET_DIR=target)
     env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -C instrument-coverage").strip()
-    env["LLVM_PROFILE_FILE"] = os.path.join(prof, "%p-%m.profraw")
-
-    # The daemon and the client, and the unit tests of each.
     run(["cargo", "build", "--locked"], env)
     built = subprocess.run(
         ["cargo", "test", "--locked", "--no-run", "--message-format=json"], cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True, check=True
@@ -88,31 +98,62 @@ def main():
             continue
         if m.get("reason") == "compiler-artifact" and m.get("executable") and m["profile"]["test"]:
             tests.append(m["executable"])
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(os.path.join(out, "tests"))
+    for name in ("mdnsd", "mdnsctl"):
+        shutil.copy(os.path.join(target, "debug", name), os.path.join(out, name))
     for t in tests:
-        run([t], env)
+        shutil.copy(t, os.path.join(out, "tests", os.path.basename(t)))
+    print(f"built {len(tests)} test executables and the binaries in {out}")
 
-    # The end-to-end tests, against the instrumented binaries: the profile is
-    # written as each daemon exits, and the environment goes on to it.
-    mdnsd, mdnsctl = os.path.join(target, "debug", "mdnsd"), os.path.join(target, "debug", "mdnsctl")
-    e2e = [sys.executable, os.path.join(ROOT, "e2e", "e2e.py"), "--ctl", mdnsctl, mdnsd]
-    if not args.no_slow:
-        e2e.insert(2, "--slow")
+
+def profile_env(out):
+    os.makedirs(out, exist_ok=True)
+    return dict(os.environ, LLVM_PROFILE_FILE=os.path.join(absolute(out), "%p-%m.profraw"))
+
+
+def unit(binaries, out):
+    tests = sorted(glob.glob(os.path.join(binaries, "tests", "*")))
+    if not tests:
+        sys.exit(f"no unit tests in {binaries}/tests: coverage.py build first")
+    make_executable(tests)
+    env = profile_env(out)
+    for t in tests:
+        run([absolute(t)], env)
+
+
+def e2e(binaries, out, slow=True, logs=None):
+    mdnsd, mdnsctl = absolute(os.path.join(binaries, "mdnsd")), absolute(os.path.join(binaries, "mdnsctl"))
+    make_executable([mdnsd, mdnsctl])
+    cmd = [sys.executable, os.path.join(ROOT, "e2e", "e2e.py"), "--ctl", mdnsctl, mdnsd]
+    if slow:
+        cmd.insert(2, "--slow")
+    if logs:
+        cmd[2:2] = ["--logs", absolute(logs)]
     # Where user namespaces are forbidden, as root.
     unshare = ["unshare", "-n"] if os.geteuid() == 0 else ["unshare", "-r", "-n"]
-    if subprocess.run(unshare + ["true"], stderr=subprocess.DEVNULL).returncode and os.geteuid() != 0:
-        e2e = ["sudo", "-E"] + e2e
-    run(e2e, env)
+    if os.geteuid() != 0 and subprocess.run(unshare + ["true"], stderr=subprocess.DEVNULL).returncode:
+        cmd = ["sudo", "-E"] + cmd
+    # The profile is written as each daemon exits, and the environment goes on to it.
+    run(cmd, profile_env(out))
 
-    # Merge, and report on the binaries the tests ran and the ones they ran.
-    merged = os.path.join(target, "all.profdata")
-    run([profdata, "merge", "-sparse", *glob.glob(os.path.join(prof, "*.profraw")), "-o", merged])
+
+def report(binaries, profiles, out, baseline_path=None):
+    profdata, cov = llvm_tool("llvm-profdata"), llvm_tool("llvm-cov")
+    raw = [f for d in profiles for f in glob.glob(os.path.join(d, "*.profraw"))]
+    if not raw:
+        sys.exit("no profiles to report on: " + ", ".join(profiles))
+    exes = [os.path.join(binaries, n) for n in ("mdnsd", "mdnsctl")] + sorted(glob.glob(os.path.join(binaries, "tests", "*")))
+    merged = os.path.join(os.path.dirname(absolute(out)), "all.profdata")
+    os.makedirs(os.path.dirname(merged), exist_ok=True)
+    run([profdata, "merge", "-sparse", *raw, "-o", merged])
     objects = []
-    for exe in tests + [mdnsd, mdnsctl]:
-        objects += [exe] if not objects else ["-object", exe]
+    for exe in exes:
+        objects += [absolute(exe)] if not objects else ["-object", absolute(exe)]
     common = [f"--instr-profile={merged}", f"--ignore-filename-regex={IGNORE}", *objects]
 
-    shutil.rmtree(args.out, ignore_errors=True)
-    os.makedirs(args.out)
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
     exported = subprocess.run([cov, "export", "-summary-only", *common], cwd=ROOT, stdout=subprocess.PIPE, text=True, check=True).stdout
     data = json.loads(exported)["data"][0]
     files = {}
@@ -121,18 +162,18 @@ def main():
         path = path[len(ROOT) + 1:] if path.startswith(ROOT + os.sep) else path
         files[path] = {k: f["summary"][k] for k in ("lines", "functions", "regions")}
     summary = {"files": files, "totals": {k: data["totals"][k] for k in ("lines", "functions", "regions")}}
-    with open(os.path.join(args.out, "summary.json"), "w") as f:
+    with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
-    with open(os.path.join(args.out, "lcov.info"), "w") as f:
+    with open(os.path.join(out, "lcov.info"), "w") as f:
         subprocess.run([cov, "export", "-format=lcov", *common], cwd=ROOT, stdout=f, check=True)
-    run([cov, "show", "-format=html", f"-output-dir={os.path.join(args.out, 'html')}", "-show-line-counts-or-regions", *common], stdout=subprocess.DEVNULL)
+    run([cov, "show", "-format=html", f"-output-dir={os.path.join(out, 'html')}", "-show-line-counts-or-regions", *common], stdout=subprocess.DEVNULL)
 
     baseline = None
-    if args.baseline and os.path.exists(args.baseline):
-        with open(args.baseline) as f:
+    if baseline_path and os.path.exists(baseline_path):
+        with open(baseline_path) as f:
             baseline = json.load(f)
     text = markdown(summary, baseline)
-    with open(os.path.join(args.out, "summary.md"), "w") as f:
+    with open(os.path.join(out, "summary.md"), "w") as f:
         f.write(text)
     print("\n" + text)
     step = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -168,6 +209,50 @@ def markdown(summary, baseline):
         )
     lines += ["", "<sub>Test code in each file counts as covered, so the figures are a little flattering.</sub>", ""]
     return "\n".join(lines)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="step")
+    b = sub.add_parser("build", help="build the binaries, instrumented")
+    b.add_argument("--out", required=True)
+    u = sub.add_parser("unit", help="run the unit tests, and keep their profile")
+    u.add_argument("--binaries", required=True)
+    u.add_argument("--out", required=True)
+    e = sub.add_parser("e2e", help="run the end-to-end tests, and keep their profile")
+    e.add_argument("--binaries", required=True)
+    e.add_argument("--out", required=True)
+    e.add_argument("--no-slow", action="store_true", help="leave out the tests that wait on a timer")
+    e.add_argument("--logs", help="keep the daemon's log of each test here")
+    r = sub.add_parser("report", help="merge profiles and report")
+    r.add_argument("--binaries", required=True)
+    r.add_argument("--profiles", nargs="+", required=True)
+    r.add_argument("--out", required=True)
+    r.add_argument("--baseline", help="a summary.json of before, to say how the figures moved")
+    a = sub.add_parser("all", help="every step, here")
+    a.add_argument("--baseline")
+    a.add_argument("--no-slow", action="store_true")
+    a.add_argument("--out", default=os.path.join(ROOT, "target", "coverage", "report"))
+    args = p.parse_args()
+
+    if args.step == "build":
+        build(args.out)
+    elif args.step == "unit":
+        unit(args.binaries, args.out)
+    elif args.step == "e2e":
+        e2e(args.binaries, args.out, not args.no_slow, args.logs)
+    elif args.step == "report":
+        report(args.binaries, args.profiles, args.out, args.baseline)
+    else:
+        work = os.path.join(ROOT, "target", "coverage")
+        binaries, unit_prof, e2e_prof = (os.path.join(work, d) for d in ("bin", "prof-unit", "prof-e2e"))
+        for d in (unit_prof, e2e_prof):
+            shutil.rmtree(d, ignore_errors=True)
+        build(binaries)
+        unit(binaries, unit_prof)
+        e2e(binaries, e2e_prof, not getattr(args, "no_slow", False))
+        out = getattr(args, "out", os.path.join(work, "report"))
+        report(binaries, [unit_prof, e2e_prof], out, getattr(args, "baseline", None))
 
 
 if __name__ == "__main__":
