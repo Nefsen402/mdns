@@ -114,7 +114,9 @@ Untrusted=wifi
   segment too (`ForwardQuestions=`), so a
   device that only answers when asked is found the moment someone looks for it.
 - `[Advertise] Hostname=router.local` makes the router itself reachable by name
-  from every network, with its own address on each.
+  from every network, with its own address on each, and `Services=_ssh._tcp:22`
+  announces that it offers ssh (a service of the host, as Avahi's
+  `/etc/avahi/services/ssh.service` does).
 - Interfaces may come and go: a VLAN that is created after the daemon starts, or
   recreated, is picked up without a restart
   (see `mdnsd(8)`).

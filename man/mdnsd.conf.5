@@ -205,6 +205,24 @@ The name is announced and kept alive like a reflected device, answers queries
 shutdown.
 No conflict detection is done: the name is assumed to be yours alone.
 .TP
+.B Services=
+Services this host offers, announced under the name and answered for, as a
+type and a port:
+.BR _ssh._tcp:22 .
+They are separated by spaces or commas, and the setting may be repeated; an
+empty one clears the list.
+Each service is of an instance named for the host, so with
+.B Hostname=pc.local
+it is
+.BR pc._ssh._tcp.local ,
+as Avahi names one
+.B %h
+in a service file.
+The daemon does not look whether anything is listening there, and has no text
+record to give them.
+Needs
+.BR Hostname= .
+.TP
 .B TTL=
 How long other devices keep the address of the name, as a time span such as
 .B 2min

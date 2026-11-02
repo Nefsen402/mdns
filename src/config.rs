@@ -14,6 +14,7 @@
 //!
 //! [Advertise]         ; optional
 //! Hostname=router.local
+//! Services=_ssh._tcp:22
 //!
 //! [Segment]
 //! Name=media_stuff
@@ -238,6 +239,9 @@ pub struct Config {
     /// The TTL of the advertised name's address records, which it is
     /// re-announced at 80% of.
     pub advertise_ttl: Duration,
+    /// The services to announce under the advertised name, each as its type
+    /// (`_ssh._tcp`) and port, by an instance named for the host.
+    pub advertise_services: Vec<(String, u16)>,
     /// How often to probe the interfaces of segments that do not set their
     /// own; `None` (the default) probes only at startup and on request. See
     /// [`Config::probe_interval_of`].
@@ -257,6 +261,7 @@ impl Default for Config {
             socket: DEFAULT_SOCKET.to_string(),
             advertise: None,
             advertise_ttl: DEFAULT_ADVERTISE_TTL,
+            advertise_services: Vec::new(),
             probe_interval: None,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
         }
@@ -440,6 +445,17 @@ impl Config {
                     ("advertise", "hostname") => {
                         config.advertise = Some(local_name(&value, lineno)?);
                     }
+                    ("advertise", "services") => {
+                        if value.is_empty() {
+                            config.advertise_services.clear();
+                        }
+                        for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+                            let service = parse_service(word, lineno)?;
+                            if !config.advertise_services.contains(&service) {
+                                config.advertise_services.push(service);
+                            }
+                        }
+                    }
                     ("advertise", "ttl") => config.advertise_ttl = parse_host_ttl(&value, lineno, "TTL")?,
                     ("ipc", "socket") => {
                         if value.is_empty() {
@@ -462,6 +478,9 @@ impl Config {
         }
         if !self.ipv4.enabled() && !self.ipv6.enabled() {
             bail!("[Listen] IPv4= and IPv6= are both off");
+        }
+        if !self.advertise_services.is_empty() && self.advertise.is_none() {
+            bail!("[Advertise] Services= needs a Hostname=, to be at");
         }
 
         for (i, seg) in self.segments.iter().enumerate() {
@@ -529,6 +548,22 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// A service to advertise: its type and port, as `_ssh._tcp:22`.
+fn parse_service(word: &str, lineno: usize) -> Result<(String, u16)> {
+    let bad = || anyhow!("line {lineno}: Services= takes a type and a port, such as _ssh._tcp:22, not {word:?}");
+    let (kind, port) = word.split_once(':').ok_or_else(bad)?;
+    let port: u16 = port.parse().ok().filter(|&p| p != 0).ok_or_else(bad)?;
+    let (service, proto) = kind.split_once('.').ok_or_else(bad)?;
+    let named = service.len() >= 2
+        && service.len() <= 16
+        && service.starts_with('_')
+        && service.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !named || !(proto.eq_ignore_ascii_case("_tcp") || proto.eq_ignore_ascii_case("_udp")) {
+        return Err(bad());
+    }
+    Ok((kind.to_ascii_lowercase(), port))
 }
 
 /// A name to advertise: a hostname under `.local`. A bare label such as
@@ -947,6 +982,25 @@ interfaces=br0,wifi
         }
         assert!(with(&format!("{}.local", "x".repeat(64))).is_err());
         assert!(with(&format!("{}.local", "x".repeat(63))).is_ok());
+    }
+
+    #[test]
+    fn advertised_services_are_a_type_and_a_port_and_need_a_hostname() {
+        let ok = |value: &str| Config::parse(&format!("[Advertise]\nHostname=pc\nServices={value}\n{EXAMPLE}")).map(|c| c.advertise_services);
+        assert_eq!(ok("_ssh._tcp:22").unwrap(), [("_ssh._tcp".to_string(), 22)]);
+        // Lists as elsewhere: spaces or commas, more than one line, none repeated.
+        let c = Config::parse(&format!("[Advertise]\nHostname=pc\nServices=_ssh._tcp:22, _http._tcp:8080\nServices=_SSH._tcp:22 _x._udp:9\n{EXAMPLE}")).unwrap();
+        assert_eq!(c.advertise_services.len(), 3);
+        assert_eq!(c.advertise_services[2], ("_x._udp".to_string(), 9));
+        // Empty clears.
+        let c = Config::parse(&format!("[Advertise]\nHostname=pc\nServices=_ssh._tcp:22\nServices=\n{EXAMPLE}")).unwrap();
+        assert!(c.advertise_services.is_empty());
+        for bad in ["ssh", "_ssh._tcp", "_ssh._tcp:0", "_ssh._tcp:70000", "ssh._tcp:22", "_ssh._sctp:22", "_ssh:22", "_ssh._tcp.local:22"] {
+            let e = ok(bad).unwrap_err().to_string();
+            assert!(e.contains("line 3") && e.contains("a type and a port"), "{bad}: {e}");
+        }
+        let e = Config::parse(&format!("[Advertise]\nServices=_ssh._tcp:22\n{EXAMPLE}")).unwrap_err().to_string();
+        assert!(e.contains("needs a Hostname="), "{e}");
     }
 
     #[test]

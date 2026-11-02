@@ -21,7 +21,7 @@ use core::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::config::Config;
-use crate::device::Device;
+use crate::device::{Device, Service};
 use crate::runtime::Why;
 use crate::netlink::{Change, Netlink};
 use crate::segment::{Owner, Segment};
@@ -44,6 +44,8 @@ pub struct Link {
     segment: Segment,
     /// The name to advertise with this host's addresses, and its TTL.
     advertise: Option<(String, Duration)>,
+    /// The services to announce with it, as a type and a port.
+    services: Vec<(String, u16)>,
     /// The interface's index, while it has sockets on it.
     index: Option<u32>,
     /// Whether it was up (and running) when last heard of. Nothing is
@@ -82,6 +84,7 @@ impl Link {
             unicast: unicast.to_vec(),
             segment,
             advertise: config.advertise.clone().map(|name| (name, config.advertise_ttl)),
+            services: config.advertise_services.clone(),
             index: None,
             up: true,
             was_here: false,
@@ -189,6 +192,19 @@ impl Link {
         }
         let mut device = Device { hostname: Some(name.clone()), ..Device::default() };
         device.add_addrs(&addrs);
+        // Each is of an instance named for the host, as Avahi's %h is.
+        let label = name.split('.').next().unwrap_or(name);
+        device.services = self
+            .services
+            .iter()
+            .map(|(kind, port)| Service {
+                instance: format!("{label}.{kind}.local"),
+                kind: format!("{kind}.local"),
+                port: *port,
+                target: Some(name.clone()),
+                ..Service::default()
+            })
+            .collect();
         match self.segment.add_manual_ttl(Owner::Own, device, *ttl) {
             Ok(true) => {
                 let shown: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
