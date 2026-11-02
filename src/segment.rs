@@ -255,6 +255,16 @@ impl Entry {
     }
 }
 
+/// "`who` `addr`", written only when it is shown: the deadlines are walked
+/// every time the loop wakes, and almost none of them is ever printed.
+struct Labelled<'a>(&'a dyn fmt::Display, &'a IpAddr);
+
+impl fmt::Display for Labelled<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.0, self.1)
+    }
+}
+
 /// A way to send over one family: a socket, and the group to send to.
 struct Outbound {
     family: Family,
@@ -557,7 +567,7 @@ impl State {
             f("expire", who, e.expires);
             // Its addresses that run out before it does, each on its own.
             for (addr, &at) in e.addr_expires.iter().filter(|&(_, at)| *at < e.expires) {
-                f("expire", &format!("{who} {addr}"), at);
+                f("expire", &Labelled(who, addr), at);
             }
             let Some(before) = before.filter(|_| !self.outbound.is_empty() && e.askable()) else {
                 continue;
@@ -3808,6 +3818,60 @@ mod tests {
         assert!(recv(&rx).is_none());
         assert_eq!(seg.refresh(t0 + Duration::from_secs(72), before).unwrap(), 3, "within 30 s of it");
         assert!(recv(&rx).is_some());
+    }
+
+    // What a full segment costs. Not a test: run it with
+    // `cargo test --release scale -- --ignored --nocapture`.
+
+    /// A segment that has heard `n` devices, each from an address of its own
+    /// (a sender may describe only so many), with an address that runs out
+    /// before the device does, as a host's address does against its services.
+    fn crowded(n: usize) -> Segment {
+        let (seg, _rx) = wired();
+        seg.set_refresh_before(Some(Duration::from_secs(30)));
+        for i in 0..n {
+            let (host, instance) = (format!("host{i}.local"), format!("Dev{i}._http._tcp.local"));
+            let from = format!("10.1.{}.{}", i / 250, i % 250 + 1);
+            hear(&seg, &from, vec![
+                ptr("_http._tcp.local", &instance),
+                srv(&instance, 80, &host),
+                txt(&instance, "ty=x"),
+                a_record(&host, &from),
+            ]);
+        }
+        assert_eq!(seg.devices().len(), n);
+        seg
+    }
+
+    /// The time `f` takes, on average over `runs`, in microseconds.
+    fn micros(runs: u32, mut f: impl FnMut()) -> f64 {
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            f();
+        }
+        start.elapsed().as_secs_f64() * 1e6 / f64::from(runs)
+    }
+
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn scale_of_the_work_a_full_segment_does_each_time_the_loop_wakes() {
+        println!("{:>8} {:>12} {:>12} {:>12} {:>12}", "devices", "next_due us", "upkeep us", "room_for us", "handle us");
+        for n in [1, 16, 128, 512, MAX_DEVICES - 1] {
+            let seg = crowded(n);
+            let next_due = micros(2000, || {
+                std::hint::black_box(seg.next_due());
+            });
+            let upkeep = micros(200, || seg.upkeep(Instant::now()));
+            let src = ip("10.9.9.9");
+            let room_for = micros(2000, || {
+                std::hint::black_box(seg.state.borrow().room_for(src));
+            });
+            // A device that is already known announcing itself again: what a
+            // packet costs from a device that has been heard before.
+            let again = announcement(120);
+            let handle = micros(2000, || seg.handle(sa("10.0.1.7"), &again).unwrap());
+            println!("{n:>8} {next_due:>12.1} {upkeep:>12.1} {room_for:>12.1} {handle:>12.1}");
+        }
     }
 
     // The timer-driven upkeep.
