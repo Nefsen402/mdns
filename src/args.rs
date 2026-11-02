@@ -3,8 +3,10 @@
 //! What the options mean is for whoever asks; this only says which is which,
 //! as it comes, and hands over an option's value when asked for it.
 
-use std::collections::VecDeque;
-use std::fmt;
+use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::{String, ToString};
+use core::fmt;
 
 /// One piece of the command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -56,11 +58,6 @@ impl fmt::Display for Error {
 }
 
 impl core::error::Error for Error {}
-
-/// The process's own command line, after its name.
-pub fn from_env() -> Result<Vec<String>, Error> {
-    std::env::args_os().skip(1).map(|a| a.into_string().map_err(|_| Error::NotUtf8)).collect()
-}
 
 /// The arguments still to come, and where in them it is.
 pub struct Parser {

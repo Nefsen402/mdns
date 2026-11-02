@@ -6,8 +6,9 @@
 //! unit, is optional. Units are case-sensitive: `m` is minutes, `M` months.
 //! Shared by the daemon's configuration and `mdnsctl`.
 
-use std::fmt;
-use std::time::Duration;
+use alloc::string::{String, ToString};
+use core::fmt;
+use core::time::Duration;
 
 const NS_PER_SEC: u128 = 1_000_000_000;
 

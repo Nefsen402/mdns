@@ -1,3 +1,5 @@
+extern crate alloc;
+
 // Shared with mdnsctl, whose options take values; the daemon's take none.
 #[allow(dead_code)]
 mod args;
@@ -36,7 +38,8 @@ pub struct Group {
 fn main() -> Result<()> {
     let signals = signal::install().context("handling shutdown signals")?;
 
-    let Some(path) = config_path(args::from_env()?)? else {
+    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.into_string()).collect::<Result<_, _>>().map_err(|_| args::Error::NotUtf8)?;
+    let Some(path) = config_path(args)? else {
         println!("usage: mdnsd [config-file]  (default {})", config::DEFAULT_PATH);
         return Ok(());
     };

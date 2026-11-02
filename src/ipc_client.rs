@@ -1,16 +1,27 @@
 //! `mdnsctl`: command line client for the daemon's control socket (see
 //! `ipc.rs` for the protocol). Every IPC command has a subcommand here.
 
-use std::collections::{HashSet, VecDeque};
-use std::ffi::{c_char, CStr, CString};
-use std::fmt;
-use std::io::{self, Write};
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::time::Duration;
+// No std: its I/O is rustix's, its memory libc's malloc, and a panic aborts.
+// Tests are built with std.
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
-use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+extern crate alloc;
+
+use alloc::borrow::ToOwned;
+use alloc::collections::{BTreeSet, VecDeque};
+use alloc::ffi::CString;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ffi::{c_char, c_int, CStr};
+use core::fmt;
+use core::net::IpAddr;
+use core::sync::atomic::{AtomicI32, Ordering};
+use core::time::Duration;
+
+use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, Signal, WaitOptions, WaitStatus};
@@ -18,14 +29,44 @@ use serde_json::Value;
 
 #[path = "args.rs"]
 mod args;
-// Shared with the daemon, which waits on more than a subscriber does.
-#[allow(dead_code)]
-#[path = "poll.rs"]
-mod poll;
-#[path = "signal.rs"]
-mod signal;
 #[path = "timespan.rs"]
 mod timespan;
+
+// What std's print macros do, to stdout and stderr: tests use std's, which
+// the test harness captures.
+#[cfg(not(test))]
+macro_rules! print {
+    ($($arg:tt)*) => { $crate::write_out(1, &::alloc::format!($($arg)*)) };
+}
+#[cfg(not(test))]
+macro_rules! println {
+    ($($arg:tt)*) => { $crate::write_out(1, &::alloc::format!("{}\n", format_args!($($arg)*))) };
+}
+#[cfg(not(test))]
+macro_rules! eprint {
+    ($($arg:tt)*) => { $crate::write_out(2, &::alloc::format!($($arg)*)) };
+}
+#[cfg(not(test))]
+macro_rules! eprintln {
+    ($($arg:tt)*) => { $crate::write_out(2, &::alloc::format!("{}\n", format_args!($($arg)*))) };
+}
+
+/// Write `text` to `fd` (stdout or stderr), as far as it goes.
+#[cfg_attr(test, allow(dead_code))]
+fn write_out(fd: c_int, text: &str) {
+    // SAFETY: stdout and stderr are open for as long as the process runs.
+    let _ = write_all(unsafe { BorrowedFd::borrow_raw(fd) }, text.as_bytes());
+}
+
+/// Stdout, for what streams to it: a write fails once no one reads it.
+struct Stdout;
+
+impl fmt::Write for Stdout {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        // SAFETY: stdout is open for as long as the process runs.
+        write_all(unsafe { BorrowedFd::borrow_raw(1) }, s.as_bytes()).map_err(|_| fmt::Error)
+    }
+}
 
 /// Keep in sync with `config::DEFAULT_SOCKET` in the daemon.
 const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
@@ -87,7 +128,7 @@ struct Subscription {
     foreground: bool,
     /// Where a subscriber in the background writes what it has to say, and
     /// its script's output.
-    log: Option<PathBuf>,
+    log: Option<String>,
 }
 
 impl From<&str> for Target {
@@ -112,7 +153,7 @@ impl Target {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
-    socket: PathBuf,
+    socket: String,
     json: bool,
     /// For `devices`: each device a line of JSON of its own.
     segmented: bool,
@@ -198,20 +239,20 @@ impl Early {
     }
 
     /// Print it as it is for, and the exit code that goes with it.
-    fn exit(self) -> ExitCode {
+    fn exit(self) -> c_int {
         match self {
             Early::Help(text) => print!("{text}"),
             Early::Version => println!("mdnsctl {}", env!("CARGO_PKG_VERSION")),
             Early::Usage { message, usage } => {
                 eprintln!("error: {message}\n\nUsage: {usage}\n\nFor more information, try '--help'.");
-                return ExitCode::from(2);
+                return 2;
             }
             Early::NoCommand => {
                 eprint!("{}", help(None));
-                return ExitCode::from(2);
+                return 2;
             }
         }
-        ExitCode::SUCCESS
+        0
     }
 }
 
@@ -294,7 +335,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
     let mut args: Vec<String> = args.into_iter().collect();
     let after_dashes = args.iter().position(|a| a == "--").map(|at| args.split_off(at).split_off(1));
     let mut parser = args::Parser::new(args);
-    let (mut socket, mut verbose, mut json, mut segmented, mut asked_help) = (PathBuf::from(DEFAULT_SOCKET), false, false, false, false);
+    let (mut socket, mut verbose, mut json, mut segmented, mut asked_help) = (DEFAULT_SOCKET.to_string(), false, false, false, false);
     let mut command: Option<&CommandInfo> = None;
     let (mut words, mut query, mut interval, mut wait, mut foreground, mut log) = (Vec::new(), Vec::new(), None, None, false, None);
     let takes = |command: Option<&CommandInfo>, option: &str| command.is_some_and(|c| c.options.iter().any(|(o, _)| o.starts_with(option)));
@@ -307,7 +348,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
         };
         let invalid = |name: &str, value: &str, e: String| Early::usage(command, format!("invalid value '{value}' for '--{name}': {e}"));
         match arg {
-            Short('s') | Long("socket") => socket = PathBuf::from(parser.value().map_err(|e| bad(command, e))?),
+            Short('s') | Long("socket") => socket = parser.value().map_err(|e| bad(command, e))?,
             Short('v') | Long("verbose") => verbose = true,
             Long("json") => json = true,
             Long("segmented-json") => segmented = true,
@@ -331,7 +372,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
                 if v.is_empty() {
                     return Err(invalid("log", &v, "a file is needed".into()));
                 }
-                log = Some(PathBuf::from(v));
+                log = Some(v);
             }
             Value(word) => {
                 match command {
@@ -499,7 +540,7 @@ fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd
     // Everything the child needs is made before it is: between fork and
     // exec, it may not allocate.
     let path = c_string(program)?;
-    let argv: Vec<CString> = std::iter::once(program).chain(args.iter().map(String::as_str)).map(c_string).collect::<Result<_, _>>()?;
+    let argv: Vec<CString> = core::iter::once(program).chain(args.iter().map(String::as_str)).map(c_string).collect::<Result<_, _>>()?;
     let mut envp: Vec<CString> = Vec::new();
     // SAFETY: environ is a NULL-terminated array of NUL-terminated strings,
     // which nothing here changes.
@@ -517,8 +558,8 @@ fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd
     for (name, value) in env {
         envp.push(c_string(&format!("{name}={value}"))?);
     }
-    let argv_ptrs: Vec<*const c_char> = argv.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-    let envp_ptrs: Vec<*const c_char> = envp.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+    let argv_ptrs: Vec<*const c_char> = argv.iter().map(|a| a.as_ptr()).chain(core::iter::once(core::ptr::null())).collect();
+    let envp_ptrs: Vec<*const c_char> = envp.iter().map(|e| e.as_ptr()).chain(core::iter::once(core::ptr::null())).collect();
     // The child says why it could not run the program, if it could not; a
     // program that runs closes this, as it is not inherited.
     let (report_rx, report_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
@@ -564,6 +605,77 @@ fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd
     }
 }
 
+/// A descriptor to wait on until it can be read.
+fn readable(fd: c_int) -> libc::pollfd {
+    libc::pollfd { fd, events: libc::POLLIN, revents: 0 }
+}
+
+/// Wait until one of `fds` is ready, or `timeout` (`None`: no limit) passes.
+/// Interrupted by a signal, it returns early, with nothing ready.
+fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<(), Errno> {
+    // Rounded up, so that what is due is due when it returns.
+    let ms = timeout.map_or(-1, |t| i32::try_from(t.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX));
+    for fd in fds.iter_mut() {
+        fd.revents = 0;
+    }
+    // SAFETY: `fds` is a valid array of pollfd of the length given.
+    match unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) } {
+        -1 if errno() != Errno::INTR => Err(errno()),
+        _ => Ok(()),
+    }
+}
+
+/// Where SIGTERM and SIGINT are written, for the loop to wait on: -1 until
+/// [`on_stop`].
+static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn stop_signal(sig: c_int) {
+    // SAFETY: errno is the calling thread's, and only write(2), which is
+    // async-signal-safe, runs between saving and restoring it. A full pipe
+    // already says a signal came.
+    unsafe {
+        let saved = *libc::__errno_location();
+        let byte = sig as u8;
+        libc::write(STOP_PIPE.load(Ordering::Relaxed), (&byte as *const u8).cast(), 1);
+        *libc::__errno_location() = saved;
+    }
+}
+
+/// Have SIGTERM and SIGINT written to a pipe, whose reading end is returned
+/// (the self-pipe trick): a signal is then something to wait on, like the
+/// rest.
+fn on_stop() -> Result<OwnedFd, Errno> {
+    use rustix::pipe::PipeFlags;
+    let (rx, tx) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+    // The writing end lives as long as the process, for the handler.
+    STOP_PIPE.store(rustix::fd::IntoRawFd::into_raw_fd(tx), Ordering::Relaxed);
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: an all-zero sigaction is valid; the fields set are its own,
+        // and the handler only does what a handler may.
+        let rc = unsafe {
+            let mut action: libc::sigaction = core::mem::zeroed();
+            action.sa_sigaction = stop_signal as extern "C" fn(c_int) as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig, &action, core::ptr::null_mut())
+        };
+        if rc != 0 {
+            return Err(errno());
+        }
+    }
+    Ok(rx)
+}
+
+/// Whether a signal to stop came, by what `signals` (from [`on_stop`]) holds.
+fn signalled(signals: &OwnedFd) -> bool {
+    let mut buf = [0u8; 16];
+    let mut any = false;
+    while let Ok(n @ 1..) = rustix::io::read(signals, &mut buf) {
+        any |= n > 0;
+    }
+    any
+}
+
 /// How a process ended, as std says it.
 fn status_text(status: WaitStatus) -> String {
     match (status.exit_status(), status.terminating_signal()) {
@@ -573,12 +685,8 @@ fn status_text(status: WaitStatus) -> String {
     }
 }
 
-fn connect_err(socket: &Path, e: Errno) -> Failure {
-    Failure::Connect(format!(
-        "cannot talk to {}: {} (is the daemon running, and can you access the socket?)",
-        socket.display(),
-        Why(e)
-    ))
+fn connect_err(socket: &str, e: Errno) -> Failure {
+    Failure::Connect(format!("cannot talk to {socket}: {} (is the daemon running, and can you access the socket?)", Why(e)))
 }
 
 /// A connection to the daemon: its socket, and what of its next line has
@@ -618,11 +726,11 @@ impl Conn {
 }
 
 /// Connect and send one request line, waiting up to `timeout` for replies.
-fn send(socket: &Path, line: &str, timeout: Duration) -> Result<Conn, Failure> {
+fn send(socket: &str, line: &str, timeout: Duration) -> Result<Conn, Failure> {
     let err = |e| connect_err(socket, e);
     let connected = || {
         use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
-        let addr = SocketAddrUnix::new(socket.as_os_str().as_encoded_bytes())?;
+        let addr = SocketAddrUnix::new(socket)?;
         let fd = rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None)?;
         rustix::io::retry_on_intr(|| rustix::net::connect(&fd, &addr))?;
         Ok(fd)
@@ -634,7 +742,7 @@ fn send(socket: &Path, line: &str, timeout: Duration) -> Result<Conn, Failure> {
 }
 
 /// Send one request line and return the one-line reply.
-fn request(socket: &Path, line: &str, timeout: Duration) -> Result<String, Failure> {
+fn request(socket: &str, line: &str, timeout: Duration) -> Result<String, Failure> {
     let mut conn = send(socket, line, timeout)?;
     match conn.read_line().map_err(|e| connect_err(socket, e))? {
         Some(reply) => Ok(reply.trim_end().to_string()),
@@ -650,7 +758,7 @@ fn server_error(reply: &Value) -> Option<Failure> {
 
 /// Send the watch request `line` and wait for the daemon to accept it: the
 /// stream its events will come on, with no time limit from then on.
-fn open_watch(socket: &Path, line: &str) -> Result<Conn, Failure> {
+fn open_watch(socket: &str, line: &str) -> Result<Conn, Failure> {
     let mut conn = send(socket, line, TIMEOUT)?;
     let Some(ack) = conn.read_line().map_err(|e| connect_err(socket, e))? else {
         return Err(Failure::Connect("the daemon closed the connection".into()));
@@ -667,10 +775,10 @@ fn open_watch(socket: &Path, line: &str) -> Result<Conn, Failure> {
 
 /// Follow a segment: print each change the daemon reports until it stops (an
 /// error) or `out` is closed (success: `mdnsctl watch | head` is fine).
-fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
+fn watch(opts: &Options, target: &Target, out: &mut impl fmt::Write) -> Result<(), Failure> {
     let socket = &opts.socket;
     let mut conn = open_watch(socket, &target.request("watch"))?;
-    let mut seen = HashSet::new();
+    let mut seen = BTreeSet::new();
     loop {
         let Some(line) = conn.read_line().map_err(|e| connect_err(socket, e))? else {
             return Err(Failure::Connect("the daemon closed the connection".into()));
@@ -687,7 +795,7 @@ fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Fa
             render_event(&reply, opts.verbose, &mut seen)?
         };
         if let Some(shown) = shown
-            && out.write_all(shown.as_bytes()).and_then(|()| out.flush()).is_err()
+            && out.write_str(&shown).is_err()
         {
             return Ok(());
         }
@@ -702,14 +810,14 @@ fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Fa
 /// as `devices` gives it, with each device as last heard of and none that
 /// went; with `--segmented-json`, each device a line of JSON of its own the
 /// moment it is found, as `--json` has it, and nothing at the end.
-fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
+fn devices_query(opts: &Options, target: &Target, out: &mut impl fmt::Write) -> Result<(), Failure> {
     let socket = &opts.socket;
     let mut conn = open_watch(socket, &target.request("watch"))?;
     let deadline = now() + target.wait.unwrap_or(DEFAULT_WAIT);
     // What is found, by where and who it is, as last heard of.
     let mut found: Vec<(String, Value)> = Vec::new();
     // What is printed: hosts, or with -v devices, by their key.
-    let mut shown = HashSet::new();
+    let mut shown = BTreeSet::new();
     loop {
         let left = deadline.saturating_sub(now());
         if left.is_zero() {
@@ -744,7 +852,7 @@ fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Resul
                 .map(|row| brief_line(&row, [0, 0])),
         };
         if let Some(text) = text
-            && out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_err()
+            && out.write_str(&text).is_err()
         {
             return Ok(());
         }
@@ -761,11 +869,11 @@ fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Resul
     } else if opts.verbose {
         devices_summary(name, found.len(), 0)
     } else {
-        let hosts: HashSet<String> = found.iter().filter_map(|(_, d)| d["hostname"].as_str()).map(str::to_ascii_lowercase).collect();
+        let hosts: BTreeSet<String> = found.iter().filter_map(|(_, d)| d["hostname"].as_str()).map(str::to_ascii_lowercase).collect();
         let unnamed = found.iter().filter(|(_, d)| !d["hostname"].is_string()).count();
         devices_summary(name, hosts.len(), unnamed)
     };
-    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+    let _ = out.write_str(&text);
     Ok(())
 }
 
@@ -787,8 +895,8 @@ fn subscribe(opts: &Options, sub: &Subscription) -> Result<(), Failure> {
     let script = executable(&sub.script[0]).map_err(Failure::Usage)?;
     let log = match &sub.log {
         Some(path) => Some(
-            rustix::fs::open(path.as_os_str().as_encoded_bytes(), OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC, Mode::from_raw_mode(0o666))
-                .map_err(|e| Failure::Usage(format!("cannot write to {}: {}", path.display(), Why(e))))?,
+            rustix::fs::open(path.as_str(), OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC, Mode::from_raw_mode(0o666))
+                .map_err(|e| Failure::Usage(format!("cannot write to {path}: {}", Why(e))))?,
         ),
         None => None,
     };
@@ -796,19 +904,19 @@ fn subscribe(opts: &Options, sub: &Subscription) -> Result<(), Failure> {
     // In the background, the watch is opened by the process that holds it,
     // so that `watchers` lists the subscriber's PID, not its parent's.
     let conn = if sub.foreground { open_watch(&opts.socket, &line)? } else { detach(&opts.socket, &line, log.as_ref())? };
-    let signals = signal::install().map_err(|e| Failure::Usage(format!("cannot handle signals: {e}")))?;
+    let signals = on_stop().map_err(|e| Failure::Usage(format!("cannot handle signals: {}", Why(e))))?;
     note(&format!("watching {}, running {script} for each change", sub.target.segment));
 
     let mut subscriber = Subscriber::new(&opts.socket, &line, conn, script, sub.script[1..].to_vec());
     loop {
-        let mut fds = vec![poll::readable(signals.fd())];
+        let mut fds = vec![readable(signals.as_raw_fd())];
         fds.extend(subscriber.fds());
         let timeout = subscriber.deadline().map(|at| at.saturating_sub(now()));
-        if let Err(e) = poll::wait(&mut fds, timeout) {
-            note(&format!("cannot wait: {e}"));
+        if let Err(e) = wait(&mut fds, timeout) {
+            note(&format!("cannot wait: {}", Why(e)));
             break;
         }
-        if signals.take().is_some() {
+        if signalled(&signals) {
             break;
         }
         subscriber.turn(&fds[1..], now());
@@ -846,8 +954,7 @@ fn executable(name: &str) -> Result<String, String> {
 /// parent then prints the child's PID and exits, or returns the error, for
 /// the caller to hear of. The child carries on with the watch, its output
 /// going to `log`, or nowhere.
-fn detach(socket: &Path, line: &str, log: Option<&OwnedFd>) -> Result<Conn, Failure> {
-    let _ = io::stdout().flush();
+fn detach(socket: &str, line: &str, log: Option<&OwnedFd>) -> Result<Conn, Failure> {
     let failed = |e| Failure::Connect(format!("cannot go into the background: {}", Why(e)));
     let (report_rx, report_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(failed)?;
     // SAFETY: no other thread has been started, so the child is a full copy.
@@ -910,7 +1017,7 @@ fn settle_in_background(log: Option<&OwnedFd>) -> Result<(), Failure> {
 /// loop that waits on whichever of them has something to do. Times are of
 /// [`now`].
 struct Subscriber {
-    socket: PathBuf,
+    socket: String,
     line: String,
     script: String,
     args: Vec<String>,
@@ -937,8 +1044,8 @@ struct Running {
 impl Subscriber {
     /// A subscriber reading the watch `line` from `conn`, as opened on
     /// `socket`, running `script` with `args`.
-    fn new(socket: &Path, line: &str, conn: Conn, script: String, args: Vec<String>) -> Subscriber {
-        let (socket, line) = (socket.to_path_buf(), line.to_string());
+    fn new(socket: &str, line: &str, conn: Conn, script: String, args: Vec<String>) -> Subscriber {
+        let (socket, line) = (socket.to_string(), line.to_string());
         let mut subscriber = Subscriber { socket, line, script, args, watch: None, retry: None, queue: VecDeque::new(), running: None };
         subscriber.watching(conn);
         subscriber
@@ -961,14 +1068,14 @@ impl Subscriber {
     fn fds(&self) -> Vec<libc::pollfd> {
         let mut fds = Vec::new();
         if let Some(conn) = &self.watch {
-            fds.push(poll::readable(conn.fd.as_raw_fd()));
+            fds.push(readable(conn.fd.as_raw_fd()));
         }
         if let Some(running) = &self.running {
             if let Some((stdin, _)) = &running.stdin {
                 fds.push(libc::pollfd { fd: stdin.as_raw_fd(), events: libc::POLLOUT, revents: 0 });
             }
             if let Some(pidfd) = &running.pidfd {
-                fds.push(poll::readable(pidfd.as_raw_fd()));
+                fds.push(readable(pidfd.as_raw_fd()));
             }
         }
         fds
@@ -1594,7 +1701,7 @@ fn service_lines(device: &Value) -> String {
 fn render_event(
     event: &Value,
     verbose: bool,
-    seen: &mut HashSet<(String, String)>,
+    seen: &mut BTreeSet<(String, String)>,
 ) -> Result<Option<String>, Failure> {
     let device = &event["device"];
     let ttl = event["ttl"].as_u64().ok_or_else(bad_reply)?;
@@ -1656,37 +1763,160 @@ fn table(rows: &[Vec<String>]) -> String {
     out
 }
 
-fn main() -> ExitCode {
-    let parsed = args::from_env().map_err(|e| Early::usage(None, e.to_string())).and_then(parse_args);
-    let opts = match parsed {
+/// Run the command line `args`, after the program's name: the exit status.
+/// Tests run the parts, not this.
+#[cfg_attr(test, allow(dead_code))]
+fn run(args: Vec<String>) -> c_int {
+    let opts = match parse_args(args) {
         Ok(opts) => opts,
         // Help and version to stdout with 0, usage errors to stderr with 2.
         Err(early) => return early.exit(),
     };
+    // As std does: a write to a pipe or socket no one reads fails, rather
+    // than ending mdnsctl, and is dealt with where it happens. A script is
+    // run with SIGPIPE as the system has it.
+    // SAFETY: setting a disposition, before anything else runs.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 
     let result = match &opts.command {
-        Command::Watch(target) => watch(&opts, target, &mut io::stdout().lock()),
-        Command::Devices(target) if !target.query.is_empty() => devices_query(&opts, target, &mut io::stdout().lock()),
+        Command::Watch(target) => watch(&opts, target, &mut Stdout),
+        Command::Devices(target) if !target.query.is_empty() => devices_query(&opts, target, &mut Stdout),
         Command::Subscribe(sub) => subscribe(&opts, sub),
         _ => execute(&opts).map(|text| print!("{text}")),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => 0,
         Err(Failure::Server(message)) => {
             eprintln!("mdnsctl: {message}");
-            ExitCode::from(1)
+            1
         }
         Err(Failure::Connect(message) | Failure::Usage(message)) => {
             eprintln!("mdnsctl: {message}");
-            ExitCode::from(2)
+            2
         }
+    }
+}
+
+/// What std would give a program: its start, its memory, and an end to it
+/// when it panics.
+#[cfg(not(test))]
+mod runtime {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::ffi::{c_char, c_int, CStr};
+    use core::fmt::Write;
+
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+
+    // std would link libc: the libc crate only declares it.
+    #[link(name = "c")]
+    unsafe extern "C" {}
+
+    /// The program's start: its arguments as text, after its name.
+    #[unsafe(no_mangle)]
+    extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
+        let mut args = Vec::new();
+        for i in 1..argc.max(1) as usize {
+            // SAFETY: argv holds argc NUL-terminated strings.
+            match unsafe { CStr::from_ptr(*argv.add(i)) }.to_str() {
+                Ok(arg) => args.push(arg.to_string()),
+                Err(_) => {
+                    eprintln!("mdnsctl: {}", crate::args::Error::NotUtf8);
+                    return 2;
+                }
+            }
+        }
+        super::run(args)
+    }
+
+    /// The most alignment malloc gives whatever is asked of it.
+    const MIN_ALIGN: usize = if cfg!(target_pointer_width = "64") { 16 } else { 8 };
+
+    /// libc's malloc, as std's own allocator uses it.
+    struct Malloc;
+
+    // SAFETY: what malloc, posix_memalign and realloc return is aligned as
+    // asked, or null, and is freed only with free.
+    unsafe impl GlobalAlloc for Malloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
+                // SAFETY: as above.
+                unsafe { libc::malloc(layout.size()).cast() }
+            } else {
+                let mut out = core::ptr::null_mut();
+                let align = layout.align().max(core::mem::size_of::<usize>());
+                // SAFETY: as above; `align` is a power of two, and a multiple of
+                // the size of a pointer.
+                match unsafe { libc::posix_memalign(&mut out, align, layout.size()) } {
+                    0 => out.cast(),
+                    _ => core::ptr::null_mut(),
+                }
+            }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, _: Layout) {
+            // SAFETY: as above.
+            unsafe { libc::free(ptr.cast()) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if layout.align() <= MIN_ALIGN && layout.align() <= new_size {
+                // SAFETY: as above.
+                return unsafe { libc::realloc(ptr.cast(), new_size).cast() };
+            }
+            // SAFETY: as above: a new allocation, what fits of the old copied
+            // in, and the old freed.
+            unsafe {
+                let new = self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
+                if !new.is_null() {
+                    core::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
+                    self.dealloc(ptr, layout);
+                }
+                new
+            }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Malloc = Malloc;
+
+    /// Stderr, unbuffered, for a panic, which may be about memory.
+    struct Stderr;
+
+    impl Write for Stderr {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            super::write_out(2, s);
+            Ok(())
+        }
+    }
+
+    // core and alloc come built to unwind, and so name the unwinder's entry
+    // points; nothing here unwinds, as a panic aborts, so they are never
+    // called, and are not worth linking libgcc_s for.
+    #[unsafe(no_mangle)]
+    extern "C" fn rust_eh_personality() {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn _Unwind_Resume() -> ! {
+        // SAFETY: abort takes nothing, and does not return.
+        unsafe { libc::abort() }
+    }
+
+    /// Say what went wrong, and end at once.
+    #[panic_handler]
+    fn panic(info: &core::panic::PanicInfo) -> ! {
+        let _ = writeln!(Stderr, "mdnsctl: {info}");
+        // SAFETY: abort takes nothing, and does not return.
+        unsafe { libc::abort() }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader};
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
@@ -1709,16 +1939,16 @@ mod tests {
         );
 
         let o = opts(&["-s", "/x.sock", "--json", "devices", "IoT", "to", "br0"]);
-        assert_eq!(o.socket, PathBuf::from("/x.sock"));
+        assert_eq!(o.socket, "/x.sock");
         assert!(o.json);
         assert_eq!(o.command, Command::Devices("IoT to br0".into()));
-        assert_eq!(opts(&["--socket=/y.sock", "segments"]).socket, PathBuf::from("/y.sock"));
+        assert_eq!(opts(&["--socket=/y.sock", "segments"]).socket, "/y.sock");
 
         // Options may come anywhere, before the command or after it, and
         // among the words of a segment's name.
         let o = opts(&["devices", "IoT", "-v", "to", "br0", "--json", "--socket", "/z.sock"]);
         assert!(o.verbose && o.json);
-        assert_eq!((o.socket, o.command), (PathBuf::from("/z.sock"), Command::Devices("IoT to br0".into())));
+        assert_eq!((o.socket.as_str(), o.command), ("/z.sock", Command::Devices("IoT to br0".into())));
         assert!(!opts(&["devices", "IoT"]).verbose);
         assert!(opts(&["-v", "devices", "IoT"]).verbose);
         assert!(opts(&["--verbose", "--json", "devices", "IoT"]).verbose);
@@ -2049,14 +2279,14 @@ mod tests {
         assert_eq!(sub.target.segment, "IoT to br0");
         assert_eq!(sub.target.query, ["_shelly._tcp"]);
         assert_eq!(sub.target.interval, Some(Duration::from_secs(60)));
-        assert_eq!(sub.log, Some(PathBuf::from("/var/log/plugs.log")));
+        assert_eq!(sub.log.as_deref(), Some("/var/log/plugs.log"));
         assert!(!sub.foreground);
         assert_eq!(sub.script, ["/usr/local/bin/configure", "--fast", "--query", "--"]);
         assert_eq!(sub.target.request("watch"), "watch --query=_shelly._tcp --interval=60 IoT to br0");
 
         let Command::Subscribe(sub) = opts(&["subscribe", "--foreground", "--log=x.log", "lan", "--", "s"]).command else { panic!() };
         assert!(sub.foreground);
-        assert_eq!((sub.log, sub.target.segment.as_str()), (Some(PathBuf::from("x.log")), "lan"));
+        assert_eq!((sub.log.as_deref(), sub.target.segment.as_str()), (Some("x.log"), "lan"));
 
         for args in [
             &["subscribe", "lan"][..],
@@ -2132,6 +2362,18 @@ mod tests {
     const EVENT: &str = r#"{"event":"added","segment":"IoT","ttl":4500,"device":{"interface":"wifi","hostname":"plug.local","addresses":["10.0.1.9"],"services":[]}}"#;
 
     #[test]
+    fn a_stop_signal_is_read_from_the_pipe() {
+        let signals = on_stop().unwrap();
+        assert!(!signalled(&signals));
+        // SAFETY: raising a signal whose handler was just installed.
+        unsafe { libc::raise(libc::SIGINT) };
+        assert!(signalled(&signals));
+        assert!(!signalled(&signals), "taken");
+        // What main says of a command line that is not text.
+        assert_eq!(args::Error::NotUtf8.to_string(), "the command line is not UTF-8");
+    }
+
+    #[test]
     fn errors_read_as_the_system_words_them() {
         assert_eq!(Why(Errno::NOENT).to_string(), "No such file or directory (os error 2)");
         assert_eq!(read_file("/no/such/file").unwrap_err(), Errno::NOENT);
@@ -2163,7 +2405,7 @@ mod tests {
     /// A subscriber with no watch, running `script` with `args`.
     fn idle(script: String, args: &[&str]) -> Subscriber {
         let args = args.iter().map(|a| a.to_string()).collect();
-        Subscriber { socket: PathBuf::new(), line: String::new(), script, args, watch: None, retry: None, queue: VecDeque::new(), running: None }
+        Subscriber { socket: String::new(), line: String::new(), script, args, watch: None, retry: None, queue: VecDeque::new(), running: None }
     }
 
     /// Turn `sub` as subscribe's loop does, until `done` says so.
@@ -2173,7 +2415,7 @@ mod tests {
             assert!(Instant::now() < deadline, "not done in time");
             let mut fds = sub.fds();
             let timeout = sub.deadline().map_or(STOP_CHECK, |at| at.saturating_sub(now()).min(STOP_CHECK));
-            poll::wait(&mut fds, Some(timeout)).unwrap();
+            wait(&mut fds, Some(timeout)).unwrap();
             sub.turn(&fds, now());
         }
     }
@@ -2243,7 +2485,7 @@ mod tests {
     #[test]
     fn a_subscriber_watches_again_after_losing_the_daemon() {
         std::fs::create_dir_all("target").unwrap();
-        let path = PathBuf::from(format!("target/mdnsctl-test-{}-again.sock", std::process::id()));
+        let path = format!("target/mdnsctl-test-{}-again.sock", std::process::id());
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let daemon = thread::spawn(move || {
@@ -2290,7 +2532,7 @@ mod tests {
 
         // A last line without its newline is not an event, even if it reads
         // as one.
-        let path = PathBuf::from(format!("target/mdnsctl-test-{}-cut.sock", std::process::id()));
+        let path = format!("target/mdnsctl-test-{}-cut.sock", std::process::id());
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let daemon = thread::spawn(move || {
@@ -2309,9 +2551,9 @@ mod tests {
 
     /// A daemon that answers one request with `lines`, then keeps the
     /// connection open for `hold`, as a watch does, and tells what it was asked.
-    fn holding_daemon(tag: &str, lines: Vec<String>, hold: Duration) -> (PathBuf, JoinHandle<String>) {
+    fn holding_daemon(tag: &str, lines: Vec<String>, hold: Duration) -> (String, JoinHandle<String>) {
         std::fs::create_dir_all("target").unwrap();
-        let path = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.sock", std::process::id()));
+        let path = format!("target/mdnsctl-test-{}-{tag}.sock", std::process::id());
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let socket_file = path.clone();
@@ -2352,7 +2594,7 @@ mod tests {
         ]
     }
 
-    fn query_options(path: &Path, json: bool, verbose: bool, wait: Duration) -> (Options, Target) {
+    fn query_options(path: &str, json: bool, verbose: bool, wait: Duration) -> (Options, Target) {
         let target = Target { segment: "IoT".into(), query: vec!["_x._tcp".into()], wait: Some(wait), ..Target::default() };
         let opts = Options { socket: path.into(), json, segmented: false, verbose, command: Command::Segments };
         (opts, target)
@@ -2367,12 +2609,12 @@ mod tests {
         let (path, daemon) = holding_daemon("query-text", query_stream(), wait * 3);
         let (opts, target) = query_options(&path, false, false, wait);
         let started = Instant::now();
-        let mut out = Vec::new();
+        let mut out = String::new();
         devices_query(&opts, &target, &mut out).unwrap();
         assert!(started.elapsed() >= wait && started.elapsed() < wait * 3, "{:?}", started.elapsed());
         assert_eq!(daemon.join().unwrap(), "watch --query=_x._tcp IoT\n", "a watch for the type, nothing else");
         assert_eq!(
-            String::from_utf8(out).unwrap(),
+            out,
             "  a.local  a.local plug  10.0.1.1\n  c.local  c.local plug  10.0.1.3\n\
              IoT: 1 device\n(1 device without a name not shown; use -v to list everything)\n",
             "each as it is first found, then what is left"
@@ -2381,9 +2623,9 @@ mod tests {
         // And with -v, as `devices -v`, the unnamed one too.
         let (path, _daemon) = holding_daemon("query-verbose", query_stream(), wait * 3);
         let (opts, target) = query_options(&path, false, true, wait);
-        let mut out = Vec::new();
+        let mut out = String::new();
         devices_query(&opts, &target, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
+        let text = out;
         assert!(text.ends_with("IoT: 2 devices\n"), "{text}");
         assert!(text.contains("c.local  addr-ttl=120") && text.contains("10.0.1.2"), "{text}");
     }
@@ -2395,9 +2637,9 @@ mod tests {
         let wait = Duration::from_millis(300);
         let (path, _daemon) = holding_daemon("query-json", query_stream(), wait * 3);
         let (opts, target) = query_options(&path, true, false, wait);
-        let mut out = Vec::new();
+        let mut out = String::new();
         devices_query(&opts, &target, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
+        let text = out;
         assert_eq!(text.lines().count(), 1, "{text}");
         let reply: Value = serde_json::from_str(&text).unwrap();
         assert_eq!((&reply["ok"], &reply["name"]), (&Value::Bool(true), &Value::from("IoT")));
@@ -2411,11 +2653,11 @@ mod tests {
     fn devices_with_a_query_report_a_refusal_or_a_daemon_that_goes() {
         let (path, _daemon) = holding_daemon("query-refused", vec![r#"{"ok":false,"error":"no such segment: IoT"}"#.into()], Duration::ZERO);
         let (opts, target) = query_options(&path, false, false, Duration::from_secs(5));
-        assert_eq!(devices_query(&opts, &target, &mut Vec::new()), Err(Failure::Server("no such segment: IoT".into())));
+        assert_eq!(devices_query(&opts, &target, &mut String::new()), Err(Failure::Server("no such segment: IoT".into())));
 
         let (path, _daemon) = holding_daemon("query-gone", vec![ACK.into()], Duration::ZERO);
         let (opts, target) = query_options(&path, false, false, Duration::from_secs(5));
-        assert!(matches!(devices_query(&opts, &target, &mut Vec::new()), Err(Failure::Connect(_))));
+        assert!(matches!(devices_query(&opts, &target, &mut String::new()), Err(Failure::Connect(_))));
     }
 
     #[test]
@@ -2449,9 +2691,9 @@ mod tests {
         let (path, _daemon) = holding_daemon("query-segmented", query_stream(), wait * 3);
         let (mut opts, target) = query_options(&path, false, false, wait);
         opts.segmented = true;
-        let mut out = Vec::new();
+        let mut out = String::new();
         devices_query(&opts, &target, &mut out).unwrap();
-        let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let lines: Vec<Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         let hosts: Vec<&Value> = lines.iter().map(|d| &d["hostname"]).collect();
         assert_eq!(hosts, [&Value::from("a.local"), &Value::Null, &Value::from("c.local")], "each once, as found");
         assert_eq!(lines[2]["addresses"], serde_json::json!(["10.0.1.3"]), "as first found");
@@ -2552,7 +2794,7 @@ mod tests {
 
     #[test]
     fn watch_lines_say_what_happened_and_for_how_long() {
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         let mut show = |e: Value, verbose| render_event(&e, verbose, &mut seen).unwrap();
 
         // Heard by address first: nothing to show until it has a name.
@@ -2577,7 +2819,7 @@ mod tests {
 
         // Already there when a watch for its type started: present, and then
         // seen, so a change to it is an update.
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         let mut show = |e: Value| render_event(&e, false, &mut seen).unwrap();
         assert!(show(event("present", 280, Some("hue.local"), "10.0.1.3", PLUG)).unwrap().starts_with("present  ttl=280 "));
         assert!(show(event("updated", 300, Some("hue.local"), "10.0.1.3", PLUG)).unwrap().starts_with("updated  "));
@@ -2585,7 +2827,7 @@ mod tests {
 
     #[test]
     fn verbose_watch_lines_are_a_device_with_its_services() {
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         let shown = render_event(&event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG), true, &mut seen)
             .unwrap()
             .unwrap();
@@ -2600,7 +2842,7 @@ mod tests {
 
     #[test]
     fn a_malformed_event_is_an_error() {
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         assert!(render_event(&serde_json::json!({"event":"added"}), false, &mut seen).is_err());
         let mut odd = event("exploded", 1, Some("x.local"), "10.0.0.1", "[]");
         assert!(render_event(&odd, false, &mut seen).is_err());
@@ -2609,9 +2851,9 @@ mod tests {
     }
 
     /// A fake daemon that acknowledges a watch, sends `lines`, and hangs up.
-    fn streaming_daemon(tag: &str, lines: Vec<String>) -> (PathBuf, JoinHandle<String>) {
+    fn streaming_daemon(tag: &str, lines: Vec<String>) -> (String, JoinHandle<String>) {
         std::fs::create_dir_all("target").unwrap();
-        let path = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.sock", std::process::id()));
+        let path = format!("target/mdnsctl-test-{}-{tag}.sock", std::process::id());
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let socket_file = path.clone();
@@ -2630,7 +2872,7 @@ mod tests {
 
     const ACK: &str = r#"{"ok":true,"name":"IoT","watching":true}"#;
 
-    fn watch_options(path: &Path, json: bool) -> Options {
+    fn watch_options(path: &str, json: bool) -> Options {
         Options { socket: path.into(), json, segmented: false, verbose: false, command: Command::Watch("IoT".into()) }
     }
 
@@ -2640,11 +2882,11 @@ mod tests {
         let removed = event("removed", 0, Some("plug.local"), "10.0.1.9", PLUG).to_string();
         let (path, daemon) = streaming_daemon("watch", vec![ACK.into(), added.clone(), removed.clone()]);
 
-        let mut out = Vec::new();
+        let mut out = String::new();
         let result = watch(&watch_options(&path, false), &"IoT".into(), &mut out);
         assert_eq!(daemon.join().unwrap(), "watch IoT\n");
         assert_eq!(
-            String::from_utf8(out).unwrap(),
+            out,
             "added    ttl=4500   plug.local  Plug S  10.0.1.9\nremoved  ttl=0      plug.local  Plug S  10.0.1.9\n"
         );
         // The daemon went away: that is a failure, not a clean end.
@@ -2655,24 +2897,24 @@ mod tests {
     fn watch_json_prints_each_event_unchanged_and_not_the_acknowledgement() {
         let added = event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG).to_string();
         let (path, daemon) = streaming_daemon("watch-json", vec![ACK.into(), added.clone()]);
-        let mut out = Vec::new();
+        let mut out = String::new();
         let _ = watch(&watch_options(&path, true), &"IoT".into(), &mut out);
         daemon.join().unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), format!("{added}\n"));
+        assert_eq!(out, format!("{added}\n"));
     }
 
     #[test]
     fn watch_reports_refusals_and_failures_mid_stream() {
         let (path, daemon) = streaming_daemon("watch-refused", vec![r#"{"ok":false,"error":"no such segment: IoT"}"#.into()]);
         assert_eq!(
-            watch(&watch_options(&path, false), &"IoT".into(), &mut Vec::new()),
+            watch(&watch_options(&path, false), &"IoT".into(), &mut String::new()),
             Err(Failure::Server("no such segment: IoT".into()))
         );
         daemon.join().unwrap();
 
         let (path, daemon) = streaming_daemon("watch-stopped", vec![ACK.into(), r#"{"ok":false,"error":"shutting down"}"#.into()]);
         assert_eq!(
-            watch(&watch_options(&path, false), &"IoT".into(), &mut Vec::new()),
+            watch(&watch_options(&path, false), &"IoT".into(), &mut String::new()),
             Err(Failure::Server("shutting down".into()))
         );
         daemon.join().unwrap();
@@ -2682,12 +2924,9 @@ mod tests {
     #[test]
     fn watch_ends_quietly_when_the_output_is_closed() {
         struct Closed;
-        impl Write for Closed {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::ErrorKind::BrokenPipe.into())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
+        impl fmt::Write for Closed {
+            fn write_str(&mut self, _: &str) -> fmt::Result {
+                Err(fmt::Error)
             }
         }
         let added = event("added", 4500, Some("plug.local"), "10.0.1.9", PLUG).to_string();
@@ -2732,10 +2971,10 @@ mod tests {
         );
         // A watch shows them too, after its own ttl: how long the daemon keeps the device.
         let event: Value = serde_json::from_str(&format!(r#"{{"event":"added","segment":"IoT","ttl":300,"device":{device}}}"#)).unwrap();
-        let shown = render_event(&event, true, &mut HashSet::new()).unwrap().unwrap();
+        let shown = render_event(&event, true, &mut BTreeSet::new()).unwrap().unwrap();
         assert!(shown.starts_with("added    ttl=300    wifi  10.0.1.9  plug.local  addr-ttl=120\n"), "{shown}");
         // The brief views stay as they were.
-        let brief = render_event(&event, false, &mut HashSet::new()).unwrap().unwrap();
+        let brief = render_event(&event, false, &mut BTreeSet::new()).unwrap().unwrap();
         assert_eq!(brief, "added    ttl=300    plug.local  Plug S  10.0.1.9\n");
     }
 
@@ -2759,11 +2998,11 @@ mod tests {
     }
 
     /// A one-shot fake daemon: replies to one request, returns what it was asked.
-    fn fake_daemon(tag: &str, reply: &'static str) -> (PathBuf, JoinHandle<String>) {
+    fn fake_daemon(tag: &str, reply: &'static str) -> (String, JoinHandle<String>) {
         // Unix socket paths are limited to ~108 bytes, so stay relative to
         // the package root (cargo's test working directory).
         std::fs::create_dir_all("target").unwrap();
-        let path = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.sock", std::process::id()));
+        let path = format!("target/mdnsctl-test-{}-{tag}.sock", std::process::id());
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let socket_file = path.clone();
@@ -2778,11 +3017,11 @@ mod tests {
         (path, handle)
     }
 
-    fn run(path: &Path, json: bool, command: Command) -> Result<String, Failure> {
+    fn run(path: &str, json: bool, command: Command) -> Result<String, Failure> {
         execute(&Options { socket: path.into(), json, segmented: false, verbose: false, command })
     }
 
-    fn run_verbose(path: &Path, command: Command) -> Result<String, Failure> {
+    fn run_verbose(path: &str, command: Command) -> Result<String, Failure> {
         execute(&Options { socket: path.into(), json: false, segmented: false, verbose: true, command })
     }
 
@@ -2839,7 +3078,7 @@ mod tests {
         assert!(matches!(run(&path2, false, Command::Segments), Err(Failure::Server(m)) if m.contains("unreadable")));
         daemon.join().unwrap();
 
-        let missing = PathBuf::from("target/mdnsctl-test-nonexistent.sock");
+        let missing = "target/mdnsctl-test-nonexistent.sock".to_string();
         assert!(matches!(run(&missing, false, Command::Segments), Err(Failure::Connect(_))));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
