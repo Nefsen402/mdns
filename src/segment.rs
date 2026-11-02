@@ -196,6 +196,39 @@ impl Entry {
         self.addr_expires.retain(|addr, _| device.has_addr(addr));
     }
 
+    /// Before `incoming` are taken in, drop the announced addresses of a
+    /// family that would keep them out at `max_addrs`, the one that runs out
+    /// first at a time: a device that moves on to a new temporary address
+    /// without saying goodbye to the last is known by its newest. Not those
+    /// `incoming` repeats, those in `gone` or of a family in `flushed`, which
+    /// go as it is taken in.
+    fn make_room(&mut self, incoming: &[IpAddr], flushed: &[Family], gone: &[IpAddr], max_addrs: usize) {
+        for family in [Family::V4, Family::V6] {
+            if flushed.contains(&family) {
+                continue;
+            }
+            let new = incoming
+                .iter()
+                .filter(|a| family_of(**a) == family && !gone.contains(a) && !self.device.has_addr(a))
+                .count();
+            let mut held: Vec<IpAddr> = self
+                .device
+                .addresses
+                .iter()
+                .filter(|a| a.origin == Origin::Announced)
+                .map(|a| a.ip)
+                .filter(|a| family_of(*a) == family && !gone.contains(a))
+                .collect();
+            let excess = (held.len() + new).saturating_sub(max_addrs);
+            // Oldest first, and those it did not repeat before those it did.
+            held.sort_by_key(|a| (incoming.contains(a), self.addr_expires.get(a).copied()));
+            for addr in held.into_iter().filter(|a| !incoming.contains(a)).take(excess) {
+                self.device.addresses.retain(|a| a.ip != addr);
+                self.addr_expires.remove(&addr);
+            }
+        }
+    }
+
     /// Drop the addresses that have run out by `now`. Returns whether any had.
     fn expire_addrs(&mut self, now: Instant) -> bool {
         let gone: Vec<IpAddr> = self.addr_expires.iter().filter(|&(_, at)| *at <= now).map(|(a, _)| *a).collect();
@@ -1272,6 +1305,7 @@ impl Segment {
             }
             let ttl = Duration::from_secs(report.longest_ttl().into());
             entry.expires = entry.expires.max(now + ttl.max(floor));
+            entry.make_room(&addrs, &report.flushed, &report.gone, max_addrs);
             entry.device.learn(report, &addrs, max_addrs);
             entry.renew_addrs(&addrs, &report.ttls, now, floor);
 
@@ -1300,6 +1334,7 @@ impl Segment {
             let ttl = Duration::from_secs(ttl as u64);
             entry.expires = entry.expires.max(now + ttl.max(floor));
             if usable {
+                entry.make_room(&[src], &[], &[], max_addrs);
                 entry.device.take_addrs(&[src], &[], &[], max_addrs);
                 entry.renew_addrs(&[src], &HashMap::new(), now, floor);
             }
@@ -3674,6 +3709,37 @@ mod tests {
         recv(&rx).unwrap();
         assert_eq!(seg.refresh(t0 + DEFAULT_MIN_LIFETIME + Duration::from_secs(10), before).unwrap(), 0);
         assert!(recv(&rx).is_none());
+    }
+
+    /// A device that moves on to a new address without saying goodbye to the
+    /// last is known by its newest once it is at the limit: the address that
+    /// runs out first makes room.
+    #[test]
+    fn a_new_address_takes_the_place_of_the_stalest_at_the_limit() {
+        let seg = Segment::new("test", &[Family::V6]);
+        seg.set_max_addrs(2);
+        let aaaa = |a: &str| record("phone.local".into(), false, 120, RData::Aaaa(a.parse().unwrap()));
+        for a in ["2001:db8::1", "2001:db8::2", "2001:db8::3"] {
+            hear(&seg, a, vec![aaaa(a)]);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let addrs: Vec<IpAddr> = seg.devices()[0].addrs().collect();
+        assert_eq!(addrs, [ip("2001:db8::2"), ip("2001:db8::3")]);
+    }
+
+    /// The addresses a packet repeats are not the ones to make room.
+    #[test]
+    fn making_room_leaves_the_addresses_a_packet_repeats() {
+        let seg = Segment::new("test", &[Family::V6]);
+        seg.set_max_addrs(2);
+        let aaaa = |a: &str| record("phone.local".into(), false, 120, RData::Aaaa(a.parse().unwrap()));
+        hear(&seg, "2001:db8::1", vec![aaaa("2001:db8::1")]);
+        std::thread::sleep(Duration::from_millis(5));
+        hear(&seg, "2001:db8::2", vec![aaaa("2001:db8::2")]);
+        std::thread::sleep(Duration::from_millis(5));
+        hear(&seg, "2001:db8::1", vec![aaaa("2001:db8::1")]);
+        let addrs: Vec<IpAddr> = seg.devices()[0].addrs().collect();
+        assert_eq!(addrs, [ip("2001:db8::1"), ip("2001:db8::2")]);
     }
 
     /// A device whose records all have this TTL, heard on `seg`.
