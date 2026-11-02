@@ -24,6 +24,7 @@
 //! Interfaces=wifi
 //! ProbeInterval=1min  ; [Probe] ProbeInterval= unless set
 //! ForwardQuestions=unknown  ; always, unknown or never; always unless set
+//! ReflectedWhen=address,hostname  ; what a device must have to be reflected; all three unless set
 //!
 //! [Interface]         ; optional: without a Name=, for every interface
 //! MaxAddresses=8      ; 8 unless set
@@ -121,6 +122,23 @@ pub enum Neighbours {
     Never,
 }
 
+/// What a device must have been heard to have, to be reflected from a segment
+/// (`ReflectedWhen=`): a routable address, a hostname, and a service whose
+/// host and port are known. Everything unless set; a device with no service,
+/// say, is then found by name alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReflectedWhen {
+    pub address: bool,
+    pub hostname: bool,
+    pub service: bool,
+}
+
+impl Default for ReflectedWhen {
+    fn default() -> ReflectedWhen {
+        ReflectedWhen { address: true, hostname: true, service: true }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
     pub name: String,
@@ -139,6 +157,8 @@ pub struct SegmentConfig {
     /// Whether what is reflected onto its interfaces is announced again
     /// before its TTL runs out though it has not changed.
     pub reannounce: bool,
+    /// What a device has to have to be reflected (`ReflectedWhen=`).
+    pub reflected_when: ReflectedWhen,
     /// The TTL of the address records of the devices it reflects; `None`
     /// (the default) announces each with the TTL it announced itself with.
     pub reflect_ttl: Option<Duration>,
@@ -324,6 +344,9 @@ impl Config {
                     }
                     ("segment", "reannounce") => {
                         config.segments.last_mut().unwrap().reannounce = !value.is_empty() && parse_bool(entry, lineno)?;
+                    }
+                    ("segment", "reflectedwhen") => {
+                        config.segments.last_mut().unwrap().reflected_when = parse_reflected_when(&value, lineno)?;
                     }
                     ("segment", "reflectttl") => {
                         config.segments.last_mut().unwrap().reflect_ttl = match value.to_ascii_lowercase().as_str() {
@@ -532,6 +555,27 @@ fn parse_neighbours(value: &str, lineno: usize) -> Result<Neighbours> {
         "never" => Ok(Neighbours::Never),
         _ => bail!("line {lineno}: invalid NeighbourAddresses {value:?}: always, link-local or never"),
     }
+}
+
+fn parse_reflected_when(value: &str, lineno: usize) -> Result<ReflectedWhen> {
+    // An empty assignment resets, as everywhere.
+    if value.is_empty() {
+        return Ok(ReflectedWhen::default());
+    }
+    let mut when = ReflectedWhen { address: false, hostname: false, service: false };
+    for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()) {
+        match word.to_ascii_lowercase().as_str() {
+            "address" => when.address = true,
+            "hostname" => when.hostname = true,
+            "service" => when.service = true,
+            _ => bail!("line {lineno}: invalid ReflectedWhen {word:?}: address, hostname or service"),
+        }
+    }
+    // A device is announced, and tracked, by its name.
+    if !when.hostname {
+        bail!("line {lineno}: ReflectedWhen= must include hostname: a device is announced by its name");
+    }
+    Ok(when)
 }
 
 fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
@@ -873,7 +917,7 @@ interfaces=br0,wifi
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
             "ReflectTTL=", "MaxAddresses=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
-            "Reannounce=",
+            "Reannounce=", "ReflectedWhen=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
@@ -1021,6 +1065,29 @@ interfaces=br0,wifi
         let fits = format!("{label}.{label}.{label}.{}.local", "a".repeat(52));
         assert_eq!(fits.len(), 250);
         assert!(Config::parse(&format!("[Advertise]\nHostname={fits}\n{EXAMPLE}")).is_ok());
+    }
+
+    /// Each segment says what a device must have to be reflected: all of an
+    /// address, a hostname and a service unless it names fewer.
+    #[test]
+    fn segments_choose_what_a_device_needs_to_be_reflected() {
+        let when = |extra: &str| {
+            let c = Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=z")).unwrap();
+            (c.segments[0].reflected_when, c.segments[1].reflected_when)
+        };
+        let all = ReflectedWhen::default();
+        assert_eq!(when(""), (all, all));
+        assert_eq!(when("ReflectedWhen=address,hostname,service"), (all, all));
+        let named = ReflectedWhen { service: false, ..all };
+        assert_eq!(when("ReflectedWhen=address, Hostname"), (named, all));
+        let nameless = ReflectedWhen { address: false, ..all };
+        assert_eq!(when("ReflectedWhen=hostname,service"), (nameless, all));
+        assert_eq!(when("reflectedwhen=address hostname"), (named, all));
+        assert_eq!(when("ReflectedWhen=hostname\nReflectedWhen="), (all, all));
+        for (bad, message) in [("name", "address, hostname or service"), ("address,service", "must include hostname")] {
+            let err = error_of(&format!("[Segment]\nName=a\nInterfaces=x\nReflectedWhen={bad}"));
+            assert!(err.contains("line 4") && err.contains(message), "{err}");
+        }
     }
 
     /// Each segment says which addresses from the neighbour table it

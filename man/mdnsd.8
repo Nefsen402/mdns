@@ -129,7 +129,11 @@ Within a segment, every interface announces the devices discovered on every
 other interface of that segment.
 Only devices that announced a hostname, a routable address and at least one
 service with its SRV record are reflected; chatty clients such as phones are
-tracked but not reflected.
+tracked but not reflected, unless
+.B ReflectedWhen=
+(see
+.BR mdnsd.conf (5))
+asks for less, which can reflect a device with no service.
 What no device could have announced is ignored: records of a class other than
 IN, hostnames not under
 .BR .local

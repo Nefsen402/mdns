@@ -21,7 +21,7 @@ use crate::time::Instant;
 
 use anyhow::{bail, Result};
 
-use crate::config::{Forward, Neighbours};
+use crate::config::{Forward, Neighbours, ReflectedWhen};
 use crate::device::{Device, Service};
 use crate::segment::{Asked, Event, Owner, Segment};
 
@@ -60,6 +60,8 @@ struct Inner {
     /// Which of the addresses a device was given from the neighbour table are
     /// reflected with it.
     neighbours: Neighbours,
+    /// What a device has to have to be reflected.
+    when: ReflectedWhen,
     /// The TTL the address records of what it reflects are announced with;
     /// `None` keeps each device's own.
     reflect_ttl: Option<Duration>,
@@ -99,13 +101,14 @@ impl Reflector {
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
     pub fn with_untrusted(rank: u32, segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
-        Self::with_options(rank, segments, untrusted, Forward::default(), Neighbours::default(), None)
+        Self::with_options(rank, segments, untrusted, Forward::default(), Neighbours::default(), ReflectedWhen::default(), None)
     }
 
     /// Like [`with_untrusted`](Reflector::with_untrusted), putting the
     /// questions asked on each segment to the others as `forward` says,
     /// reflecting the addresses a device was given from the neighbour table as
-    /// `neighbours` says, and announcing what it reflects with the address TTL
+    /// `neighbours` says, reflecting the devices that have what `when` asks
+    /// for, and announcing what it reflects with the address TTL
     /// `reflect_ttl`, if given, in place of each device's own.
     pub fn with_options(
         rank: u32,
@@ -113,6 +116,7 @@ impl Reflector {
         untrusted: &[String],
         forward: Forward,
         neighbours: Neighbours,
+        when: ReflectedWhen,
         reflect_ttl: Option<Duration>,
     ) -> Result<Reflector> {
         if segments.is_empty() {
@@ -135,6 +139,7 @@ impl Reflector {
             untrusted,
             forward,
             neighbours,
+            when,
             reflect_ttl,
             book: RefCell::default(),
             notices: RefCell::default(),
@@ -147,7 +152,7 @@ impl Reflector {
             let mut book = inner.book();
             for (src, seg) in inner.segments.iter().enumerate() {
                 for device in seg.devices() {
-                    track(&mut book, src, device, inner.neighbours);
+                    track(&mut book, src, device, inner.neighbours, inner.when);
                 }
             }
             inner.reconcile(&mut book);
@@ -313,7 +318,7 @@ impl Inner {
         self.notify(src, &event);
         let mut book = self.book();
         match event {
-            Event::Added(device) | Event::Updated(device) => track(&mut book, src, device, self.neighbours),
+            Event::Added(device) | Event::Updated(device) => track(&mut book, src, device, self.neighbours, self.when),
             Event::Removed(device) => {
                 // A device that never had a name was never tracked.
                 if let Some(key) = device.key() {
@@ -432,9 +437,11 @@ impl Inner {
 /// takes a hostname for the address record and a routable address to put in it
 /// (a device known only by a link-local address cannot be reached from another
 /// network), and a resolved service to give clients a reason to care (bare
-/// chatty clients such as phones are skipped).
-fn reflectable(device: &Device) -> bool {
-    device.hostname.is_some() && device.routable().next().is_some() && device.services.iter().any(resolved)
+/// chatty clients such as phones are skipped): of these, what `when` asks for.
+fn reflectable(device: &Device, when: ReflectedWhen) -> bool {
+    (!when.hostname || device.hostname.is_some())
+        && (!when.address || device.routable().next().is_some())
+        && (!when.service || device.services.iter().any(resolved))
 }
 
 /// Whether it is known where `svc` is, by its SRV record: a host and a port.
@@ -448,7 +455,7 @@ fn resolved(svc: &Service) -> bool {
 /// is reflectable, with the addresses it was given from the neighbour table
 /// that `neighbours` lets through: without them, one whose only routable
 /// address was given so is not.
-fn track(book: &mut Book, src: usize, device: Device, neighbours: Neighbours) {
+fn track(book: &mut Book, src: usize, device: Device, neighbours: Neighbours, when: ReflectedWhen) {
     // Without a name there is nothing to key it by, and it is not reflectable.
     let Some(key) = device.key() else { return };
     let key = (src, key);
@@ -457,7 +464,7 @@ fn track(book: &mut Book, src: usize, device: Device, neighbours: Neighbours) {
         Neighbours::LinkLocal => device.with_neighbours_of_link_local_families(),
         Neighbours::Never => device.without_neighbours(),
     };
-    if reflectable(&device) {
+    if reflectable(&device, when) {
         book.sources.insert(key, device);
     } else {
         book.sources.remove(&key);
@@ -685,6 +692,55 @@ mod tests {
         assert!(drain(&brx).is_empty());
     }
 
+    /// A device with a hostname and a routable address is reflected without a
+    /// service only if `ReflectedWhen=` leaves it out: it is then found by
+    /// name, though browsing finds nothing of it.
+    #[test]
+    fn a_device_without_services_is_reflected_only_if_asked_to() {
+        for service in [true, false] {
+            let (a, _arx) = wired("a");
+            let (b, _brx) = wired("b");
+            let when = ReflectedWhen { service, ..ReflectedWhen::default() };
+            let _r =
+                Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), when, None)
+                    .unwrap();
+
+            announce(&a, "10.0.1.6", "bare.local", &[]);
+            deliver_made();
+            let reflected = b.manual_devices();
+            assert_eq!(reflected.len(), usize::from(!service));
+            if !service {
+                assert_eq!(reflected[0].hostname.as_deref(), Some("bare.local"));
+                assert!(reflected[0].services.is_empty());
+            }
+        }
+    }
+
+    /// A device known only by a link-local address is reflected, if
+    /// `ReflectedWhen=` does not ask for an address, by its services alone:
+    /// its link-local address means nothing on another link.
+    #[test]
+    fn a_device_without_a_routable_address_is_reflected_only_if_asked_to() {
+        for address in [true, false] {
+            let (a, _arx) = wired_v6("a");
+            let (b, _brx) = wired_v6("b");
+            let when = ReflectedWhen { address, ..ReflectedWhen::default() };
+            let _r =
+                Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), when, None)
+                    .unwrap();
+
+            announce6(&a, "fe80::6", "mute.local", &["fe80::6"], "Mute");
+            wait_for(|| !a.devices().is_empty());
+            deliver_made();
+            let reflected = b.manual_devices();
+            assert_eq!(reflected.len(), usize::from(!address), "{reflected:?}");
+            if !address {
+                assert_eq!(reflected[0].addrs().count(), 0);
+                assert_eq!(reflected[0].services.len(), 1);
+            }
+        }
+    }
+
     #[test]
     fn drop_withdraws_everything() {
         let (a, _arx) = wired("a");
@@ -803,7 +859,7 @@ mod tests {
         let (a, _arx) = wired("a");
         let (b, brx) = wired("b");
         let ttl = Some(Duration::from_secs(900));
-        let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), ttl).unwrap();
+        let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), ReflectedWhen::default(), ttl).unwrap();
 
         announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
         wait_for(|| b.manual_devices().len() == 1);
@@ -818,7 +874,7 @@ mod tests {
         let (media, _mrx) = wired("media");
         let (wifi, _wrx) = wired("wifi");
         let ttl = Some(Duration::from_secs(900));
-        let _media = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], Forward::default(), Neighbours::default(), ttl);
+        let _media = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], Forward::default(), Neighbours::default(), ReflectedWhen::default(), ttl);
         let _wifi = Reflector::new(1, vec![br0.clone(), wifi.clone()]).unwrap();
 
         announce_ttl(&media, "10.0.2.5", "tv.local", &["TV"], 300, 600);
@@ -1037,7 +1093,7 @@ mod tests {
         let (wifi, wifi_rx) = wired("wifi");
         let segments = vec![br0.clone(), media.clone(), wifi.clone()];
         let _r =
-            Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, Neighbours::default(), None).unwrap();
+            Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, Neighbours::default(), ReflectedWhen::default(), None).unwrap();
 
         ask(&br0, "10.0.0.50", "printer.local");
         deliver_made();
@@ -1073,7 +1129,7 @@ mod tests {
         for forward in [Forward::Always, Forward::Unknown, Forward::Never] {
             let (br0, _br0_rx) = wired("br0");
             let (media, media_rx) = wired("media");
-            let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward, Neighbours::default(), None).unwrap();
+            let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward, Neighbours::default(), ReflectedWhen::default(), None).unwrap();
             announce(&media, "10.0.2.7", "tv.local", &["TV"]);
             wait_for(|| br0.manual_devices().len() == 1);
             drain(&media_rx);
@@ -1186,7 +1242,7 @@ mod tests {
         ] {
             let (a, _arx) = wired("a");
             let (b, _brx) = wired("b");
-            let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), mode, None).unwrap();
+            let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), mode, ReflectedWhen::default(), None).unwrap();
             a.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
             for (addr, mac) in [("10.0.1.9", 9), ("fd00::9", 9), ("fe80::8", 8), ("fd00::8", 8)] {
                 a.neighbour(ip(addr), Some(vec![2, 0, 0, 0, 0, mac]));

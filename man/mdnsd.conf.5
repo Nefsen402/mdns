@@ -278,6 +278,37 @@ address of its own not at all.
 The addresses are learned all the same, and listed by
 .BR mdnsctl (1).
 .TP
+.B ReflectedWhen=
+Optional: a list of
+.BR address ,
+.B hostname
+and
+.BR service ,
+separated by commas or spaces.
+What a device that was heard on one interface of the segment must have, to be
+reflected onto the others: a routable address, a hostname, and a service whose
+host and port are known.
+Default
+.BR address,hostname,service .
+Leaving out
+.B service
+reflects a device with none too, so that it is found by name (a lookup of
+.IR host .local
+from another network), though browsing finds nothing of it.
+By default clients that only announce themselves, such as phones, are tracked
+but not shown on the other networks; without
+.B service
+they are.
+Services whose host and port are not known are never reflected.
+Leaving out
+.B address
+reflects a device that has none a client could reach (only a link-local one, say)
+by its services alone, with no address record: it is for the host to be found by
+other means.
+.B hostname
+cannot be left out: a device is announced, and tracked, by its name.
+An empty assignment resets it.
+.TP
 .B Reannounce=
 Optional boolean, default
 .BR no .

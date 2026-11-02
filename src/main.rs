@@ -111,7 +111,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
     for (rank, seg) in (0..).zip(&config.segments) {
         let members = seg.interfaces.iter().map(|iface| links[iface.as_str()].clone()).collect();
         let reflector =
-            Reflector::with_options(rank, members, &seg.untrusted, seg.forward, seg.neighbour_addresses, seg.reflect_ttl)
+            Reflector::with_options(rank, members, &seg.untrusted, seg.forward, seg.neighbour_addresses, seg.reflected_when, seg.reflect_ttl)
             .with_context(|| format!("starting segment {:?}", seg.name))?;
         eprintln!("segment {:?}: {}", seg.name, seg.interfaces.join(", "));
         if !seg.untrusted.is_empty() {
@@ -123,6 +123,15 @@ fn daemon(args: Vec<String>) -> Result<()> {
             Forward::Never => "no questions",
         };
         eprintln!("segment {:?}: asking {forwarding} on the others", seg.name);
+        let when = seg.reflected_when;
+        if when != config::ReflectedWhen::default() {
+            let needs: Vec<&str> = [(when.address, "address"), (when.hostname, "hostname"), (when.service, "service")]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, name)| *name)
+                .collect();
+            eprintln!("segment {:?}: reflecting devices that have: {}", seg.name, needs.join(", "));
+        }
         match seg.neighbour_addresses {
             Neighbours::Always => eprintln!("segment {:?}: reflecting the addresses from the neighbour table of every family", seg.name),
             Neighbours::LinkLocal => {}

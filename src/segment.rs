@@ -952,10 +952,6 @@ impl Segment {
         let Some(key) = device.key() else {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
         };
-        if device.addrs().next().is_none() {
-            bail!("{key} has no address to announce");
-        }
-
         let claim = Claim { device, host_ttl };
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
@@ -3423,14 +3419,18 @@ mod tests {
         assert_eq!(seg.manual_devices().len(), 1, "same hostname, so it replaced the device");
     }
 
+    /// Whether a device with no address is worth announcing is for whoever
+    /// adds it to say: its services are announced, with no address record.
     #[test]
-    fn add_rejects_a_device_with_no_addresses() {
+    fn a_device_with_no_addresses_is_announced_by_its_services() {
         let (seg, rx) = wired();
         let mut none = tv("10.0.1.9", &["TV"]);
         none.addresses.clear();
-        assert!(seg.add_manual(Owner::Own, none).is_err());
-        assert!(seg.manual_devices().is_empty());
-        assert!(recv(&rx).is_none());
+        seg.add_manual(Owner::Own, none).unwrap();
+        assert_eq!(seg.manual_devices().len(), 1);
+        let m = recv(&rx).unwrap();
+        assert!(m.answers.iter().all(|r| addr_of(&r.data).is_none()));
+        assert!(m.answers.iter().any(|r| matches!(r.data, RData::Srv { .. })));
     }
 
     /// Records do not belong to the transport they go out on: an IPv4
