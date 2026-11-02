@@ -740,7 +740,7 @@ mod tests {
 
     use super::*;
     use crate::parser::{Header, Message, RData, Record};
-    use crate::reflector::Reflector;
+    use crate::reflector::{deliver_made, Reflector};
 
     fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Segment>) {
         let segs: Vec<Segment> = interfaces.iter().map(|i| Segment::new(i, &[family])).collect();
@@ -878,7 +878,7 @@ mod tests {
     fn reflected_copies_are_not_listed() {
         let (g, segs) = group("media", Family::V4, &["a", "b"]);
         announce(&segs[0], "10.0.1.5", "tv.local", "TV");
-        std::thread::sleep(Duration::from_millis(150));
+        deliver_made();
         assert!(!segs[1].manual_devices().is_empty(), "precondition: reflected onto b");
         let out = handle(&[g], &Watches::default(), "devices media");
         assert_eq!(out.matches("\"addresses\"").count(), 1, "{out}");
@@ -1021,6 +1021,7 @@ mod tests {
             serde_json::from_str::<Value>(&line).unwrap()
         };
         segs[0].observe(ip("10.0.1.7"));
+        deliver_made();
         let added = next();
         assert_eq!((added["event"].as_str(), added["segment"].as_str()), (Some("added"), Some("IoT")));
         assert_eq!(added["ttl"], 300);
@@ -1028,6 +1029,7 @@ mod tests {
         assert_eq!(added["device"]["addresses"][0], "10.0.1.7");
 
         segs[0].expire(Instant::now() + Duration::from_secs(3600));
+        deliver_made();
         let removed = next();
         assert_eq!(removed["event"], "removed");
         assert_eq!(removed["ttl"], 0);
@@ -1137,6 +1139,7 @@ mod tests {
         // One without the type is not shown; one with it is.
         seg.observe(ip("10.0.1.8"));
         announce(&seg, "10.0.1.9", "plug.local", "Plug");
+        deliver_made();
         let added = next();
         assert_eq!((added["event"].as_str(), added["device"]["hostname"].as_str()), (Some("added"), Some("plug.local")));
         let _ = fs::remove_file(&path);

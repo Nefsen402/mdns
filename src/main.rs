@@ -171,7 +171,7 @@ fn main() -> Result<()> {
     let segments = Arc::new(segments);
     ipc::serve(&config.socket, &segments)?;
 
-    let signal = run(&signals, &waker, netlink, &mut tracked)?;
+    let signal = run(&signals, &waker, netlink, &mut tracked, &segments)?;
     eprintln!("received {signal}: withdrawing reflected devices");
     // The loop has stopped, and the upkeep with it, while the goodbyes go out.
     release(segments);
@@ -188,16 +188,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The event loop: follow what netlink reports for `links`, and run each
-/// link's upkeep when it is due, until a shutdown signal comes, whose name is
+/// The event loop: read what `links` hear, follow what netlink reports for
+/// them, and run each link's upkeep when it is due, handing what changes to
+/// the reflectors of `groups`, until a shutdown signal comes, whose name is
 /// returned. `waker` cuts a wait short when something comes due sooner.
 /// Should netlink fail, interfaces are no longer followed, and the daemon
 /// goes on as they are.
-fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [Link]) -> Result<&'static str> {
+fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [Link], groups: &[Group]) -> Result<&'static str> {
+    let reflectors: Vec<&Reflector> = groups.iter().map(|g| &g.reflector).collect();
     links::ask_neighbours(&netlink);
     let mut netlink = Some(netlink);
     loop {
-        let next = links.iter().filter_map(|l| l.segment().next_wake()).min();
+        let upkeep = links.iter().filter_map(|l| l.segment().next_wake());
+        let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).min();
         // The signals, the waker and netlink, then every link's sockets,
         // each with the link it is of.
         let mut fds = vec![poll::readable(signals.fd()), poll::readable(waker.fd())];
@@ -231,6 +234,10 @@ fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [
             if link.segment().next_due().is_some_and(|at| at <= now) {
                 link.segment().upkeep(now);
             }
+        }
+        reflector::deliver(&reflectors);
+        for r in &reflectors {
+            r.retry(now);
         }
     }
 }

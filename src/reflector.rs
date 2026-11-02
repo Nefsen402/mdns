@@ -11,10 +11,8 @@
 //! single segment only tracks and reflects nothing.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -22,11 +20,8 @@ use anyhow::{bail, Result};
 use crate::device::{Device, Service};
 use crate::segment::{Asked, Event, Owner, Segment};
 
-/// How often a worker checks for shutdown while waiting for events.
-const TICK: Duration = Duration::from_millis(250);
-
-/// How often a worker reconciles even without events, to retry failed sends.
-const RETRY: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 5000 });
+/// How long after a send failed it is tried again.
+const RETRY: Duration = Duration::from_secs(5);
 
 /// Which of the questions asked on one of a reflector's segments it puts to
 /// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
@@ -73,7 +68,6 @@ pub struct Notice {
 
 pub struct Reflector {
     inner: Arc<Inner>,
-    threads: Vec<JoinHandle<()>>,
 }
 
 struct Inner {
@@ -91,7 +85,6 @@ struct Inner {
     /// `None` keeps each device's own.
     reflect_ttl: Option<Duration>,
     book: Mutex<Book>,
-    stop: AtomicBool,
     subscribers: Mutex<Vec<Sender<Notice>>>,
 }
 
@@ -103,6 +96,8 @@ struct Book {
     /// What each target segment has been told, as last sent successfully,
     /// keyed by (segment index, lowercase hostname).
     pushed: HashMap<(usize, String), Device>,
+    /// When to reconcile again, as a send failed.
+    retry: Option<Instant>,
 }
 
 impl Reflector {
@@ -162,13 +157,12 @@ impl Reflector {
             neighbours,
             reflect_ttl,
             book: Mutex::default(),
-            stop: AtomicBool::new(false),
             subscribers: Mutex::default(),
         });
 
-        // Subscribe before taking the snapshot so no change is missed. A
-        // device seen both ways is harmless: tracking is idempotent.
-        let receivers: Vec<_> = inner.segments.iter().map(Segment::subscribe).collect();
+        // What is known already; what changes from now on is handed in by
+        // the event loop ([`deliver`]). A device seen both ways is harmless:
+        // tracking is idempotent.
         {
             let mut book = inner.book();
             for (src, seg) in inner.segments.iter().enumerate() {
@@ -179,15 +173,9 @@ impl Reflector {
             inner.reconcile(&mut book);
         }
 
-        let threads = receivers
-            .into_iter()
-            .enumerate()
-            .map(|(src, events)| {
-                let inner = Arc::clone(&inner);
-                thread::spawn(move || inner.run(src, events))
-            })
-            .collect();
-        Ok(Reflector { inner, threads })
+        #[cfg(test)]
+        MADE.with(|made| made.borrow_mut().push(Arc::downgrade(&inner)));
+        Ok(Reflector { inner })
     }
 }
 
@@ -211,12 +199,79 @@ impl Reflector {
     }
 }
 
+impl Reflector {
+    /// Act on `event`, a change on `segment`, if that is one this reflector
+    /// spans.
+    pub fn handle(&self, segment: &Segment, event: Event) {
+        self.inner.handle(segment, event);
+    }
+
+    /// When it is to try again what it could not send, if anything.
+    pub fn next_retry(&self) -> Option<Instant> {
+        self.inner.book().retry
+    }
+
+    /// Try again what could not be sent, if that is due at `now`.
+    pub fn retry(&self, now: Instant) {
+        let mut book = self.inner.book();
+        if book.retry.is_some_and(|at| at <= now) {
+            self.inner.reconcile(&mut book);
+        }
+    }
+}
+
+/// Hand what has changed on each segment of `reflectors` to every one of
+/// them that spans it, in the order it happened. A segment several
+/// reflectors share is taken from once.
+pub fn deliver(reflectors: &[&Reflector]) {
+    deliver_to(&reflectors.iter().map(|r| &*r.inner).collect::<Vec<_>>());
+}
+
+fn deliver_to(inners: &[&Inner]) {
+    let mut segments: Vec<&Segment> = Vec::new();
+    for seg in inners.iter().flat_map(|i| &i.segments) {
+        if !segments.iter().any(|s| s.is(seg)) {
+            segments.push(seg);
+        }
+    }
+    for seg in segments {
+        for event in seg.take_events() {
+            for inner in inners {
+                inner.handle(seg, event.clone());
+            }
+        }
+    }
+}
+
+// The reflectors made on this thread, for tests to deliver to as the event
+// loop would.
+#[cfg(test)]
+thread_local! {
+    static MADE: std::cell::RefCell<Vec<std::sync::Weak<Inner>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Deliver what has changed to the reflectors made on this thread that are
+/// still there, as the event loop does after anything happens.
+#[cfg(test)]
+pub fn deliver_made() {
+    let inners: Vec<Arc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(std::sync::Weak::upgrade).collect());
+    deliver_to(&inners.iter().map(|i| &**i).collect::<Vec<_>>());
+}
+
+/// Have the reflectors made on this thread retry as if it were `now`.
+#[cfg(test)]
+pub fn retry_made(now: Instant) {
+    let inners: Vec<Arc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(std::sync::Weak::upgrade).collect());
+    for inner in inners {
+        let mut book = inner.book();
+        if book.retry.is_some_and(|at| at <= now) {
+            inner.reconcile(&mut book);
+        }
+    }
+}
+
 impl Drop for Reflector {
     fn drop(&mut self) {
-        self.inner.stop.store(true, Ordering::SeqCst);
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
         // Nothing is wanted any more, so reconciling sends the goodbyes.
         let mut book = self.inner.book();
         book.sources.clear();
@@ -230,20 +285,9 @@ impl Inner {
         self.book.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// One worker per source segment: apply its events, and reconcile every
-    /// [`RETRY`] to repair failed sends.
-    fn run(&self, src: usize, events: Receiver<Event>) {
-        let mut last_retry = Instant::now();
-        while !self.stop.load(Ordering::SeqCst) {
-            match events.recv_timeout(TICK) {
-                Ok(event) => self.apply(src, event),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            if last_retry.elapsed() >= RETRY {
-                self.reconcile(&mut self.book());
-                last_retry = Instant::now();
-            }
+    fn handle(&self, segment: &Segment, event: Event) {
+        if let Some(src) = self.segments.iter().position(|s| s.is(segment)) {
+            self.apply(src, event);
         }
     }
 
@@ -339,6 +383,7 @@ impl Inner {
     /// Bring every target in line with [`Inner::desired`]. Failures are
     /// logged and left as a difference, so the next call retries them.
     fn reconcile(&self, book: &mut Book) {
+        let mut failed = false;
         for (target, seg) in self.segments.iter().enumerate() {
             let desired = self.desired(book, target);
 
@@ -353,7 +398,10 @@ impl Inner {
                     Ok(_) => {
                         book.pushed.remove(&(target, key));
                     }
-                    Err(e) => eprintln!("{}: withdrawing {key} failed: {e:#}", seg.interface()),
+                    Err(e) => {
+                        eprintln!("{}: withdrawing {key} failed: {e:#}", seg.interface());
+                        failed = true;
+                    }
                 }
             }
 
@@ -369,10 +417,14 @@ impl Inner {
                     Ok(_) => {
                         book.pushed.insert((target, key), device);
                     }
-                    Err(e) => eprintln!("{}: announcing {key} failed: {e:#}", seg.interface()),
+                    Err(e) => {
+                        eprintln!("{}: announcing {key} failed: {e:#}", seg.interface());
+                        failed = true;
+                    }
                 }
             }
         }
+        book.retry = failed.then(|| Instant::now() + RETRY);
     }
 }
 
@@ -457,7 +509,10 @@ mod tests {
         let reflector = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
         let (tx, notices) = std::sync::mpsc::channel();
         reflector.watch(tx);
-        let next = || notices.recv_timeout(Duration::from_secs(2)).unwrap();
+        let next = || {
+            deliver_made();
+            notices.recv_timeout(Duration::from_secs(2)).unwrap()
+        };
 
         a.observe("10.0.1.1".parse().unwrap());
         let first = next();
@@ -486,10 +541,7 @@ mod tests {
         drop(notices);
         // The first event finds the receiver gone; reflecting is unaffected.
         a.observe("10.0.1.1".parse().unwrap());
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !reflector.inner.subscribers.lock().unwrap().is_empty() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
+        deliver_made();
         assert!(reflector.inner.subscribers.lock().unwrap().is_empty());
         let _ = rb;
     }
@@ -503,14 +555,11 @@ mod tests {
         out
     }
 
+    /// Deliver what has changed, as the event loop would, and check `cond`
+    /// holds then.
     fn wait_for(cond: impl Fn() -> bool) {
-        for _ in 0..300 {
-            if cond() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("timed out waiting for condition");
+        deliver_made();
+        assert!(cond(), "not so once delivered");
     }
 
     fn rec(name: &str, data: RData) -> Record {
@@ -638,7 +687,7 @@ mod tests {
 
         a.observe(ip("10.0.1.5")); // no hostname, no services
         announce(&a, "10.0.1.6", "bare.local", &[]); // hostname only
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert!(b.manual_devices().is_empty());
         assert!(drain(&brx).is_empty());
     }
@@ -709,7 +758,7 @@ mod tests {
         // each other.
         assert_eq!(announced_on(&br0), ["plug.local", "speaker.local"]);
         assert!(announced_on(&media).is_empty() && announced_on(&wifi).is_empty());
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert!(drain(&media_rx).is_empty() && drain(&wifi_rx).is_empty(), "nothing was sent to them");
         assert!(!drain(&br0_rx).is_empty());
 
@@ -799,7 +848,7 @@ mod tests {
         announce(&a, "10.0.1.5", "tv.local", &["Airplay"]);
         announce(&a, "10.0.1.5", "tv-nsas-1.local", &["Display"]);
         wait_for(|| a.devices().len() == 2);
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
 
         let mut names: Vec<_> = b.manual_devices().iter().map(|d| d.hostname.clone().unwrap()).collect();
         names.sort();
@@ -820,7 +869,7 @@ mod tests {
         announce(&a, "10.0.1.5", "tv-a.local", &["A"]);
         announce(&c, "10.0.3.5", "tv-c.local", &["C"]);
         wait_for(|| b.manual_devices().len() == 2);
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
 
         // b learned both, but a and c each only learned about b's side.
         assert_eq!(a.manual_devices().len(), 0);
@@ -857,16 +906,16 @@ mod tests {
         wait_for(|| on_br0() == [Some(ip("10.0.2.5"))]);
         announce(&wifi, "10.0.3.5", "tv.local", &["Wifi TV"]);
         wait_for(|| wifi.devices().len() == 1);
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert_eq!(on_br0(), [Some(ip("10.0.2.5"))]);
 
         wifi.expire(gone());
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert_eq!(on_br0(), [Some(ip("10.0.2.5"))]);
 
         // The winner going hands the name over instead of withdrawing it.
         announce(&wifi, "10.0.3.5", "tv.local", &["Wifi TV"]);
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         drain(&br0_rx);
         media.expire(gone());
         wait_for(|| on_br0() == [Some(ip("10.0.3.5"))]);
@@ -892,7 +941,7 @@ mod tests {
         announce(&br0, "10.0.0.5", "tv.local", &["Living Room"]);
         announce(&media, "10.0.2.5", "TV.local", &["Living Room"]);
         wait_for(|| br0.devices().len() == 1 && media.devices().len() == 1);
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert!(on_br0().is_empty() && media.manual_devices().is_empty());
         assert!(tv_records(drain(&br0_rx)).is_empty(), "nothing about tv.local was sent onto br0");
 
@@ -923,12 +972,12 @@ mod tests {
 
         announce(&media, "10.0.2.5", "Router.local", &["Admin"]);
         wait_for(|| media.devices().len() == 1);
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert_eq!(br0.manual_devices(), std::slice::from_ref(&router));
 
         media.expire(Instant::now() + Duration::from_secs(3600));
         wait_for(|| media.devices().is_empty());
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert_eq!(br0.manual_devices(), [router]);
         assert!(drain(&br0_rx).is_empty(), "nothing about it was sent, or withdrawn");
     }
@@ -952,7 +1001,7 @@ mod tests {
         };
         a.handle(SocketAddr::new(ip("10.0.1.5"), 5353), &msg.encode().unwrap()).unwrap();
         wait_for(|| a.devices().iter().any(|d| !d.services.is_empty()));
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert!(b.manual_devices().is_empty(), "nothing resolved to reflect");
 
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
@@ -998,7 +1047,7 @@ mod tests {
             Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, Neighbours::default(), None).unwrap();
 
         ask(&br0, "10.0.0.50", "printer.local");
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert_eq!(asked_names(&drain(&media_rx)), ["printer.local"]);
         assert_eq!(asked_names(&drain(&wifi_rx)), ["printer.local"]);
         assert!(drain(&br0_rx).is_empty(), "nothing to answer, and nothing asked there");
@@ -1012,12 +1061,12 @@ mod tests {
         // The client asking again is answered on br0 (once the copy may be
         // multicast again), and nothing more is asked elsewhere.
         ask(&br0, "10.0.0.50", "printer.local");
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert!(asked_names(&drain(&media_rx)).is_empty() && asked_names(&drain(&wifi_rx)).is_empty());
 
         // The untrusted one asks: nothing is asked on its behalf.
         ask(&wifi, "10.0.3.50", "nas.local");
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert!(asked_names(&drain(&br0_rx)).is_empty() && asked_names(&drain(&media_rx)).is_empty());
     }
 
@@ -1037,7 +1086,7 @@ mod tests {
             drain(&media_rx);
 
             ask_type(&br0, "10.0.0.50", "_http._tcp.local", rtype::PTR);
-            thread::sleep(Duration::from_millis(100));
+            deliver_made();
             let queries: Vec<Message> = drain(&media_rx).into_iter().filter(|m| !m.header.response).collect();
             if forward == Forward::Always {
                 assert_eq!(asked_names(&queries), ["_http._tcp.local"]);
@@ -1051,7 +1100,7 @@ mod tests {
 
             // Never forwarding, not even what nothing answers is asked.
             ask(&br0, "10.0.0.50", "printer.local");
-            thread::sleep(Duration::from_millis(100));
+            deliver_made();
             let asked = asked_names(&drain(&media_rx));
             assert_eq!(asked.is_empty(), forward == Forward::Never, "{forward:?}: {asked:?}");
         }
@@ -1068,13 +1117,20 @@ mod tests {
         let repair = || b.attach(Family::V4, UdpSocket::bind("127.0.0.1:0").unwrap(), b_rx.local_addr().unwrap());
         let (socket, dest) = broken();
         b.attach(Family::V4, socket, dest);
-        let _r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
+        let r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
 
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
-        thread::sleep(RETRY * 3);
+        deliver_made();
         assert!(b.manual_devices().is_empty(), "it could not be announced");
+        let retry = r.next_retry().expect("to be tried again");
+        assert!(retry > Instant::now() + RETRY - Duration::from_secs(1));
+        retry_made(retry);
+        assert!(b.manual_devices().is_empty(), "still not");
         repair();
-        wait_for(|| b.manual_devices().len() == 1);
+        assert!(r.next_retry().is_some_and(|at| at > retry), "put off");
+        retry_made(r.next_retry().unwrap());
+        assert_eq!(b.manual_devices().len(), 1);
+        assert_eq!(r.next_retry(), None, "nothing left to try");
         let told: Vec<Record> = drain(&b_rx).into_iter().flat_map(|m| m.answers).collect();
         assert!(told.iter().any(|r| r.data == RData::A("10.0.1.5".parse().unwrap()) && r.ttl > 0), "{told:?}");
 
@@ -1082,10 +1138,11 @@ mod tests {
         let (socket, dest) = broken();
         b.attach(Family::V4, socket, dest);
         a.expire(Instant::now() + Duration::from_secs(100_000));
-        thread::sleep(RETRY * 3);
+        deliver_made();
         assert_eq!(b.manual_devices().len(), 1, "kept: its goodbye did not go out");
         repair();
-        wait_for(|| b.manual_devices().is_empty());
+        retry_made(r.next_retry().unwrap());
+        assert!(b.manual_devices().is_empty());
         let told: Vec<Record> = drain(&b_rx).into_iter().flat_map(|m| m.answers).collect();
         assert!(told.iter().any(|r| r.data == RData::A("10.0.1.5".parse().unwrap()) && r.ttl == 0), "{told:?}");
     }
@@ -1114,7 +1171,7 @@ mod tests {
             additionals: vec![],
         };
         a.handle(SocketAddr::new(ip("fe80::9"), 5353), &msg.encode().unwrap()).unwrap();
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert!(b.manual_devices().is_empty(), "nowhere to reach it at");
 
         a.neighbour(ip("fd00::9"), Some(mac));
@@ -1165,7 +1222,7 @@ mod tests {
             match &tv {
                 Some(addrs) => wait_for(|| copy("tv.local").is_some_and(|d| d.addrs().eq(addrs.iter().copied()))),
                 None => {
-                    thread::sleep(Duration::from_millis(100));
+                    deliver_made();
                     assert!(copy("tv.local").is_none(), "{mode:?}: nowhere to reach it at");
                 }
             }
@@ -1298,7 +1355,7 @@ mod tests {
 
         announce6(&a, "fe80::6", "mute.local", &["fe80::6"], "Mute");
         wait_for(|| !a.devices().is_empty());
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert_eq!(v4(&a.devices()[0]), None);
         assert!(b.manual_devices().is_empty());
         assert!(drain(&brx).is_empty());
@@ -1309,7 +1366,7 @@ mod tests {
         let (a, arx) = wired("a");
         let _r = Reflector::new(0, vec![a.clone()]).unwrap();
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
-        thread::sleep(Duration::from_millis(100));
+        deliver_made();
         assert!(a.manual_devices().is_empty());
         assert!(drain(&arx).is_empty());
     }

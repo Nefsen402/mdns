@@ -10,7 +10,6 @@
 use std::fmt;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -373,7 +372,8 @@ struct State {
     /// Devices we announce on this segment on behalf of somewhere else, by
     /// lowercase hostname.
     manual: HashMap<String, Manual>,
-    subscribers: Vec<Sender<Event>>,
+    /// Changes not yet taken by the event loop ([`Segment::take_events`]).
+    outbox: Vec<Event>,
     /// How to send, over each family the segment has a socket of.
     outbound: Vec<Outbound>,
     /// Service types devices on this segment have said they offer, learned
@@ -464,8 +464,13 @@ impl State {
     }
 
     fn notify(&mut self, event: Event) {
-        // A dropped receiver is an unsubscribe.
-        self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+        // A change made while the loop waits has it look.
+        if self.outbox.is_empty()
+            && let Some(waker) = &self.upkeep.waker
+        {
+            waker.wake();
+        }
+        self.outbox.push(event);
     }
 
     /// The next time [`Segment::expire`], [`Segment::refresh`] or
@@ -840,12 +845,15 @@ impl Segment {
 
     // 2. Change notifications for the discovered list.
 
-    /// Receive an [`Event`] whenever a device appears, changes or disappears
-    /// from the discovered list. Drop the receiver to unsubscribe.
-    pub fn subscribe(&self) -> Receiver<Event> {
-        let (tx, rx) = mpsc::channel();
-        self.state.lock().unwrap().subscribers.push(tx);
-        rx
+    /// The changes to its devices since last asked, oldest first, for the
+    /// event loop to hand on.
+    pub fn take_events(&self) -> Vec<Event> {
+        std::mem::take(&mut self.state.lock().unwrap().outbox)
+    }
+
+    /// Whether `other` is this very segment, not just one of the same name.
+    pub fn is(&self, other: &Segment) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
     }
 
     /// Everything this segment's timer is waiting for, soonest first: devices
@@ -1068,8 +1076,8 @@ impl Segment {
     /// is about to take is not answered with reflected copies: it would take
     /// them for a conflict, and once it announces, the copy gives way.
     ///
-    /// What it has no answer to is passed on to the subscribers as an
-    /// [`Event::Question`], for the reflector to ask elsewhere.
+    /// What it has no answer to is passed on as an [`Event::Question`], for
+    /// the reflector to ask elsewhere.
     fn respond(&self, from: SocketAddr, query: &Message) -> Result<()> {
         let h = &query.header;
         if h.response || h.opcode != 0 || h.rcode != 0 || query.questions.is_empty() {
@@ -1614,6 +1622,8 @@ fn transmit(outbound: &[Outbound], family: Family, msg: &Message, dest: Option<S
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::net::Ipv4Addr;
 
     use super::*;
@@ -2657,8 +2667,34 @@ mod tests {
         .unwrap()
     }
 
+    /// The events of a segment, taken as a test asks for them, the way a
+    /// channel's receiver gives them.
+    struct Events<'a> {
+        seg: &'a Segment,
+        taken: RefCell<VecDeque<Event>>,
+    }
+
+    impl Segment {
+        fn subscribe(&self) -> Events<'_> {
+            self.take_events();
+            Events { seg: self, taken: RefCell::default() }
+        }
+    }
+
+    impl Events<'_> {
+        fn try_recv(&self) -> Result<Event, ()> {
+            let mut taken = self.taken.borrow_mut();
+            taken.extend(self.seg.take_events());
+            taken.pop_front().ok_or(())
+        }
+
+        fn try_iter(&self) -> impl Iterator<Item = Event> + '_ {
+            std::iter::from_fn(|| self.try_recv().ok())
+        }
+    }
+
     /// The questions passed on so far, one list per query.
-    fn passed_on(events: &Receiver<Event>) -> Vec<Vec<Asked>> {
+    fn passed_on(events: &Events) -> Vec<Vec<Asked>> {
         events
             .try_iter()
             .filter_map(|e| match e {
@@ -3828,11 +3864,16 @@ mod tests {
     }
 
     #[test]
-    fn dropped_subscriber_is_pruned() {
+    fn events_wait_to_be_taken_and_poke_the_loop() {
         let seg = Segment::new("test", &[Family::V4]);
-        drop(seg.subscribe());
+        let waker = Arc::new(Waker::new().unwrap());
+        seg.set_waker(waker.clone());
         seg.observe(ip("10.0.1.5"));
-        assert!(seg.state.lock().unwrap().subscribers.is_empty());
+        seg.observe(ip("10.0.1.6"));
+        assert!(woken(&waker), "the first one pokes it");
+        assert_eq!(seg.take_events().len(), 2);
+        assert!(seg.take_events().is_empty(), "taken");
+        assert!(seg.is(&seg.clone()) && !seg.is(&Segment::new("test", &[Family::V4])));
     }
 
     /// Service types learned from the enumeration are one per type, whatever
