@@ -8,7 +8,9 @@
 //! it.
 
 use std::fmt;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use hashbrown::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::cell::RefCell;
 use std::rc::Rc;

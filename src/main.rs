@@ -17,7 +17,7 @@ mod socket;
 mod time;
 mod timespan;
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::path::PathBuf;
 use time::Instant;
 

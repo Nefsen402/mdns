@@ -87,7 +87,7 @@
 //! or TXT's), in seconds, `null` when not known. A reflected copy is announced
 //! with them, unless the configuration says otherwise.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fs::{self, Permissions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;

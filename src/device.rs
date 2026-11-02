@@ -6,7 +6,9 @@
 //! [`Device`] then takes in with [`Device::learn`]; a device is turned back
 //! into records with [`Device::announcement`] and [`Device::answers`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+
+use hashbrown::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use crate::parser::{self, rtype, Header, Message, Question, RData, Record};

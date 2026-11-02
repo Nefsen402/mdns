@@ -10,7 +10,9 @@
 //! interfaces share a reflector is the caller's policy. A reflector with a
 //! single segment only tracks and reflects nothing.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+
+use hashbrown::HashMap;
 use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
 use std::time::Duration;
