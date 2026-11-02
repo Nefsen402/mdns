@@ -25,7 +25,6 @@ pub enum Family {
 }
 
 pub struct MdnsSocket {
-    pub interface: String,
     pub index: u32,
     pub family: Family,
     pub socket: Socket,
@@ -220,7 +219,6 @@ pub fn open(interface: &str, family: Family) -> Result<MdnsSocket> {
     }
 
     Ok(MdnsSocket {
-        interface: interface.to_string(),
         index,
         family,
         socket,

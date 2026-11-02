@@ -12,8 +12,8 @@
 //! An interface that is not there when the daemon starts is waited for.
 
 use std::net::{IpAddr, UdpSocket};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -24,11 +24,11 @@ use crate::device::Device;
 use crate::netlink::{Change, Netlink};
 use crate::poll::Waker;
 use crate::segment::{Owner, Segment};
-use crate::socket::{self, Family, MdnsSocket};
+use crate::socket::{self, Family};
 
-/// How often a receive loop looks up from waiting to see whether it is to
-/// stop: a socket whose interface is gone may never hear anything again.
-const STOP_CHECK: Duration = Duration::from_millis(500);
+/// The most a datagram read from an mDNS socket may hold: mDNS's own limit
+/// (RFC 6762 section 17).
+const MAX_DATAGRAM: usize = 9000;
 
 /// One interface the daemon serves, and the sockets it has on it while it is
 /// there.
@@ -48,8 +48,9 @@ pub struct Link {
     was_here: bool,
     /// Its MTU, once known: what a packet sent on it may hold follows it.
     mtu: Option<u32>,
-    /// Tells the receive loops of the current sockets to stop.
-    stop: Arc<AtomicBool>,
+    /// The sockets it hears on while the interface is there, one per family,
+    /// for the event loop to read when they are readable.
+    sockets: Vec<UdpSocket>,
 }
 
 impl Link {
@@ -73,7 +74,7 @@ impl Link {
             up: true,
             was_here: false,
             mtu: None,
-            stop: Arc::new(AtomicBool::new(true)),
+            sockets: Vec::new(),
         }
     }
 
@@ -81,8 +82,8 @@ impl Link {
         &self.segment
     }
 
-    /// Open a socket for each family on the interface, if it is there, start
-    /// a receive loop for each, both feeding the one list of devices, and
+    /// Open a socket for each family on the interface, if it is there, for
+    /// the event loop to read, both feeding the one list of devices, and
     /// advertise the name. Returns whether it was there.
     pub fn open(&mut self) -> Result<bool> {
         let Ok(index) = socket::ifindex(&self.interface) else {
@@ -95,15 +96,17 @@ impl Link {
                 .with_context(|| format!("opening {family:?} socket on {}", self.interface))?;
             sockets.push(sock);
         }
-        let stop = Arc::new(AtomicBool::new(false));
+        let mut receivers = Vec::new();
         for sock in sockets {
+            // Never waited on: the loop reads it when it is readable, and a
+            // send that cannot go out at once fails, and is tried again.
+            sock.socket.set_nonblocking(true)?;
             let (tx, dest) = sock.sender()?;
             self.segment.attach(sock.family, tx, dest);
             eprintln!("listening on {} ({:?})", self.interface, sock.family);
-            let (segment, stop) = (self.segment.clone(), stop.clone());
-            thread::spawn(move || recv_loop(sock, segment, stop));
+            receivers.push(sock.socket.into());
         }
-        self.stop = stop;
+        self.sockets = receivers;
         self.index = Some(index);
         self.was_here = true;
         if self.up {
@@ -112,10 +115,10 @@ impl Link {
         Ok(true)
     }
 
-    /// Close the sockets, as the interface is gone: their receive loops stop,
-    /// and nothing is sent until it is back.
+    /// Close the sockets, as the interface is gone: nothing is heard or sent
+    /// until it is back.
     fn close(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.sockets.clear();
         self.segment.detach_all();
         self.index = None;
     }
@@ -231,6 +234,34 @@ impl Link {
         self.mtu = Some(mtu);
     }
 
+    /// The descriptors of its sockets, for the event loop to wait on.
+    pub fn fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        self.sockets.iter().map(|s| s.as_raw_fd())
+    }
+
+    /// Handle everything the socket `fd` has heard, if it is one of this
+    /// link's: the event loop found it readable.
+    pub fn receive(&self, fd: RawFd) {
+        let Some(sock) = self.sockets.iter().find(|s| s.as_raw_fd() == fd) else { return };
+        let mut buf = [0u8; MAX_DATAGRAM];
+        loop {
+            match sock.recv_from(&mut buf) {
+                Ok((len, from)) => {
+                    if let Err(e) = self.segment.handle(from, &buf[..len]) {
+                        eprintln!("{}: reply failed: {e:#}", self.interface);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    // Reported once (an ICMP error, say), it is cleared.
+                    eprintln!("{}: recv failed: {e}", self.interface);
+                    return;
+                }
+            }
+        }
+    }
+
     /// The interface is back, or up again: whoever is on it now may never
     /// have heard what is announced there, nor been asked about.
     fn came_back(&self) {
@@ -262,29 +293,6 @@ pub fn follow(netlink: &Netlink, links: &mut [Link], changes: &[Change]) {
     for change in changes {
         for link in links.iter_mut() {
             link.changed(change);
-        }
-    }
-}
-
-/// Handle what `sock` hears, until told to `stop`.
-fn recv_loop(sock: MdnsSocket, segment: Segment, stop: Arc<AtomicBool>) {
-    let udp: UdpSocket = sock.socket.into();
-    if let Err(e) = udp.set_read_timeout(Some(STOP_CHECK)) {
-        eprintln!("{} {:?}: {e}", sock.interface, sock.family);
-    }
-    let mut buf = [0u8; 9000];
-    while !stop.load(Ordering::Relaxed) {
-        match udp.recv_from(&mut buf) {
-            Ok((len, from)) => {
-                if let Err(e) = segment.handle(from, &buf[..len]) {
-                    eprintln!("{} {:?}: reply failed: {e:#}", sock.interface, sock.family);
-                }
-            }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
-            Err(e) => {
-                eprintln!("{} {:?}: recv failed: {e}", sock.interface, sock.family);
-                return;
-            }
         }
     }
 }

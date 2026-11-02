@@ -198,8 +198,13 @@ fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [
     let mut netlink = Some(netlink);
     loop {
         let next = links.iter().filter_map(|l| l.segment().next_wake()).min();
+        // The signals, the waker and netlink, then every link's sockets,
+        // each with the link it is of.
         let mut fds = vec![poll::readable(signals.fd()), poll::readable(waker.fd())];
-        fds.extend(netlink.as_ref().map(|n| poll::readable(n.fd())));
+        fds.push(poll::readable(netlink.as_ref().map_or(-1, Netlink::fd)));
+        let sockets: Vec<(usize, i32)> =
+            links.iter().enumerate().flat_map(|(i, l)| l.fds().map(move |fd| (i, fd))).collect();
+        fds.extend(sockets.iter().map(|&(_, fd)| poll::readable(fd)));
         poll::wait(&mut fds, next.map(|at| at.saturating_duration_since(Instant::now())))
             .context("waiting for something to do")?;
         if let Some(name) = signals.take() {
@@ -208,7 +213,11 @@ fn run(signals: &signal::Signals, waker: &Waker, netlink: Netlink, links: &mut [
         if poll::ready(&fds[1]) {
             waker.clear();
         }
-        if let Some(n) = netlink.as_ref().filter(|_| fds.get(2).is_some_and(poll::ready)) {
+        // What was heard first: a change of interfaces may close the sockets.
+        for (&(link, fd), _) in sockets.iter().zip(&fds[3..]).filter(|(_, p)| poll::ready(p)) {
+            links[link].receive(fd);
+        }
+        if let Some(n) = netlink.as_ref().filter(|_| poll::ready(&fds[2])) {
             match n.changes() {
                 Ok(changes) => links::follow(n, links, &changes),
                 Err(e) => {
