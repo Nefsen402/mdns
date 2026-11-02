@@ -6,9 +6,14 @@
 //! the daemon listens for link and address changes, and acts on those to the
 //! interfaces it serves. Only the few fields it needs are read.
 
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use rustix::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use rustix::io::Errno;
+
+use crate::errno::{self, Why};
 
 /// A change to an interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,16 +73,16 @@ pub struct Netlink {
 }
 
 impl Netlink {
-    pub fn open() -> io::Result<Netlink> {
+    pub fn open() -> Result<Netlink, Why> {
         // SAFETY: plain socket creation; the result is checked.
         let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Why(errno::last()));
         }
         // SAFETY: `fd` was just created and is owned by nothing else.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         // SAFETY: an all-zero sockaddr_nl is valid; the fields set are its own.
-        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut addr: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
         addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
         addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR | RTMGRP_NEIGH;
         // SAFETY: `addr` is a valid sockaddr_nl of the size given.
@@ -85,11 +90,11 @@ impl Netlink {
             libc::bind(
                 fd.as_raw_fd(),
                 (&addr as *const libc::sockaddr_nl).cast(),
-                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
             )
         };
         if rc < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Why(errno::last()));
         }
         Ok(Netlink { fd })
     }
@@ -97,7 +102,7 @@ impl Netlink {
     /// Ask the kernel for every entry of every interface's neighbour table:
     /// they come as [`Change::Neighbour`]s among the next changes. For what
     /// was there before the daemon started, or before changes were lost.
-    pub fn request_neighbours(&self) -> io::Result<()> {
+    pub fn request_neighbours(&self) -> Result<(), Why> {
         let mut msg = Vec::with_capacity(NLMSG_HDRLEN + NDMSG_LEN);
         msg.extend(((NLMSG_HDRLEN + NDMSG_LEN) as u32).to_ne_bytes());
         msg.extend(RTM_GETNEIGH.to_ne_bytes());
@@ -106,7 +111,7 @@ impl Netlink {
         msg.extend(0u32.to_ne_bytes()); // port: the kernel fills it in
         msg.extend([0u8; NDMSG_LEN]); // every family, every interface
         // SAFETY: an all-zero sockaddr_nl is the kernel's address.
-        let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut kernel: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
         kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
         // SAFETY: `msg` is readable for its length, and `kernel` is a valid
         // sockaddr_nl of the size given.
@@ -117,10 +122,10 @@ impl Netlink {
                 msg.len(),
                 0,
                 (&kernel as *const libc::sockaddr_nl).cast(),
-                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
             )
         };
-        if n < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+        if n < 0 { Err(Why(errno::last())) } else { Ok(()) }
     }
 
     /// The descriptor to wait on: readable when there are changes.
@@ -130,7 +135,7 @@ impl Netlink {
 
     /// The changes the kernel has reported since last asked, without
     /// waiting: none if there are none yet.
-    pub fn changes(&self) -> io::Result<Vec<Change>> {
+    pub fn changes(&self) -> Result<Vec<Change>, Why> {
         let mut buf = vec![0u8; 64 * 1024];
         let mut changes = Vec::new();
         loop {
@@ -140,11 +145,11 @@ impl Netlink {
                 changes.extend(parse(&buf[..n as usize]));
                 continue;
             }
-            match io::Error::last_os_error() {
-                e if e.kind() == io::ErrorKind::Interrupted => continue,
-                e if e.kind() == io::ErrorKind::WouldBlock => return Ok(changes),
-                e if e.raw_os_error() == Some(libc::ENOBUFS) => changes.push(Change::Lost),
-                e => return Err(e),
+            match errno::last() {
+                Errno::INTR => continue,
+                Errno::AGAIN => return Ok(changes),
+                Errno::NOBUFS => changes.push(Change::Lost),
+                e => return Err(Why(e)),
             }
         }
     }

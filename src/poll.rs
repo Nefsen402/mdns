@@ -1,9 +1,12 @@
 //! Waiting on several descriptors at once, with poll(2): with the handful of
 //! descriptors the daemon has, nothing more elaborate is called for.
 
-use std::io;
-use std::os::fd::RawFd;
-use std::time::Duration;
+use core::time::Duration;
+
+use rustix::fd::RawFd;
+use rustix::io::Errno;
+
+use crate::errno::{self, Why};
 
 /// A descriptor to wait on until it can be read.
 pub fn readable(fd: RawFd) -> libc::pollfd {
@@ -18,7 +21,7 @@ pub fn ready(fd: &libc::pollfd) -> bool {
 
 /// Wait until one of `fds` is ready, or `timeout` (`None`: no limit) passes.
 /// Interrupted by a signal, it returns early, with nothing ready.
-pub fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<()> {
+pub fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<(), Why> {
     // Rounded up, so that what is due is due when it returns.
     let ms = timeout.map_or(-1, |t| i32::try_from(t.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX));
     for fd in fds.iter_mut() {
@@ -26,9 +29,9 @@ pub fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<(
     }
     // SAFETY: `fds` is a valid array of pollfd of the length given.
     if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) } < 0 {
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
+        let e = errno::last();
+        if e != Errno::INTR {
+            return Err(Why(e));
         }
     }
     Ok(())

@@ -3,9 +3,11 @@
 //! polls (the self-pipe trick). Writing to a pipe is one of the few things a
 //! handler may safely do.
 
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, Ordering};
+
+use rustix::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+use crate::errno::{self, Why};
 
 /// The pipe's writing end, for the handler: -1 until [`install`]ed.
 static WRITE_END: AtomicI32 = AtomicI32::new(-1);
@@ -29,11 +31,11 @@ pub struct Signals {
 
 /// Handle SIGTERM and SIGINT from now on by writing to a pipe, whose reading
 /// end is returned. Call once.
-pub fn install() -> io::Result<Signals> {
+pub fn install() -> Result<Signals, Why> {
     let mut fds = [0; 2];
     // SAFETY: `fds` has room for the two descriptors pipe2 fills in.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(Why(errno::last()));
     }
     // SAFETY: both were just created, and are owned by nothing else. The
     // writing end lives as long as the process, for the handler.
@@ -43,14 +45,14 @@ pub fn install() -> io::Result<Signals> {
         // SAFETY: an all-zero sigaction is valid; the fields set are its own,
         // and the handler only does what a handler may.
         let rc = unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
+            let mut action: libc::sigaction = core::mem::zeroed();
             action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
             action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(sig, &action, std::ptr::null_mut())
+            libc::sigaction(sig, &action, core::ptr::null_mut())
         };
         if rc != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Why(errno::last()));
         }
     }
     Ok(Signals { read })

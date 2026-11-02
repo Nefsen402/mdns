@@ -18,7 +18,6 @@ use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, CStr};
 use core::fmt;
 use core::net::IpAddr;
-use core::sync::atomic::{AtomicI32, Ordering};
 use core::time::Duration;
 
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
@@ -27,12 +26,22 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, Signal, WaitOptions, WaitStatus};
 use serde_json::Value;
 
+use crate::errno::Why;
+
 // First, for its print macros.
 #[macro_use]
 #[path = "runtime.rs"]
 mod runtime;
 #[path = "args.rs"]
 mod args;
+#[path = "errno.rs"]
+mod errno;
+// Shared with the daemon, which waits on more than a subscriber does.
+#[allow(dead_code)]
+#[path = "poll.rs"]
+mod poll;
+#[path = "signal.rs"]
+mod signal;
 #[path = "timespan.rs"]
 mod timespan;
 
@@ -423,29 +432,6 @@ enum Failure {
 // The system, through rustix, and what only libc does: forking and running
 // a program, the environment, and the words for an error.
 
-/// An error as the system words it: rustix, without std, says only "os
-/// error 2".
-struct Why(Errno);
-
-impl fmt::Display for Why {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut buf = [0u8; 128];
-        // SAFETY: `buf` is writable for its length; the XSI strerror_r writes a
-        // NUL-terminated message into it, or fails and leaves it alone.
-        let ok = unsafe { libc::strerror_r(self.0.raw_os_error(), buf.as_mut_ptr().cast(), buf.len()) } == 0;
-        match CStr::from_bytes_until_nul(&buf).ok().and_then(|m| m.to_str().ok()).filter(|_| ok) {
-            Some(message) => write!(f, "{message} (os error {})", self.0.raw_os_error()),
-            None => write!(f, "os error {}", self.0.raw_os_error()),
-        }
-    }
-}
-
-/// What the last libc call that failed left in `errno`.
-fn errno() -> Errno {
-    // SAFETY: errno is the calling thread's, and always there to read.
-    Errno::from_raw_os_error(unsafe { *libc::__errno_location() })
-}
-
 /// The time on the monotonic clock: for how long something takes, and when
 /// to do something next.
 fn now() -> Duration {
@@ -546,7 +532,7 @@ fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd
     // async-signal-safe calls on what was made above until it runs the
     // program or exits.
     match unsafe { libc::fork() } {
-        -1 => Err(errno()),
+        -1 => Err(errno::last()),
         0 => unsafe {
             if stdin == 0 || libc::dup2(stdin, 0) >= 0 {
                 // A program starts with SIGPIPE as the system has it, whatever
@@ -580,77 +566,6 @@ fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd
             Err(Errno::from_raw_os_error(i32::from_ne_bytes(errno)))
         }
     }
-}
-
-/// A descriptor to wait on until it can be read.
-fn readable(fd: c_int) -> libc::pollfd {
-    libc::pollfd { fd, events: libc::POLLIN, revents: 0 }
-}
-
-/// Wait until one of `fds` is ready, or `timeout` (`None`: no limit) passes.
-/// Interrupted by a signal, it returns early, with nothing ready.
-fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<(), Errno> {
-    // Rounded up, so that what is due is due when it returns.
-    let ms = timeout.map_or(-1, |t| i32::try_from(t.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX));
-    for fd in fds.iter_mut() {
-        fd.revents = 0;
-    }
-    // SAFETY: `fds` is a valid array of pollfd of the length given.
-    match unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) } {
-        -1 if errno() != Errno::INTR => Err(errno()),
-        _ => Ok(()),
-    }
-}
-
-/// Where SIGTERM and SIGINT are written, for the loop to wait on: -1 until
-/// [`on_stop`].
-static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
-
-extern "C" fn stop_signal(sig: c_int) {
-    // SAFETY: errno is the calling thread's, and only write(2), which is
-    // async-signal-safe, runs between saving and restoring it. A full pipe
-    // already says a signal came.
-    unsafe {
-        let saved = *libc::__errno_location();
-        let byte = sig as u8;
-        libc::write(STOP_PIPE.load(Ordering::Relaxed), (&byte as *const u8).cast(), 1);
-        *libc::__errno_location() = saved;
-    }
-}
-
-/// Have SIGTERM and SIGINT written to a pipe, whose reading end is returned
-/// (the self-pipe trick): a signal is then something to wait on, like the
-/// rest.
-fn on_stop() -> Result<OwnedFd, Errno> {
-    use rustix::pipe::PipeFlags;
-    let (rx, tx) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
-    // The writing end lives as long as the process, for the handler.
-    STOP_PIPE.store(rustix::fd::IntoRawFd::into_raw_fd(tx), Ordering::Relaxed);
-    for sig in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: an all-zero sigaction is valid; the fields set are its own,
-        // and the handler only does what a handler may.
-        let rc = unsafe {
-            let mut action: libc::sigaction = core::mem::zeroed();
-            action.sa_sigaction = stop_signal as extern "C" fn(c_int) as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(sig, &action, core::ptr::null_mut())
-        };
-        if rc != 0 {
-            return Err(errno());
-        }
-    }
-    Ok(rx)
-}
-
-/// Whether a signal to stop came, by what `signals` (from [`on_stop`]) holds.
-fn signalled(signals: &OwnedFd) -> bool {
-    let mut buf = [0u8; 16];
-    let mut any = false;
-    while let Ok(n @ 1..) = rustix::io::read(signals, &mut buf) {
-        any |= n > 0;
-    }
-    any
 }
 
 /// How a process ended, as std says it.
@@ -881,19 +796,19 @@ fn subscribe(opts: &Options, sub: &Subscription) -> Result<(), Failure> {
     // In the background, the watch is opened by the process that holds it,
     // so that `watchers` lists the subscriber's PID, not its parent's.
     let conn = if sub.foreground { open_watch(&opts.socket, &line)? } else { detach(&opts.socket, &line, log.as_ref())? };
-    let signals = on_stop().map_err(|e| Failure::Usage(format!("cannot handle signals: {}", Why(e))))?;
+    let signals = signal::install().map_err(|e| Failure::Usage(format!("cannot handle signals: {e}")))?;
     note(&format!("watching {}, running {script} for each change", sub.target.segment));
 
     let mut subscriber = Subscriber::new(&opts.socket, &line, conn, script, sub.script[1..].to_vec());
     loop {
-        let mut fds = vec![readable(signals.as_raw_fd())];
+        let mut fds = vec![poll::readable(signals.fd())];
         fds.extend(subscriber.fds());
         let timeout = subscriber.deadline().map(|at| at.saturating_sub(now()));
-        if let Err(e) = wait(&mut fds, timeout) {
-            note(&format!("cannot wait: {}", Why(e)));
+        if let Err(e) = poll::wait(&mut fds, timeout) {
+            note(&format!("cannot wait: {e}"));
             break;
         }
-        if signalled(&signals) {
+        if signals.take().is_some() {
             break;
         }
         subscriber.turn(&fds[1..], now());
@@ -936,7 +851,7 @@ fn detach(socket: &str, line: &str, log: Option<&OwnedFd>) -> Result<Conn, Failu
     let (report_rx, report_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(failed)?;
     // SAFETY: no other thread has been started, so the child is a full copy.
     match unsafe { libc::fork() } {
-        -1 => Err(failed(errno())),
+        -1 => Err(failed(errno::last())),
         0 => {
             drop(report_rx);
             let opened = settle_in_background(log).and_then(|()| open_watch(socket, line));
@@ -1045,14 +960,14 @@ impl Subscriber {
     fn fds(&self) -> Vec<libc::pollfd> {
         let mut fds = Vec::new();
         if let Some(conn) = &self.watch {
-            fds.push(readable(conn.fd.as_raw_fd()));
+            fds.push(poll::readable(conn.fd.as_raw_fd()));
         }
         if let Some(running) = &self.running {
             if let Some((stdin, _)) = &running.stdin {
                 fds.push(libc::pollfd { fd: stdin.as_raw_fd(), events: libc::POLLOUT, revents: 0 });
             }
             if let Some(pidfd) = &running.pidfd {
-                fds.push(readable(pidfd.as_raw_fd()));
+                fds.push(poll::readable(pidfd.as_raw_fd()));
             }
         }
         fds
@@ -2229,21 +2144,10 @@ mod tests {
     const EVENT: &str = r#"{"event":"added","segment":"IoT","ttl":4500,"device":{"interface":"wifi","hostname":"plug.local","addresses":["10.0.1.9"],"services":[]}}"#;
 
     #[test]
-    fn a_stop_signal_is_read_from_the_pipe() {
-        let signals = on_stop().unwrap();
-        assert!(!signalled(&signals));
-        // SAFETY: raising a signal whose handler was just installed.
-        unsafe { libc::raise(libc::SIGINT) };
-        assert!(signalled(&signals));
-        assert!(!signalled(&signals), "taken");
+    fn errors_say_what_is_wrong() {
+        assert_eq!(read_file("/no/such/file").unwrap_err(), Errno::NOENT);
         // What main says of a command line that is not text.
         assert_eq!(args::Error::NotUtf8.to_string(), "the command line is not UTF-8");
-    }
-
-    #[test]
-    fn errors_read_as_the_system_words_them() {
-        assert_eq!(Why(Errno::NOENT).to_string(), "No such file or directory (os error 2)");
-        assert_eq!(read_file("/no/such/file").unwrap_err(), Errno::NOENT);
     }
 
     #[test]
@@ -2282,7 +2186,7 @@ mod tests {
             assert!(Instant::now() < deadline, "not done in time");
             let mut fds = sub.fds();
             let timeout = sub.deadline().map_or(STOP_CHECK, |at| at.saturating_sub(now()).min(STOP_CHECK));
-            wait(&mut fds, Some(timeout)).unwrap();
+            poll::wait(&mut fds, Some(timeout)).unwrap();
             sub.turn(&fds, now());
         }
     }
