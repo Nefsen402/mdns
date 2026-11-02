@@ -1532,24 +1532,16 @@ impl Segment {
             if report.addrs.is_empty() && !report.gone.is_empty() && known.is_none() {
                 continue;
             }
-            // The sender, if it announced the address the packet came from, or
-            // is the only host described and announced no address of that
-            // family: not even one no one can be reached at, or one it says
-            // goodbye to, which are not to be made good with the sender's.
-            let same_family = |a: &IpAddr| a.is_ipv4() == src.is_ipv4();
-            let is_sender = report.addrs.contains(&src)
-                || (!report.addrs.iter().chain(&report.refused).chain(&report.gone).any(same_family)
-                    && reports.len() == 1);
-            // A packet sent from an address no device can be reached at
-            // (a device without an IPv4 address sends from 0.0.0.0) vouches
-            // for no address.
-            let mut addrs = report.addrs.clone();
-            if is_sender && !addrs.contains(&src) && is_usable(src) {
-                addrs.push(src);
-            }
+            // The sender, if it announced the address the packet came from. A
+            // device has the addresses it announced and no other: that a packet
+            // about it came from one is not its saying so (a router answers for
+            // what is behind it).
+            let announced_src = report.addrs.contains(&src);
+            let addrs = report.addrs.clone();
 
-            // A device first heard only by address becomes the named device.
-            let nameless = state.discovered.find_nameless(&src).filter(|_| is_sender);
+            // A device first heard only by address becomes the named device, if
+            // it announced the address.
+            let nameless = state.discovered.find_nameless(&src).filter(|_| announced_src);
             let earlier = nameless.and_then(|id| {
                 touched.note(&state.discovered, id);
                 state.discovered.remove(id)
@@ -1577,7 +1569,7 @@ impl Segment {
             entry.renew_addrs(&addrs, &report.ttls, now, floor);
 
             resolved.extend(report.resolved().map(|instance| (id, instance.to_string())));
-            if is_sender && sender.is_none() {
+            if announced_src && sender.is_none() {
                 sender = Some(id);
             }
         }
@@ -2903,6 +2895,60 @@ mod tests {
     /// Only addresses in a network the interface is on are learned: an entry
     /// left from an old prefix is not, and a device follows the interface's
     /// networks as they change.
+    /// A router that answers for devices behind it, with the service records
+    /// of one of them and no address, says nothing of itself by it: the
+    /// address it sends from is not the device's, nor is what it says of its
+    /// own, in the same packet, the device's.
+    #[test]
+    fn a_device_known_at_the_address_is_not_taken_for_the_sender_of_a_packet_about_another() {
+        let seg = Segment::new("test", &[Family::V4]);
+        // The router, heard of by what it announces.
+        hear(&seg, "10.0.0.1", vec![a_record("router.local", "10.0.0.1"), ptr("_ssh._tcp.local", "router._ssh._tcp.local"), srv("router._ssh._tcp.local", 22, "router.local")]);
+        // Then, from it, the browse answer: one device's services, and a service of its own, no addresses.
+        hear(&seg, "10.0.0.1", vec![
+            ptr("_raop._tcp.local", "Speakers._raop._tcp.local"),
+            srv("Speakers._raop._tcp.local", 7000, "speakers.local"),
+            ptr("_ssh._tcp.local", "router._ssh._tcp.local"),
+        ]);
+        let devices = seg.devices();
+        let device = |host: &str| devices.iter().find(|d| d.hostname.as_deref() == Some(host)).unwrap_or_else(|| panic!("{host}: {devices:?}"));
+        assert_eq!(device("speakers.local").addrs().collect::<Vec<_>>(), Vec::<IpAddr>::new(), "no address of the router's");
+        assert!(device("speakers.local").services.iter().all(|s| s.kind == "_raop._tcp.local"), "{:?}", device("speakers.local").services);
+        assert_eq!(device("router.local").addrs().collect::<Vec<_>>(), [ip("10.0.0.1")]);
+        assert!(device("router.local").service("router._ssh._tcp.local").is_some_and(|s| s.is_resolved()));
+
+        // Nor is any other device given the address it sent from, if it announced none.
+        hear(&seg, "10.0.0.9", vec![ptr("_http._tcp.local", "Cam._http._tcp.local"), srv("Cam._http._tcp.local", 80, "cam.local")]);
+        let devices = seg.devices();
+        let cam = devices.iter().find(|d| d.hostname.as_deref() == Some("cam.local")).unwrap();
+        assert_eq!(cam.addrs().collect::<Vec<_>>(), Vec::<IpAddr>::new());
+    }
+
+    /// What a router says of its own services, with no host to say whose they
+    /// are, is not the device's it was guessed to be the sender of: nothing is
+    /// added to a device by a guess.
+    #[test]
+    fn a_service_without_a_host_is_not_given_to_a_device_whose_address_was_guessed() {
+        let seg = Segment::new("test", &[Family::V4]);
+        hear(&seg, "10.0.0.1", vec![
+            ptr("_raop._tcp.local", "Speakers._raop._tcp.local"),
+            srv("Speakers._raop._tcp.local", 7000, "speakers.local"),
+            ptr("_ssh._tcp.local", "router._ssh._tcp.local"),
+        ]);
+        let speakers = |seg: &Segment| seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("speakers.local")).unwrap();
+        assert!(speakers(&seg).services.iter().all(|s| s.kind == "_raop._tcp.local"), "{:?}", speakers(&seg).services);
+        // Held where it was heard from, by address, until it says whose it is.
+        let by_address = seg.devices().into_iter().find(|d| d.hostname.is_none() && d.service("router._ssh._tcp.local").is_some());
+        assert!(by_address.is_some(), "{:?}", seg.devices());
+
+        // The router says whose: its own, with its address.
+        hear(&seg, "10.0.0.1", vec![a_record("router.local", "10.0.0.1"), srv("router._ssh._tcp.local", 22, "router.local")]);
+        let devices = seg.devices();
+        let router = devices.iter().find(|d| d.hostname.as_deref() == Some("router.local")).unwrap();
+        assert!(router.service("router._ssh._tcp.local").is_some_and(|s| s.is_resolved()));
+        assert!(speakers(&seg).services.iter().all(|s| s.kind == "_raop._tcp.local"));
+    }
+
     #[test]
     fn only_neighbour_addresses_on_the_interfaces_networks_are_learned() {
         let seg = Segment::new("test", &[Family::V4, Family::V6]);
@@ -3103,7 +3149,8 @@ mod tests {
     }
 
     /// A host that announced only an address no one can be reached at is not
-    /// given the address the packet came from instead.
+    /// given the address the packet came from instead, nor is one that
+    /// announced none at all.
     #[test]
     fn a_host_with_only_unusable_addresses_is_not_given_the_senders() {
         let seg = Segment::new("test", &[Family::V4]);
@@ -3111,23 +3158,20 @@ mod tests {
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         assert_eq!((v4(&tv), ll4(&tv)), (None, None));
 
-        // One that announced none at all still is: it is the sender.
         hear(&seg, "10.0.1.8", vec![srv("NAS._smb._tcp.local", 445, "nas.local")]);
         let nas = seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("nas.local")).unwrap();
-        assert_eq!(v4(&nas), Some(ip("10.0.1.8")));
+        assert_eq!(v4(&nas), None);
     }
 
-    /// The sender is credited with its address in the family it sent over:
-    /// a host that announced only IPv4 addresses is still the sender of a
-    /// packet over IPv6, but one that announced an unusable address of the
-    /// family is not made good with the sender's.
+    /// The sender is not credited with the address it sent from, in the
+    /// family it sent over or any: a host has the addresses it announced.
     #[test]
-    fn the_sender_is_credited_in_the_family_it_sent_over() {
+    fn the_sender_is_not_credited_with_an_address_it_did_not_announce() {
         let seg = Segment::new("test", &[Family::V6]);
         hear(&seg, "fe80::7", vec![a_record("tv.local", "10.0.1.7"), srv("TV._http._tcp.local", 80, "tv.local")]);
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         assert_eq!(v4(&tv), Some(ip("10.0.1.7")));
-        assert_eq!(ll6(&tv), Some(ip("fe80::7")), "the sender, over IPv6");
+        assert_eq!(ll6(&tv), None, "not the sender's, over IPv6");
 
         let seg = Segment::new("test", &[Family::V4]);
         hear(&seg, "10.0.1.8", vec![a_record("nas.local", "0.0.0.0"), aaaa("nas.local", "fd00::8")]);
@@ -3521,7 +3565,8 @@ mod tests {
             ])
         );
 
-        // Once the instance says where it is, it is no longer asked about.
+        // Once the instance says where it is, it is no longer asked about; its
+        // host is, for the address it did not say, and the sender's is not taken.
         hear(&seg, "10.0.2.73", vec![record(
             "Speaker._airplay._tcp.local".into(),
             true,
@@ -3531,10 +3576,24 @@ mod tests {
         seg.probe_round().unwrap();
         assert_eq!(
             asked(&recv(&rx).unwrap()),
+            BTreeSet::from([
+                q(META_QUERY, rtype::PTR),
+                q("_airplay._tcp.local", rtype::PTR),
+                q("speaker.local", rtype::A),
+                q("speaker.local", rtype::AAAA),
+            ])
+        );
+        let speaker = seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("speaker.local")).unwrap();
+        assert_eq!(v4(&speaker), None);
+        // Once it says where it is, it is reflectable, and no longer asked for it.
+        hear(&seg, "10.0.2.73", vec![a_record("speaker.local", "10.0.2.73")]);
+        seg.probe_round().unwrap();
+        assert_eq!(
+            asked(&recv(&rx).unwrap()),
             BTreeSet::from([q(META_QUERY, rtype::PTR), q("_airplay._tcp.local", rtype::PTR)])
         );
-        // ...and that is what makes it reflectable.
-        assert_eq!(seg.devices()[0].hostname.as_deref(), Some("speaker.local"));
+        let speaker = seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("speaker.local")).unwrap();
+        assert_eq!(v4(&speaker), Some(ip("10.0.2.73")));
     }
 
     /// Run a probe (`kinds` `None`) or a query for types to its end, as the
@@ -3946,12 +4005,12 @@ mod tests {
     }
 
     #[test]
-    fn the_only_host_a_packet_describes_is_the_sender_when_it_announces_no_address() {
+    fn the_only_host_a_packet_describes_is_not_given_the_senders_address_when_it_announces_none() {
         let seg = Segment::new("test", &[Family::V4]);
         hear(&seg, "10.0.1.9", vec![srv("Dev._http._tcp.local", 80, "dev.local")]);
         let devices = seg.devices();
         assert_eq!(devices.len(), 1);
-        assert_eq!((devices[0].hostname.as_deref(), v4(&devices[0])), (Some("dev.local"), Some(ip("10.0.1.9"))));
+        assert_eq!((devices[0].hostname.as_deref(), v4(&devices[0])), (Some("dev.local"), None));
     }
 
     /// A bare browse answer leaves unresolved instances on the sender. Once a
