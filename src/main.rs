@@ -144,28 +144,10 @@ fn main() -> Result<()> {
             ),
         }
     }
+    // The rounds run in the event loop; the interval is between starts.
     for link in links.values() {
-        let link = link.clone();
-        let interval = config.probe_interval_of(link.interface());
-        thread::spawn(move || {
-            let name = link.interface().to_string();
-            let mut first = true;
-            loop {
-                let started = Instant::now();
-                match link.probe() {
-                    Ok(queries) if first => eprintln!("{name}: startup probe sent {queries} queries"),
-                    // Routine probes are not worth a journal line each.
-                    Ok(_) => {}
-                    Err(e) => eprintln!("{name}: {} probe failed: {e:#}", if first { "startup" } else { "periodic" }),
-                }
-                first = false;
-                // The interval is between starts, and a probe itself takes a few seconds.
-                match interval {
-                    Some(i) => thread::sleep(i.saturating_sub(started.elapsed())),
-                    None => return,
-                }
-            }
-        });
+        link.set_probe_interval(config.probe_interval_of(link.interface()));
+        link.start_probe("startup");
     }
 
     let segments = Arc::new(segments);

@@ -14,7 +14,6 @@
 use std::net::{IpAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -268,12 +267,7 @@ impl Link {
         if let Err(e) = self.segment.announce_all() {
             eprintln!("{}: announcing again failed: {e:#}", self.interface);
         }
-        let (segment, name) = (self.segment.clone(), self.interface.clone());
-        thread::spawn(move || {
-            if let Err(e) = segment.probe() {
-                eprintln!("{name}: probe failed: {e:#}");
-            }
-        });
+        self.segment.start_probe("return");
     }
 }
 

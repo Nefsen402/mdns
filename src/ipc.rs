@@ -122,6 +122,10 @@ const STREAM_WRITE: Duration = Duration::from_secs(10);
 
 /// The least a watch's `--interval=` may be: asking takes about four seconds,
 /// and asking more often than this is only noise.
+/// The longest `probe` waits for a probe, which takes a few seconds, to
+/// finish: mdnsctl waits fifteen.
+const PROBE_WAIT: Duration = Duration::from_secs(10);
+
 const MIN_QUERY_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 
 /// Bind the socket and serve it on background threads. Binding happens
@@ -374,27 +378,6 @@ fn links_of<'a>(groups: &'a [Group], name: &str) -> Vec<&'a Segment> {
     links
 }
 
-/// Run `f` on each of `links` at once, as they are independent: it takes
-/// one's time, not one per interface. What each returned, as `probe`
-/// reports it.
-fn on_each(links: &[&Segment], f: impl Fn(&Segment) -> Result<usize> + Sync) -> Vec<Value> {
-    thread::scope(|scope| {
-        let f = &f;
-        let running: Vec<_> = links.iter().map(|&seg| scope.spawn(move || (seg, f(seg)))).collect();
-        running
-            .into_iter()
-            .map(|handle| {
-                let (seg, result) = handle.join().expect("query thread panicked");
-                let (queries, err) = match result {
-                    Ok(n) => (Some(n), None),
-                    Err(e) => (None, Some(format!("{e:#}"))),
-                };
-                json!({ "interface": seg.interface(), "queries": queries, "error": err })
-            })
-            .collect()
-    })
-}
-
 /// A watch on a segment, as registered.
 struct Watch {
     name: String,
@@ -434,15 +417,14 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
     Ok(Watch { name: name.to_string(), query, events: rx, present })
 }
 
-/// Ask for the types of `query` on the interfaces of the named segment, in
-/// the background, holding the segments only while asking.
-fn ask_in_background(groups: &Weak<Vec<Group>>, name: &str, kinds: &[String]) {
-    let (groups, name, kinds) = (groups.clone(), name.to_string(), kinds.to_vec());
-    thread::spawn(move || {
-        if let Some(groups) = groups.upgrade() {
-            on_each(&links_of(&groups, &name), |seg| seg.query_types(&kinds));
+/// Ask for the types of `query` on the interfaces of the named segment: the
+/// event loop runs the rounds, while the watch goes on.
+fn ask_for_types(groups: &Weak<Vec<Group>>, name: &str, kinds: &[String]) {
+    if let Some(groups) = groups.upgrade() {
+        for seg in links_of(&groups, name) {
+            seg.query_types(kinds);
         }
-    });
+    }
 }
 
 /// Send what happens to the segment's devices, a line each, until the client
@@ -465,7 +447,7 @@ fn stream_events(writer: &mut UnixStream, groups: &Weak<Vec<Group>>, watch: Watc
     let mut next_ask = (!query.kinds.is_empty()).then(Instant::now);
     loop {
         if let Some(at) = next_ask.filter(|&at| at <= Instant::now()) {
-            ask_in_background(groups, &name, &query.kinds);
+            ask_for_types(groups, &name, &query.kinds);
             next_ask = query.interval.map(|every| at + every);
         }
         let wait = next_ask.map_or(STREAM_CHECK, |at| at.saturating_duration_since(Instant::now()).min(STREAM_CHECK));
@@ -652,7 +634,21 @@ fn probe(groups: &[Group], name: &str) -> Value {
     if links.is_empty() {
         return error(&format!("no such segment: {name}"));
     }
-    json!({ "ok": true, "probed": on_each(&links, Segment::probe) })
+    // All at once, as they are independent: it takes one's time, not one per
+    // interface.
+    let running: Vec<_> = links.iter().map(|&seg| (seg, seg.probe())).collect();
+    let probed: Vec<Value> = running
+        .into_iter()
+        .map(|(seg, done)| {
+            let result = done.recv_timeout(PROBE_WAIT).unwrap_or_else(|_| Err("the probe did not finish".into()));
+            let (queries, err) = match result {
+                Ok(n) => (Some(n), None),
+                Err(e) => (None, Some(e)),
+            };
+            json!({ "interface": seg.interface(), "queries": queries, "error": err })
+        })
+        .collect();
+    json!({ "ok": true, "probed": probed })
 }
 
 fn timer_list(groups: &[Group]) -> Value {
@@ -1131,8 +1127,12 @@ mod tests {
         let mut asked = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while asked.len() < 6 && Instant::now() < deadline {
+            // The rounds, run as the event loop would.
+            if seg.next_due().is_some_and(|at| at <= Instant::now()) {
+                seg.upkeep(Instant::now());
+            }
             asked.extend(queries(&rx).into_iter().filter(|(names, _)| names == &["_http._tcp.local"]));
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(5));
         }
         assert!(asked.len() >= 6 && asked.iter().all(|&(_, known)| known == 1), "{asked:?}");
 

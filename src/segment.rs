@@ -10,8 +10,8 @@
 use std::fmt;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -349,6 +349,26 @@ struct Upkeep {
     last_took: Option<Duration>,
 }
 
+/// What a probe tells whoever asked for it: how many questions it sent.
+pub type Probed = std::result::Result<usize, String>;
+
+/// A probe, or a query for types by name, under way: which round comes next,
+/// and when.
+struct Probing {
+    /// The types asked for by name; `None` for a probe of everything.
+    kinds: Option<Vec<String>>,
+    /// Why it runs, for the journal: at startup it says how it went, and
+    /// otherwise only if it failed.
+    why: &'static str,
+    /// The next round, or [`PROBE_GAPS`]'s length when only the wait for the
+    /// last answers is left.
+    round: usize,
+    next: Instant,
+    sent: usize,
+    /// Who to tell how it went, when it is done.
+    done: Vec<Sender<Probed>>,
+}
+
 /// How a segment's upkeep has run, for `timers`.
 pub struct UpkeepInfo {
     pub due: Option<Instant>,
@@ -374,6 +394,11 @@ struct State {
     manual: HashMap<String, Manual>,
     /// Changes not yet taken by the event loop ([`Segment::take_events`]).
     outbox: Vec<Event>,
+    /// The probes and queries for types under way.
+    probing: Vec<Probing>,
+    /// How often to probe on its own, if at all, and when next.
+    probe_interval: Option<Duration>,
+    next_routine: Option<Instant>,
     /// How to send, over each family the segment has a socket of.
     outbound: Vec<Outbound>,
     /// Service types devices on this segment have said they offer, learned
@@ -514,6 +539,13 @@ impl State {
             if at < soonest {
                 f("refresh", who, at);
             }
+        }
+        for p in &self.probing {
+            let kinds = p.kinds.as_ref().map(|k| k.join(", "));
+            f("probe", &kinds.as_deref().unwrap_or("every type"), p.next);
+        }
+        if let Some(at) = self.next_routine {
+            f("probe", &"every type, as configured", at);
         }
         for (key, m) in &self.manual {
             if let Some(at) = m.reannounce_at(self.reannounce) {
@@ -804,6 +836,7 @@ impl Segment {
         if let Err(e) = self.reannounce(now) {
             eprintln!("{}: re-announce failed: {e:#}", self.interface);
         }
+        self.run_probes(now);
         let mut state = self.state.lock().unwrap();
         state.upkeep.running = false;
         state.upkeep.runs += 1;
@@ -1375,20 +1408,117 @@ impl Segment {
     /// Actively look for devices: ask what service types exist, browse each
     /// type for instances, and resolve every instance that has not yet said
     /// where it is (target and port). Three rounds, a few seconds in all,
-    /// because each round's answers decide the next one's questions. Blocks
-    /// until done and returns how many questions were sent; answers are
-    /// processed by the receive loop as they arrive.
-    pub fn probe(&self) -> Result<usize> {
-        self.probe_with(&PROBE_GAPS)
+    /// because each round's answers decide the next one's questions; the
+    /// upkeep runs them as they come due, and the answers are handled as they
+    /// arrive. How many questions it sent is told to the receiver returned,
+    /// once it is done. One asked for while another is under way is that one.
+    pub fn probe(&self) -> Receiver<Probed> {
+        let (tx, rx) = mpsc::channel();
+        self.begin(None, "asked for", Some(tx));
+        rx
     }
 
-    fn probe_with(&self, gaps: &[Duration]) -> Result<usize> {
-        let mut sent = 0;
-        for gap in gaps {
-            sent += self.probe_round()?;
-            thread::sleep(*gap);
+    /// Like [`Segment::probe`], with no one to tell but the journal: `why`
+    /// says what it is for there.
+    pub fn start_probe(&self, why: &'static str) {
+        self.begin(None, why, None);
+    }
+
+    /// Probe on its own every `every`, the first one that long from now, as
+    /// well as when asked; `None` (the default) does not.
+    pub fn set_probe_interval(&self, every: Option<Duration>) {
+        let mut state = self.state.lock().unwrap();
+        state.probe_interval = every;
+        state.next_routine = every.and_then(|every| Instant::now().checked_add(every));
+        drop(state);
+        self.rearm();
+    }
+
+    /// Ask for the service types `kinds` by name, in three rounds like a
+    /// [probe](Segment::probe): devices that only answer when asked for
+    /// their type, and do not say what types they have, are found this way.
+    /// The types are remembered, so that every later probe asks for them too.
+    /// What is known here already goes along as known answers, so only what
+    /// is new, or about to run out, answers.
+    pub fn query_types(&self, kinds: &[String]) {
+        self.begin(Some(kinds.to_vec()), "query for types", None);
+    }
+
+    /// Start a probe (`kinds` `None`) or a query for types, unless the same
+    /// is under way already, which `done` is then told of instead. A segment
+    /// that cannot send has nothing to do, and is done at once.
+    fn begin(&self, kinds: Option<Vec<String>>, why: &'static str, done: Option<Sender<Probed>>) {
+        let mut state = self.state.lock().unwrap();
+        if state.outbound.is_empty() {
+            drop(state);
+            self.finish(Probing { kinds, why, round: 0, next: Instant::now(), sent: 0, done: done.into_iter().collect() }, Ok(0));
+            return;
         }
-        Ok(sent)
+        if let Some(p) = state.probing.iter_mut().find(|p| p.kinds == kinds) {
+            p.done.extend(done);
+            return;
+        }
+        let probing = Probing { kinds, why, round: 0, next: Instant::now(), sent: 0, done: done.into_iter().collect() };
+        state.probing.push(probing);
+        drop(state);
+        self.rearm();
+    }
+
+    /// Run the rounds of the probes and queries that are due at `now`, and
+    /// finish those whose last answers have had their time; start a routine
+    /// probe if one is due.
+    fn run_probes(&self, now: Instant) {
+        let routine = {
+            let mut state = self.state.lock().unwrap();
+            let due = state.next_routine.is_some_and(|at| at <= now);
+            if due {
+                state.next_routine = state.probe_interval.and_then(|every| now.checked_add(every));
+            }
+            due
+        };
+        if routine {
+            self.begin(None, "periodic", None);
+        }
+        let due: Vec<(Option<Vec<String>>, usize)> = {
+            let state = self.state.lock().unwrap();
+            state.probing.iter().filter(|p| p.next <= now).map(|p| (p.kinds.clone(), p.round)).collect()
+        };
+        for (kinds, round) in due {
+            let ran = match (round < PROBE_GAPS.len(), &kinds) {
+                (false, _) => None,
+                (true, None) => Some(self.probe_round()),
+                (true, Some(kinds)) => Some(self.query_types_round(kinds)),
+            };
+            let mut state = self.state.lock().unwrap();
+            let Some(at) = state.probing.iter().position(|p| p.kinds == kinds) else { continue };
+            let p = &mut state.probing[at];
+            let result = match ran {
+                Some(Ok(sent)) => {
+                    p.sent += sent;
+                    p.next = now + PROBE_GAPS[round];
+                    p.round += 1;
+                    continue;
+                }
+                Some(Err(e)) => Err(format!("{e:#}")),
+                None => Ok(p.sent),
+            };
+            let p = state.probing.remove(at);
+            drop(state);
+            self.finish(p, result);
+        }
+    }
+
+    /// Tell whoever asked how `probing` went, and the journal if it is worth
+    /// a line.
+    fn finish(&self, probing: Probing, result: Probed) {
+        match (&result, probing.why) {
+            (Ok(sent), "startup") => eprintln!("{}: startup probe sent {sent} queries", self.interface),
+            (Ok(_), _) => {}
+            (Err(e), why) => eprintln!("{}: {why} probe failed: {e}", self.interface),
+        }
+        for tx in probing.done {
+            let _ = tx.send(result.clone());
+        }
     }
 
     /// One round of queries, built from what is known right now. A no-op
@@ -1401,26 +1531,6 @@ impl Segment {
 
         let devices: Vec<Device> = state.discovered.values().map(|e| e.device.clone()).collect();
         ask(&state.outbound, &Device::probe_queries(&devices, &state.types, state.max_packet))
-    }
-
-    /// Ask for the service types `kinds` by name, in three rounds like a
-    /// [probe](Segment::probe): devices that only answer when asked for
-    /// their type, and do not say what types they have, are found this way.
-    /// The types are remembered, so that every later probe asks for them too.
-    /// What is known here already goes along as known answers, so only what
-    /// is new, or about to run out, answers. Returns how many questions were
-    /// sent; a no-op when the segment has no sender attached.
-    pub fn query_types(&self, kinds: &[String]) -> Result<usize> {
-        self.query_types_with(kinds, &PROBE_GAPS)
-    }
-
-    fn query_types_with(&self, kinds: &[String], gaps: &[Duration]) -> Result<usize> {
-        let mut sent = 0;
-        for gap in gaps {
-            sent += self.query_types_round(kinds)?;
-            thread::sleep(*gap);
-        }
-        Ok(sent)
     }
 
     fn query_types_round(&self, kinds: &[String]) -> Result<usize> {
@@ -2050,8 +2160,8 @@ mod tests {
         hear(&seg, "10.0.1.5", vec![a_record("plug.local", "10.0.1.5"), srv("Plug._shelly._tcp.local", 80, "plug.local")]);
         let kinds = ["_shelly._tcp.local".to_string(), "_Hue._tcp.local".to_string(), "bogus".to_string()];
 
-        assert_eq!(seg.query_types_with(&kinds, &[Duration::ZERO, Duration::ZERO]).unwrap(), 6);
-        for _ in 0..2 {
+        assert_eq!(run_probe(&seg, Some(&kinds)).0, Ok(9));
+        for _ in 0..3 {
             let m = recv(&rx).unwrap();
             let questions: Vec<(String, u16)> = m.questions.iter().map(|q| (q.name.clone(), q.qtype)).collect();
             assert_eq!(questions, [q("_shelly._tcp.local", rtype::PTR), q("_Hue._tcp.local", rtype::PTR), q("bogus", rtype::PTR)]);
@@ -2067,7 +2177,7 @@ mod tests {
         assert!(probed.iter().any(|n| n == "_hue._tcp.local"), "{probed:?}");
 
         // Without a sender, nothing.
-        assert_eq!(Segment::new("quiet", &[Family::V4]).query_types_with(&kinds, &[Duration::ZERO]).unwrap(), 0);
+        assert_eq!(run_probe(&Segment::new("quiet", &[Family::V4]), Some(&kinds)).0, Ok(0));
     }
 
     /// A way to send over IPv4 that always fails: its group is an IPv6
@@ -2942,11 +3052,57 @@ mod tests {
         assert_eq!(seg.devices()[0].hostname.as_deref(), Some("speaker.local"));
     }
 
+    /// Run a probe (`kinds` `None`) or a query for types to its end, as the
+    /// event loop would: the upkeep at each time it says it is due. How it
+    /// went, and when each round, and its end, came due.
+    fn run_probe(seg: &Segment, kinds: Option<&[String]>) -> (Probed, Vec<Instant>) {
+        let (tx, rx) = mpsc::channel();
+        seg.begin(kinds.map(<[String]>::to_vec), "asked for", Some(tx));
+        let mut rounds = Vec::new();
+        loop {
+            if let Ok(result) = rx.try_recv() {
+                return (result, rounds);
+            }
+            let at = seg.next_due().expect("a round or its end is due");
+            rounds.push(at);
+            seg.upkeep(at);
+        }
+    }
+
     #[test]
     fn probe_runs_every_round_and_counts_questions() {
         let (seg, rx) = wired();
-        assert_eq!(seg.probe().unwrap(), 3);
+        let (result, rounds) = run_probe(&seg, None);
+        assert_eq!(result, Ok(3));
         assert_eq!(drain_queries(&rx), 3);
+        // A round at once, then after each gap; done once the last has passed.
+        let gaps: Vec<Duration> = rounds.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(gaps, PROBE_GAPS);
+    }
+
+    #[test]
+    fn a_probe_asked_for_while_one_runs_is_that_one() {
+        let (seg, _rx) = wired();
+        seg.start_probe("startup");
+        let joined = seg.probe();
+        assert_eq!(seg.state.lock().unwrap().probing.len(), 1);
+        let (result, _) = run_probe(&seg, None);
+        assert_eq!(joined.try_recv(), Ok(result));
+        assert!(seg.state.lock().unwrap().probing.is_empty());
+    }
+
+    #[test]
+    fn a_segment_probes_on_its_own_as_often_as_it_is_told() {
+        let (seg, rx) = wired();
+        seg.set_probe_interval(Some(Duration::from_secs(240)));
+        let at = seg.next_due().expect("a routine probe");
+        assert!(at > Instant::now() + Duration::from_secs(239), "not at once: startup does that");
+        seg.upkeep(at);
+        assert_eq!(drain_queries(&rx), 1, "its first round");
+        let next = seg.state.lock().unwrap().next_routine.unwrap();
+        assert_eq!(next, at + Duration::from_secs(240));
+        seg.set_probe_interval(None);
+        assert_eq!(seg.state.lock().unwrap().next_routine, None);
     }
 
     fn drain_queries(rx: &UdpSocket) -> usize {
@@ -2986,7 +3142,7 @@ mod tests {
     #[test]
     fn probe_without_a_sender_does_nothing() {
         let seg = Segment::new("test", &[Family::V4]);
-        assert_eq!(seg.probe().unwrap(), 0);
+        assert_eq!(seg.probe().try_recv(), Ok(Ok(0)), "done at once");
     }
 
     #[test]
