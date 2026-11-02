@@ -216,11 +216,33 @@ fn deliver_to(inners: &[&Inner]) {
     }
     for seg in segments {
         for event in seg.take_events() {
+            log(seg.interface(), &event);
             for inner in inners {
                 inner.handle(seg, event.clone());
             }
         }
     }
+}
+
+/// Log a change to the devices of `interface`, in a line: what happened, to
+/// which device, and what it is known by. The questions passed on are not
+/// worth a line each.
+fn log(interface: &str, event: &Event) {
+    let (what, device) = match event {
+        Event::Added(d) => ("added", d),
+        Event::Updated(d) => ("updated", d),
+        Event::Removed(d) => ("removed", d),
+        Event::Question(_) => return,
+    };
+    let name = device.hostname.as_deref().unwrap_or("(no name)");
+    let addrs: Vec<String> = device.addrs().map(|a| a.to_string()).collect();
+    let addrs = if addrs.is_empty() { "no addresses".to_string() } else { addrs.join(", ") };
+    let services = match device.services.len() {
+        0 => String::new(),
+        1 => ", 1 service".to_string(),
+        n => format!(", {n} services"),
+    };
+    eprintln!("{interface}: {what} {name} ({addrs}{services})");
 }
 
 // The reflectors made on this thread, for tests to deliver to as the event
