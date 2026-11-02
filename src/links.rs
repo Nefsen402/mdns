@@ -177,15 +177,14 @@ impl Link {
         self.advertise();
     }
 
-    /// Announce the names to advertise with this host's addresses on the
-    /// interface, one of each family, read afresh: on its own link the
-    /// router's link-local address is as good as any, and for IPv6 it is the
-    /// one the kernel picks. With none at all, they are withdrawn.
+    /// Announce the names to advertise with all of this host's addresses on the
+    /// interface, of the families listened to, read afresh. With none at all,
+    /// they are withdrawn.
     fn advertise(&self) {
         if self.advertise.is_empty() {
             return;
         }
-        let addrs: Vec<IpAddr> = self.families.iter().filter_map(|&f| socket::local_addr(&self.interface, f).ok()).collect();
+        let addrs = socket::addresses(&self.interface, &self.families).unwrap_or_default();
         for block in &self.advertise {
             self.advertise_one(block, &addrs);
         }

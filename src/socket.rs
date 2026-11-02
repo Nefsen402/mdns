@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::ffi::CStr;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
 use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
@@ -118,25 +118,6 @@ mod pinned {
     // Not exported by the libc crate on all versions (Linux >= 4.20).
     const IPV6_MULTICAST_ALL: libc::c_int = 29;
 
-    /// The address this host uses on `interface` for `family`: the source
-    /// address the kernel picks for traffic to the mDNS group there, which is the
-    /// primary IPv4 address and, for IPv6, the link-local address. Nothing is
-    /// sent.
-    pub fn local_addr(interface: &str, family: Family) -> Result<IpAddr> {
-        let index = ifindex(interface)?;
-        let group = match family {
-            Family::V4 => SocketAddr::V4(SocketAddrV4::new(GROUP_V4, MDNS_PORT)),
-            Family::V6 => SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, index)),
-        };
-        // A throwaway socket: connecting UDP only makes the kernel choose a
-        // source address, which getsockname then reveals.
-        let probe = udp(family)?;
-        bind_device(&probe, interface)?;
-        rustix::net::connect(&probe, &group).map_err(Why).with_context(|| format!("finding the address used on {interface}"))?;
-        let local = rustix::net::getsockname(&probe).map_err(Why)?;
-        SocketAddr::try_from(local).map(|a| a.ip()).map_err(|_| anyhow!("no local address on {interface}"))
-    }
-
     /// A socket pinned to `interface` over `family`: bound to the group, or, if
     /// `unicast`, to the wildcard address, which hears what is sent to the
     /// daemon itself too.
@@ -209,7 +190,7 @@ mod pinned {
 }
 
 #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
-pub use pinned::{local_addr, open};
+pub use pinned::open;
 
 /// Where sockets are pinned to their interface, each hears for itself and
 /// there is nothing shared to read.
@@ -313,6 +294,40 @@ pub fn prefixes(name: &str) -> Result<Vec<Prefix>> {
         out.push(prefix);
     })?;
     Ok(out)
+}
+
+/// Every address the interface called `name` has, of `families`, for this host
+/// to be reached at on it: see [`ordered`].
+pub fn addresses(name: &str, families: &[Family]) -> Result<Vec<IpAddr>> {
+    let found: Vec<IpAddr> = prefixes(name)?.into_iter().map(|p| p.addr).collect();
+    Ok(ordered(&found, families))
+}
+
+/// `found`, of `families`, each once: IPv4 before IPv6 and routable before
+/// link-local, so that where there are more than a device keeps, it is the
+/// link-local ones that go. A link-local IPv6 address the system writes with
+/// its scope in it (the BSDs) is written without.
+fn ordered(found: &[IpAddr], families: &[Family]) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = found
+        .iter()
+        .map(|a| match a {
+            IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80 => {
+                let mut s = v6.segments();
+                s[1] = 0;
+                IpAddr::V6(Ipv6Addr::from(s))
+            }
+            a => *a,
+        })
+        .filter(|a| !a.is_loopback() && !a.is_unspecified())
+        .filter(|a| families.contains(&if a.is_ipv4() { Family::V4 } else { Family::V6 }))
+        .collect();
+    let link_local = |a: &IpAddr| match a {
+        IpAddr::V4(a) => a.is_link_local(),
+        IpAddr::V6(a) => a.segments()[0] & 0xffc0 == 0xfe80,
+    };
+    out.sort_by_key(|a| (link_local(a), a.is_ipv6(), *a));
+    out.dedup();
+    out
 }
 
 /// The MTU of the interface called `name`, as its network namespace has it.
@@ -448,6 +463,7 @@ fn control_of(msg: &libc::msghdr) -> (Option<u32>, Option<IpAddr>) {
 #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
 mod portable {
     use super::*;
+    use anyhow::anyhow;
 
     /// The first IPv4 address of `interface`: what the group is joined by, and
     /// what traffic to it is sent from, where an interface is named by its
@@ -460,26 +476,6 @@ mod portable {
                 IpAddr::V6(_) => None,
             })
             .ok_or_else(|| anyhow!("no IPv4 address on {interface}"))
-    }
-
-    /// The address this host uses on `interface` for `family`: the interface's
-    /// first IPv4 address and, for IPv6, the one the system picks for traffic
-    /// to the group there. Nothing is sent.
-    pub fn local_addr(interface: &str, family: Family) -> Result<IpAddr> {
-        let index = ifindex(interface)?;
-        match family {
-            Family::V4 => interface_v4(interface).map(IpAddr::V4),
-            Family::V6 => {
-                let group = SocketAddr::V6(SocketAddrV6::new(GROUP_V6, MDNS_PORT, 0, index));
-                // A throwaway socket: connecting UDP only makes the system choose a
-                // source address, which getsockname then reveals; the scope of the
-                // group says which interface.
-                let probe = udp(family)?;
-                rustix::net::connect(&probe, &group).map_err(Why).with_context(|| format!("finding the address used on {interface}"))?;
-                let local = rustix::net::getsockname(&probe).map_err(Why)?;
-                SocketAddr::try_from(local).map(|a| a.ip()).map_err(|_| anyhow!("no local address on {interface}"))
-            }
-        }
     }
 
     /// The sockets of the BSDs and of `portable-sockets`: one for each family,
@@ -609,7 +605,7 @@ mod portable {
 }
 
 #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
-pub use portable::{local_addr, Hub};
+pub use portable::Hub;
 
 /// Reading the control message that says which interface a datagram came in
 /// on. Pure, so it is tested with the bytes of each system's, which can all be
@@ -764,6 +760,18 @@ mod tests {
     const LOOPBACK: &str = "lo0";
 
     #[test]
+    fn the_addresses_to_advertise_are_all_of_the_wanted_families_routable_first() {
+        let found = [ip("fe80::1"), ip("fd00::2"), ip("10.0.0.9"), ip("127.0.0.1"), ip("169.254.1.1"), ip("10.0.0.5"), ip("2001:db8::3"), ip("10.0.0.9"), ip("fe80:2::7")];
+        assert_eq!(
+            ordered(&found, &[Family::V4, Family::V6]),
+            [ip("10.0.0.5"), ip("10.0.0.9"), ip("2001:db8::3"), ip("fd00::2"), ip("169.254.1.1"), ip("fe80::1"), ip("fe80::7")],
+            "each once, routable first, the scope of a link-local taken out, no loopback"
+        );
+        assert_eq!(ordered(&found, &[Family::V4]), [ip("10.0.0.5"), ip("10.0.0.9"), ip("169.254.1.1")]);
+        assert_eq!(ordered(&found, &[]), Vec::<IpAddr>::new());
+    }
+
+    #[test]
     fn an_interfaces_mtu_is_read() {
         assert!(mtu(LOOPBACK).unwrap() >= 1280, "every network namespace has a loopback");
         assert!(mtu("no-such-if0").is_err());
@@ -792,19 +800,5 @@ mod tests {
         let nets = prefixes(LOOPBACK).unwrap();
         assert!(nets.contains(&prefix("127.0.0.1/8")), "{nets:?}");
         assert!(prefixes("no-such-interface").unwrap().is_empty());
-    }
-
-    /// Manual check against a real interface: `MDNS_TEST_IFACE=br cargo test
-    /// live_local_addr -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn live_local_addr() {
-        let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
-        for family in [Family::V4, Family::V6] {
-            let addr = local_addr(&iface, family).unwrap();
-            println!("{iface} {family:?}: {addr}");
-            assert!(!addr.is_loopback() && !addr.is_unspecified());
-            assert_eq!(addr.is_ipv4(), family == Family::V4);
-        }
     }
 }

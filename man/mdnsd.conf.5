@@ -195,11 +195,9 @@ A bare label such as
 means
 .BR router.local .
 .IP
-Each interface is told the address at which this host can be reached on it:
-the IPv4 socket publishes an A record with the interface's primary IPv4
-address, and the IPv6 socket an AAAA record with its link-local IPv6 address,
-which is what the kernel uses as the source address towards the mDNS group
-there.
+Each interface is told all of the addresses this host has on it, of the
+families listened to, link-local ones too: an A record for each IPv4 address
+and an AAAA record for each IPv6 one.
 An interface that has no address of a family is skipped, with a message in
 the log.
 The addresses are read again whenever they change.
