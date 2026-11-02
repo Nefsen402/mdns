@@ -2,16 +2,18 @@
 //! `ipc.rs` for the protocol). Every IPC command has a subcommand here.
 
 use std::collections::{HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::ffi::{c_char, CStr, CString};
+use std::fmt;
+use std::io::{self, Write};
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, ExitCode, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::ExitCode;
+use std::time::Duration;
 
+use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+use rustix::fs::{FileType, Mode, OFlags};
+use rustix::io::Errno;
+use rustix::process::{Pid, PidfdFlags, Signal, WaitOptions, WaitStatus};
 use serde_json::Value;
 
 #[path = "args.rs"]
@@ -400,32 +402,244 @@ enum Failure {
     Server(String),
 }
 
-fn connect_err(socket: &Path, e: io::Error) -> Failure {
+// The system, through rustix, and what only libc does: forking and running
+// a program, the environment, and the words for an error.
+
+/// An error as the system words it: rustix, without std, says only "os
+/// error 2".
+struct Why(Errno);
+
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut buf = [0u8; 128];
+        // SAFETY: `buf` is writable for its length; the XSI strerror_r writes a
+        // NUL-terminated message into it, or fails and leaves it alone.
+        let ok = unsafe { libc::strerror_r(self.0.raw_os_error(), buf.as_mut_ptr().cast(), buf.len()) } == 0;
+        match CStr::from_bytes_until_nul(&buf).ok().and_then(|m| m.to_str().ok()).filter(|_| ok) {
+            Some(message) => write!(f, "{message} (os error {})", self.0.raw_os_error()),
+            None => write!(f, "os error {}", self.0.raw_os_error()),
+        }
+    }
+}
+
+/// What the last libc call that failed left in `errno`.
+fn errno() -> Errno {
+    // SAFETY: errno is the calling thread's, and always there to read.
+    Errno::from_raw_os_error(unsafe { *libc::__errno_location() })
+}
+
+/// The time on the monotonic clock: for how long something takes, and when
+/// to do something next.
+fn now() -> Duration {
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// Write all of `buf` to `fd`, waiting as it must.
+fn write_all(fd: impl AsFd, mut buf: &[u8]) -> Result<(), Errno> {
+    while !buf.is_empty() {
+        match rustix::io::write(&fd, buf) {
+            Ok(0) => return Err(Errno::PIPE),
+            Ok(n) => buf = &buf[n..],
+            Err(Errno::INTR) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// All of the file at `path`.
+fn read_file(path: &str) -> Result<Vec<u8>, Errno> {
+    let fd = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+    let (mut out, mut buf) = (Vec::new(), [0u8; 4096]);
+    loop {
+        match rustix::io::read(&fd, &mut buf) {
+            Ok(0) => return Ok(out),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(Errno::INTR) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Make reads and writes on `fd` return at once, with `AGAIN`, rather than
+/// wait.
+fn set_nonblocking(fd: impl AsFd) -> Result<(), Errno> {
+    let flags = rustix::fs::fcntl_getfl(&fd)?;
+    rustix::fs::fcntl_setfl(&fd, flags | OFlags::NONBLOCK)
+}
+
+/// The environment variable `name`, if it is set and text.
+fn getenv(name: &str) -> Option<String> {
+    let name = CString::new(name).ok()?;
+    // SAFETY: a NUL-terminated name; what getenv returns, if anything, is a
+    // NUL-terminated string that stays put while nothing changes the
+    // environment, which nothing here does.
+    let value = unsafe { libc::getenv(name.as_ptr()) };
+    // SAFETY: as above.
+    (!value.is_null()).then(|| unsafe { CStr::from_ptr(value) }.to_str().ok().map(str::to_string)).flatten()
+}
+
+/// End the process, with `code`.
+fn exit(code: i32) -> ! {
+    // SAFETY: exit takes a status, and does not return.
+    unsafe { libc::exit(code) }
+}
+
+unsafe extern "C" {
+    /// The process's environment, as `NAME=value` strings, NULL-terminated.
+    static environ: *const *const c_char;
+}
+
+/// Run `program` (a path) with `args`, in the environment of this process
+/// with `env` added, its stdin from `stdin`. That it could not be run at all
+/// (not there, not executable) is an error here, not an exit status later.
+fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd) -> Result<Pid, Errno> {
+    let c_string = |s: &str| CString::new(s).map_err(|_| Errno::INVAL);
+    // Everything the child needs is made before it is: between fork and
+    // exec, it may not allocate.
+    let path = c_string(program)?;
+    let argv: Vec<CString> = std::iter::once(program).chain(args.iter().map(String::as_str)).map(c_string).collect::<Result<_, _>>()?;
+    let mut envp: Vec<CString> = Vec::new();
+    // SAFETY: environ is a NULL-terminated array of NUL-terminated strings,
+    // which nothing here changes.
+    unsafe {
+        let mut at = environ;
+        while !at.is_null() && !(*at).is_null() {
+            let entry = CStr::from_ptr(*at);
+            let name = entry.to_bytes().split(|&b| b == b'=').next().unwrap_or_default();
+            if !env.iter().any(|(n, _)| n.as_bytes() == name) {
+                envp.push(entry.to_owned());
+            }
+            at = at.add(1);
+        }
+    }
+    for (name, value) in env {
+        envp.push(c_string(&format!("{name}={value}"))?);
+    }
+    let argv_ptrs: Vec<*const c_char> = argv.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+    let envp_ptrs: Vec<*const c_char> = envp.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+    // The child says why it could not run the program, if it could not; a
+    // program that runs closes this, as it is not inherited.
+    let (report_rx, report_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    let (stdin, report) = (stdin.as_raw_fd(), report_tx.as_raw_fd());
+
+    // SAFETY: no other thread is running, and the child makes only
+    // async-signal-safe calls on what was made above until it runs the
+    // program or exits.
+    match unsafe { libc::fork() } {
+        -1 => Err(errno()),
+        0 => unsafe {
+            if stdin == 0 || libc::dup2(stdin, 0) >= 0 {
+                // A program starts with SIGPIPE as the system has it, whatever
+                // this process did with it.
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+            }
+            let errno = (*libc::__errno_location()).to_ne_bytes();
+            libc::write(report, errno.as_ptr().cast(), errno.len());
+            libc::_exit(127)
+        },
+        pid => {
+            drop(report_tx);
+            // SAFETY: fork returned the PID of the child it made.
+            let pid = unsafe { Pid::from_raw_unchecked(pid) };
+            let mut errno = [0u8; 4];
+            let mut got = 0;
+            while got < errno.len() {
+                match rustix::io::read(&report_rx, &mut errno[got..]) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    Err(Errno::INTR) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if got == 0 {
+                return Ok(pid);
+            }
+            // It never ran: reap it.
+            let _ = rustix::process::waitpid(Some(pid), WaitOptions::empty());
+            Err(Errno::from_raw_os_error(i32::from_ne_bytes(errno)))
+        }
+    }
+}
+
+/// How a process ended, as std says it.
+fn status_text(status: WaitStatus) -> String {
+    match (status.exit_status(), status.terminating_signal()) {
+        (Some(code), _) => format!("exit status: {code}"),
+        (_, Some(sig)) => format!("signal: {sig}"),
+        _ => format!("{status:?}"),
+    }
+}
+
+fn connect_err(socket: &Path, e: Errno) -> Failure {
     Failure::Connect(format!(
-        "cannot talk to {}: {e} (is the daemon running, and can you access the socket?)",
-        socket.display()
+        "cannot talk to {}: {} (is the daemon running, and can you access the socket?)",
+        socket.display(),
+        Why(e)
     ))
 }
 
+/// A connection to the daemon: its socket, and what of its next line has
+/// come.
+#[derive(Debug)]
+struct Conn {
+    fd: OwnedFd,
+    pending: Vec<u8>,
+}
+
+impl Conn {
+    /// The next whole line, without its newline; `None` once the daemon has
+    /// closed the connection, a line it cut short not counting as one.
+    fn read_line(&mut self) -> Result<Option<String>, Errno> {
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=end).collect();
+                return Ok(Some(String::from_utf8_lossy(&line[..end]).into_owned()));
+            }
+            match rustix::io::read(&self.fd, &mut buf) {
+                Ok(0) => return Ok(None),
+                Ok(n) => self.pending.extend_from_slice(&buf[..n]),
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// How long a read may wait before it fails with `AGAIN`; `None` for as
+    /// long as it takes. A write may wait [`TIMEOUT`].
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), Errno> {
+        use rustix::net::sockopt::{set_socket_timeout, Timeout};
+        set_socket_timeout(&self.fd, Timeout::Recv, timeout)?;
+        set_socket_timeout(&self.fd, Timeout::Send, Some(TIMEOUT))
+    }
+}
+
 /// Connect and send one request line, waiting up to `timeout` for replies.
-fn send(socket: &Path, line: &str, timeout: Duration) -> Result<UnixStream, Failure> {
+fn send(socket: &Path, line: &str, timeout: Duration) -> Result<Conn, Failure> {
     let err = |e| connect_err(socket, e);
-    let mut stream = UnixStream::connect(socket).map_err(err)?;
-    stream.set_read_timeout(Some(timeout)).map_err(err)?;
-    stream.set_write_timeout(Some(TIMEOUT)).map_err(err)?;
-    writeln!(stream, "{line}").map_err(err)?;
-    Ok(stream)
+    let connected = || {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+        let addr = SocketAddrUnix::new(socket.as_os_str().as_encoded_bytes())?;
+        let fd = rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None)?;
+        rustix::io::retry_on_intr(|| rustix::net::connect(&fd, &addr))?;
+        Ok(fd)
+    };
+    let conn = Conn { fd: connected().map_err(err)?, pending: Vec::new() };
+    conn.set_read_timeout(Some(timeout)).map_err(err)?;
+    write_all(&conn.fd, format!("{line}\n").as_bytes()).map_err(err)?;
+    Ok(conn)
 }
 
 /// Send one request line and return the one-line reply.
 fn request(socket: &Path, line: &str, timeout: Duration) -> Result<String, Failure> {
-    let stream = send(socket, line, timeout)?;
-    let mut reply = String::new();
-    let n = BufReader::new(stream).read_line(&mut reply).map_err(|e| connect_err(socket, e))?;
-    if n == 0 {
-        return Err(Failure::Connect("the daemon closed the connection without replying".into()));
+    let mut conn = send(socket, line, timeout)?;
+    match conn.read_line().map_err(|e| connect_err(socket, e))? {
+        Some(reply) => Ok(reply.trim_end().to_string()),
+        None => Err(Failure::Connect("the daemon closed the connection without replying".into())),
     }
-    Ok(reply.trim_end().to_string())
 }
 
 /// The error a reply carries, if it is one.
@@ -436,35 +650,31 @@ fn server_error(reply: &Value) -> Option<Failure> {
 
 /// Send the watch request `line` and wait for the daemon to accept it: the
 /// stream its events will come on, with no time limit from then on.
-fn open_watch(socket: &Path, line: &str) -> Result<BufReader<UnixStream>, Failure> {
-    let mut reader = BufReader::new(send(socket, line, TIMEOUT)?);
-    let mut ack = String::new();
-    if reader.read_line(&mut ack).map_err(|e| connect_err(socket, e))? == 0 {
+fn open_watch(socket: &Path, line: &str) -> Result<Conn, Failure> {
+    let mut conn = send(socket, line, TIMEOUT)?;
+    let Some(ack) = conn.read_line().map_err(|e| connect_err(socket, e))? else {
         return Err(Failure::Connect("the daemon closed the connection".into()));
-    }
+    };
     let reply: Value =
         serde_json::from_str(ack.trim_end()).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
     if let Some(failure) = server_error(&reply) {
         return Err(failure);
     }
     // Now it waits for changes, however long that takes.
-    reader.get_ref().set_read_timeout(None).map_err(|e| connect_err(socket, e))?;
-    Ok(reader)
+    conn.set_read_timeout(None).map_err(|e| connect_err(socket, e))?;
+    Ok(conn)
 }
 
 /// Follow a segment: print each change the daemon reports until it stops (an
 /// error) or `out` is closed (success: `mdnsctl watch | head` is fine).
 fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
     let socket = &opts.socket;
-    let mut reader = open_watch(socket, &target.request("watch"))?;
-    let mut line = String::new();
+    let mut conn = open_watch(socket, &target.request("watch"))?;
     let mut seen = HashSet::new();
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).map_err(|e| connect_err(socket, e))?;
-        if n == 0 {
+        let Some(line) = conn.read_line().map_err(|e| connect_err(socket, e))? else {
             return Err(Failure::Connect("the daemon closed the connection".into()));
-        }
+        };
         let text = line.trim_end();
         let reply: Value =
             serde_json::from_str(text).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
@@ -494,28 +704,24 @@ fn watch(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Fa
 /// moment it is found, as `--json` has it, and nothing at the end.
 fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Result<(), Failure> {
     let socket = &opts.socket;
-    let mut reader = open_watch(socket, &target.request("watch"))?;
-    let deadline = Instant::now() + target.wait.unwrap_or(DEFAULT_WAIT);
+    let mut conn = open_watch(socket, &target.request("watch"))?;
+    let deadline = now() + target.wait.unwrap_or(DEFAULT_WAIT);
     // What is found, by where and who it is, as last heard of.
     let mut found: Vec<(String, Value)> = Vec::new();
     // What is printed: hosts, or with -v devices, by their key.
     let mut shown = HashSet::new();
-    let mut line = String::new();
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = deadline.saturating_sub(now());
         if left.is_zero() {
             break;
         }
-        reader.get_ref().set_read_timeout(Some(left)).map_err(|e| connect_err(socket, e))?;
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(n) if n == 0 || !line.ends_with('\n') => {
-                return Err(Failure::Connect("the daemon closed the connection".into()));
-            }
-            Ok(_) => {}
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => break,
+        conn.set_read_timeout(Some(left)).map_err(|e| connect_err(socket, e))?;
+        let line = match conn.read_line() {
+            Ok(Some(line)) => line,
+            Ok(None) => return Err(Failure::Connect("the daemon closed the connection".into())),
+            Err(Errno::AGAIN) => break,
             Err(e) => return Err(connect_err(socket, e)),
-        }
+        };
         let event: Value =
             serde_json::from_str(line.trim_end()).map_err(|e| Failure::Server(format!("unreadable reply: {e}")))?;
         if let Some(failure) = server_error(&event) {
@@ -543,7 +749,7 @@ fn devices_query(opts: &Options, target: &Target, out: &mut impl Write) -> Resul
             return Ok(());
         }
     }
-    drop(reader);
+    drop(conn);
 
     let name = target.segment.trim_matches('"');
     let text = if opts.segmented {
@@ -581,26 +787,23 @@ fn subscribe(opts: &Options, sub: &Subscription) -> Result<(), Failure> {
     let script = executable(&sub.script[0]).map_err(Failure::Usage)?;
     let log = match &sub.log {
         Some(path) => Some(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| Failure::Usage(format!("cannot write to {}: {e}", path.display())))?,
+            rustix::fs::open(path.as_os_str().as_encoded_bytes(), OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC, Mode::from_raw_mode(0o666))
+                .map_err(|e| Failure::Usage(format!("cannot write to {}: {}", path.display(), Why(e))))?,
         ),
         None => None,
     };
     let line = sub.target.request("watch");
     // In the background, the watch is opened by the process that holds it,
     // so that `watchers` lists the subscriber's PID, not its parent's.
-    let reader = if sub.foreground { open_watch(&opts.socket, &line)? } else { detach(&opts.socket, &line, log.as_ref())? };
+    let conn = if sub.foreground { open_watch(&opts.socket, &line)? } else { detach(&opts.socket, &line, log.as_ref())? };
     let signals = signal::install().map_err(|e| Failure::Usage(format!("cannot handle signals: {e}")))?;
-    note(&format!("watching {}, running {} for each change", sub.target.segment, script.display()));
+    note(&format!("watching {}, running {script} for each change", sub.target.segment));
 
-    let mut subscriber = Subscriber::new(&opts.socket, &line, reader, script, sub.script[1..].to_vec());
+    let mut subscriber = Subscriber::new(&opts.socket, &line, conn, script, sub.script[1..].to_vec());
     loop {
         let mut fds = vec![poll::readable(signals.fd())];
         fds.extend(subscriber.fds());
-        let timeout = subscriber.deadline().map(|at| at.saturating_duration_since(Instant::now()));
+        let timeout = subscriber.deadline().map(|at| at.saturating_sub(now()));
         if let Err(e) = poll::wait(&mut fds, timeout) {
             note(&format!("cannot wait: {e}"));
             break;
@@ -608,7 +811,7 @@ fn subscribe(opts: &Options, sub: &Subscription) -> Result<(), Failure> {
         if signals.take().is_some() {
             break;
         }
-        subscriber.turn(&fds[1..], Instant::now());
+        subscriber.turn(&fds[1..], now());
     }
     subscriber.stop();
     note("stopped");
@@ -620,17 +823,22 @@ fn subscribe(opts: &Options, sub: &Subscription) -> Result<(), Failure> {
 /// happens to the working directory or `PATH` later, but not resolved
 /// through symlinks: `sh` linked to `bash`, or a busybox applet, behaves by
 /// the name it is run under.
-fn executable(name: &str) -> Result<PathBuf, String> {
-    let candidates: Vec<PathBuf> = if name.contains('/') {
-        vec![PathBuf::from(name)]
+fn executable(name: &str) -> Result<String, String> {
+    let candidates: Vec<String> = if name.contains('/') {
+        vec![name.to_string()]
     } else {
-        std::env::var_os("PATH")
-            .map(|path| std::env::split_paths(&path).map(|dir| dir.join(name)).collect())
-            .unwrap_or_default()
+        // An empty entry is the working directory.
+        let path = getenv("PATH").unwrap_or_default();
+        path.split(':').map(|dir| if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }).collect()
     };
-    let runnable = |p: &PathBuf| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    let runnable = |p: &String| rustix::fs::stat(p.as_str()).is_ok_and(|st| FileType::from_raw_mode(st.st_mode).is_file() && st.st_mode & 0o111 != 0);
     let found = candidates.into_iter().find(runnable).ok_or_else(|| format!("{name}: not an executable file"))?;
-    std::path::absolute(&found).map_err(|e| format!("{name}: {e}"))
+    if found.starts_with('/') {
+        return Ok(found);
+    }
+    let cwd = rustix::process::getcwd(Vec::new()).map_err(|e| format!("{name}: {}", Why(e)))?;
+    let cwd = cwd.to_string_lossy();
+    Ok(format!("{cwd}/{}", found.trim_start_matches("./")))
 }
 
 /// Go into the background, and open the watch `line` there. The child, in a
@@ -638,18 +846,13 @@ fn executable(name: &str) -> Result<PathBuf, String> {
 /// parent then prints the child's PID and exits, or returns the error, for
 /// the caller to hear of. The child carries on with the watch, its output
 /// going to `log`, or nowhere.
-fn detach(socket: &Path, line: &str, log: Option<&File>) -> Result<BufReader<UnixStream>, Failure> {
+fn detach(socket: &Path, line: &str, log: Option<&OwnedFd>) -> Result<Conn, Failure> {
     let _ = io::stdout().flush();
-    let mut fds = [0; 2];
-    // SAFETY: `fds` has room for the two descriptors pipe2 returns.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(Failure::Connect(format!("cannot go into the background: {}", io::Error::last_os_error())));
-    }
-    // SAFETY: both were just opened, and are owned by nothing else.
-    let (mut report_rx, mut report_tx) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    let failed = |e| Failure::Connect(format!("cannot go into the background: {}", Why(e)));
+    let (report_rx, report_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(failed)?;
     // SAFETY: no other thread has been started, so the child is a full copy.
     match unsafe { libc::fork() } {
-        -1 => Err(Failure::Connect(format!("cannot go into the background: {}", io::Error::last_os_error()))),
+        -1 => Err(failed(errno())),
         0 => {
             drop(report_rx);
             let opened = settle_in_background(log).and_then(|()| open_watch(socket, line));
@@ -660,20 +863,24 @@ fn detach(socket: &Path, line: &str, log: Option<&File>) -> Result<BufReader<Uni
                 Err(Failure::Server(m)) => format!("S{m}"),
                 Err(Failure::Connect(m) | Failure::Usage(m)) => format!("C{m}"),
             };
-            let _ = report_tx.write_all(report.as_bytes());
+            let _ = write_all(&report_tx, report.as_bytes());
             drop(report_tx);
-            let Ok(reader) = opened else { std::process::exit(1) };
-            Ok(reader)
+            let Ok(conn) = opened else { exit(1) };
+            Ok(conn)
         }
         pid => {
             drop(report_tx);
-            let mut report = String::new();
-            let _ = report_rx.read_to_string(&mut report);
+            let mut report = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = rustix::io::retry_on_intr(|| rustix::io::read(&report_rx, &mut buf)) {
+                report.extend_from_slice(&buf[..n]);
+            }
+            let report = String::from_utf8_lossy(&report).into_owned();
             // Nothing at all: the child died before it could say.
             match (report.chars().next(), report.get(1..).unwrap_or_default()) {
                 (Some('+'), _) => {
                     println!("{pid}");
-                    std::process::exit(0);
+                    exit(0);
                 }
                 (None, _) => Err(Failure::Connect("the subscriber died before it was watching".into())),
                 (Some('S'), message) => Err(Failure::Server(message.into())),
@@ -686,39 +893,32 @@ fn detach(socket: &Path, line: &str, log: Option<&File>) -> Result<BufReader<Uni
 /// In the child of [`detach`]: leave the caller's session, so that its
 /// terminal going away does not take the subscriber with it, and send stdin
 /// from `/dev/null` and stdout and stderr to `log`, or there.
-fn settle_in_background(log: Option<&File>) -> Result<(), Failure> {
-    let failed = |what: &str| Failure::Connect(format!("cannot go into the background: {what}: {}", io::Error::last_os_error()));
-    // SAFETY: setsid takes no arguments; it fails only for a process group
-    // leader, which a child just forked is not.
-    if unsafe { libc::setsid() } == -1 {
-        return Err(failed("setsid"));
-    }
-    let null = File::options().read(true).write(true).open("/dev/null");
-    let null = null.map_err(|e| Failure::Connect(format!("cannot open /dev/null: {e}")))?;
+fn settle_in_background(log: Option<&OwnedFd>) -> Result<(), Failure> {
+    let failed = |what: &str, e| Failure::Connect(format!("cannot go into the background: {what}: {}", Why(e)));
+    rustix::process::setsid().map_err(|e| failed("setsid", e))?;
+    let null = rustix::fs::open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty());
+    let null = null.map_err(|e| Failure::Connect(format!("cannot open /dev/null: {}", Why(e))))?;
     let out = log.unwrap_or(&null);
-    for (from, to) in [(&null, 0), (out, 1), (out, 2)] {
-        // SAFETY: both descriptors are open in this process; dup2 replaces
-        // `to` (stdin, stdout or stderr) with a copy of `from`.
-        if unsafe { libc::dup2(from.as_raw_fd(), to) } == -1 {
-            return Err(failed("dup2"));
-        }
-    }
+    rustix::stdio::dup2_stdin(&null).map_err(|e| failed("dup2", e))?;
+    rustix::stdio::dup2_stdout(out).map_err(|e| failed("dup2", e))?;
+    rustix::stdio::dup2_stderr(out).map_err(|e| failed("dup2", e))?;
     Ok(())
 }
 
 /// A subscriber: the watch it reads events from, opened again whenever it is
 /// lost, and the script it runs for each event, one at a time, all from one
-/// loop that waits on whichever of them has something to do.
+/// loop that waits on whichever of them has something to do. Times are of
+/// [`now`].
 struct Subscriber {
     socket: PathBuf,
     line: String,
-    script: PathBuf,
+    script: String,
     args: Vec<String>,
-    /// The watch while it is open, and what of its next line has come.
-    watch: Option<(UnixStream, Vec<u8>)>,
+    /// The watch while it is open.
+    watch: Option<Conn>,
     /// While it is not: when to try to open it again, and how long to wait
     /// after that if it fails.
-    retry: Option<(Instant, Duration)>,
+    retry: Option<(Duration, Duration)>,
     /// Events waiting for the script.
     queue: VecDeque<String>,
     running: Option<Running>,
@@ -726,31 +926,33 @@ struct Subscriber {
 
 /// The script, running for an event.
 struct Running {
-    child: std::process::Child,
+    pid: Pid,
     /// Readable once it has exited, where the kernel can say so.
     pidfd: Option<OwnedFd>,
     /// Its stdin, and what of the event is still to be written to it.
-    stdin: Option<(ChildStdin, Vec<u8>)>,
+    stdin: Option<(OwnedFd, Vec<u8>)>,
     event: String,
 }
 
 impl Subscriber {
-    /// A subscriber reading the watch `line` from `reader`, as opened on
+    /// A subscriber reading the watch `line` from `conn`, as opened on
     /// `socket`, running `script` with `args`.
-    fn new(socket: &Path, line: &str, reader: BufReader<UnixStream>, script: PathBuf, args: Vec<String>) -> Subscriber {
-        // What came after the acknowledgement is the start of the events.
-        let pending = reader.buffer().to_vec();
-        let stream = reader.into_inner();
-        let watch = match stream.set_nonblocking(true) {
-            Ok(()) => Some((stream, pending)),
-            Err(e) => {
-                note(&format!("lost the daemon: {e}"));
-                None
-            }
-        };
-        let retry = watch.is_none().then(|| (Instant::now() + RECONNECT_FIRST, RECONNECT_FIRST));
+    fn new(socket: &Path, line: &str, conn: Conn, script: String, args: Vec<String>) -> Subscriber {
         let (socket, line) = (socket.to_path_buf(), line.to_string());
-        Subscriber { socket, line, script, args, watch, retry, queue: VecDeque::new(), running: None }
+        let mut subscriber = Subscriber { socket, line, script, args, watch: None, retry: None, queue: VecDeque::new(), running: None };
+        subscriber.watching(conn);
+        subscriber
+    }
+
+    /// Read events from `conn` from now on, without waiting on it.
+    fn watching(&mut self, conn: Conn) {
+        match set_nonblocking(&conn.fd) {
+            Ok(()) => (self.watch, self.retry) = (Some(conn), None),
+            Err(e) => {
+                note(&format!("lost the daemon: {}", Why(e)));
+                self.retry = Some((now() + RECONNECT_FIRST, RECONNECT_FIRST));
+            }
+        }
     }
 
     /// The descriptors to wait on: the watch, readable when events come; the
@@ -758,8 +960,8 @@ impl Subscriber {
     /// once it exits.
     fn fds(&self) -> Vec<libc::pollfd> {
         let mut fds = Vec::new();
-        if let Some((stream, _)) = &self.watch {
-            fds.push(poll::readable(stream.as_raw_fd()));
+        if let Some(conn) = &self.watch {
+            fds.push(poll::readable(conn.fd.as_raw_fd()));
         }
         if let Some(running) = &self.running {
             if let Some((stdin, _)) = &running.stdin {
@@ -774,16 +976,16 @@ impl Subscriber {
 
     /// When to look again whatever happens: to open the watch again, or to
     /// see whether a script the kernel cannot tell of has exited.
-    fn deadline(&self) -> Option<Instant> {
-        let check = self.running.as_ref().filter(|r| r.pidfd.is_none()).map(|_| Instant::now() + STOP_CHECK);
+    fn deadline(&self) -> Option<Duration> {
+        let check = self.running.as_ref().filter(|r| r.pidfd.is_none()).map(|_| now() + STOP_CHECK);
         self.retry.map(|(at, _)| at).into_iter().chain(check).min()
     }
 
     /// Do what `fds` (as [`Subscriber::fds`] gave them, after waiting) say
     /// can be done, and what is due at `now`.
-    fn turn(&mut self, fds: &[libc::pollfd], now: Instant) {
-        let ready = |fd: RawFd, flags: libc::c_short| fds.iter().any(|p| p.fd == fd && p.revents & (flags | libc::POLLHUP | libc::POLLERR) != 0);
-        if self.watch.as_ref().is_some_and(|(stream, _)| ready(stream.as_raw_fd(), libc::POLLIN)) {
+    fn turn(&mut self, fds: &[libc::pollfd], now: Duration) {
+        let ready = |fd: i32, flags: libc::c_short| fds.iter().any(|p| p.fd == fd && p.revents & (flags | libc::POLLHUP | libc::POLLERR) != 0);
+        if self.watch.as_ref().is_some_and(|conn| ready(conn.fd.as_raw_fd(), libc::POLLIN)) {
             self.read();
         }
         if let Some(running) = &mut self.running {
@@ -792,16 +994,17 @@ impl Subscriber {
             }
             let exited = running.pidfd.as_ref().is_none_or(|pidfd| ready(pidfd.as_raw_fd(), libc::POLLIN));
             if exited {
-                match running.child.try_wait() {
-                    Ok(Some(status)) => {
-                        if !status.success() {
-                            note(&format!("{} {status}, for: {}", self.script.display(), running.event));
+                match rustix::process::waitpid(Some(running.pid), WaitOptions::NOHANG) {
+                    // Stopped or continued is not ended.
+                    Ok(Some((_, status))) if status.exited() || status.signaled() => {
+                        if status.exit_status() != Some(0) {
+                            note(&format!("{} {}, for: {}", self.script, status_text(status), running.event));
                         }
                         self.running = None;
                     }
-                    Ok(None) => {}
+                    Ok(_) | Err(Errno::INTR) => {}
                     Err(e) => {
-                        note(&format!("lost {}: {e}", self.script.display()));
+                        note(&format!("lost {}: {}", self.script, Why(e)));
                         self.running = None;
                     }
                 }
@@ -814,10 +1017,9 @@ impl Subscriber {
         }
         if let Some((at, wait)) = self.retry.filter(|&(at, _)| at <= now) {
             match open_watch(&self.socket, &self.line) {
-                Ok(reader) => {
+                Ok(conn) => {
                     note("watching again");
-                    let fresh = Subscriber::new(&self.socket, &self.line, reader, PathBuf::new(), Vec::new());
-                    (self.watch, self.retry) = (fresh.watch, fresh.retry);
+                    self.watching(conn);
                 }
                 Err(failure) => {
                     if let Failure::Server(why) = failure {
@@ -833,26 +1035,21 @@ impl Subscriber {
     /// Take what the watch has sent: each whole line that is an event goes in
     /// the queue. The watch lost, it is opened again after a while.
     fn read(&mut self) {
-        let Some((stream, pending)) = &mut self.watch else { return };
-        let mut buf = [0u8; 4096];
+        let Some(conn) = &mut self.watch else { return };
+        let mut lines = Vec::new();
         let lost = loop {
-            match stream.read(&mut buf) {
+            match conn.read_line() {
+                Ok(Some(line)) => lines.push(line),
                 // Cut off by the end of the stream: what is pending is not a
                 // line to trust.
-                Ok(0) => break Some("the daemon closed the connection".to_string()),
-                Ok(n) => pending.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break None,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => break Some(format!("lost the daemon: {e}")),
+                Ok(None) => break Some("the daemon closed the connection".to_string()),
+                Err(Errno::AGAIN) => break None,
+                Err(e) => break Some(format!("lost the daemon: {}", Why(e))),
             }
         };
-        let mut lines = Vec::new();
-        while let Some(end) = pending.iter().position(|&b| b == b'\n') {
-            lines.push(String::from_utf8_lossy(&pending.drain(..=end).collect::<Vec<u8>>()).trim_end().to_string());
-        }
         let mut lost = lost;
         for text in lines {
-            if let Err(why) = self.take(&text) {
+            if let Err(why) = self.take(text.trim_end()) {
                 lost = Some(why);
                 break;
             }
@@ -860,7 +1057,7 @@ impl Subscriber {
         if let Some(why) = lost {
             note(&format!("{why}; watching again once the daemon is back"));
             self.watch = None;
-            self.retry = Some((Instant::now() + RECONNECT_FIRST, RECONNECT_FIRST));
+            self.retry = Some((now() + RECONNECT_FIRST, RECONNECT_FIRST));
         }
     }
 
@@ -892,34 +1089,29 @@ impl Subscriber {
     /// script takes it, and what [`event_env`] takes from it in the
     /// environment.
     fn start(&mut self, event: String) {
-        let spawned = std::process::Command::new(&self.script)
-            .args(&self.args)
-            .envs(event_env(&event))
-            .stdin(Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
-            Ok(child) => child,
-            Err(e) => return note(&format!("cannot run {}: {e}", self.script.display())),
+        let cannot = |e| note(&format!("cannot run {}: {}", self.script, Why(e)));
+        let (stdin_rx, stdin_tx) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
+            Ok(pipe) => pipe,
+            Err(e) => return cannot(e),
         };
-        // SAFETY: pidfd_open takes a PID and flags, and returns a new
-        // descriptor or -1; the child is ours and not yet reaped.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
-        // SAFETY: a descriptor just made, owned by nothing else.
-        let pidfd = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+        let pid = match spawn(&self.script, &self.args, &event_env(&event), &stdin_rx) {
+            Ok(pid) => pid,
+            Err(e) => return cannot(e),
+        };
+        drop(stdin_rx);
         // A script that does not read its input must not hold the subscriber up.
-        let stdin = child.stdin.take().filter(|stdin| set_nonblocking(stdin.as_raw_fd()).is_ok());
-        let stdin = stdin.map(|stdin| (stdin, format!("{event}\n").into_bytes()));
-        let mut running = Running { child, pidfd, stdin, event };
+        let stdin = set_nonblocking(&stdin_tx).is_ok().then(|| (stdin_tx, format!("{event}\n").into_bytes()));
+        let pidfd = rustix::process::pidfd_open(pid, PidfdFlags::empty()).ok();
+        let mut running = Running { pid, pidfd, stdin, event };
         running.feed();
         self.running = Some(running);
     }
 
     /// Stop the script, if one is running, and wait for it.
     fn stop(&mut self) {
-        if let Some(mut running) = self.running.take() {
-            // SAFETY: a plain signal to the child, which has not been reaped.
-            unsafe { libc::kill(running.child.id() as libc::pid_t, libc::SIGTERM) };
-            let _ = running.child.wait();
+        if let Some(running) = self.running.take() {
+            let _ = rustix::process::kill_process(running.pid, Signal::TERM);
+            let _ = rustix::io::retry_on_intr(|| rustix::process::waitpid(Some(running.pid), WaitOptions::empty()));
         }
     }
 }
@@ -930,25 +1122,15 @@ impl Running {
     fn feed(&mut self) {
         let Some((stdin, rest)) = &mut self.stdin else { return };
         loop {
-            match stdin.write(rest) {
+            match rustix::io::write(&stdin, rest) {
                 Ok(n) if n == rest.len() => break self.stdin = None,
                 Ok(n) => drop(rest.drain(..n)),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(Errno::AGAIN) => return,
+                Err(Errno::INTR) => {}
                 Err(_) => break self.stdin = None,
             }
         }
     }
-}
-
-/// Make `fd` non-blocking.
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    // SAFETY: F_GETFL and F_SETFL on a descriptor the caller holds.
-    let ok = unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
-    };
-    if ok { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 /// The environment a script gets for `event`, for scripts that would rather
@@ -970,12 +1152,12 @@ fn event_env(event: &str) -> Vec<(&'static str, String)> {
 
 /// Say something in a subscriber's log (its stderr), with the time.
 fn note(message: &str) {
-    eprintln!("{} mdnsctl[{}]: {message}", utc_now(), std::process::id());
+    eprintln!("{} mdnsctl[{}]: {message}", utc_now(), rustix::process::getpid().as_raw_pid());
 }
 
 /// The time now, in UTC, as `2026-10-30T15:52:01Z`.
 fn utc_now() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let secs = rustix::time::clock_gettime(rustix::time::ClockId::Realtime).tv_sec as u64;
     let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
     // From days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
     let z = days + 719_468;
@@ -1163,7 +1345,7 @@ fn render_watchers(
 
 /// The name of the user with `uid`, from `/etc/passwd`.
 fn user_name(uid: u32) -> Option<String> {
-    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    let passwd = String::from_utf8(read_file("/etc/passwd").ok()?).ok()?;
     passwd.lines().find_map(|line| {
         let mut fields = line.split(':');
         let name = fields.next()?;
@@ -1173,7 +1355,7 @@ fn user_name(uid: u32) -> Option<String> {
 
 /// The command line of the process `pid`, if this one may see it.
 fn command_line(pid: i32) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let raw = read_file(&format!("/proc/{pid}/cmdline")).ok()?;
     let words: Vec<String> =
         raw.split(|&b| b == 0).filter(|w| !w.is_empty()).map(|w| String::from_utf8_lossy(w).into_owned()).collect();
     (!words.is_empty()).then(|| words.join(" "))
@@ -1503,8 +1685,10 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
 
     use super::*;
 
@@ -1907,8 +2091,14 @@ mod tests {
     #[test]
     fn a_script_is_an_executable_file_found_by_path_or_in_path() {
         let sh = executable("sh").unwrap();
-        assert!(sh.is_absolute() && sh.file_name() == Some("sh".as_ref()), "not followed through a symlink: {}", sh.display());
-        assert_eq!(executable(sh.to_str().unwrap()).unwrap(), sh);
+        assert!(sh.starts_with('/') && sh.ends_with("/sh"), "not followed through a symlink: {sh}");
+        assert_eq!(executable(&sh).unwrap(), sh);
+        // One found by a relative path is made absolute.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(executable("./src/../Cargo.toml").unwrap_err(), "./src/../Cargo.toml: not an executable file");
+        let (script, _) = script("relative", 0);
+        let relative = script.strip_prefix(&format!("{}/", cwd.display())).unwrap();
+        assert_eq!(executable(&format!("./{relative}")).unwrap(), script);
         assert!(executable("target").is_err(), "a directory");
         assert!(executable("Cargo.toml").is_err(), "not on PATH, and no slash");
         assert!(executable("./Cargo.toml").unwrap_err().contains("not an executable"));
@@ -1920,7 +2110,7 @@ mod tests {
     /// file this process had open for writing could be held open a moment by
     /// a child another test forks meanwhile, and could not be run ("Text file
     /// busy") until that child execs.
-    fn script(tag: &str, status: u8) -> (PathBuf, PathBuf) {
+    fn script(tag: &str, status: u8) -> (String, PathBuf) {
         std::fs::create_dir_all("target").unwrap();
         let path = PathBuf::from(format!("target/mdnsctl-test-{}-{tag}.sh", std::process::id()));
         let draft = path.with_extension("draft");
@@ -1941,8 +2131,37 @@ mod tests {
 
     const EVENT: &str = r#"{"event":"added","segment":"IoT","ttl":4500,"device":{"interface":"wifi","hostname":"plug.local","addresses":["10.0.1.9"],"services":[]}}"#;
 
+    #[test]
+    fn errors_read_as_the_system_words_them() {
+        assert_eq!(Why(Errno::NOENT).to_string(), "No such file or directory (os error 2)");
+        assert_eq!(read_file("/no/such/file").unwrap_err(), Errno::NOENT);
+    }
+
+    #[test]
+    fn a_program_runs_with_its_input_and_environment() {
+        // Not inherited, as in Subscriber::start: a script holding the
+        // writing end of its own stdin would never see it end.
+        let (stdin_rx, stdin_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+        let (out, _) = script("spawned", 3);
+        let out_file = PathBuf::from(out.replace(".sh", ".out"));
+        let pid = spawn(&out, &["one".into()], &[("MDNS_HOSTNAME", "set".into())], &stdin_rx).unwrap();
+        drop(stdin_rx);
+        write_all(&stdin_tx, b"input\n").unwrap();
+        drop(stdin_tx);
+        let (_, status) = rustix::process::waitpid(Some(pid), WaitOptions::empty()).unwrap().unwrap();
+        assert_eq!(status_text(status), "exit status: 3");
+        assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "input\none||set|\n");
+    }
+
+    #[test]
+    fn a_program_that_cannot_run_is_an_error_at_once() {
+        let (stdin, _) = rustix::pipe::pipe().unwrap();
+        assert_eq!(spawn("/no/such/program", &[], &[], &stdin).unwrap_err(), Errno::NOENT);
+        assert_eq!(spawn("/etc/passwd", &[], &[], &stdin).unwrap_err(), Errno::ACCESS);
+    }
+
     /// A subscriber with no watch, running `script` with `args`.
-    fn idle(script: PathBuf, args: &[&str]) -> Subscriber {
+    fn idle(script: String, args: &[&str]) -> Subscriber {
         let args = args.iter().map(|a| a.to_string()).collect();
         Subscriber { socket: PathBuf::new(), line: String::new(), script, args, watch: None, retry: None, queue: VecDeque::new(), running: None }
     }
@@ -1953,9 +2172,9 @@ mod tests {
         while !done(sub) {
             assert!(Instant::now() < deadline, "not done in time");
             let mut fds = sub.fds();
-            let timeout = sub.deadline().map_or(STOP_CHECK, |at| at.saturating_duration_since(Instant::now()).min(STOP_CHECK));
+            let timeout = sub.deadline().map_or(STOP_CHECK, |at| at.saturating_sub(now()).min(STOP_CHECK));
             poll::wait(&mut fds, Some(timeout)).unwrap();
-            sub.turn(&fds, Instant::now());
+            sub.turn(&fds, now());
         }
     }
 
