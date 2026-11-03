@@ -401,7 +401,9 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let start = Instant::now();
+        // Not the clock's now: on a machine that has only just started the clock
+        // is no later than the refresh time, and the time to ask again is its start.
+        let start = Instant::START + Duration::from_secs(30);
         for step in 0..20_000u64 {
             let (n, pick) = (next() % 300, next());
             // A name of mixed case, as announced, spelt differently each time.
@@ -413,7 +415,11 @@ mod tests {
                 0 | 1 => {
                     let id = match devices.find_host(&spelt(step)) {
                         Some(id) => id,
-                        None => devices.create(named(&spelt(step), &format!("10.9.{}.{}", n % 7, n % 5))),
+                        None => {
+                            let id = devices.create(Entry::new(start, format!("10.9.{}.{}", n % 7, n % 5).parse().unwrap(), Some(&spelt(step))));
+                            devices.reindex(id, &Indexed::default());
+                            id
+                        }
                     };
                     assert_eq!(*model.entry(key).or_insert(id), id, "found as it was made");
                     let was = devices.indexed_of(id);
