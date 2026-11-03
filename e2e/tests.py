@@ -221,7 +221,7 @@ class Patterns(Case):
         self.two_links()
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=*\n"))
         self.assertTrue(d.wait_log(r"rb: here \(index \d+\), listening", 5), self.logs(d))
-        self.assertTrue(d.wait_log(r"lo: a loopback interface", 5), self.logs(d))
+        self.assertTrue(d.wait_log(r"lo0?: a loopback interface", 5), self.logs(d))
         d.settle()
         self.assertEqual(d.request("segments")["segments"][0]["interfaces"], ["ra", "rb"])
 
