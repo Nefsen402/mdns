@@ -172,6 +172,41 @@ class Interfaces(Case):
         self.assertTrue(ha.wait(alive("pc.local", A, "10.9.1.1"), 5, since=heard), "announced again\n" + self.logs(d))
         self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE), heard)), "and asked on again")
 
+    def test_a_daemon_starts_where_an_interface_has_no_ipv4_address_yet(self):
+        self.lab.link("ra", None, "10.9.1.2/24")
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
+        d.settle()
+        self.assertIsNone(d.proc.poll(), "it waits for the address; it does not stop\n" + self.logs(d))
+
+    @follows_changes
+    def test_ipv6_is_listened_to_while_ipv4_waits_for_an_address(self):
+        la = self.lab.link("ra", None, "10.9.1.2/24")
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
+        self.assertTrue(d.wait_log(r"listening on ra \(V6\)", 5), self.logs(d))
+        la.add_router_addr("10.9.1.1/24")
+        self.assertTrue(d.wait_log(r"listening on ra \(V4\)", 5), self.logs(d))
+
+    @follows_changes
+    def test_an_interface_that_is_up_before_it_has_an_address_is_waited_for_when_the_daemon_starts(self):
+        # As one is that is yet to be given its address, by DHCP, when the daemon starts at boot.
+        la = self.lab.link("ra", None, "10.9.1.2/24")
+        ha = la.hearer()
+        d = self.lab.daemon(conf("[Advertise]\nHostname=pc\n[Segment]\nName=s\nInterfaces=ra\n"))
+        la.add_router_addr("10.9.1.1/24")
+        self.assertTrue(d.advance_until(lambda: ha.seen(alive("pc.local", A, "10.9.1.1"))), "it is listened to when it has one\n" + self.logs(d))
+
+    @follows_changes
+    def test_an_interface_that_appears_before_it_has_an_address_is_listened_to_when_it_gets_one(self):
+        d = self.lab.daemon(conf("[Advertise]\nHostname=pc\n[Segment]\nName=s\nInterfaces=ra\n"))
+        la = self.lab.link("ra", None, "10.9.1.2/24")
+        ha = la.hearer()
+        la.add_router_addr("10.9.1.1/24")
+        self.assertTrue(d.advance_until(lambda: ha.seen(alive("pc.local", A, "10.9.1.1"))), "and announces on it\n" + self.logs(d))
+        # It is a device that is heard from too, where it did not hear before.
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        d.settle()
+        self.assertTrue(d.host("s", "tv.local"), self.logs(d))
+
     @follows_changes
     def test_a_change_of_mtu_is_taken(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")

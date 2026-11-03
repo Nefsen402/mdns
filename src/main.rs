@@ -35,7 +35,7 @@ use time::Instant;
 use anyhow::{Context, Result};
 
 use config::{Config, Forward, Neighbours};
-use links::Link;
+use links::{Link, Opened};
 use netlink::Netlink;
 use reflector::Reflector;
 use segment::{Owner, Segment};
@@ -106,8 +106,10 @@ fn daemon(args: Vec<String>) -> Result<()> {
     let mut links: HashMap<&str, Segment> = HashMap::new();
     for interface in &interfaces {
         let mut link = Link::new(interface, &families, &unicast, &config, hub.clone());
-        if !link.open()? {
-            eprintln!("{}: not there yet; waiting for it", interface.name);
+        match link.open()? {
+            Opened::Listening => {}
+            Opened::Absent => eprintln!("{}: not there yet; waiting for it", interface.name),
+            Opened::Waiting => {} // it said what it waits for
         }
         links.insert(&interface.name, link.segment().clone());
         tracked.push(link);

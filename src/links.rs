@@ -32,6 +32,18 @@ use crate::prelude::*;
 /// (RFC 6762 section 17).
 pub const MAX_DATAGRAM: usize = 9000;
 
+/// How opening an interface went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opened {
+    /// It is not there.
+    Absent,
+    /// It is there, and cannot be joined to the group over any family yet, having
+    /// no address to do it by: it is opened when it is given one.
+    Waiting,
+    /// It is listened to, over every family it can be yet.
+    Listening,
+}
+
 /// One interface the daemon serves, and the sockets it has on it while it is
 /// there.
 pub struct Link {
@@ -49,6 +61,10 @@ pub struct Link {
     /// announced or asked on one that is not, and its addresses, going as it
     /// goes down, are not taken for a change.
     up: bool,
+    /// The families it is there and not listened to over, as it has no address to
+    /// join the group by yet (IPv4, where the sockets are shared): they are
+    /// joined when it has one.
+    missing: Vec<Family>,
     /// Whether it has had sockets before: one that comes again is back.
     was_here: bool,
     /// Its MTU, once known: what a packet sent on it may hold follows it.
@@ -91,6 +107,7 @@ impl Link {
                 .collect(),
             index: None,
             up: true,
+            missing: Vec::new(),
             was_here: false,
             mtu: None,
             sockets: Vec::new(),
@@ -104,19 +121,51 @@ impl Link {
 
     /// Open a socket for each family on the interface, if it is there, for
     /// the event loop to read, both feeding the one list of devices, and
-    /// advertise the name. Returns whether it was there.
-    pub fn open(&mut self) -> Result<bool> {
+    /// advertise the name. Says whether it was there, and could be listened to.
+    pub fn open(&mut self) -> Result<Opened> {
         let Ok(index) = socket::ifindex(&self.interface) else {
-            return Ok(false);
+            self.missing.clear();
+            return Ok(Opened::Absent);
         };
         self.take_mtu(socket::mtu(&self.interface).ok());
+        // Of the families it has no address to join the group over, only what is
+        // waited for waits: IPv6 is listened to when IPv4 cannot be yet.
+        let missing: Vec<Family> = self.families.iter().copied().filter(|&f| !socket::joinable(&self.interface, f)).collect();
+        let before = core::mem::replace(&mut self.missing, missing);
+        if !self.missing.is_empty() && self.missing != before {
+            eprintln!("{}: no IPv4 address yet: IPv4 is listened to when it has one", self.interface);
+        }
+        if self.missing.len() == self.families.len() {
+            return Ok(Opened::Waiting);
+        }
         self.open_sockets()?;
         self.index = Some(index);
         self.was_here = true;
         if self.up {
             self.addresses_changed();
         }
-        Ok(true)
+        Ok(Opened::Listening)
+    }
+
+    /// The interface is there under `index`, new or created again, or has an
+    /// address to be joined to the group by now: open it, and say so.
+    fn appeared(&mut self, index: u32, up: bool) {
+        let how = if self.was_here { "back" } else { "here" };
+        self.close();
+        match self.open() {
+            Ok(Opened::Listening) => {
+                eprintln!("{}: {how} (index {index}), listening", self.interface);
+                // Not yet up, it is announced and asked on once it is.
+                if up {
+                    self.came_back();
+                }
+            }
+            Ok(Opened::Waiting | Opened::Absent) => {}
+            Err(e) => {
+                eprintln!("{}: {e:#}", self.interface);
+                self.close();
+            }
+        }
     }
 
     /// A socket of its own for each family, pinned to the interface.
@@ -145,7 +194,7 @@ impl Link {
     /// The shared sockets, joined to the group on this interface.
     #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
     fn open_sockets(&mut self) -> Result<()> {
-        for &family in &self.families {
+        for &family in self.families.iter().filter(|f| !self.missing.contains(f)) {
             let (tx, dest) = self
                 .hub
                 .join(&self.interface, family)
@@ -235,22 +284,7 @@ impl Link {
                 self.up = *up;
                 if self.index != Some(*index) {
                     // It appeared, or was created again under a new index.
-                    let how = if self.was_here { "back" } else { "here" };
-                    self.close();
-                    match self.open() {
-                        Ok(true) => {
-                            eprintln!("{}: {how} (index {index}), listening", self.interface);
-                            // Not yet up, it is announced and asked on once it is.
-                            if *up {
-                                self.came_back();
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            eprintln!("{}: {e:#}", self.interface);
-                            self.close();
-                        }
-                    }
+                    self.appeared(*index, *up);
                 } else if came_up {
                     eprintln!("{}: up", self.interface);
                     self.addresses_changed();
@@ -259,6 +293,14 @@ impl Link {
             }
             Change::Gone { index } if self.index == Some(*index) => self.gone(),
             // An interface going down loses its addresses: that is not news.
+            // One that was waiting for an address to listen over a family by, and has one now.
+            Change::Address { index }
+                if self.up
+                    && self.missing.iter().any(|&f| socket::joinable(&self.interface, f))
+                    && socket::ifindex(&self.interface).ok() == Some(*index) =>
+            {
+                self.appeared(*index, true)
+            }
             Change::Address { index } if self.index == Some(*index) && self.up => self.addresses_changed(),
             Change::Neighbour { index, ip, mac } if self.index == Some(*index) => self.segment.neighbour(*ip, mac.clone()),
             Change::Lost => self.look_again(),

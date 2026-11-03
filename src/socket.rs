@@ -192,6 +192,13 @@ mod pinned {
 #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
 pub use pinned::open;
 
+/// Whether the group can be joined on `interface` over `family` now: a socket
+/// of the interface's own is joined by its index, and needs nothing of it.
+#[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
+pub fn joinable(_interface: &str, _family: Family) -> bool {
+    true
+}
+
 /// Where sockets are pinned to their interface, each hears for itself and
 /// there is nothing shared to read.
 #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
@@ -468,7 +475,7 @@ mod portable {
     /// The first IPv4 address of `interface`: what the group is joined by, and
     /// what traffic to it is sent from, where an interface is named by its
     /// address.
-    fn interface_v4(interface: &str) -> Result<Ipv4Addr> {
+    pub(super) fn interface_v4(interface: &str) -> Result<Ipv4Addr> {
         prefixes(interface)?
             .into_iter()
             .find_map(|p| match p.addr {
@@ -606,6 +613,15 @@ mod portable {
 
 #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
 pub use portable::Hub;
+
+/// Whether the group can be joined on `interface` over `family` now: the shared
+/// sockets join it over IPv4 by an address of the interface, which one that has
+/// only come up, as one does that is yet to be given its address by DHCP, has
+/// not. Over IPv6 it is joined by the interface's index, and needs no address.
+#[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
+pub fn joinable(interface: &str, family: Family) -> bool {
+    family == Family::V6 || portable::interface_v4(interface).is_ok()
+}
 
 /// Reading the control message that says which interface a datagram came in
 /// on. Pure, so it is tested with the bytes of each system's, which can all be
