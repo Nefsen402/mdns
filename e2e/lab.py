@@ -29,11 +29,7 @@ A, PTR, TXT, AAAA, SRV, NSEC = 1, 12, 16, 28, 33, 47
 
 # ---------------------------------------------------------------- running things
 
-def sh(*args, check=True):
-    r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if check and r.returncode:
-        raise RuntimeError(f"{' '.join(args)}: {r.stderr.strip()}")
-    return r
+from net import LINUX, make as make_net, sh  # noqa: E402  (sh is the tests' too)
 
 
 # Woken whenever something is heard or the daemon says something: what a wait
@@ -217,7 +213,7 @@ class Hearer(threading.Thread):
     """Hears what is sent to port 5353 at `addr` of an interface, and, if
     `group`, the mDNS group on it."""
 
-    def __init__(self, interface, addr, group=True, sock=None):
+    def __init__(self, net, interface, addr, group=True, sock=None):
         super().__init__(daemon=True)
         self.heard, self.stopped = [], False
         self.reading = threading.Lock()
@@ -228,20 +224,26 @@ class Hearer(threading.Thread):
             sock.setblocking(False)
             self.socks.append((sock, False))
         elif group:
-            s = self._sock(interface, (GROUP, PORT))
+            s = self._sock(net, interface, (GROUP, PORT))
             s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(GROUP) + socket.inet_aton(addr))
             self.socks.append((s, True))
         if not sock:
-            self.socks.append((self._sock(interface, (addr, PORT)), False))
+            self.socks.append((self._sock(net, interface, (addr, PORT)), False))
         self.start()
 
     @staticmethod
-    def _sock(interface, bind):
+    def _sock(net, interface, bind):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode())
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        net.bind_to_interface(s, interface)
+        # As much as the system lets it hold: a BSD's limit is lower than Linux's.
+        for size in (4 << 20, 1 << 20, 256 << 10):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, size)
+                break
+            except OSError:
+                pass
         s.bind(bind)
         s.setblocking(False)
         return s
@@ -325,7 +327,7 @@ class Device:
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
         self.sock.bind((addr, PORT))
         # What comes to it is heard on the socket it sends from.
-        self.hearer = Hearer(link.peer, addr, group=False, sock=self.sock)
+        self.hearer = Hearer(link.lab.net, link.peer, addr, group=False, sock=self.sock)
 
     def multicast(self, data):
         self.sock.sendto(data, (GROUP, PORT))
@@ -350,7 +352,7 @@ class Daemon:
             f.write(config)
         self.lines, self.lock = [], threading.Lock()
         self.proc = subprocess.Popen(
-            ["nsenter", "-t", str(lab.holder.pid), "-n", "--", binary, self.conf],
+            [*lab.net.router_argv(), binary, self.conf],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=dict(os.environ, **(env or {})),
         )
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -535,27 +537,59 @@ class AvahiCall:
 # ---------------------------------------------------------------- the lab
 
 class Link:
-    """A veth pair: `name` in the router's namespace, `peer` in the test's."""
+    """A pair of interfaces: `name` in the router, `peer` where the test is."""
 
     def __init__(self, lab, name, router_cidr, peer_cidr):
         self.lab, self.name, self.peer = lab, name, "p-" + name
         self.router_addr = router_cidr.split("/")[0] if router_cidr else None
         self.peer_addr = peer_cidr.split("/")[0]
         self.prefix = peer_cidr.split("/")[1] if "/" in peer_cidr else "24"
-        sh("ip", "link", "add", name, "type", "veth", "peer", "name", self.peer)
-        sh("ip", "link", "set", name, "netns", str(lab.holder.pid))
+        self.net = lab.net
+        self.net.create_link(name, self.peer)
         if router_cidr:
-            lab.router("ip", "addr", "add", router_cidr, "dev", name)
-        lab.router("ip", "link", "set", name, "up")
-        sh("ip", "addr", "add", peer_cidr, "dev", self.peer)
-        sh("ip", "link", "set", self.peer, "up")
+            self.net.add_addr("router", name, router_cidr)
+        self.net.set_up("router", name, True)
+        self.net.add_addr("peer", self.peer, peer_cidr)
+        self.net.set_up("peer", self.peer, True)
 
     def add_peer_addr(self, addr):
         if addr != self.peer_addr:
-            sh("ip", "addr", "add", f"{addr}/{self.prefix}", "dev", self.peer, check=False)
+            try:
+                self.net.add_addr("peer", self.peer, f"{addr}/{self.prefix}")
+            except RuntimeError:
+                pass  # it is there already
+
+    def add_peer_cidr(self, cidr):
+        self.net.add_addr("peer", self.peer, cidr)
+
+    def add_router_addr(self, cidr):
+        self.net.add_addr("router", self.name, cidr)
+
+    def del_router_addr(self, cidr):
+        self.net.del_addr("router", self.name, cidr)
+
+    def set_router_up(self, up):
+        self.net.set_up("router", self.name, up)
+
+    def set_router_mtu(self, mtu):
+        self.net.set_mtu(self.name, mtu)
+
+    def peer_mac(self):
+        return self.net.mac("peer", self.peer)
+
+    def neighbour(self, ip, mac):
+        """The router's neighbour table has `ip` at `mac`, for good."""
+        self.net.neighbour(self.name, ip, mac)
+
+    def forget_neighbour(self, ip):
+        self.net.forget_neighbour(self.name, ip)
+
+    def delete(self):
+        """The link is gone, both ends."""
+        self.net.delete_link(self.name, self.peer)
 
     def hearer(self, group=True):
-        return self.lab.track(Hearer(self.peer, self.peer_addr, group))
+        return self.lab.track(Hearer(self.net, self.peer, self.peer_addr, group))
 
     def device(self, addr):
         return self.lab.track(Device(self, addr))
@@ -566,31 +600,22 @@ class Lab:
         self.binary, self.ctl = binary, ctl
         self.dir = tempfile.mkdtemp(prefix="mdnsd-e2e-")
         self.daemons, self.links, self.tracked = [], [], []
-        # The router's namespace is held by a process that says when it is in it.
-        self.holder = subprocess.Popen(
-            ["unshare", "-n", "--", "sh", "-c", "echo ready; exec sleep infinity"], stdout=subprocess.PIPE, text=True
-        )
-        if self.holder.stdout.readline().strip() != "ready":
-            raise RuntimeError("no namespace for the router")
-        self.router("ip", "link", "set", "lo", "up")
-        # Addresses are there at once, for what is sent from them.
-        self.router("sh", "-c", "echo 0 > /proc/sys/net/ipv6/conf/all/accept_dad; echo 0 > /proc/sys/net/ipv6/conf/default/accept_dad")
-        sh("sh", "-c", "echo 0 > /proc/sys/net/ipv6/conf/all/accept_dad; echo 0 > /proc/sys/net/ipv6/conf/default/accept_dad")
+        self.net = make_net()
 
     def router(self, *cmd, check=True):
-        """Run a command in the router's namespace."""
-        return sh("nsenter", "-t", str(self.holder.pid), "-n", "--", *cmd, check=check)
+        """Run a command in the router."""
+        return self.net.run("router", *cmd, check=check)
 
     def neighbours(self, interface):
         """A watch of the router's neighbour table on `interface`, which has
         what the kernel there learns or changes as it does. It is made ready by
         an entry of its own, which it has seen by the time this returns."""
-        watch = self.track(Watch(["nsenter", "-t", str(self.holder.pid), "-n", "--", "ip", "-6", "monitor", "neigh", "dev", interface]))
-        self.router("ip", "-6", "neigh", "replace", "fd00:ffff::1", "lladdr", "02:ff:ff:ff:ff:01", "dev", interface, "nud", "permanent")
+        watch = self.track(Watch(self.net.neighbour_watch_argv(interface)))
+        self.net.neighbour(interface, "fd00:ffff::1", "02:ff:ff:ff:ff:01")
         if not watch.wait("fd00:ffff::1", 5):
             raise RuntimeError("the neighbour table cannot be watched")
         # Taking it away is seen at once, as the entry failing: it is only reported deleted later.
-        self.router("ip", "-6", "neigh", "del", "fd00:ffff::1", "dev", interface)
+        self.net.forget_neighbour(interface, "fd00:ffff::1")
         watch.wait("fd00:ffff::1 FAILED", 5)
         return watch
 
@@ -615,7 +640,6 @@ class Lab:
         for t in self.tracked:
             t.close()
         for link in self.links:
-            sh("ip", "link", "del", link.peer, check=False)
-        self.holder.kill()
-        self.holder.wait()
+            link.delete()
+        self.net.close()
         shutil.rmtree(self.dir, ignore_errors=True)

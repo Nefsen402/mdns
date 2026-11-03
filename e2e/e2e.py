@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Run a built mdnsd through scenarios that the unit tests cannot: interfaces
 that come and go, addresses that change, real sockets, signals, the control
-socket and the avahi socket, all from outside, over the network, in network
-namespaces.
+socket and the avahi socket, all from outside, over the network, with the
+daemon in a router of its own.
 
     e2e.py [-v] [-k PATTERN] [--ctl MDNSCTL] [--logs DIR] MDNSD
 
-It needs `ip`, `unshare` and `nsenter` (iproute2 and util-linux). It makes its
-own user and network namespaces, as the fuzzer and the benchmark do, so it
-needs no privileges; run as root, it makes a network namespace only. Where the
-system forbids unprivileged user namespaces (the AppArmor setting of recent
-Ubuntu), run it as root, or allow them:
+On Linux it needs `ip`, `unshare` and `nsenter` (iproute2 and util-linux). It
+makes its own user and network namespaces, as the fuzzer and the benchmark do,
+so it needs no privileges; run as root, it makes a network namespace only.
+Where the system forbids unprivileged user namespaces (the AppArmor setting of
+recent Ubuntu), run it as root, or allow them:
 
     sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+On FreeBSD it makes a VNET jail for the router and `epair` interfaces for the
+links, and so must be run as root, and changes the host's network stack: it is
+for a machine that may be changed, such as a virtual machine. The daemon does
+not follow interfaces, addresses or neighbours as they change there yet, so the
+tests of that are left out.
 """
 import argparse
 import os
@@ -20,6 +26,9 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from net import FREEBSD, LINUX  # noqa: E402
 
 
 def main():
@@ -42,6 +51,12 @@ def main():
         if args.logs:
             os.makedirs(args.logs, exist_ok=True)
             env["E2E_LOGS"] = os.path.abspath(args.logs)
+        if FREEBSD:
+            # The router is a VNET jail, which only root makes, and what is run
+            # changes the host's network: it is for a machine that may be changed.
+            if os.geteuid() != 0:
+                sys.exit("run as root: the router is a VNET jail, and its links epair interfaces")
+            os.execvpe(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]], env)
         # Root makes only the network namespace; anyone else a user namespace
         # to be root in.
         unshare = ["unshare", "-n"] if os.geteuid() == 0 else ["unshare", "-r", "-n"]
@@ -52,7 +67,8 @@ def main():
             )
         os.execvpe("unshare", unshare + ["--", sys.executable, os.path.abspath(__file__), *sys.argv[1:]], env)
 
-    subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+    if LINUX:
+        subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     sys.path.insert(0, HERE)
     import unittest
 

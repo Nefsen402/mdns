@@ -40,10 +40,29 @@ unprivileged user namespaces (recent Ubuntu), run it as root, or allow them:
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 ```
 
+### On FreeBSD
+
+```
+cargo build --features test-clock
+doas python3 e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd
+```
+
+There are no network namespaces, so each test makes a VNET jail for the router
+and `epair` interfaces for the links (`net.py`), with `ifconfig` and `jexec`.
+That needs root, and it changes the host's network stack: run it on a machine
+that may be changed, such as a virtual machine. It needs Python 3 (`pkg install
+python3`). Where the daemon does not follow interfaces, addresses and neighbours
+as they change, as a BSD's does not yet (it does not read the routing socket),
+the tests of that are skipped, with that as the reason.
+
 ## Writing a test
 
-`lab.py` has the pieces: `Lab` (the router's namespace; `lab.link(...)` makes
-an interface of it and the far end, `lab.router(...)` runs a command there),
+`net.py` is how the router and its links are made, for Linux and for FreeBSD,
+with the same methods; the tests do not run `ip` or `ifconfig` themselves.
+`lab.py` has the pieces: `Lab` (the router; `lab.link(...)` makes an interface
+of it and the far end, with methods to add and remove its addresses, take it
+down and up, change its MTU and set its neighbours; `lab.router(...)` runs a
+command there),
 `Link.hearer()` (what is heard on the link, with `wait` for a message that
 matches), `Link.device(addr)` (a device to send and be sent to), `Daemon`
 (`wait_log`, `request`, `ctl`, `stop`), and DNS to build and parse messages.

@@ -1,16 +1,19 @@
 """The scenarios. See e2e.py for how to run them."""
 import os
-import re
 import subprocess
 import unittest
 
-from lab import A, AAAA, PTR, SRV, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, until
+from lab import A, AAAA, LINUX, PTR, SRV, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, until
 
 BINARY = os.environ["E2E_DAEMON"]
 CTL = os.environ.get("E2E_CTL")
 LOGS = os.environ.get("E2E_LOGS")
 
 PROBE = ("_services._dns-sd._udp.local", PTR)
+
+# What the daemon follows as the network changes under it it gets from netlink,
+# and a BSD's routing socket, which says the same, is not read yet.
+follows_changes = unittest.skipUnless(LINUX, "the daemon does not follow changes of the network on this system yet")
 
 
 def conf(body, ipv6=False):
@@ -118,6 +121,7 @@ class Reflecting(Case):
 
 
 class Interfaces(Case):
+    @follows_changes
     def test_an_interface_that_is_not_there_yet_is_waited_for_and_followed_as_it_comes_and_goes(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,late\n"))
@@ -136,7 +140,7 @@ class Interfaces(Case):
 
         # It goes, and comes back, in another form.
         mark = d.mark()
-        self.lab.router("ip", "link", "del", "late")
+        late.delete()
         self.assertTrue(d.wait_log(r"late: gone; waiting for it to come back", 5, mark), self.logs(d))
         mark = d.mark()
         late = self.lab.link("late", "10.9.3.1/24", "10.9.3.2/24")
@@ -149,30 +153,32 @@ class Interfaces(Case):
         late_dev.multicast(announcement("cam", "10.9.3.50", "Cam"))
         d.settle()
         self.assertTrue(d.host("s", "cam.local"), self.logs(d))
-        self.lab.router("ip", "link", "del", "late")
+        late.delete()
         d.settle()
         self.assertTrue(not d.host("s", "cam.local"), "what was heard there is forgotten\n" + self.logs(d))
         self.assertEqual(d.stop(), 0)
 
+    @follows_changes
     def test_an_interface_that_goes_down_and_comes_up_is_announced_on_again(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         ha = la.hearer()
         d = self.lab.daemon(conf("[Advertise]\nHostname=pc\n[Segment]\nName=s\nInterfaces=ra\n"))
         self.assertTrue(ha.wait(alive("pc.local", A, "10.9.1.1")), self.logs(d))
-        self.lab.router("ip", "link", "set", "ra", "down")
+        la.set_router_up(False)
         d.settle()
         mark, heard = d.mark(), ha.count()
-        self.lab.router("ip", "link", "set", "ra", "up")
+        la.set_router_up(True)
         self.assertTrue(d.wait_log(r"ra: up$", 5, mark), self.logs(d))
         self.assertTrue(ha.wait(alive("pc.local", A, "10.9.1.1"), 5, since=heard), "announced again\n" + self.logs(d))
         self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE), heard)), "and asked on again")
 
+    @follows_changes
     def test_a_change_of_mtu_is_taken(self):
-        self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n"))
         self.assertTrue(d.wait_log(r"ra: MTU is 1500", 2), self.logs(d))
         mark = d.mark()
-        self.lab.router("ip", "link", "set", "ra", "mtu", "1400")
+        la.set_router_mtu(1400)
         self.assertTrue(d.wait_log(r"ra: MTU now 1400", 5, mark), self.logs(d))
 
     def test_a_daemon_with_no_interface_there_still_starts_and_stops(self):
@@ -207,16 +213,17 @@ class Advertising(Case):
         self.assertEqual(d.stop(), 0)
         self.assertTrue(ha.wait(goodbye("pc.local", A, "10.9.1.1")), "withdrawn on shutdown")
 
+    @follows_changes
     def test_the_advertised_name_follows_the_interfaces_addresses(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         ha = la.hearer()
         d = self.lab.daemon(conf("[Advertise]\nHostname=pc\n[Segment]\nName=s\nInterfaces=ra\n"))
         self.assertTrue(ha.wait(alive("pc.local", A, "10.9.1.1")))
         # A second address is announced.
-        self.lab.router("ip", "addr", "add", "10.9.1.9/24", "dev", "ra")
+        la.add_router_addr("10.9.1.9/24")
         self.assertTrue(ha.wait(alive("pc.local", A, "10.9.1.9"), 5), self.logs(d))
         # The one that goes is retracted, with a goodbye.
-        self.lab.router("ip", "addr", "del", "10.9.1.9/24", "dev", "ra")
+        la.del_router_addr("10.9.1.9/24")
         self.assertTrue(ha.wait(goodbye("pc.local", A, "10.9.1.9"), 5), self.logs(d))
         self.assertTrue(d.wait_log(r"ra: advertising pc.local as 10.9.1.1 ", 2))
         # One asked for now is not told of it.
@@ -258,7 +265,7 @@ class Unicast(Case):
     def world(self, listen, source="10.9.1.50"):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         # A packet from an address that is not on the link is not for the kernel to drop.
-        self.lab.router("sh", "-c", "for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > $f; done")
+        self.lab.net.relax_source_checks()
         d = self.lab.daemon(f"[Listen]\nIPv4={listen}\nIPv6=off\n[Segment]\nName=s\nInterfaces=ra\n")
         dev = la.device(source)
         dev.unicast(announcement("tv", source, "TV"), "10.9.1.1")
@@ -464,17 +471,18 @@ class Startup(Case):
                     lab.close()
 
 
+@follows_changes
 class Neighbours(Case):
     def test_addresses_the_neighbour_table_has_for_a_device_are_learned(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
-        self.lab.router("ip", "addr", "add", "fd00:9::1/64", "dev", "ra", "nodad")
-        sh("ip", "addr", "add", "fd00:9::2/64", "dev", la.peer, "nodad")
+        la.add_router_addr("fd00:9::1/64")
+        la.add_peer_cidr("fd00:9::2/64")
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
         mac = "02:00:00:00:00:50"
         # The device announces an IPv4 address and a link-local IPv6 one, and
         # is known to the router's neighbour table at a routable one too.
-        self.lab.router("ip", "-6", "neigh", "replace", "fd00:9::50", "lladdr", mac, "dev", "ra", "nud", "permanent")
-        self.lab.router("ip", "-4", "neigh", "replace", "10.9.1.50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        la.neighbour("fd00:9::50", mac)
+        la.neighbour("10.9.1.50", mac)
         dev = la.device("10.9.1.50")
         dev.multicast(response(a("tv.local", "10.9.1.50"), aaaa("tv.local", "fe80::50"), srv("TV._http._tcp.local", 80, "tv.local"),
                                ptr("_http._tcp.local", "TV._http._tcp.local")))
@@ -482,17 +490,15 @@ class Neighbours(Case):
         learned = (d.host("s", "tv.local") or [{}])[0].get("neighbour_addresses")
         self.assertEqual(learned, ["fd00:9::50"], self.logs(d))
         # The entry goes, and so does what was learned of it.
-        self.lab.router("ip", "-6", "neigh", "del", "fd00:9::50", "dev", "ra")
+        la.forget_neighbour("fd00:9::50")
         d.settle()
         self.assertTrue(not d.host("s", "tv.local")[0]["neighbour_addresses"], d.host("s", "tv.local"))
-
-    NEIGH = ["ip", "-6", "neigh", "replace"]
 
     def v6_link(self):
         """A link with IPv6 on both ends, a device's far end of it and the router's."""
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
-        self.lab.router("ip", "addr", "add", "fd00:9::1/64", "dev", "ra", "nodad")
-        sh("ip", "addr", "add", "fd00:9::2/64", "dev", la.peer, "nodad")
+        la.add_router_addr("fd00:9::1/64")
+        la.add_peer_cidr("fd00:9::2/64")
         return la
 
     def known(self, d, host="tv.local"):
@@ -504,11 +510,11 @@ class Neighbours(Case):
 
     def test_the_kernel_is_asked_to_find_a_device_with_only_a_link_local_address_and_what_it_has_is_learned(self):
         la = self.v6_link()
-        sh("ip", "addr", "add", "fe80::50/64", "dev", la.peer, "nodad")
-        mac = re.search(r"link/ether ([0-9a-f:]{17})", sh("ip", "-o", "link", "show", la.peer).stdout).group(1)
+        la.add_peer_cidr("fe80::50/64")
+        mac = la.peer_mac()
         # The router knows the device at a routable address already, under the
         # link-layer address its link-local one is to be found at.
-        self.lab.router(*self.NEIGH, "fd00:9::2", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        la.neighbour("fd00:9::2", mac)
         watch = self.lab.neighbours("ra")
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
         la.device("10.9.1.50").multicast(response(aaaa("tv.local", "fe80::50"), srv("TV._http._tcp.local", 80, "tv.local"),
@@ -524,41 +530,41 @@ class Neighbours(Case):
     def test_an_address_in_a_network_the_interface_is_not_on_is_learned_when_it_is(self):
         la = self.v6_link()
         mac = "02:00:00:00:00:50"
-        self.lab.router("ip", "-4", "neigh", "replace", "10.9.1.50", "lladdr", mac, "dev", "ra", "nud", "permanent")
-        self.lab.router(*self.NEIGH, "fd00:7::50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        la.neighbour("10.9.1.50", mac)
+        la.neighbour("fd00:7::50", mac)
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
         la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
         self.assertEqual(self.known(d)["neighbour_addresses"], [], "the interface is not on fd00:7::/64")
-        self.lab.router("ip", "addr", "add", "fd00:7::1/64", "dev", "ra", "nodad")
+        la.add_router_addr("fd00:7::1/64")
         self.assertEqual(self.known(d)["neighbour_addresses"], ["fd00:7::50"], "and is, now")
-        self.lab.router("ip", "addr", "del", "fd00:7::1/64", "dev", "ra")
+        la.del_router_addr("fd00:7::1/64")
         self.assertEqual(self.known(d)["neighbour_addresses"], [], "and is not again")
 
     def test_an_entry_that_comes_after_the_device_was_heard_is_learned_and_forgotten_when_it_changes_hands(self):
         la = self.v6_link()
         mac, other = "02:00:00:00:00:50", "02:00:00:00:00:51"
-        self.lab.router("ip", "-4", "neigh", "replace", "10.9.1.50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        la.neighbour("10.9.1.50", mac)
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
         la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
         self.assertEqual(self.known(d)["neighbour_addresses"], [])
         # Another address under its link-layer address turns up in the table.
-        self.lab.router(*self.NEIGH, "fd00:9::50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        la.neighbour("fd00:9::50", mac)
         self.assertEqual(self.known(d)["neighbour_addresses"], ["fd00:9::50"])
         # It is another device that has it now.
-        self.lab.router(*self.NEIGH, "fd00:9::50", "lladdr", other, "dev", "ra", "nud", "permanent")
+        la.neighbour("fd00:9::50", other)
         self.assertEqual(self.known(d)["neighbour_addresses"], [], "no longer the device's")
         # And it is the device's again, with another beside it.
-        self.lab.router(*self.NEIGH, "fd00:9::50", "lladdr", mac, "dev", "ra", "nud", "permanent")
-        self.lab.router(*self.NEIGH, "fd00:9::51", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        la.neighbour("fd00:9::50", mac)
+        la.neighbour("fd00:9::51", mac)
         self.assertEqual(self.known(d)["neighbour_addresses"], ["fd00:9::50", "fd00:9::51"])
 
     def test_nothing_is_learned_of_a_family_the_device_announced_a_routable_address_of(self):
         la = self.v6_link()
         mac = "02:00:00:00:00:50"
         for ip in ("10.9.1.50", "10.9.1.51"):
-            self.lab.router("ip", "-4", "neigh", "replace", ip, "lladdr", mac, "dev", "ra", "nud", "permanent")
+            la.neighbour(ip, mac)
         for ip in ("fd00:9::50", "fd00:9::51"):
-            self.lab.router(*self.NEIGH, ip, "lladdr", mac, "dev", "ra", "nud", "permanent")
+            la.neighbour(ip, mac)
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
         # It says what it has of both families: what it announces is what it has.
         la.device("10.9.1.50").multicast(response(a("tv.local", "10.9.1.50"), aaaa("tv.local", "fd00:9::50"),
