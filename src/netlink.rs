@@ -6,6 +6,14 @@
 //! the daemon listens for link and address changes, and acts on those to the
 //! interfaces it serves. Only the few fields it needs are read.
 //!
+//! What the kernel says is not what the rest of the daemon is told. A
+//! [`Netlink`] keeps what it knows of each interface, and gives an [`Event`]
+//! only where something is new: an interface is *up* (new, or up again,
+//! under a new index), is *down* (down, deleted, or renamed), has a new MTU
+//! or new addresses, or a neighbour has changed. The kernel's order of
+//! messages, its repeats, and what is lost when its queue runs over (which
+//! is asked for again, and compared) are its own business.
+//!
 //! Linux has netlink, and FreeBSD (14 and 15) a netlink of the same messages, so
 //! the same code reads them: only the socket is made another way. FreeBSD says
 //! of ARP what its routing socket does not, which is why it is netlink there too.
@@ -15,6 +23,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use hashbrown::{HashMap, HashSet};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use rustix::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -24,9 +33,29 @@ use crate::runtime::{errno, Why};
 
 use crate::prelude::*;
 
-/// A change to an interface.
+/// What the daemon is told of the network.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Change {
+pub enum Event {
+    /// The interface called `name` is there and up (and running), with
+    /// `index`, as it is new, or up again, or created again. `back` if it was
+    /// up before.
+    Up { name: String, index: u32, mtu: Option<u32>, back: bool },
+    /// The interface called `name` is no longer up, or there.
+    Down { name: String, index: u32 },
+    /// The MTU of the interface called `name`, that is up, is now `mtu`.
+    Mtu { name: String, mtu: u32 },
+    /// An address of the interface called `name`, that is up, was added or
+    /// removed.
+    Addresses { name: String, index: u32 },
+    /// The neighbour table of the interface with `index` has `ip` at
+    /// link-layer address `mac`, or with `None`, no longer (the entry went,
+    /// or the neighbour could not be reached).
+    Neighbour { index: u32, ip: IpAddr, mac: Option<Vec<u8>> },
+}
+
+/// A change to an interface, as the kernel says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Change {
     /// The interface called `name` is there, with `index`, and is up (and
     /// running) or not, with its MTU if the kernel said. Sent when it appears
     /// and whenever it changes.
@@ -39,9 +68,9 @@ pub enum Change {
     /// link-layer address `mac`, or with `None`, no longer (the entry went,
     /// or the neighbour could not be reached).
     Neighbour { index: u32, ip: IpAddr, mac: Option<Vec<u8>> },
-    /// Changes were lost (the kernel's queue ran over): what is there has to
-    /// be looked at afresh.
-    Lost,
+    /// The kernel has said everything of the dump asked for with sequence
+    /// number `seq`.
+    Done { seq: u32 },
 }
 
 // rtnetlink, from <linux/rtnetlink.h> and <linux/if.h>.
@@ -55,11 +84,13 @@ const RTMGRP_IPV4_IFADDR: u32 = 0x10;
 const RTMGRP_IPV6_IFADDR: u32 = 0x100;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
+const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_NEWNEIGH: u16 = 28;
 const RTM_DELNEIGH: u16 = 29;
 const RTM_GETNEIGH: u16 = 30;
+const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_DUMP: u16 = 0x300;
 const NDA_DST: u16 = 1;
@@ -99,10 +130,15 @@ const IFADDRMSG_LEN: usize = 8;
 const NDMSG_LEN: usize = 12;
 const RTA_HDRLEN: usize = 4;
 
+/// The sequence numbers of the dumps asked for.
+const NEIGHBOUR_DUMP: u32 = 1;
+const LINK_DUMP: u32 = 2;
+
 /// A socket that hears of link and address changes.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub struct Netlink {
     fd: OwnedFd,
+    tracker: Tracker,
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -131,7 +167,7 @@ impl Netlink {
         if rc < 0 {
             return Err(Why(errno()));
         }
-        Ok(Netlink { fd })
+        Ok(Netlink { fd, tracker: Tracker::default() })
     }
 
     /// FreeBSD's netlink is not bound to the groups it wants, but joined to
@@ -160,19 +196,36 @@ impl Netlink {
                 return Err(Why(errno()));
             }
         }
-        Ok(Netlink { fd })
+        Ok(Netlink { fd, tracker: Tracker::default() })
     }
 
-    /// Ask the kernel for every entry of every interface's neighbour table:
-    /// they come as [`Change::Neighbour`]s among the next changes. For what
-    /// was there before the daemon started, or before changes were lost.
-    pub fn request_neighbours(&self) -> Result<(), Why> {
+    /// Ask the kernel for every interface and then every entry of every
+    /// interface's neighbour table: they come as [`Event`]s among the next
+    /// ones, those of what is new to the daemon. For what was there before it
+    /// started, or before changes were lost; an interface that is not among
+    /// them is down.
+    pub fn resync(&mut self) -> Result<(), Why> {
+        let mut msg = Vec::with_capacity(NLMSG_HDRLEN + IFINFOMSG_LEN);
+        msg.extend(((NLMSG_HDRLEN + IFINFOMSG_LEN) as u32).to_ne_bytes());
+        msg.extend(RTM_GETLINK.to_ne_bytes());
+        msg.extend((NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        msg.extend(LINK_DUMP.to_ne_bytes());
+        msg.extend(0u32.to_ne_bytes()); // port: the kernel fills it in
+        msg.extend([0u8; IFINFOMSG_LEN]); // every family, every interface
+        self.tracker.dumping = Some(HashSet::new());
+        self.send_to_kernel(&msg)
+    }
+
+    /// Ask the kernel for every entry of every interface's neighbour table.
+    /// Only one dump is made at a time on a socket: this is for when the one
+    /// of the links is done.
+    fn request_neighbours(&self) -> Result<(), Why> {
         let mut msg = Vec::with_capacity(NLMSG_HDRLEN + NDMSG_LEN);
         msg.extend(((NLMSG_HDRLEN + NDMSG_LEN) as u32).to_ne_bytes());
         msg.extend(RTM_GETNEIGH.to_ne_bytes());
         msg.extend((NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
-        msg.extend(1u32.to_ne_bytes()); // sequence
-        msg.extend(0u32.to_ne_bytes()); // port: the kernel fills it in
+        msg.extend(NEIGHBOUR_DUMP.to_ne_bytes());
+        msg.extend(0u32.to_ne_bytes());
         msg.extend([0u8; NDMSG_LEN]); // every family, every interface
         self.send_to_kernel(&msg)
     }
@@ -210,22 +263,36 @@ impl Netlink {
         self.fd.as_raw_fd()
     }
 
-    /// The changes the kernel has reported since last asked, without
-    /// waiting: none if there are none yet.
-    pub fn changes(&self) -> Result<Vec<Change>, Why> {
+    /// What is new since last asked, without waiting: nothing if there is
+    /// nothing yet.
+    pub fn events(&mut self) -> Result<Vec<Event>, Why> {
         let mut buf = vec![0u8; 64 * 1024];
-        let mut changes = Vec::new();
+        let mut events = Vec::new();
         loop {
             // SAFETY: `buf` is writable for its whole length.
             let n = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
             if n >= 0 {
-                changes.extend(parse(&buf[..n as usize]));
+                for change in parse(&buf[..n as usize]) {
+                    // The neighbours are asked for when the links are all said.
+                    let links_done = change == Change::Done { seq: LINK_DUMP };
+                    self.tracker.apply(change, &mut events);
+                    if links_done {
+                        if let Err(e) = self.request_neighbours() {
+                            eprintln!("netlink: asking for the neighbour tables failed: {e}");
+                        }
+                    }
+                }
                 continue;
             }
             match errno() {
                 Errno::INTR => continue,
-                Errno::AGAIN => return Ok(changes),
-                Errno::NOBUFS => changes.push(Change::Lost),
+                Errno::AGAIN => return Ok(events),
+                // What was lost is not known: look at everything again.
+                Errno::NOBUFS => {
+                    if let Err(e) = self.resync() {
+                        eprintln!("netlink: asking for what is there failed: {e}");
+                    }
+                }
                 e => return Err(Why(e)),
             }
         }
@@ -246,7 +313,7 @@ impl Netlink {
         Ok(Netlink)
     }
 
-    pub fn request_neighbours(&self) -> Result<(), Why> {
+    pub fn resync(&mut self) -> Result<(), Why> {
         Ok(())
     }
 
@@ -255,14 +322,111 @@ impl Netlink {
         -1
     }
 
-    pub fn changes(&self) -> Result<Vec<Change>, Why> {
+    pub fn events(&mut self) -> Result<Vec<Event>, Why> {
         Ok(Vec::new())
+    }
+}
+
+/// What is known of each interface, to turn what the kernel says into what
+/// is new.
+#[derive(Default)]
+struct Tracker {
+    links: HashMap<u32, Tracked>,
+    /// The names that have been up, for saying one is back.
+    seen: HashSet<String>,
+    /// While the links are being asked for again, the indexes of those said
+    /// so far: when it is done, any other is gone.
+    dumping: Option<HashSet<u32>>,
+}
+
+struct Tracked {
+    name: String,
+    up: bool,
+    mtu: Option<u32>,
+}
+
+impl Tracker {
+    /// Say what `change` makes new, in `events`.
+    fn apply(&mut self, change: Change, events: &mut Vec<Event>) {
+        match change {
+            Change::Link { index, name, up, mtu } => {
+                if let Some(said) = &mut self.dumping {
+                    said.insert(index);
+                }
+                // An interface of the name under another index, or the index under
+                // another name: what was there is gone.
+                let stale: Vec<u32> = self
+                    .links
+                    .iter()
+                    .filter(|&(&i, l)| (l.name == name) != (i == index))
+                    .map(|(&i, _)| i)
+                    .collect();
+                for i in stale {
+                    self.forget(i, events);
+                }
+                match self.links.get_mut(&index) {
+                    Some(link) => {
+                        let (was_up, was_mtu) = (link.up, link.mtu);
+                        link.up = up;
+                        link.mtu = mtu.or(link.mtu);
+                        match (was_up, up) {
+                            (true, false) => events.push(Event::Down { name, index }),
+                            (false, true) => {
+                                let mtu = link.mtu;
+                                events.push(self.up(name, index, mtu));
+                            }
+                            (true, true) if mtu.is_some() && mtu != was_mtu => {
+                                events.extend(mtu.map(|mtu| Event::Mtu { name, mtu }))
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => {
+                        self.links.insert(index, Tracked { name: name.clone(), up, mtu });
+                        if up {
+                            events.push(self.up(name, index, mtu));
+                        }
+                    }
+                }
+            }
+            Change::Gone { index } => self.forget(index, events),
+            Change::Address { index } => {
+                if let Some(Tracked { name, up: true, .. }) = self.links.get(&index) {
+                    events.push(Event::Addresses { name: name.clone(), index });
+                }
+            }
+            Change::Neighbour { index, ip, mac } => {
+                if self.links.contains_key(&index) {
+                    events.push(Event::Neighbour { index, ip, mac });
+                }
+            }
+            Change::Done { seq: LINK_DUMP } => {
+                let said = self.dumping.take().unwrap_or_default();
+                let gone: Vec<u32> = self.links.keys().copied().filter(|i| !said.contains(i)).collect();
+                for index in gone {
+                    self.forget(index, events);
+                }
+            }
+            Change::Done { .. } => {}
+        }
+    }
+
+    fn up(&mut self, name: String, index: u32, mtu: Option<u32>) -> Event {
+        let back = !self.seen.insert(name.clone());
+        Event::Up { name, index, mtu, back }
+    }
+
+    /// The interface with `index` is gone.
+    fn forget(&mut self, index: u32, events: &mut Vec<Event>) {
+        if let Some(Tracked { name, up: true, .. }) = self.links.remove(&index) {
+            events.push(Event::Down { name, index });
+        }
     }
 }
 
 /// The changes in one datagram of rtnetlink messages. What cannot be read is
 /// skipped.
-pub fn parse(buf: &[u8]) -> Vec<Change> {
+fn parse(buf: &[u8]) -> Vec<Change> {
     let mut out = Vec::new();
     let mut at = 0;
     while at + NLMSG_HDRLEN <= buf.len() {
@@ -283,6 +447,7 @@ pub fn parse(buf: &[u8]) -> Vec<Change> {
                     out.push(Change::Link { index, name, up, mtu });
                 }
             }
+            NLMSG_DONE => out.push(Change::Done { seq: u32_at(buf, at + 8) }),
             RTM_NEWADDR | RTM_DELADDR if body.len() >= IFADDRMSG_LEN => {
                 out.push(Change::Address { index: u32_at(body, 4) });
             }
@@ -491,14 +656,92 @@ mod tests {
         assert!(parse(&message(2, &[0u8; 20])).is_empty());
     }
 
+    /// What the kernel says, as a [`Tracker`] turns it into what is new.
+    fn said(tracker: &mut Tracker, changes: Vec<Change>) -> Vec<Event> {
+        let mut events = Vec::new();
+        for change in changes {
+            tracker.apply(change, &mut events);
+        }
+        events
+    }
+
+    fn link_change(index: u32, name: &str, up: bool, mtu: u32) -> Change {
+        Change::Link { index, name: name.into(), up, mtu: Some(mtu) }
+    }
+
+    fn up(name: &str, index: u32, mtu: u32, back: bool) -> Event {
+        Event::Up { name: name.into(), index, mtu: Some(mtu), back }
+    }
+
+    fn down(name: &str, index: u32) -> Event {
+        Event::Down { name: name.into(), index }
+    }
+
+    #[test]
+    fn an_interface_is_up_once_however_often_it_is_said_so() {
+        let mut t = Tracker::default();
+        assert_eq!(said(&mut t, vec![link_change(3, "ra", false, 1500)]), [], "not up yet");
+        assert_eq!(said(&mut t, vec![link_change(3, "ra", true, 1500)]), [up("ra", 3, 1500, false)]);
+        assert_eq!(said(&mut t, vec![link_change(3, "ra", true, 1500), link_change(3, "ra", true, 1500)]), []);
+        assert_eq!(said(&mut t, vec![link_change(3, "ra", true, 1400)]), [Event::Mtu { name: "ra".into(), mtu: 1400 }]);
+    }
+
+    #[test]
+    fn an_interface_down_and_up_again_is_back() {
+        let mut t = Tracker::default();
+        said(&mut t, vec![link_change(3, "ra", true, 1500)]);
+        assert_eq!(said(&mut t, vec![link_change(3, "ra", false, 1500)]), [down("ra", 3)]);
+        // Its addresses going with it are not news.
+        assert_eq!(said(&mut t, vec![Change::Address { index: 3 }]), []);
+        assert_eq!(said(&mut t, vec![link_change(3, "ra", true, 1500)]), [up("ra", 3, 1500, true)]);
+        assert_eq!(said(&mut t, vec![Change::Address { index: 3 }]), [Event::Addresses { name: "ra".into(), index: 3 }]);
+    }
+
+    #[test]
+    fn an_interface_made_again_is_down_and_up() {
+        let mut t = Tracker::default();
+        said(&mut t, vec![link_change(3, "ra", true, 1500)]);
+        // Deleted, and made again; or made again before the deletion was said.
+        assert_eq!(said(&mut t, vec![Change::Gone { index: 3 }, link_change(5, "ra", true, 1500)]), [down("ra", 3), up("ra", 5, 1500, true)]);
+        assert_eq!(said(&mut t, vec![link_change(6, "ra", true, 1500)]), [down("ra", 5), up("ra", 6, 1500, true)]);
+        // Renamed.
+        assert_eq!(said(&mut t, vec![link_change(6, "rb", true, 1500)]), [down("ra", 6), up("rb", 6, 1500, false)]);
+        // One that was down is not down again.
+        said(&mut t, vec![link_change(6, "rb", false, 1500)]);
+        assert_eq!(said(&mut t, vec![Change::Gone { index: 6 }]), []);
+    }
+
+    #[test]
+    fn asking_again_finds_what_was_lost() {
+        let mut t = Tracker::default();
+        said(&mut t, vec![link_change(3, "ra", true, 1500), link_change(4, "rb", true, 1500)]);
+        t.dumping = Some(HashSet::new());
+        // Of the two, one is said again, unchanged, and one not at all; a third is new.
+        let events = said(&mut t, vec![link_change(3, "ra", true, 1500), link_change(7, "rc", true, 1500), Change::Done { seq: LINK_DUMP }]);
+        assert_eq!(events, [up("rc", 7, 1500, false), down("rb", 4)]);
+        // The dump of neighbours ending says nothing.
+        assert_eq!(said(&mut t, vec![Change::Done { seq: NEIGHBOUR_DUMP }]), []);
+    }
+
+    #[test]
+    fn neighbours_are_those_of_interfaces_known() {
+        let mut t = Tracker::default();
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        let entry = |index| Change::Neighbour { index, ip, mac: None };
+        assert_eq!(said(&mut t, vec![entry(3)]), []);
+        said(&mut t, vec![link_change(3, "ra", true, 1500)]);
+        assert_eq!(said(&mut t, vec![entry(3)]), [Event::Neighbour { index: 3, ip, mac: None }]);
+    }
+
     /// Manual check against the real kernel: needs nothing but a network
     /// namespace to change, `unshare -rn cargo test netlink_live -- --ignored`.
     #[test]
     #[ignore]
     fn netlink_live() {
-        let netlink = Netlink::open().unwrap();
+        let mut netlink = Netlink::open().unwrap();
         std::process::Command::new("ip").args(["link", "add", "nl-test", "type", "dummy"]).status().unwrap();
-        let changes = netlink.changes().unwrap();
-        assert!(changes.iter().any(|c| matches!(c, Change::Link { name, .. } if name == "nl-test")), "{changes:?}");
+        std::process::Command::new("ip").args(["link", "set", "nl-test", "up"]).status().unwrap();
+        let events = netlink.events().unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::Up { name, .. } if name == "nl-test")), "{events:?}");
     }
 }

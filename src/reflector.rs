@@ -55,9 +55,11 @@ struct Inner {
     /// Whose the devices it announces are, on segments it shares with other
     /// reflectors.
     owner: Owner,
-    segments: Vec<Segment>,
-    /// Whether each segment is untrusted: it is not announced anything.
-    untrusted: Vec<bool>,
+    /// The segments it spans, and whether each is untrusted: it is not
+    /// announced anything. They come and go with their interfaces.
+    members: RefCell<Vec<Member>>,
+    /// The interfaces whose segments are untrusted, whether they are here or not.
+    untrusted: Vec<String>,
     forward: Forward,
     /// Which of the addresses a device was given from the neighbour table are
     /// reflected with it.
@@ -72,6 +74,12 @@ struct Inner {
     notices: RefCell<Vec<Notice>>,
 }
 
+#[derive(Clone)]
+struct Member {
+    segment: Segment,
+    untrusted: bool,
+}
+
 #[derive(Default)]
 struct Book {
     /// The hostnames, in lowercase, that could not be reflected to every
@@ -82,8 +90,9 @@ struct Book {
 }
 
 impl Reflector {
-    /// Start reflecting between `segments`, which must all be the same
-    /// address family and on different interfaces. Devices already
+    /// Start reflecting between `segments`, which must be on different
+    /// interfaces, and may be none yet: [`add`](Reflector::add) and
+    /// [`remove`](Reflector::remove) say what comes and goes. Devices already
     /// discovered are reflected before this returns.
     ///
     /// `rank` settles clashes with other reflectors that share an interface:
@@ -95,7 +104,7 @@ impl Reflector {
     }
 
     /// Like [`new`](Reflector::new), but the segments on the interfaces named
-    /// in `untrusted` are announced nothing: their devices are still
+    /// in `untrusted`, now or when added, are announced nothing: their devices are still
     /// announced to the others, but they do not learn about the devices of the
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
@@ -118,23 +127,21 @@ impl Reflector {
         when: ReflectedWhen,
         reflect_ttl: Option<Duration>,
     ) -> Result<Reflector> {
-        if segments.is_empty() {
-            bail!("a reflector needs at least one segment");
-        }
         for (i, seg) in segments.iter().enumerate() {
             if segments[..i].iter().any(|o| o.interface() == seg.interface()) {
                 bail!("more than one segment for interface {}", seg.interface());
             }
         }
 
-        if let Some(unknown) = untrusted.iter().find(|name| !segments.iter().any(|s| s.interface() == name.as_str())) {
-            bail!("{unknown} is untrusted but not one of the segments");
-        }
-        let untrusted = segments.iter().map(|s| untrusted.iter().any(|name| name == s.interface())).collect();
+        let untrusted: Vec<String> = untrusted.to_vec();
+        let members = segments
+            .into_iter()
+            .map(|segment| Member { untrusted: untrusted.iter().any(|name| name == segment.interface()), segment })
+            .collect();
 
         let inner = Rc::new(Inner {
             owner: Owner::Reflector(rank),
-            segments,
+            members: RefCell::new(members),
             untrusted,
             forward,
             neighbours,
@@ -149,9 +156,7 @@ impl Reflector {
         // reflecting is idempotent.
         {
             let mut book = inner.book();
-            let hosts: HashSet<String> =
-                inner.segments.iter().flat_map(|seg| seg.devices()).filter_map(|device| device.key()).collect();
-            for host in hosts {
+            for host in inner.hosts() {
                 inner.sync(&mut book, &host);
             }
         }
@@ -163,15 +168,53 @@ impl Reflector {
 }
 
 impl Reflector {
-    /// The segments this reflector spans, in the order they were given.
-    pub fn segments(&self) -> &[Segment] {
-        &self.inner.segments
+    /// The segments this reflector spans, in the order they came.
+    pub fn segments(&self) -> Vec<Segment> {
+        self.inner.snapshot().into_iter().map(|m| m.segment).collect()
     }
 
-    /// The interfaces whose segments are announced nothing.
-    pub fn untrusted(&self) -> Vec<&str> {
-        let segments = &self.inner.segments;
-        (0..segments.len()).filter(|&i| self.inner.untrusted[i]).map(|i| segments[i].interface()).collect()
+    /// The interfaces whose segments are announced nothing, of those it spans.
+    pub fn untrusted(&self) -> Vec<String> {
+        self.inner.snapshot().into_iter().filter(|m| m.untrusted).map(|m| m.segment.interface().to_string()).collect()
+    }
+
+    /// Span `segment` too, as its interface has come: what the others have is
+    /// announced on it (unless it is untrusted), and what it finds is
+    /// announced on them. It must not be on an interface already spanned.
+    pub fn add(&self, segment: Segment) -> Result<()> {
+        let untrusted = self.inner.untrusted.iter().any(|name| name == segment.interface());
+        {
+            let mut members = self.inner.members.borrow_mut();
+            if members.iter().any(|m| m.segment.interface() == segment.interface()) {
+                bail!("more than one segment for interface {}", segment.interface());
+            }
+            members.push(Member { segment, untrusted });
+        }
+        let mut book = self.inner.book();
+        for host in self.inner.hosts() {
+            self.inner.sync(&mut book, &host);
+        }
+        Ok(())
+    }
+
+    /// Stop spanning the segment of `interface`, as it is gone: what this
+    /// reflector announced on it is withdrawn, and so is what it announced
+    /// elsewhere of what was found on it. What the segment had found is to be
+    /// forgotten and delivered ([`deliver`]) first, for the watches to be told.
+    pub fn remove(&self, interface: &str) {
+        let removed = {
+            let mut members = self.inner.members.borrow_mut();
+            let Some(at) = members.iter().position(|m| m.segment.interface() == interface) else { return };
+            members.remove(at).segment
+        };
+        let hosts = removed.devices().into_iter().filter_map(|device| device.key());
+        if let Err(e) = removed.withdraw_all(self.inner.owner) {
+            eprintln!("{interface}: withdrawing what was reflected failed: {e:#}");
+        }
+        let mut book = self.inner.book();
+        for host in hosts.collect::<HashSet<_>>() {
+            self.inner.sync(&mut book, &host);
+        }
     }
 
     /// A [`Notice`] of every device that appeared, changed or went on the
@@ -211,13 +254,13 @@ pub fn deliver(reflectors: &[&Reflector]) {
 }
 
 fn deliver_to(inners: &[&Inner]) {
-    let mut segments: Vec<&Segment> = Vec::new();
-    for seg in inners.iter().flat_map(|i| &i.segments) {
-        if !segments.iter().any(|s| s.is(seg)) {
+    let mut segments: Vec<Segment> = Vec::new();
+    for seg in inners.iter().flat_map(|i| i.snapshot()).map(|m| m.segment) {
+        if !segments.iter().any(|s| s.is(&seg)) {
             segments.push(seg);
         }
     }
-    for seg in segments {
+    for seg in &segments {
         for event in seg.take_events() {
             log(seg.interface(), &event);
             for inner in inners {
@@ -278,7 +321,7 @@ pub fn retry_made(now: Instant) {
 impl Drop for Reflector {
     fn drop(&mut self) {
         // Nothing is wanted any more: what it announced is withdrawn.
-        for seg in &self.inner.segments {
+        for seg in self.segments() {
             if let Err(e) = seg.withdraw_all(self.inner.owner) {
                 eprintln!("{}: withdrawing what was reflected failed: {e:#}", seg.interface());
             }
@@ -291,15 +334,25 @@ impl Inner {
         self.book.borrow_mut()
     }
 
+    /// The segments it spans now, with whether each is untrusted.
+    fn snapshot(&self) -> Vec<Member> {
+        self.members.borrow().clone()
+    }
+
+    /// The hostnames of every device discovered on a segment it spans.
+    fn hosts(&self) -> HashSet<String> {
+        self.snapshot().iter().flat_map(|m| m.segment.devices()).filter_map(|device| device.key()).collect()
+    }
+
     fn handle(&self, segment: &Segment, event: Event) {
-        if let Some(src) = self.segments.iter().position(|s| s.is(segment)) {
+        if let Some(src) = self.snapshot().iter().position(|m| m.segment.is(segment)) {
             self.apply(src, event);
         }
     }
 
     /// Note what happened for the watches, before the reflecting.
     fn notify(&self, src: usize, event: &Event) {
-        let seg = &self.segments[src];
+        let seg = self.snapshot().swap_remove(src).segment;
         let ttl = match event {
             Event::Removed(_) | Event::Question(_) => Duration::ZERO,
             Event::Added(device) | Event::Updated(device) => seg.lifetime_left(device),
@@ -330,7 +383,8 @@ impl Inner {
     /// answers will be. An untrusted segment is announced nothing, so its
     /// questions are put nowhere.
     fn forward(&self, src: usize, asked: &[Asked]) {
-        if self.untrusted[src] {
+        let members = self.snapshot();
+        if members[src].untrusted {
             return;
         }
         let questions: Vec<_> = asked
@@ -345,12 +399,12 @@ impl Inner {
         if questions.is_empty() {
             return;
         }
-        for (target, seg) in self.segments.iter().enumerate() {
+        for (target, seg) in members.iter().map(|m| &m.segment).enumerate() {
             if target == src {
                 continue;
             }
             if let Err(e) = seg.query_question(&questions) {
-                eprintln!("{}: asking on behalf of {} failed: {e:#}", seg.interface(), self.segments[src].interface());
+                eprintln!("{}: asking on behalf of {} failed: {e:#}", seg.interface(), members[src].segment.interface());
             }
         }
     }
@@ -367,9 +421,10 @@ impl Inner {
     /// Failures are logged and left as a difference, so the next call
     /// retries them.
     fn sync(&self, book: &mut Book, host: &str) {
-        let sources: Vec<Option<Source>> = self
-            .segments
+        let members = self.snapshot();
+        let sources: Vec<Option<Source>> = members
             .iter()
+            .map(|m| &m.segment)
             .map(|seg| {
                 let source = seg.source_of(host)?;
                 let reflectable = source.with(|device| reflectable(&device.with_neighbours_as(self.neighbours), self.when));
@@ -378,10 +433,10 @@ impl Inner {
             .collect();
 
         let mut failed = false;
-        for (target, seg) in self.segments.iter().enumerate() {
+        for (target, (seg, untrusted)) in members.iter().map(|m| (&m.segment, m.untrusted)).enumerate() {
             let winner = sources.iter().enumerate().find(|(src, source)| *src != target && source.is_some());
             let result = match winner {
-                Some((_, Some(source))) if !self.untrusted[target] => {
+                Some((_, Some(source))) if !untrusted => {
                     seg.reflect(self.owner, source.clone(), self.neighbours, self.reflect_ttl)
                 }
                 _ => seg.remove_manual(self.owner, host),
@@ -804,10 +859,30 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_must_name_a_segment_of_the_reflector_and_trusted_is_the_default() {
+    fn a_segment_added_is_told_of_what_is_known_and_one_removed_is_forgotten() {
         let (a, _ra) = wired("a");
         let (b, _rb) = wired("b");
-        assert!(Reflector::with_untrusted(0, vec![a.clone(), b.clone()], &["c".to_string()]).is_err());
+        let r = Reflector::new(0, vec![a.clone()]).unwrap();
+        announce(&a, "10.0.1.5", "tv.local", &["TV"]);
+        r.add(b.clone()).unwrap();
+        wait_for(|| announced_on(&b) == ["tv.local"]);
+        assert!(r.add(b.clone()).is_err(), "an interface once");
+
+        // What it finds is told to the other, and withdrawn when it is removed.
+        announce(&b, "10.0.2.5", "nas.local", &["NAS"]);
+        wait_for(|| announced_on(&a) == ["nas.local"]);
+        b.forget_discovered();
+        deliver_made();
+        r.remove("b");
+        wait_for(|| announced_on(&a).is_empty());
+        assert_eq!(r.segments().len(), 1);
+        r.remove("b");
+    }
+
+    #[test]
+    fn trusted_is_the_default() {
+        let (a, _ra) = wired("a");
+        let (b, _rb) = wired("b");
         let r = Reflector::new(0, vec![a.clone(), b.clone()]).unwrap();
         assert!(r.untrusted().is_empty());
 
@@ -1409,7 +1484,6 @@ mod tests {
     #[test]
     fn rejects_bad_construction() {
         let (a, _) = wired("a");
-        assert!(Reflector::new(0, vec![]).is_err());
         assert!(Reflector::new(0, vec![a.clone(), a.clone()]).is_err());
     }
 }

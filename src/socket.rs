@@ -337,6 +337,10 @@ fn ordered(found: &[IpAddr], families: &[Family]) -> Vec<IpAddr> {
     out
 }
 
+/// The most a datagram read from an mDNS socket may hold: mDNS's own limit
+/// (RFC 6762 section 17).
+pub const MAX_DATAGRAM: usize = 9000;
+
 /// The MTU of the interface called `name`, as its network namespace has it.
 #[cfg(target_os = "linux")]
 pub fn mtu(name: &str) -> Result<u32> {
@@ -380,6 +384,26 @@ pub fn mtu(name: &str) -> Result<u32> {
     })?;
     let mtu = found.with_context(|| format!("reading the MTU of {name}: no such interface"))?;
     u32::try_from(mtu).with_context(|| format!("{name} says its MTU is {mtu}"))
+}
+
+/// Everything `sock` has heard, each datagram given to `heard` with who sent
+/// it and what it was sent to, for the socket of the interface `interface`.
+pub fn drain(sock: impl AsFd, interface: &str, mut heard: impl FnMut(SocketAddr, Option<IpAddr>, &[u8])) {
+    let mut buf = [0u8; MAX_DATAGRAM];
+    loop {
+        match recv(&sock, &mut buf) {
+            // A datagram from an IP address, as on a UDP socket.
+            Ok(Datagram { len, from: Some(from), to, .. }) => heard(from, to, &buf[..len]),
+            Ok(_) => {}
+            Err(Errno::AGAIN) => return,
+            Err(Errno::INTR) => {}
+            Err(e) => {
+                // Reported once (an ICMP error, say), it is cleared.
+                eprintln!("{interface}: recv failed: {}", Why(e));
+                return;
+            }
+        }
+    }
 }
 
 pub fn ifindex(name: &str) -> Result<u32> {
@@ -581,7 +605,7 @@ mod portable {
                 Family::V4 => IpAddr::V4(GROUP_V4),
                 Family::V6 => IpAddr::V6(GROUP_V6),
             };
-            let mut buf = [0u8; crate::links::MAX_DATAGRAM];
+            let mut buf = [0u8; MAX_DATAGRAM];
             loop {
                 match recv(socket, &mut buf) {
                     Ok(Datagram { len, from: Some(from), arrived_on: Some(index), to }) => {

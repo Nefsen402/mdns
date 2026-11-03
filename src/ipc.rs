@@ -642,8 +642,8 @@ fn service_type(name: &str) -> Result<String, Value> {
 
 /// The interfaces of the named segment, or of all segments if `name` is
 /// empty, each once.
-pub fn links_of<'a>(groups: &'a [Group], name: &str) -> Vec<&'a Segment> {
-    let mut links: Vec<&Segment> = Vec::new();
+pub fn links_of(groups: &[Group], name: &str) -> Vec<Segment> {
+    let mut links: Vec<Segment> = Vec::new();
     for seg in groups.iter().filter(|g| name.is_empty() || g.name == name).flat_map(|g| g.reflector.segments()) {
         if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);
@@ -794,11 +794,12 @@ fn segments(groups: &[Group]) -> Value {
         .into_iter()
         .map(|name| {
             let members: Vec<&Group> = groups.iter().filter(|g| g.name == name).collect();
-            let interfaces: Vec<&str> = members[0].reflector.segments().iter().map(Segment::interface).collect();
+            let interfaces: Vec<String> = members[0].reflector.segments().iter().map(|s| s.interface().to_string()).collect();
             let mut families: Vec<&str> = members
                 .iter()
                 .flat_map(|g| g.reflector.segments())
-                .flat_map(|seg| seg.families().iter().map(|&f| family_name(f)))
+                .flat_map(|seg| seg.families().to_vec())
+                .map(family_name)
                 .collect();
             families.sort_unstable();
             families.dedup();
@@ -909,7 +910,7 @@ fn timer_list(groups: &[Group]) -> Value {
 
     // Each link's upkeep, and what it is waiting to do. A link that is in
     // several segments is listed once.
-    let mut links: Vec<&Segment> = Vec::new();
+    let mut links: Vec<Segment> = Vec::new();
     for seg in groups.iter().flat_map(|g| g.reflector.segments()) {
         if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);

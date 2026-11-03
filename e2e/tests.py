@@ -292,7 +292,7 @@ class Interfaces(Case):
         # It goes, and comes back, in another form.
         mark = d.mark()
         late.delete()
-        self.assertTrue(d.wait_log(r"late: gone; waiting for it to come back", 5, mark), self.logs(d))
+        self.assertTrue(d.wait_log(r"late: (gone|down); waiting for it to come", 5, mark), self.logs(d))
         mark = d.mark()
         late = self.lab.link("late", "10.9.3.1/24", "10.9.3.2/24")
         hl = late.hearer()

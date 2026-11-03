@@ -16,7 +16,6 @@ mod avahi_compat;
 mod config;
 mod device;
 mod ipc;
-mod links;
 mod netlink;
 mod parser;
 mod poll;
@@ -29,17 +28,18 @@ mod time;
 use alloc::rc::Rc;
 use core::ffi::c_int;
 
-use hashbrown::HashMap;
+use rustix::fd::{AsRawFd, OwnedFd, RawFd};
+
+use hashbrown::HashSet;
 use time::Instant;
 
 use anyhow::{Context, Result};
 
-use config::{Config, Forward, Neighbours};
-use links::{Link, Opened};
-use netlink::Netlink;
+use config::{AdvertiseConfig, Config, Forward, Interface, Neighbours};
+use netlink::{Event, Netlink};
 use reflector::Reflector;
 use segment::{Owner, Segment};
-use socket::Family;
+use socket::{Family, Hub};
 
 /// What every module takes from alloc, as std's prelude would give it.
 mod prelude {
@@ -105,33 +105,13 @@ fn daemon(args: Vec<String>) -> Result<()> {
         Err(e) => return Err(e).context("listening for interface changes (netlink)"),
     };
 
-    // One link per interface, however many segments use it, with a socket
-    // for each family and one list of devices for both: mDNS records do not
-    // belong to the transport they come over. One that is not there yet is
-    // waited for.
-    let hub = Rc::new(socket::Hub::new(&families, &unicast).context("opening the sockets")?);
-    let mut tracked = Vec::new();
-    let interfaces = config.interfaces();
-    let mut links: HashMap<&str, Segment> = HashMap::new();
-    for interface in &interfaces {
-        let mut link = Link::new(interface, &families, &unicast, &config, hub.clone());
-        match link.open()? {
-            Opened::Listening => {}
-            Opened::Absent => eprintln!("{}: not there yet; waiting for it", interface.name),
-            Opened::Waiting => {} // it said what it waits for
-        }
-        links.insert(&interface.name, link.segment().clone());
-        tracked.push(link);
-    }
-
-    // One reflector per configured segment, over the shared links. Where
-    // segments share an interface and both want a hostname announced there,
-    // the one listed first wins.
+    // One reflector per configured segment, over the interfaces that are
+    // there, which come and go. Where segments share an interface and both
+    // want a hostname announced there, the one listed first wins.
     let mut segments = Vec::new();
     for (rank, seg) in (0..).zip(&config.segments) {
-        let members = seg.interfaces.iter().map(|iface| links[iface.as_str()].clone()).collect();
         let reflector =
-            Reflector::with_options(rank, members, &seg.untrusted, seg.forward, seg.neighbour_addresses, seg.reflected_when, seg.reflect_ttl)
+            Reflector::with_options(rank, Vec::new(), &seg.untrusted, seg.forward, seg.neighbour_addresses, seg.reflected_when, seg.reflect_ttl)
             .with_context(|| format!("starting segment {:?}", seg.name))?;
         eprintln!("segment {:?}: {}", seg.name, seg.interfaces.join(", "));
         if !seg.untrusted.is_empty() {
@@ -163,6 +143,19 @@ fn daemon(args: Vec<String>) -> Result<()> {
             eprintln!("segment {:?}: announcing reflected devices with a TTL of {}s", seg.name, ttl.as_secs());
         }
         segments.push(Group { name: seg.name.clone(), reflector });
+    }
+
+    // One entry per interface that is there, however many segments use it,
+    // with a socket for each family and one list of devices for both: mDNS
+    // records do not belong to the transport they come over. One that is not
+    // there yet is waited for.
+    let hub = Rc::new(socket::Hub::new(&families, &unicast).context("opening the sockets")?);
+    let interfaces = config.interfaces();
+    let mut ifaces = Ifaces { config: &config, families: families.clone(), unicast, hub, groups: &segments, live: Vec::new(), seen: HashSet::new() };
+    for interface in &interfaces {
+        if ifaces.add(&interface.name)? == Opened::Absent {
+            eprintln!("{}: not there yet; waiting for it", interface.name);
+        }
     }
 
     // Look for devices right away instead of waiting for them to announce
@@ -213,8 +206,8 @@ fn daemon(args: Vec<String>) -> Result<()> {
             None => eprintln!("{name}: not probing periodically (no ProbeInterval= for it): only at startup and on request"),
         }
     }
-    for link in links.values() {
-        link.start_probe("startup");
+    for iface in &ifaces.live {
+        iface.segment.start_probe("startup");
     }
 
     let mut server = ipc::Server::bind(&config.socket, config.socket_mode as rustix::fs::RawMode)?;
@@ -223,7 +216,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
         None => None,
     };
 
-    let signal = event_loop(&signals, netlink, &hub, &mut tracked, &segments, &mut server, &mut avahi)?;
+    let signal = event_loop(&signals, netlink, &mut ifaces, &mut server, &mut avahi)?;
     eprintln!("received {signal}: withdrawing reflected devices");
     // The loop has stopped, and the upkeep with it, while the goodbyes go
     // out: the watches are told, and dropping the reflectors withdraws all
@@ -231,10 +224,12 @@ fn daemon(args: Vec<String>) -> Result<()> {
     server.shut_down();
     drop(server);
     drop(avahi);
+    let links: Vec<Segment> = ifaces.live.iter().map(|i| i.segment.clone()).collect();
+    drop(ifaces);
     drop(segments);
     // With the reflectors gone, what is left in the manual lists is the
     // advertised name: say goodbye to it too.
-    for link in links.values() {
+    for link in &links {
         for host in link.manual_devices().into_iter().filter_map(|d| d.hostname) {
             if let Err(e) = link.remove_manual(Owner::Own, &host) {
                 eprintln!("{}: withdrawing {host} failed: {e:#}", link.interface());
@@ -243,6 +238,298 @@ fn daemon(args: Vec<String>) -> Result<()> {
     }
     let _ = rustix::fs::unlink(config.socket.as_str());
     Ok(())
+}
+
+/// How opening an interface went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Opened {
+    /// It is not there.
+    Absent,
+    /// It is there, and cannot be joined to the group over any family yet, having
+    /// no address to do it by: it is opened when it is given one.
+    Waiting,
+    /// It is listened to, over every family it can be yet.
+    Listening,
+}
+
+/// The interfaces the daemon serves that are there and up, and how it listens
+/// on them. What netlink says of the network is acted on here: an interface
+/// that is there and in the config gets sockets of its own and a list of
+/// devices, which every segment of the config that names it is given; one
+/// that goes down or away has them taken from the segments and closed, its
+/// devices forgotten; and one that comes again is a new one, listened to and
+/// asked of from the start. A socket bound to an interface that was deleted
+/// and created again (a VLAN reconfigured, hostapd restarted) hears nothing,
+/// so none is kept across that.
+struct Ifaces<'a> {
+    config: &'a Config,
+    families: Vec<Family>,
+    /// The families of which what is sent to the daemon itself is heard too.
+    unicast: Vec<Family>,
+    hub: Rc<Hub>,
+    /// The reflector of each segment of the config, in its order.
+    groups: &'a [Group],
+    live: Vec<Iface>,
+    /// The names of those that have been there, for saying one is back.
+    seen: HashSet<String>,
+}
+
+/// One interface that is there: its list of devices, and the sockets it has
+/// on it.
+struct Iface {
+    name: String,
+    segment: Segment,
+    /// The names to advertise with this host's addresses here.
+    advertise: Vec<AdvertiseConfig>,
+    /// The interface's index.
+    index: u32,
+    /// The families it is there and not listened to over, as it has no address to
+    /// join the group by yet (IPv4, where the sockets are shared): they are
+    /// joined when it has one.
+    missing: Vec<Family>,
+    /// Its MTU, once known: what a packet sent on it may hold follows it.
+    mtu: Option<u32>,
+    /// The sockets it hears on, one per family, for the event loop to read
+    /// when they are readable. None where one socket per family is shared by
+    /// every interface: it is the hub's, which joins the group on this
+    /// interface for as long as it is there.
+    sockets: Vec<OwnedFd>,
+}
+
+impl Ifaces<'_> {
+    /// Whether the config names the interface `name` in a segment.
+    fn wants(&self, name: &str) -> bool {
+        self.config.segments.iter().any(|seg| seg.interfaces.iter().any(|i| i == name))
+    }
+
+    /// Serve the interface `name`, if it is wanted, is there and is not
+    /// served already: open its sockets, and give it to the segments that
+    /// name it, to be told of what is known and tell of what it finds. Says
+    /// whether it was there, and could be listened to.
+    fn add(&mut self, name: &str) -> Result<Opened> {
+        if !self.wants(name) || self.live.iter().any(|i| i.name == name) {
+            return Ok(Opened::Absent);
+        }
+        let Ok(index) = socket::ifindex(name) else {
+            return Ok(Opened::Absent);
+        };
+        let mut iface = Iface::new(&self.config.interface(name), index, self);
+        iface.take_mtu(socket::mtu(name).ok());
+        // Of the families it has no address to join the group over, only what is
+        // waited for waits: IPv6 is listened to when IPv4 cannot be yet.
+        iface.missing = self.families.iter().copied().filter(|&f| !socket::joinable(name, f)).collect();
+        if !iface.missing.is_empty() {
+            eprintln!("{name}: no IPv4 address yet: IPv4 is listened to when it has one");
+        }
+        if iface.missing.len() == self.families.len() {
+            return Ok(Opened::Waiting);
+        }
+        iface.open_sockets(self)?;
+        let how = if self.seen.insert(name.to_string()) { "here" } else { "back" };
+        if how == "back" {
+            eprintln!("{name}: up");
+        }
+        eprintln!("{name}: {how} (index {index}), listening");
+        iface.addresses_changed(&self.families);
+        for (seg, group) in self.config.segments.iter().zip(self.groups) {
+            if seg.interfaces.iter().any(|i| i == name) {
+                group.reflector.add(iface.segment.clone())?;
+            }
+        }
+        // Whoever is there may never have been asked about.
+        iface.segment.start_probe(how);
+        self.live.push(iface);
+        Ok(Opened::Listening)
+    }
+
+    /// Stop serving the interface at `at`, as it is gone or down: what was
+    /// found on it is forgotten, and what the segments announced of that is
+    /// withdrawn, and the segments let go of it.
+    fn remove(&mut self, at: usize) {
+        let iface = self.live.remove(at);
+        // Nothing is heard or sent until it is back.
+        iface.segment.detach_all();
+        iface.segment.forget_discovered();
+        let reflectors: Vec<&Reflector> = self.groups.iter().map(|g| &g.reflector).collect();
+        reflector::deliver(&reflectors);
+        for r in &reflectors {
+            r.remove(&iface.name);
+        }
+        iface.close(self);
+    }
+
+    /// Act on what `netlink` said is new.
+    fn follow(&mut self, events: &[Event]) {
+        for event in events {
+            if let Err(e) = self.changed(event) {
+                eprintln!("{e:#}");
+            }
+        }
+    }
+
+    fn changed(&mut self, event: &Event) -> Result<()> {
+        match event {
+            Event::Up { name, index, .. } => {
+                // One of that name that is there is of another index: it was made again.
+                if let Some(at) = self.live.iter().position(|i| i.name == *name && i.index != *index) {
+                    self.remove(at);
+                }
+                self.add(name)?;
+            }
+            Event::Down { name, index } => {
+                if let Some(at) = self.live.iter().position(|i| i.index == *index) {
+                    eprintln!("{name}: down; waiting for it to come up");
+                    self.remove(at);
+                }
+            }
+            Event::Mtu { name, mtu } => {
+                if let Some(iface) = self.live.iter_mut().find(|i| i.name == *name) {
+                    iface.take_mtu(Some(*mtu));
+                }
+            }
+            Event::Addresses { name, index } => match self.live.iter().position(|i| i.index == *index) {
+                // One that was waiting for an address to listen over a family by, and has one now.
+                Some(at) if self.live[at].missing.iter().any(|&f| socket::joinable(name, f)) => {
+                    self.remove(at);
+                    self.add(name)?;
+                }
+                Some(at) => self.live[at].addresses_changed(&self.families),
+                // Perhaps one that is there, and had no address to be joined to the group by.
+                None => {
+                    self.add(name)?;
+                }
+            },
+            Event::Neighbour { index, ip, mac } => {
+                if let Some(iface) = self.live.iter().find(|i| i.index == *index) {
+                    iface.segment.neighbour(*ip, mac.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Iface {
+    /// The entry for `interface`, with what the names to advertise in the
+    /// config say of it. It has no sockets until
+    /// [`open_sockets`](Iface::open_sockets).
+    fn new(interface: &Interface, index: u32, ifaces: &Ifaces) -> Iface {
+        let segment = Segment::new(&interface.name, &ifaces.families);
+        segment.set_min_lifetime(interface.min_lifetime);
+        segment.set_max_addrs(interface.max_addrs);
+        segment.set_direct(&ifaces.unicast);
+        segment.set_max_devices(interface.max_devices);
+        segment.set_max_services(interface.max_services);
+        segment.set_reannounce(interface.reannounce);
+        segment.set_refresh_before(interface.refresh_before);
+        // The rounds run in the event loop; the interval is between starts.
+        segment.set_probe_interval(interface.probe_interval);
+
+        Iface {
+            name: interface.name.clone(),
+            segment,
+            advertise: ifaces
+                .config
+                .advertise
+                .iter()
+                .filter(|a| a.interfaces.is_empty() || a.interfaces.iter().any(|i| *i == interface.name))
+                .cloned()
+                .collect(),
+            index,
+            missing: Vec::new(),
+            mtu: None,
+            sockets: Vec::new(),
+        }
+    }
+
+    /// A socket of its own for each family, pinned to the interface.
+    #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
+    fn open_sockets(&mut self, ifaces: &Ifaces) -> Result<()> {
+        let mut sockets = Vec::new();
+        for &family in &ifaces.families {
+            let sock = socket::open(&self.name, family, ifaces.unicast.contains(&family))
+                .with_context(|| format!("opening {family:?} socket on {}", self.name))?;
+            sockets.push(sock);
+        }
+        let mut receivers = Vec::new();
+        for sock in sockets {
+            // Never waited on: the loop reads it when it is readable, and a
+            // send that cannot go out at once fails, and is tried again.
+            rustix::io::ioctl_fionbio(&sock.socket, true).map_err(runtime::Why)?;
+            let (tx, dest) = sock.sender()?;
+            self.segment.attach(sock.family, tx, dest);
+            eprintln!("listening on {} ({:?})", self.name, sock.family);
+            receivers.push(sock.socket);
+        }
+        self.sockets = receivers;
+        Ok(())
+    }
+
+    /// The shared sockets, joined to the group on this interface.
+    #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
+    fn open_sockets(&mut self, ifaces: &Ifaces) -> Result<()> {
+        for &family in ifaces.families.iter().filter(|f| !self.missing.contains(f)) {
+            let (tx, dest) = ifaces
+                .hub
+                .join(&self.name, family)
+                .with_context(|| format!("joining the group over {family:?} on {}", self.name))?;
+            self.segment.attach(family, tx, dest);
+            eprintln!("listening on {} ({:?})", self.name, family);
+        }
+        Ok(())
+    }
+
+    /// Let go of the sockets: the shared ones leave the group on this interface.
+    fn close(self, ifaces: &Ifaces) {
+        #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
+        for &family in &ifaces.families {
+            ifaces.hub.leave(&self.name, family);
+        }
+        #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
+        let _ = ifaces;
+    }
+
+    /// The interface's addresses are new: tell its segment the networks it is
+    /// on, and announce the advertised name with them.
+    fn addresses_changed(&self, families: &[Family]) {
+        match socket::prefixes(&self.name) {
+            Ok(prefixes) => self.segment.set_prefixes(prefixes),
+            Err(e) => eprintln!("{}: {e:#}", self.name),
+        }
+        // Announce the names to advertise with all of this host's addresses on
+        // the interface, of the families listened to, read afresh. With none at
+        // all, they are withdrawn.
+        if self.advertise.is_empty() {
+            return;
+        }
+        let addrs = socket::addresses(&self.name, families).unwrap_or_default();
+        for block in &self.advertise {
+            self.segment.advertise(block, &addrs);
+        }
+    }
+
+    /// Take the interface's MTU, if it is known and new: packets sent on it
+    /// are kept within what it leaves.
+    fn take_mtu(&mut self, mtu: Option<u32>) {
+        let Some(mtu) = mtu.filter(|&m| Some(m) != self.mtu) else { return };
+        let max_packet = self.segment.set_mtu(mtu);
+        let how = if self.mtu.is_some() { "now" } else { "is" };
+        eprintln!("{}: MTU {how} {mtu}: packets of at most {max_packet} bytes", self.name);
+        self.mtu = Some(mtu);
+    }
+
+    /// The descriptors of its sockets, for the event loop to wait on.
+    fn fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        self.sockets.iter().map(|s| s.as_raw_fd())
+    }
+
+    /// Handle everything the socket `fd` has heard, if it is one of this
+    /// interface's: the event loop found it readable.
+    fn receive(&self, fd: RawFd) {
+        if let Some(sock) = self.sockets.iter().find(|s| s.as_raw_fd() == fd) {
+            socket::drain(sock, &self.name, |from, to, datagram| self.segment.hear(from, to, datagram));
+        }
+    }
 }
 
 /// The configuration file the command line names, or the default; `None` if
@@ -270,19 +557,21 @@ fn config_path(args: Vec<String>) -> Result<Option<String>, args::Error> {
 fn event_loop(
     signals: &signal::Signals,
     netlink: Option<Netlink>,
-    hub: &socket::Hub,
-    links: &mut [Link],
-    groups: &[Group],
+    ifaces: &mut Ifaces,
     server: &mut ipc::Server,
     avahi: &mut Option<avahi_compat::Server>,
 ) -> Result<&'static str> {
+    let groups = ifaces.groups;
     let reflectors: Vec<&Reflector> = groups.iter().map(|g| &g.reflector).collect();
     let mut netlink = netlink;
-    if let Some(netlink) = &netlink {
-        links::ask_neighbours(netlink);
+    if let Some(netlink) = netlink.as_mut() {
+        // What is there already, and what is known of its neighbours.
+        if let Err(e) = netlink.resync() {
+            eprintln!("netlink: asking for what is there failed: {e}");
+        }
     }
     loop {
-        let upkeep = links.iter().filter_map(|l| l.segment().next_due());
+        let upkeep = ifaces.live.iter().filter_map(|i| i.segment.next_due());
         let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).chain(avahi.as_ref().and_then(|a| a.next_due())).min();
         // The signals and netlink, then every link's sockets, each with the
         // link it is of, then the sockets shared by the interfaces, if there
@@ -290,9 +579,9 @@ fn event_loop(
         let mut fds = vec![poll::readable(signals.fd())];
         fds.push(poll::readable(netlink.as_ref().map_or(-1, Netlink::fd)));
         let sockets: Vec<(usize, i32)> =
-            links.iter().enumerate().flat_map(|(i, l)| l.fds().map(move |fd| (i, fd))).collect();
+            ifaces.live.iter().enumerate().flat_map(|(i, l)| l.fds().map(move |fd| (i, fd))).collect();
         fds.extend(sockets.iter().map(|&(_, fd)| poll::readable(fd)));
-        let shared: Vec<i32> = hub.fds().collect();
+        let shared: Vec<i32> = ifaces.hub.fds().collect();
         let shared_at = fds.len();
         fds.extend(shared.iter().map(|&fd| poll::readable(fd)));
         let clients = fds.len();
@@ -310,20 +599,20 @@ fn event_loop(
         }
         // What was heard first: a change of interfaces may close the sockets.
         for (&(link, fd), _) in sockets.iter().zip(&fds[2..shared_at]).filter(|(_, p)| poll::ready(p)) {
-            links[link].receive(fd);
+            ifaces.live[link].receive(fd);
         }
         // A datagram of a shared socket goes to the link of the interface it came
         // in on, and to none if that is not one of ours.
         for (&fd, _) in shared.iter().zip(&fds[shared_at..clients]).filter(|(_, p)| poll::ready(p)) {
-            hub.receive(fd, |index, from, to, datagram| {
-                if let Some(link) = links.iter().find(|l| l.index() == Some(index)) {
-                    link.heard(from, to, datagram);
+            ifaces.hub.receive(fd, |index, from, to, datagram| {
+                if let Some(iface) = ifaces.live.iter().find(|i| i.index == index) {
+                    iface.segment.hear(from, to, datagram);
                 }
             });
         }
-        if let Some(n) = netlink.as_ref().filter(|_| poll::ready(&fds[1])) {
-            match n.changes() {
-                Ok(changes) => links::follow(n, links, &changes),
+        if let Some(n) = netlink.as_mut().filter(|_| poll::ready(&fds[1])) {
+            match n.events() {
+                Ok(events) => ifaces.follow(&events),
                 Err(e) => {
                     eprintln!("netlink: {e}; no longer following interfaces as they come and go");
                     netlink = None;
@@ -338,9 +627,9 @@ fn event_loop(
             avahi.ready(&fds[avahi_at..]);
         }
         let now = Instant::now();
-        for link in links.iter() {
-            if link.segment().next_due().is_some_and(|at| at <= now) {
-                link.segment().upkeep(now);
+        for iface in ifaces.live.iter() {
+            if iface.segment.next_due().is_some_and(|at| at <= now) {
+                iface.segment.upkeep(now);
             }
         }
         reflector::deliver(&reflectors);

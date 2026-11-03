@@ -22,10 +22,10 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::{Neighbours, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
+use crate::config::{AdvertiseConfig, Neighbours, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
 use crate::runtime::Why;
 use crate::device::{
-    addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Report,
+    addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Service, Report,
     DEFAULT_MAX_PACKET, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
 };
 use crate::socket::{Family, Prefix, Sender, MDNS_PORT};
@@ -1288,6 +1288,52 @@ impl Segment {
         }
         drop(guard);
         first_err.map_or(Ok(()), Err)
+    }
+
+    /// Handle a datagram that came in on this interface, if it is of a host
+    /// it hears.
+    pub fn hear(&self, from: SocketAddr, to: Option<IpAddr>, datagram: &[u8]) {
+        if !self.accepts(from.ip(), to) {
+            return;
+        }
+        if let Err(e) = self.handle(from, datagram) {
+            eprintln!("{}: reply failed: {e:#}", self.interface);
+        }
+    }
+
+    /// Announce `advertise` with `addrs`, this host's addresses on the
+    /// interface, or withdraw it if there are none.
+    pub fn advertise(&self, advertise: &AdvertiseConfig, addrs: &[IpAddr]) {
+        let AdvertiseConfig { name, ttl, services, .. } = advertise;
+        if addrs.is_empty() {
+            eprintln!("{}: no address to advertise {name} with", self.interface);
+            if let Err(e) = self.remove_manual(Owner::Own, name) {
+                eprintln!("{}: withdrawing {name} failed: {e:#}", self.interface);
+            }
+            return;
+        }
+        let mut device = Device { hostname: Some(name.clone()), ..Device::default() };
+        device.add_addrs(addrs);
+        // Each is of an instance named for the host, as Avahi's %h is.
+        let label = name.split('.').next().unwrap_or(name);
+        device.services = services
+            .iter()
+            .map(|(kind, port)| Service {
+                instance: format!("{label}.{kind}.local"),
+                kind: format!("{kind}.local"),
+                port: *port,
+                target: Some(name.clone()),
+                ..Service::default()
+            })
+            .collect();
+        match self.add_manual_ttl(Owner::Own, device, *ttl) {
+            Ok(true) => {
+                let shown: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
+                eprintln!("{}: advertising {name} as {} (TTL {}s)", self.interface, shown.join(", "), ttl.as_secs());
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("{}: not advertising {name}: {e:#}", self.interface),
+        }
     }
 
     /// Forget every device discovered here, as when the interface is gone:
