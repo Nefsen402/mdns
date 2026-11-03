@@ -331,10 +331,14 @@ with goodbyes (see `mdnsd(8)`).
 
 ## Other systems
 
-Linux is what it is made for and tested on. The code also builds for FreeBSD,
-NetBSD, OpenBSD and DragonFly, but has not been run on any of them: what is
-known is that it compiles there, and that the part that differs has been run on
-Linux (`cargo build --features portable-sockets`).
+Linux is what it is made for and tested on: the unit tests and the end-to-end
+tests (see `e2e/`) run there in CI.
+
+FreeBSD 14.5 builds it and passes the unit tests, run by hand in a virtual
+machine; the end-to-end tests need Linux's network namespaces and have not been
+run on it. The other BSDs, NetBSD, OpenBSD and DragonFly, have not been tried.
+The part that differs between the BSDs and Linux is run end to end on Linux, in
+CI (`cargo build --features portable-sockets`).
 
 What differs is the sockets. Linux pins a socket to each interface
 (`SO_BINDTODEVICE`), so each hears nothing from another. The BSDs cannot, so

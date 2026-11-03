@@ -1359,9 +1359,37 @@ fn user_name(uid: u32) -> Option<String> {
     })
 }
 
-/// The command line of the process `pid`, if this one may see it.
+/// The command line of the process `pid`, if this one may see it: `/proc`
+/// has it on Linux.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn command_line(pid: i32) -> Option<String> {
-    let raw = read_file(&format!("/proc/{pid}/cmdline")).ok()?;
+    words_of(&read_file(&format!("/proc/{pid}/cmdline")).ok()?)
+}
+
+/// The command line of the process `pid`, if this one may see it: FreeBSD and
+/// DragonFly give it as a `sysctl`, where `/proc` is not mounted.
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+fn command_line(pid: i32) -> Option<String> {
+    // -1 is the process asking, here: no process is that.
+    if pid <= 0 {
+        return None;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ARGS, pid];
+    let mut buf = vec![0u8; 16 << 10];
+    let mut len = buf.len();
+    // SAFETY: `mib` is four long, and `buf` is as long as `len` says; nothing is set.
+    let ok = unsafe { libc::sysctl(mib.as_mut_ptr(), 4, buf.as_mut_ptr().cast(), &mut len, core::ptr::null_mut(), 0) } == 0;
+    words_of(buf.get(..len).filter(|_| ok)?)
+}
+
+/// The other systems do not say: the column is left empty.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly")))]
+fn command_line(_pid: i32) -> Option<String> {
+    None
+}
+
+/// A command line as the system has it, its words each ended by a NUL.
+fn words_of(raw: &[u8]) -> Option<String> {
     let words: Vec<String> =
         raw.split(|&b| b == 0).filter(|w| !w.is_empty()).map(|w| String::from_utf8_lossy(w).into_owned()).collect();
     (!words.is_empty()).then(|| words.join(" "))
@@ -2553,9 +2581,14 @@ mod tests {
     #[test]
     fn this_process_is_named_by_its_user_and_command_line() {
         let me = std::process::id() as i32;
-        assert!(command_line(me).is_some_and(|c| !c.is_empty()));
+        if cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly")) {
+            assert!(command_line(me).is_some_and(|c| !c.is_empty()));
+        } else {
+            assert!(command_line(me).is_none(), "the system does not say");
+        }
         assert_eq!(user_name(0).as_deref(), Some("root"));
         assert!(command_line(-1).is_none());
+        assert!(command_line(i32::MAX).is_none(), "no such process");
     }
 
     #[test]

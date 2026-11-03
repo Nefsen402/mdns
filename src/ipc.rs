@@ -493,10 +493,11 @@ struct Open {
     since: Instant,
 }
 
-/// The process at the other end of a connection, as the kernel has it.
+/// The process at the other end of a connection, as the kernel has it. Where
+/// the system does not say which process, only whose it is, there is no `pid`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Peer {
-    pid: i32,
+    pid: Option<i32>,
     uid: u32,
 }
 
@@ -511,7 +512,7 @@ impl Watches {
                     "segment": w.segment,
                     "query": w.query.kinds,
                     "interval_s": w.query.interval.map(|d| d.as_secs()),
-                    "pid": w.peer.map(|p| p.pid),
+                    "pid": w.peer.and_then(|p| p.pid),
                     "uid": w.peer.map(|p| p.uid),
                     "age_ms": u64::try_from(w.since.elapsed().as_millis()).unwrap_or(u64::MAX),
                 })
@@ -525,17 +526,57 @@ impl Watches {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn peer_of(stream: &OwnedFd) -> Option<Peer> {
     let cred = rustix::net::sockopt::socket_peercred(stream).ok()?;
-    Some(Peer { pid: cred.pid.as_raw_pid(), uid: cred.uid.as_raw() })
+    Some(Peer { pid: Some(cred.pid.as_raw_pid()), uid: cred.uid.as_raw() })
 }
 
 /// Who is at the other end of `stream`, or `None` if the system will not say.
-/// The BSDs say whose user it is, and not which process.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// FreeBSD says whose user it is and which process, as `LOCAL_PEERCRED` does
+/// since 13.0.
+#[cfg(target_os = "freebsd")]
+fn peer_of(stream: &OwnedFd) -> Option<Peer> {
+    use rustix::fd::AsRawFd;
+
+    /// `struct xucred`, which the `libc` crate does not let the process be read
+    /// from: after the groups there is a union of a pointer and `cr_pid`, which
+    /// is why it is not right after them.
+    #[repr(C)]
+    struct XUcred {
+        version: libc::c_uint,
+        uid: libc::uid_t,
+        ngroups: libc::c_short,
+        groups: [libc::gid_t; 16],
+        pid: PidOrPointer,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union PidOrPointer {
+        pid: libc::pid_t,
+        _unused: *mut libc::c_void,
+    }
+    /// The level of the options of a Unix socket (`SOL_LOCAL`), and `XUCRED_VERSION`.
+    const SOL_LOCAL: libc::c_int = 0;
+    const XUCRED_VERSION: libc::c_uint = 0;
+
+    // SAFETY: all zeros is what it is before the kernel fills it in.
+    let mut cred: XUcred = unsafe { core::mem::zeroed() };
+    let mut len = core::mem::size_of::<XUcred>() as libc::socklen_t;
+    // SAFETY: the descriptor is open, and `cred` is as long as `len` says.
+    let ok = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), SOL_LOCAL, libc::LOCAL_PEERCRED, (&mut cred as *mut XUcred).cast(), &mut len)
+    } == 0;
+    // SAFETY: the kernel wrote the union by its `cr_pid` member, and it is plain data.
+    let pid = Some(unsafe { cred.pid.pid }).filter(|&p| p > 0);
+    (ok && cred.version == XUCRED_VERSION).then_some(Peer { pid, uid: cred.uid })
+}
+
+/// Who is at the other end of `stream`, or `None` if the system will not say.
+/// The other BSDs say whose user it is, and not which process.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
 fn peer_of(stream: &OwnedFd) -> Option<Peer> {
     use rustix::fd::AsRawFd;
     let (mut uid, mut gid) = (0, 0);
     // SAFETY: the descriptor is open, and the two are valid to write to.
-    (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(Peer { pid: 0, uid })
+    (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(Peer { pid: None, uid })
 }
 
 /// Queue `line` and a newline for a client, to go out whole: it is never
@@ -1411,7 +1452,8 @@ mod tests {
         // Taking some starts the wait afresh.
         let mut buf = vec![0u8; 64 << 10];
         let mut theirs = theirs;
-        theirs.read_exact(&mut buf).unwrap();
+        // Some of it: how much the socket holds is the system's, and BSDs hold less than 64 KiB.
+        assert!(theirs.read(&mut buf).unwrap() > 0);
         c.flush(now + Duration::from_millis(100));
         assert_eq!(c.stalled, Some(now + Duration::from_millis(100)));
 
@@ -1620,10 +1662,16 @@ mod tests {
         let _second = open(&mut h, "watch --query=_shelly._tcp --interval=60 IoT");
         let watchers = list(&mut h);
         assert_eq!(watchers.len(), 2, "{watchers:?}");
-        let me = (std::process::id() as i64, unsafe { libc::getuid() } as i64);
+        let (pid, uid) = (std::process::id() as i64, unsafe { libc::getuid() } as i64);
         for w in &watchers {
             assert_eq!(w["segment"], "IoT");
-            assert_eq!((w["pid"].as_i64().unwrap(), w["uid"].as_i64().unwrap()), me, "the kernel's word for who holds it");
+            assert_eq!(w["uid"].as_i64().unwrap(), uid, "the kernel's word for who holds it");
+            // Where the system says only whose it is, there is no process to name.
+            if cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd")) {
+                assert_eq!(w["pid"].as_i64(), Some(pid));
+            } else {
+                assert!(w["pid"].is_null(), "{w}");
+            }
             assert!(w["age_ms"].as_u64().is_some());
         }
         assert!(watchers[0]["id"].as_u64() < watchers[1]["id"].as_u64(), "oldest first");

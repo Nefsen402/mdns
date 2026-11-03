@@ -698,6 +698,11 @@ fn set_int(fd: impl AsFd, level: libc::c_int, name: libc::c_int, value: libc::c_
     Ok(())
 }
 
+/// The loopback interface, as it is called here: what tests that need an
+/// interface that is there use.
+#[cfg(test)]
+pub(crate) const LOOPBACK: &str = if cfg!(target_os = "linux") { "lo" } else { "lo0" };
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,11 +758,7 @@ mod tests {
         assert_eq!(arrival::index_of(libc::SOL_SOCKET, libc::IPV6_PKTINFO, &in6), None);
     }
 
-    /// The loopback interface, as it is called here.
-    #[cfg(target_os = "linux")]
-    const LOOPBACK: &str = "lo";
-    #[cfg(not(target_os = "linux"))]
-    const LOOPBACK: &str = "lo0";
+    use super::LOOPBACK;
 
     #[test]
     fn the_addresses_to_advertise_are_all_of_the_wanted_families_routable_first() {
