@@ -102,13 +102,14 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // waited for.
     let hub = Rc::new(socket::Hub::new(&families, &unicast).context("opening the sockets")?);
     let mut tracked = Vec::new();
+    let interfaces = config.interfaces();
     let mut links: HashMap<&str, Segment> = HashMap::new();
-    for interface in config.interfaces() {
+    for interface in &interfaces {
         let mut link = Link::new(interface, &families, &unicast, &config, hub.clone());
         if !link.open()? {
-            eprintln!("{interface}: not there yet; waiting for it");
+            eprintln!("{}: not there yet; waiting for it", interface.name);
         }
-        links.insert(interface, link.segment().clone());
+        links.insert(&interface.name, link.segment().clone());
         tracked.push(link);
     }
 
@@ -158,51 +159,50 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // answer when asked, so without this a quiet one expires and is withdrawn
     // from the other networks. The probes run as rounds in the event loop, so
     // startup is not held up; `mdnsctl probe` does the same on demand.
-    for interface in config.interfaces() {
-        match config.min_lifetime_of(interface).as_secs() {
-            0 => eprintln!("{interface}: keeping a device for as long as its records say"),
-            kept => eprintln!("{interface}: keeping a device for at least {kept}s after it was last heard from"),
+    for interface in &interfaces {
+        let name = &interface.name;
+        match interface.min_lifetime.as_secs() {
+            0 => eprintln!("{name}: keeping a device for as long as its records say"),
+            kept => eprintln!("{name}: keeping a device for at least {kept}s after it was last heard from"),
         }
-        if config.reannounce_on(interface) {
-            eprintln!("{interface}: announcing reflected devices again at 80% of their TTL, changed or not");
+        if interface.reannounce {
+            eprintln!("{name}: announcing reflected devices again at 80% of their TTL, changed or not");
         }
     }
-    for interface in config.interfaces() {
-        match config.refresh_before_of(interface) {
+    for interface in &interfaces {
+        let name = &interface.name;
+        match interface.refresh_before {
             Some(before) => eprintln!(
-                "{interface}: asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
+                "{name}: asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
                 before.as_secs()
             ),
-            None => eprintln!("{interface}: refreshing devices before they expire is off"),
+            None => eprintln!("{name}: refreshing devices before they expire is off"),
         }
     }
     // Each interface is probed as often as the most frequent of its segments
     // asks.
-    for interface in config.interfaces() {
-        match config.probe_interval_of(interface) {
+    for interface in &interfaces {
+        let name = &interface.name;
+        match interface.probe_interval {
             Some(interval) => {
-                eprintln!("{interface}: probing every {}s", interval.as_secs());
+                eprintln!("{name}: probing every {}s", interval.as_secs());
                 // With refreshing on, each device is asked just before it
                 // would expire, so a long interval only delays finding new
                 // devices.
                 // Most devices announce their addresses for two minutes.
-                let kept = config.min_lifetime_of(interface).max(core::time::Duration::from_secs(120));
-                if config.refresh_before_of(interface).is_none() && interval > kept {
+                let kept = interface.min_lifetime.max(core::time::Duration::from_secs(120));
+                if interface.refresh_before.is_none() && interval > kept {
                     eprintln!(
                         "warning: that is longer than the {}s a device is usually kept without being heard from, \
-                         so devices on {interface} whose records all expire sooner will come and go between probes",
+                         so devices on {name} whose records all expire sooner will come and go between probes",
                         kept.as_secs()
                     );
                 }
             }
-            None => eprintln!(
-                "{interface}: not probing periodically (no ProbeInterval= for it): only at startup and on request"
-            ),
+            None => eprintln!("{name}: not probing periodically (no ProbeInterval= for it): only at startup and on request"),
         }
     }
-    // The rounds run in the event loop; the interval is between starts.
     for link in links.values() {
-        link.set_probe_interval(config.probe_interval_of(link.interface()));
         link.start_probe("startup");
     }
 

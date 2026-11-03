@@ -19,7 +19,7 @@ use rustix::io::Errno;
 
 use anyhow::{Context, Result};
 
-use crate::config::{AdvertiseConfig, Config};
+use crate::config::{AdvertiseConfig, Config, Interface};
 use crate::device::{Device, Service};
 use crate::runtime::Why;
 use crate::netlink::{Change, Netlink};
@@ -63,27 +63,30 @@ pub struct Link {
 }
 
 impl Link {
-    /// The link for `interface`, over `families`, configured by `config`. It
-    /// has no sockets until [`open`](Link::open).
-    pub fn new(interface: &str, families: &[Family], unicast: &[Family], config: &Config, hub: Rc<Hub>) -> Link {
-        let segment = Segment::new(interface, families);
-        segment.set_min_lifetime(config.min_lifetime_of(interface));
-        segment.set_max_addrs(config.max_addrs_of(interface));
+    /// The link for `interface`, over `families`, with what the names to
+    /// advertise in `config` say of it. It has no sockets until
+    /// [`open`](Link::open).
+    pub fn new(interface: &Interface, families: &[Family], unicast: &[Family], config: &Config, hub: Rc<Hub>) -> Link {
+        let segment = Segment::new(&interface.name, families);
+        segment.set_min_lifetime(interface.min_lifetime);
+        segment.set_max_addrs(interface.max_addrs);
         segment.set_direct(unicast);
-        segment.set_max_devices(config.max_devices_of(interface));
-        segment.set_max_services(config.max_services_of(interface));
-        segment.set_reannounce(config.reannounce_on(interface));
-        segment.set_refresh_before(config.refresh_before_of(interface));
+        segment.set_max_devices(interface.max_devices);
+        segment.set_max_services(interface.max_services);
+        segment.set_reannounce(interface.reannounce);
+        segment.set_refresh_before(interface.refresh_before);
+        // The rounds run in the event loop; the interval is between starts.
+        segment.set_probe_interval(interface.probe_interval);
 
         Link {
-            interface: interface.to_string(),
+            interface: interface.name.clone(),
             families: families.to_vec(),
             unicast: unicast.to_vec(),
             segment,
             advertise: config
                 .advertise
                 .iter()
-                .filter(|a| a.interfaces.is_empty() || a.interfaces.iter().any(|i| i == interface))
+                .filter(|a| a.interfaces.is_empty() || a.interfaces.iter().any(|i| *i == interface.name))
                 .cloned()
                 .collect(),
             index: None,
