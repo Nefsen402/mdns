@@ -170,6 +170,69 @@ class Topologies(Case):
         self.assertTrue(hb.none(lambda h: h.message.has("tv.local")), "a is not seen from b")
 
 
+class Patterns(Case):
+    """Interfaces named by a pattern: those there when the daemon starts, and
+    those that come after."""
+
+    @follows_changes
+    def test_an_interface_a_pattern_matches_is_listened_to_whether_it_was_there_at_the_start_or_came_after(self):
+        la, lb = self.two_links()
+        ha, hb = la.hearer(), lb.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=r?\n"))
+        self.assertTrue(d.wait_log(r"ra: here \(index \d+\), listening", 5), self.logs(d))
+        self.assertTrue(d.wait_log(r"rb: here \(index \d+\), listening", 5), self.logs(d))
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        self.assertTrue(hb.wait(alive("tv.local", A, "10.9.1.50")), "reflected between what the pattern matches\n" + self.logs(d))
+
+        # One made after is listened to, told what is known, and heard.
+        mark = d.mark()
+        lc = self.lab.link("rc", "10.9.3.1/24", "10.9.3.2/24")
+        hc = lc.hearer()
+        self.assertTrue(d.wait_log(r"rc: here \(index \d+\), listening", 5, mark), self.logs(d))
+        self.assertTrue(d.advance_until(lambda: hc.seen(alive("tv.local", A, "10.9.1.50"))), self.logs(d))
+        lc.device("10.9.3.50").multicast(announcement("cam", "10.9.3.50", "Cam"))
+        self.assertTrue(ha.wait(alive("cam.local", A, "10.9.3.50")), self.logs(d))
+        self.assertEqual(d.request("segments")["segments"][0]["interfaces"], ["ra", "rb", "rc"])
+
+        # And one that goes is forgotten.
+        lc.delete()
+        d.settle()
+        self.assertTrue(not d.host("s", "cam.local"), self.logs(d))
+        self.assertTrue(ha.wait(goodbye("cam.local", A, "10.9.3.50")), "withdrawn\n" + self.logs(d))
+        self.assertEqual(d.request("segments")["segments"][0]["interfaces"], ["ra", "rb"])
+
+    @follows_changes
+    def test_interfaces_a_pattern_of_untrusted_names_match_are_told_nothing(self):
+        lan = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        iot1 = self.lab.link("iot1", "10.9.2.1/24", "10.9.2.2/24")
+        iot2 = self.lab.link("iot2", "10.9.3.1/24", "10.9.3.2/24")
+        h_lan, h1, h2 = lan.hearer(), iot1.hearer(), iot2.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,iot*\nUntrusted=iot*\n"))
+        self.assertTrue(d.wait_log(r"iot2: here", 5), self.logs(d))
+        iot1.device("10.9.2.50").multicast(announcement("plug", "10.9.2.50", "Plug"))
+        self.assertTrue(h_lan.wait(alive("plug.local", A, "10.9.2.50")), "what an untrusted one has is reflected out of it\n" + self.logs(d))
+        lan.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        d.settle()
+        self.assertTrue(d.host("s", "tv.local"))
+        self.assertTrue(h1.none(lambda h: h.message.has("tv.local") or h.message.has("plug.local")), "told nothing\n" + self.logs(d))
+        self.assertTrue(h2.none(lambda h: h.message.has("tv.local") or h.message.has("plug.local")), "nor the other, of the first\n" + self.logs(d))
+
+    def test_a_pattern_does_not_take_the_loopback_interface(self):
+        self.two_links()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=*\n"))
+        self.assertTrue(d.wait_log(r"rb: here \(index \d+\), listening", 5), self.logs(d))
+        self.assertTrue(d.wait_log(r"lo: a loopback interface", 5), self.logs(d))
+        d.settle()
+        self.assertEqual(d.request("segments")["segments"][0]["interfaces"], ["ra", "rb"])
+
+    def test_a_pattern_that_matches_nothing_is_waited_on(self):
+        la, _ = self.two_links()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,zz*\n"))
+        d.settle()
+        self.assertIsNone(d.proc.poll(), self.logs(d))
+        self.assertEqual(d.request("segments")["segments"][0]["interfaces"], ["ra"])
+
+
 class Vlans(Case):
     """Interfaces that are VLANs of one link, as a router has them: each a
     network of its own, over the same wire."""
