@@ -350,6 +350,7 @@ class Daemon:
             config = f"[Ipc]\nSocket={self.socket_path}\n" + config
         with open(self.conf, "w") as f:
             f.write(config)
+        self.avahi_socket = re.search(r"^\s*AvahiSocket\s*=\s*\S", config, re.M | re.I) is not None
         self.lines, self.lock = [], threading.Lock()
         self.proc = subprocess.Popen(
             [*lab.net.router_argv(), binary, self.conf],
@@ -370,8 +371,13 @@ class Daemon:
             return list(self.lines)
 
     def ready(self, timeout=10):
-        """Wait until it listens on its control socket: everything is set up."""
-        return self.wait_log(r"ipc: listening on", timeout)
+        """Wait until it listens on its control socket, and on the avahi socket if
+        it is to: it binds that one after, and says so, and everything is set up
+        once both have."""
+        said = self.wait_log(r"ipc: listening on", timeout)
+        if said and self.avahi_socket:
+            said = self.wait_log(r"avahi: listening on", timeout)
+        return said
 
     def wait_log(self, pattern, timeout=5.0, since=0):
         """The first line from index `since` that has `pattern`, or None."""
