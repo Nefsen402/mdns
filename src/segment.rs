@@ -4353,6 +4353,31 @@ mod tests {
         assert_eq!(seg.refresh(long + Duration::from_secs(91), before).unwrap(), 3);
     }
 
+    /// A device that announces a TTL of a second, as a buggy one may, is kept for
+    /// the default minimum and asked once in it: it is not asked every few seconds.
+    #[test]
+    fn a_device_that_announces_a_tiny_ttl_is_asked_once_and_kept_the_default_minimum() {
+        let (seg, rx) = wired();
+        seg.set_min_lifetime(DEFAULT_MIN_LIFETIME);
+        hear_a_device_with_ttl(&seg, 1);
+        let t0 = Instant::now();
+        let before = Duration::from_secs(30);
+
+        for secs in [0, 1, 5, 30, 44] {
+            assert_eq!(seg.refresh(t0 + Duration::from_secs(secs), before).unwrap(), 0, "{secs}s");
+        }
+        assert!(recv(&rx).is_none());
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(46), before).unwrap(), 3, "three quarters of the minute in");
+        assert!(recv(&rx).is_some());
+        for secs in [47, 50, 52] {
+            assert_eq!(seg.refresh(t0 + Duration::from_secs(secs), before).unwrap(), 0, "not again at {secs}s");
+        }
+        seg.expire(t0 + Duration::from_secs(59));
+        assert_eq!(seg.devices().len(), 1, "kept for the minute");
+        seg.expire(t0 + Duration::from_secs(61));
+        assert!(seg.devices().is_empty());
+    }
+
     /// The other extreme: a margin longer than any lifetime has every device
     /// asked three quarters of the way through its life, once. It must not turn
     /// into a flood.

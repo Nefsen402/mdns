@@ -36,7 +36,7 @@
 //!
 //! [Interface]         ; optional, for each interface that needs its own
 //! Name=wifi
-//! MinimumLifetime=1h  ; none unless set: a device lives for its TTL
+//! MinimumLifetime=1h  ; 1min unless set; 0 keeps a device for exactly its TTL
 //! ```
 //!
 //! Each `[Segment]` is a group of interfaces whose devices are reflected
@@ -91,9 +91,10 @@ const MAX_HOST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MIN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The default for how long a device is kept at least after it was last heard
-/// from, whatever TTLs it announced: none, so a device is kept for its TTL. See
+/// from, whatever TTLs it announced: a minute, so that a device that announces a
+/// TTL of a second, as a buggy one may, is not asked about every few seconds. See
 /// [`Segment::set_min_lifetime`].
-pub const DEFAULT_MIN_LIFETIME: Duration = Duration::ZERO;
+pub const DEFAULT_MIN_LIFETIME: Duration = Duration::from_secs(60);
 
 /// The default for how many addresses of a family a device is kept with:
 /// enough for a global and a ULA address, a few temporary ones, and a
@@ -190,8 +191,8 @@ pub struct SegmentConfig {
 pub struct InterfaceConfig {
     pub name: Option<String>,
     /// The least a device heard on it is kept after it was last heard from,
-    /// whatever TTLs it announced: the default is [`DEFAULT_MIN_LIFETIME`],
-    /// which keeps it for exactly its longest TTL.
+    /// whatever TTLs it announced: the default is [`DEFAULT_MIN_LIFETIME`], and
+    /// zero keeps it for exactly its longest TTL.
     pub min_lifetime: Option<Duration>,
     /// How many addresses of a family a device heard on it is kept with, at
     /// most: the default is [`DEFAULT_MAX_ADDRS`].
@@ -1537,8 +1538,8 @@ ProbeInterval=off
             .unwrap();
         let secs = |i: &str| c.min_lifetime_of(i).as_secs();
         assert_eq!((secs("wifi"), secs("media")), (3600, 0), "wifi is in two segments");
-        assert_eq!(secs("br0"), 0, "an interface with no section has the default: none");
-        assert_eq!(secs("elsewhere"), 0);
+        assert_eq!(secs("br0"), 60, "an interface with no section has the default");
+        assert_eq!(secs("elsewhere"), 60);
     }
 
     #[test]
@@ -1576,8 +1577,8 @@ ProbeInterval=off
     }
 
     #[test]
-    fn the_minimum_lifetime_is_none_unless_set_and_takes_systemd_time_spans() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().min_lifetime_of("br0"), Duration::ZERO);
+    fn the_minimum_lifetime_defaults_to_a_minute_and_takes_systemd_time_spans() {
+        assert_eq!(Config::parse(EXAMPLE).unwrap().min_lifetime_of("br0"), Duration::from_secs(60));
 
         let with = |v: &str| Config::parse(&format!("{EXAMPLE}\n[Interface]\nName=br0\nMinimumLifetime={v}"));
         let secs = |v: &str| with(v).unwrap().min_lifetime_of("br0").as_secs();

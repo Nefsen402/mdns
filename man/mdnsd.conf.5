@@ -180,7 +180,7 @@ or
 turns it off.
 A device lives for as long as the longest TTL it announced, and at least
 .B MinimumLifetime=
-(none by default).
+(one minute by default).
 This long before that runs out, or when a quarter of its life is left if that is
 less (see below), the daemon asks that device, and only it, for
 the records it announced, and asks again about every quarter of this margin
@@ -574,15 +574,18 @@ or
 .BR 1h ,
 at most one day.
 Default
-.BR 0 :
-none, so each device lives for exactly its longest TTL.
-A device lives for the longest TTL it announced, but never for less than this.
+.BR 1min .
+A device lives for the longest TTL it announced, but never for less than this,
+so that one that announces a TTL of a second, as a buggy one may, is not asked
+about every few seconds.
+.B 0
+removes the minimum: each device then lives for exactly its longest TTL.
 .IP
 It is the price of a device that vanishes without saying goodbye: it stays
 listed, and announced to the other networks, for up to this long.
 A longer one keeps a device that goes quiet (one that sleeps on battery and
 ignores questions, say) listed through the silence, so it is a setting for a
-network of the devices that do, and none for a network of laptops and phones.
+network of the devices that do, and a short one for a network of laptops and phones.
 A device is asked to answer again a quarter of its life before the end where
 that is less than
 .BR RefreshBefore= ,

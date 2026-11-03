@@ -523,7 +523,7 @@ class Timers(Case):
     def test_a_device_with_a_short_ttl_is_asked_three_quarters_of_the_way_in_and_not_at_once(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         # No minimum lifetime, so it lives for its TTL, which is less than the margin.
-        d = self.lab.daemon(conf("[Probe]\nRefreshBefore=30s\n[Segment]\nName=s\nInterfaces=ra\n"))
+        d = self.lab.daemon(conf("[Probe]\nRefreshBefore=30s\n[Interface]\nMinimumLifetime=0\n[Segment]\nName=s\nInterfaces=ra\n"))
         dev = la.device("10.9.1.50")
         dev.multicast(announcement("dev", "10.9.1.50", ttl=20))
         d.settle()
@@ -535,6 +535,24 @@ class Timers(Case):
         got = dev.hearer.seen(asks("dev.local", A), asked) or dev.hearer.wait(asks("dev.local", A), 5, since=asked)
         self.assertTrue(got, "asked 15 seconds in\n" + self.logs(d))
         # It does not answer, so it goes when its TTL runs out.
+        d.advance(5)
+        self.assertFalse(d.host("s", "dev.local"))
+
+    def test_a_ttl_of_a_second_is_kept_the_minute_and_asked_once_in_it(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        d = self.lab.daemon(conf("[Probe]\nRefreshBefore=30s\n[Segment]\nName=s\nInterfaces=ra\n"))
+        dev = la.device("10.9.1.50")
+        dev.multicast(announcement("dev", "10.9.1.50", ttl=1))
+        d.settle()
+        asked = dev.hearer.count()
+        d.advance(44)
+        self.assertTrue(d.host("s", "dev.local"), "kept, not dropped after its second")
+        self.assertTrue(dev.hearer.none(asks("dev.local", A), since=asked), "and not asked about every few seconds")
+        d.advance(2)
+        got = dev.hearer.seen(asks("dev.local", A), asked) or dev.hearer.wait(asks("dev.local", A), 5, since=asked)
+        self.assertTrue(got, "asked three quarters of the minute in\n" + self.logs(d))
+        d.advance(10)
+        self.assertEqual(len([h for h in dev.hearer.heard[asked:] if asks("dev.local", A)(h)]), 1, "once")
         d.advance(5)
         self.assertFalse(d.host("s", "dev.local"))
 
