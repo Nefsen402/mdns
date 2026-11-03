@@ -225,6 +225,22 @@ class Patterns(Case):
         d.settle()
         self.assertEqual(d.request("segments")["segments"][0]["interfaces"], ["ra", "rb"])
 
+    @follows_changes
+    def test_an_interface_that_is_kept_out_is_not_listened_to(self):
+        la, lb = self.two_links()
+        lc = self.lab.link("rc", "10.9.3.1/24", "10.9.3.2/24")
+        ha, hc = la.hearer(), lc.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=r?,!rc\n"))
+        self.assertTrue(d.wait_log(r"rb: here \(index \d+\), listening", 5), self.logs(d))
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        self.assertTrue(lb.hearer().wait(alive("tv.local", A, "10.9.1.50")), self.logs(d))
+        lc.device("10.9.3.50").multicast(announcement("cam", "10.9.3.50", "Cam"))
+        d.settle()
+        self.assertTrue(hc.none(lambda h: h.message.has("tv.local")), "kept out, so told nothing\n" + self.logs(d))
+        self.assertTrue(ha.none(lambda h: h.message.has("cam.local")), "nor heard\n" + self.logs(d))
+        self.assertNotIn("rc: here", self.logs(d))
+        self.assertEqual(d.request("segments")["segments"][0]["interfaces"], ["ra", "rb"])
+
     def test_a_pattern_that_matches_nothing_is_waited_on(self):
         la, _ = self.two_links()
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,zz*\n"))
