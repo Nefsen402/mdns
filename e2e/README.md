@@ -120,3 +120,10 @@ binaries (`e2e` once for each form of the sockets), each keeping its profile, th
 merges the profiles. The table is in the job's summary, on a pull request in a
 comment that is kept up to date and compares with the last run on `master`, and
 the report is an artifact.
+
+A `freebsd` job runs alongside them, for each of the FreeBSD releases that are
+supported (14.5 and 15.1): in a virtual machine, which
+[cross-platform-actions](https://github.com/cross-platform-actions/action) starts,
+it builds the daemon, runs the unit tests, and runs these tests as root, with the
+router a VNET jail. What it builds is its own, not the build job's, so it records
+no coverage.

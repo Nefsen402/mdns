@@ -203,3 +203,45 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
+
+  # The daemon on FreeBSD, in a virtual machine, which is what pfSense and OPNsense
+  # are: its unit tests, and the end-to-end tests, where the router is a VNET jail
+  # and the links epair interfaces (see e2e/). They are run as root, and change the
+  # network of the machine, which is why it is a virtual machine. It builds in the
+  # machine, and not from the build job's binaries, which are for Linux; so it
+  # records no coverage. What is built there is not synchronised back, so it is all
+  # one step. The action is pinned by its commit, as it is not GitHub's.
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: cpa.sh {0} --sync-files runner-to-vm
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['14.5', '15.1']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Start the virtual machine
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
+        with:
+          operating_system: freebsd
+          version: ${{ matrix.version }}
+          architecture: x86_64
+
+      - name: Build, and run the unit tests and the end-to-end tests
+        run: |
+          set -eux
+          freebsd-version
+          sudo pkg install -y rust python3
+          rustc --version
+          cargo test --locked
+          # Last, and with the clock the end-to-end tests move: without it they
+          # skip what needs it, and still pass.
+          cargo build --locked --features test-clock
+          strings target/debug/mdnsd | grep -q 'advance <milliseconds>'
+          sudo python3 e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd

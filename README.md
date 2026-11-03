@@ -334,11 +334,11 @@ with goodbyes (see `mdnsd(8)`).
 Linux is what it is made for and tested on: the unit tests and the end-to-end
 tests (see `e2e/`) run there in CI.
 
-FreeBSD 14.5 builds it and passes the unit tests and the end-to-end tests,
-run by hand in a virtual machine (the router is a VNET jail: see `e2e/`). The
-other BSDs, NetBSD, OpenBSD and DragonFly, have not been tried. The part that
-differs between the BSDs and Linux is run end to end on Linux as well, in CI
-(`cargo build --features portable-sockets`).
+FreeBSD builds it and passes the unit tests and the end-to-end tests, which CI
+runs in a virtual machine on 14.5 and 15.1 (the router is a VNET jail: see
+`e2e/`). The other BSDs, NetBSD, OpenBSD and DragonFly, have not been tried. The
+part that differs between the BSDs and Linux is run end to end on Linux as well,
+in CI (`cargo build --features portable-sockets`).
 
 What differs is the sockets. Linux pins a socket to each interface
 (`SO_BINDTODEVICE`), so each hears nothing from another. The BSDs cannot, so
