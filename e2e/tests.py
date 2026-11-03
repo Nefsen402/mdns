@@ -173,6 +173,54 @@ class Vlans(Case):
         self.assertTrue(d.advance_until(lambda: h20.seen(alive("tv.local", A, "10.10.0.50"))), "what is known is announced on it\n" + self.logs(d))
 
 
+class Bridges(Case):
+    """A bridge of the router, with the devices on its ports and the address on the
+    bridge: what the daemon is on is the bridge, and what comes in on a port is the
+    bridge's."""
+
+    def world(self, ports=2):
+        bridge = self.lab.bridge("br0", "10.9.1.1/24")
+        ports = [bridge.port(f"rp{i + 1}", f"10.9.1.{i + 2}/24") for i in range(ports)]
+        return bridge, ports, self.lab.link("rc", "10.9.3.1/24", "10.9.3.2/24")
+
+    def test_devices_on_every_port_of_a_bridge_are_heard_as_on_the_bridge_and_reflected(self):
+        bridge, (p1, p2), other = self.world()
+        ho = other.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=br0,rc\n"))
+        p1.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        p2.device("10.9.1.60").multicast(announcement("nas", "10.9.1.60", "NAS"))
+        self.assertTrue(ho.wait(alive("tv.local", A, "10.9.1.50")), self.logs(d))
+        self.assertTrue(ho.wait(alive("nas.local", A, "10.9.1.60")), self.logs(d))
+        d.settle()
+        for host in ("tv.local", "nas.local"):
+            self.assertEqual([x["interface"] for x in d.host("s", host)], ["br0"], f"{host}: on the bridge, not a port\n" + self.logs(d))
+
+    def test_what_is_sent_to_a_bridge_is_heard_on_every_port_from_its_address(self):
+        bridge, (p1, p2), other = self.world()
+        h1, h2 = p1.hearer(), p2.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=br0,rc\n"))
+        other.device("10.9.3.50").multicast(announcement("cam", "10.9.3.50", "Cam"))
+        for h in (h1, h2):
+            got = h.wait(alive("cam.local", A, "10.9.3.50"))
+            self.assertTrue(got, self.logs(d))
+            self.assertEqual(got.src, bridge.router_addr)
+
+    def test_a_name_advertised_on_a_bridge_is_heard_on_every_port(self):
+        bridge, (p1, p2), _ = self.world()
+        h1, h2 = p1.hearer(), p2.hearer()
+        d = self.lab.daemon(conf("[Advertise]\nHostname=pc\nInterface=br0\n[Segment]\nName=s\nInterfaces=br0\n"))
+        for h in (h1, h2):
+            self.assertTrue(h.wait(alive("pc.local", A, bridge.router_addr)), self.logs(d))
+
+    def test_a_port_added_after_the_daemon_started_is_heard(self):
+        bridge, _, other = self.world(ports=1)
+        ho = other.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=br0,rc\n"))
+        late = bridge.port("rp2", "10.9.1.3/24")
+        late.device("10.9.1.70").multicast(announcement("printer", "10.9.1.70", "Printer"))
+        self.assertTrue(ho.wait(alive("printer.local", A, "10.9.1.70")), self.logs(d))
+
+
 class Interfaces(Case):
     @follows_changes
     def test_an_interface_that_is_not_there_yet_is_waited_for_and_followed_as_it_comes_and_goes(self):

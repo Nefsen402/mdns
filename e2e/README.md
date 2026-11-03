@@ -50,7 +50,8 @@ doas python3 e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd
 There are no network namespaces, so each test makes a VNET jail for the router
 and `epair` interfaces for the links (`net.py`), with `ifconfig` and `jexec`.
 That needs root, and it changes the host's network stack: run it on a machine
-that may be changed, such as a virtual machine. It needs Python 3 (`pkg install
+that may be changed, such as a virtual machine (it loads `if_bridge`, which a
+jail cannot, for the tests of bridges). It needs Python 3 (`pkg install
 python3`). The daemon follows interfaces, addresses and neighbours through
 FreeBSD's netlink, as it does through Linux's, so the tests of that run; one is
 skipped, for what FreeBSD's netlink does not tell (an entry for an address that
@@ -64,8 +65,9 @@ with the same methods; the tests do not run `ip` or `ifconfig` themselves.
 of it and the far end, with methods to add and remove its addresses, take it
 down and up, change its MTU and set its neighbours; `lab.trunk(name)` makes one
 with no addresses of its own, and `trunk.vlan(tag, router_cidr, peer_cidr)` a VLAN
-of it, `ra.10`, that is a link as far as a test goes; `lab.router(...)` runs a
-command there),
+of it, `ra.10`, that is a link as far as a test goes; `lab.bridge(name,
+router_cidr)` a bridge with the address, and `bridge.port(name, peer_cidr)` a link
+whose router end is a port of it; `lab.router(...)` runs a command there),
 `Link.hearer()` (what is heard on the link, with `wait` for a message that
 matches), `Link.device(addr)` (a device to send and be sent to), `Daemon`
 (`wait_log`, `request`, `ctl`, `stop`), and DNS to build and parse messages.

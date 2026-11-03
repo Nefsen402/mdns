@@ -79,6 +79,17 @@ class Linux:
         sh("ip", "link", "del", peer, check=False)
         self.run("router", "ip", "link", "del", name, check=False)
 
+    def create_bridge(self, name):
+        self.run("router", "ip", "link", "add", "name", name, "type", "bridge")
+
+    def bridge_add(self, bridge, port):
+        """`port`, an interface of the router, is a port of `bridge`: what it hears
+        is the bridge's, which has the address."""
+        self.run("router", "ip", "link", "set", port, "master", bridge)
+
+    def delete_bridge(self, name):
+        self.run("router", "ip", "link", "del", name, check=False)
+
     def add_addr(self, side, iface, cidr):
         self.run(side, "ip", "addr", "add", cidr, "dev", iface, *(["nodad"] if ":" in cidr else []))
 
@@ -168,6 +179,21 @@ class FreeBSD:
 
     def delete_vlan(self, name, peer):
         sh("ifconfig", peer, "destroy", check=False)
+        self.run("router", "ifconfig", name, "destroy", check=False)
+
+    def create_bridge(self, name):
+        # A jail cannot load the kernel module that a bridge is: the host does, as
+        # it is loaded when one is made there. It may be loaded already.
+        sh("kldload", "if_bridge", check=False)
+        made = self.run("router", "ifconfig", "bridge", "create").stdout.strip()  # bridge0
+        self.run("router", "ifconfig", made, "name", name)
+
+    def bridge_add(self, bridge, port):
+        """`port`, an interface of the router, is a port of `bridge`: what it hears
+        is the bridge's, which has the address."""
+        self.run("router", "ifconfig", bridge, "addm", port)
+
+    def delete_bridge(self, name):
         self.run("router", "ifconfig", name, "destroy", check=False)
 
     def add_addr(self, side, iface, cidr):

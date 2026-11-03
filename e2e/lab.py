@@ -617,6 +617,29 @@ class Link:
         return self.lab.track(Device(self, addr))
 
 
+class Bridge:
+    """A bridge of the router: it has the address, and ports that are links to the
+    test, each with the address of a device's end of it, and none of their own at
+    the router's. The daemon is on the bridge, as a router has it: what comes in
+    on a port is the bridge's."""
+
+    def __init__(self, lab, name, router_cidr):
+        self.lab, self.net, self.name = lab, lab.net, name
+        self.router_addr = router_cidr.split("/")[0]
+        self.net.create_bridge(name)
+        self.net.add_addr("router", name, router_cidr)
+        self.net.set_up("router", name, True)
+
+    def port(self, name, peer_cidr):
+        """A link whose router end is a port of the bridge."""
+        link = self.lab.link(name, None, peer_cidr)
+        self.net.bridge_add(self.name, name)
+        return link
+
+    def delete(self):
+        self.net.delete_bridge(self.name)
+
+
 class Lab:
     def __init__(self, binary, ctl=None):
         self.binary, self.ctl = binary, ctl
@@ -651,6 +674,12 @@ class Lab:
         link = Link(self, name, router_cidr, peer_cidr)
         self.links.append(link)
         return link
+
+    def bridge(self, name, router_cidr):
+        """A bridge with the address `router_cidr`, for ports to be made on."""
+        bridge = Bridge(self, name, router_cidr)
+        self.links.append(bridge)
+        return bridge
 
     def trunk(self, name):
         """A link with no address of its own, for VLANs."""
