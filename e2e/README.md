@@ -7,15 +7,19 @@ control socket, the avahi socket and the neighbour table. Everything is
 checked from outside, as a device on the other end of a link would see it.
 
 ```
-cargo build --release
-python3 e2e/e2e.py --ctl target/release/mdnsctl target/release/mdnsd
+cargo build --features test-clock
+python3 e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd
 ```
+
+The daemon is built with `test-clock`, a clock of its own that the tests move
+forward (see below), so that nothing waits for a timer: the whole suite runs in
+a few seconds. A daemon without it runs the tests that do not need the clock and
+skips the others.
 
 | Option | |
 |---|---|
 | `-k PATTERN` | only the tests with this in their name (repeat for more) |
 | `-v` | name each test as it runs |
-| `--slow` | also the tests that wait on a timer, about a minute (CI does) |
 | `--logs DIR` | keep the daemon's log of each test in `DIR` |
 | `--list` | list the tests |
 
@@ -39,8 +43,25 @@ matches), `Link.device(addr)` (a device to send and be sent to), `Daemon`
 (`wait_log`, `request`, `ctl`, `stop`), and DNS to build and parse messages.
 Scenarios are in `tests.py`.
 
-A test that waits for something that must *not* happen uses `none(...)`, which
-waits a second and a half: keep those few.
+Nothing in the lab sleeps, and nothing waits for a timer. Waits are for what
+happens: `wait` on a hearer or the daemon's log is woken by each packet or line,
+and the time it is given is how long a test has to fail.
+
+**The clock.** The daemon built with `--features test-clock` has a monotonic
+clock that is at a fixed time when it starts, and moves only when `Daemon.advance(seconds)`
+(the control socket's `advance <milliseconds>`) says, by exactly that much. It
+does not wait for a timer, so what the daemon does after a delay of its own, an
+announcement again a second on, a question asked a quarter of the way into a
+TTL, a probe's rounds, is done when the clock is moved past it:
+`Daemon.advance_until(condition)` moves it on a step at a time until the
+condition is so. A request waits on the daemon's clock, not the test's.
+(`mdnsctl --wait` is mdnsctl's own time: give it a millisecond.)
+
+**Nothing heard.** A negative check does not wait to be sure: the daemon handles
+what has come to its sockets, then the interface changes the kernel told it of,
+then requests, so `Daemon.settle()`, a request, returns once everything sent
+before it has been done, and `Hearer.none(...)` looks at what has come by then.
+Make the daemon do what must not be heard of, `settle`, then `none`.
 
 ## Coverage
 

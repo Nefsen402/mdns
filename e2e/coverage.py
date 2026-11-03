@@ -6,7 +6,7 @@ The steps, which CI runs as jobs of their own, one after another:
     coverage.py build  --out BIN                  build, with instrumentation
     coverage.py unit   --binaries BIN --out PROF  run the unit tests from it
     coverage.py e2e    --binaries BIN --out PROF  run the end-to-end tests on it
-                       [--logs DIR] [--no-slow]
+                       [--logs DIR]
     coverage.py report --binaries BIN --profiles PROF... --out REPORT
                                                   merge the profiles, report
 
@@ -86,7 +86,9 @@ def build(out):
     target = os.path.join(ROOT, "target", "coverage")
     env = dict(os.environ, CARGO_TARGET_DIR=target)
     env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -C instrument-coverage").strip()
-    run(["cargo", "build", "--locked"], env)
+    # The daemon has a clock the end-to-end tests move, so that they do not wait
+    # for a timer; the unit tests are of the code without it.
+    run(["cargo", "build", "--locked", "--features", "test-clock"], env)
     built = subprocess.run(
         ["cargo", "test", "--locked", "--no-run", "--message-format=json"], cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True, check=True
     )
@@ -122,12 +124,10 @@ def unit(binaries, out):
         run([absolute(t)], env)
 
 
-def e2e(binaries, out, slow=True, logs=None):
+def e2e(binaries, out, logs=None):
     mdnsd, mdnsctl = absolute(os.path.join(binaries, "mdnsd")), absolute(os.path.join(binaries, "mdnsctl"))
     make_executable([mdnsd, mdnsctl])
     cmd = [sys.executable, os.path.join(ROOT, "e2e", "e2e.py"), "--ctl", mdnsctl, mdnsd]
-    if slow:
-        cmd.insert(2, "--slow")
     if logs:
         cmd[2:2] = ["--logs", absolute(logs)]
     # Where user namespaces are forbidden, as root.
@@ -222,7 +222,6 @@ def main():
     e = sub.add_parser("e2e", help="run the end-to-end tests, and keep their profile")
     e.add_argument("--binaries", required=True)
     e.add_argument("--out", required=True)
-    e.add_argument("--no-slow", action="store_true", help="leave out the tests that wait on a timer")
     e.add_argument("--logs", help="keep the daemon's log of each test here")
     r = sub.add_parser("report", help="merge profiles and report")
     r.add_argument("--binaries", required=True)
@@ -231,7 +230,6 @@ def main():
     r.add_argument("--baseline", help="a summary.json of before, to say how the figures moved")
     a = sub.add_parser("all", help="every step, here")
     a.add_argument("--baseline")
-    a.add_argument("--no-slow", action="store_true")
     a.add_argument("--out", default=os.path.join(ROOT, "target", "coverage", "report"))
     args = p.parse_args()
 
@@ -240,7 +238,7 @@ def main():
     elif args.step == "unit":
         unit(args.binaries, args.out)
     elif args.step == "e2e":
-        e2e(args.binaries, args.out, not args.no_slow, args.logs)
+        e2e(args.binaries, args.out, args.logs)
     elif args.step == "report":
         report(args.binaries, args.profiles, args.out, args.baseline)
     else:
@@ -250,7 +248,7 @@ def main():
             shutil.rmtree(d, ignore_errors=True)
         build(binaries)
         unit(binaries, unit_prof)
-        e2e(binaries, e2e_prof, not getattr(args, "no_slow", False))
+        e2e(binaries, e2e_prof)
         out = getattr(args, "out", os.path.join(work, "report"))
         report(binaries, [unit_prof, e2e_prof], out, getattr(args, "baseline", None))
 

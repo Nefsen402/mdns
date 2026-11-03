@@ -293,8 +293,12 @@ fn event_loop(
         fds.extend(server.fds());
         let avahi_at = fds.len();
         fds.extend(avahi.as_ref().map(avahi_compat::Server::fds).unwrap_or_default());
-        poll::wait(&mut fds, next.map(|at| at.saturating_duration_since(Instant::now())))
-            .context("waiting for something to do")?;
+        let timeout = next.map(|at| at.saturating_duration_since(Instant::now()));
+        // A clock that moves only when it is told to is not waited on: what is not
+        // due now is due after the request that moves it, which wakes the loop.
+        #[cfg(feature = "test-clock")]
+        let timeout = timeout.filter(|wait| wait.is_zero());
+        poll::wait(&mut fds, timeout).context("waiting for something to do")?;
         if let Some(name) = signals.take() {
             return Ok(name);
         }
@@ -311,10 +315,6 @@ fn event_loop(
                 }
             });
         }
-        server.ready(&fds[clients..avahi_at]);
-        if let Some(avahi) = avahi.as_mut().filter(|_| avahi_at < fds.len()) {
-            avahi.ready(&fds[avahi_at..]);
-        }
         if let Some(n) = netlink.as_ref().filter(|_| poll::ready(&fds[1])) {
             match n.changes() {
                 Ok(changes) => links::follow(n, links, &changes),
@@ -323,6 +323,13 @@ fn event_loop(
                     netlink = None;
                 }
             }
+        }
+        // Requests last, so that one is answered with what everything that came
+        // before it has done, and what a request does (move the test clock, say)
+        // is run on before the next one is.
+        server.ready(&fds[clients..avahi_at]);
+        if let Some(avahi) = avahi.as_mut().filter(|_| avahi_at < fds.len()) {
+            avahi.ready(&fds[avahi_at..]);
         }
         let now = Instant::now();
         for link in links.iter() {

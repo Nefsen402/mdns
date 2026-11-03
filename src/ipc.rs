@@ -729,6 +729,8 @@ pub fn handle(groups: &[Group], watches: &Watches, request: &str) -> String {
         "devices" => devices(groups, arg),
         "probe" => probe(groups, arg),
         "timers" => timer_list(groups),
+        #[cfg(feature = "test-clock")]
+        "advance" => advance(arg),
         "watchers" => watches.json(),
         "watch" => error("watch streams events: it needs a connection of its own"),
         "" => error("empty request"),
@@ -837,6 +839,20 @@ fn probe(groups: &[Group], name: &str) -> Value {
             probe_reply(probes.into_iter().map(|(interface, id)| (interface.clone(), done(&interface, id))).collect())
         }
         Err(reply) => reply,
+    }
+}
+
+/// Move the clock forward by the milliseconds `arg` says. What is due by then is
+/// done before the next request is answered: the event loop runs what is due
+/// after the request that moved the clock.
+#[cfg(feature = "test-clock")]
+fn advance(arg: &str) -> Value {
+    match arg.parse::<u64>() {
+        Ok(ms) => {
+            crate::time::advance(Duration::from_millis(ms));
+            json!({ "ok": true, "advanced_ms": ms })
+        }
+        Err(_) => error("advance <milliseconds>"),
     }
 }
 
@@ -1178,6 +1194,26 @@ mod tests {
             handle(&[g], &Watches::default(), "probe media"),
             r#"{"ok":true,"probed":[{"interface":"a","queries":0,"error":null}]}"#
         );
+    }
+
+    /// The clock moves forward only where the daemon is built with one that can.
+    /// Where it is, it is a clock of its own that the other tests, which run in the
+    /// same process, would share: run it on its own (`-- --test-threads=1`).
+    #[test]
+    fn the_clock_is_moved_only_by_a_daemon_built_for_it() {
+        let (g, _) = group("media", Family::V4, &["a", "b"]);
+        let groups = [g];
+        let out = handle(&groups, &Watches::default(), "advance 1500");
+        if cfg!(feature = "test-clock") {
+            let before = Instant::now();
+            assert_eq!(Instant::now(), before, "it does not move by itself");
+            let out2 = handle(&groups, &Watches::default(), "advance 2000");
+            assert!(out.contains(r#""ok":true"#) && out2.contains(r#""advanced_ms":2000"#), "{out} {out2}");
+            assert_eq!(Instant::now(), before + Duration::from_secs(2), "and by exactly what it is told");
+            assert!(handle(&groups, &Watches::default(), "advance soon").contains("advance <milliseconds>"));
+        } else {
+            assert!(out.contains("unknown command"), "{out}");
+        }
     }
 
     #[test]

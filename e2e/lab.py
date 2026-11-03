@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unittest
 
 GROUP = "224.0.0.251"
 PORT = 5353
@@ -35,16 +36,30 @@ def sh(*args, check=True):
     return r
 
 
-def until(condition, timeout=5.0, every=0.02):
-    """The value `condition` gives once it gives one that is not false, or None."""
-    end = time.time() + timeout
-    while True:
-        value = condition()
-        if value:
-            return value
-        if time.time() >= end:
-            return None
-        time.sleep(every)
+# Woken whenever something is heard or the daemon says something: what a wait
+# is for. Nothing in the lab sleeps; `timeout` is how long a test is let to fail.
+_changed = threading.Condition()
+
+
+def changed():
+    with _changed:
+        _changed.notify_all()
+
+
+def until(condition, timeout=5.0):
+    """The value `condition` gives once it gives one that is not false, or None
+    if it does not within `timeout`. It is looked at again each time something
+    changes, not each so often."""
+    end = time.monotonic() + timeout
+    with _changed:
+        while True:
+            value = condition()
+            if value:
+                return value
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            _changed.wait(left)
 
 
 # ---------------------------------------------------------------- DNS, as much as is needed
@@ -205,6 +220,7 @@ class Hearer(threading.Thread):
     def __init__(self, interface, addr, group=True, sock=None):
         super().__init__(daemon=True)
         self.heard, self.stopped = [], False
+        self.reading = threading.Lock()
         self.socks = []
         if sock:
             # Of one that is read from only here: a second socket on the same
@@ -233,15 +249,30 @@ class Hearer(threading.Thread):
     def run(self):
         while not self.stopped:
             ready, _, _ = select.select([s for s, _ in self.socks], [], [], 0.05)
+            self._take(ready)
+
+    def _take(self, ready):
+        """Everything waiting in `ready`."""
+        got = False
+        with self.reading:
             for s in ready:
-                try:
-                    data, src = s.recvfrom(9000)
-                except BlockingIOError:
-                    continue
-                message = parse(data)
-                if message:
-                    to_group = next(g for sock, g in self.socks if sock is s)
-                    self.heard.append(Heard(time.time(), src[0], to_group, message))
+                while True:
+                    try:
+                        data, src = s.recvfrom(9000)
+                    except (BlockingIOError, OSError):
+                        break
+                    message = parse(data)
+                    if message:
+                        to_group = next(g for sock, g in self.socks if sock is s)
+                        self.heard.append(Heard(time.time(), src[0], to_group, message))
+                        got = True
+        if got:
+            changed()
+
+    def flush(self):
+        """Take what has come to the sockets by now, instead of when the thread
+        gets to it: what the daemon sent before is here."""
+        self._take([s for s, _ in self.socks])
 
     def close(self):
         self.stopped = True
@@ -265,9 +296,18 @@ class Hearer(threading.Thread):
     def count(self):
         return len(self.heard)
 
-    def none(self, condition, wait=1.5, since=0):
-        """Whether nothing that `condition` says yes to is heard for `wait` seconds."""
-        return self.wait(condition, wait, since) is None
+    def seen(self, condition, since=0):
+        """The first message from index `since` that `condition` says yes to,
+        among what has been sent by now, or None."""
+        self.flush()
+        return next((h for h in self.heard[since:] if condition(h)), None)
+
+    def none(self, condition, since=0):
+        """Whether nothing from index `since` that `condition` says yes to has
+        been heard. It is what has been sent by now: the daemon has to have
+        been made to do what is not to be heard of ([`Daemon.settle`]) first."""
+        self.flush()
+        return not any(condition(h) for h in self.heard[since:])
 
 
 class Device:
@@ -321,6 +361,7 @@ class Daemon:
         for line in self.proc.stderr:
             with self.lock:
                 self.lines.append(line.rstrip("\n"))
+            changed()
 
     def log(self):
         with self.lock:
@@ -379,6 +420,39 @@ class Daemon:
         s.close()
         return json.loads(data)
 
+    def settle(self):
+        """Return once the daemon has done what it was sent before: it handles
+        what has come to its sockets before it answers a request, so a request
+        is a wait for it."""
+        self.request("timers")
+
+    def advance(self, seconds):
+        """Move the daemon's clock forward, and return once what is due by
+        then is done: the daemon runs what is due after the request that moves
+        the clock, and before the next. Its clock moves only by this."""
+        reply = self.request(f"advance {round(seconds * 1000)}")
+        if not reply.get("ok"):
+            raise unittest.SkipTest("the daemon has no clock to move: build it with --features test-clock")
+        self.settle()
+
+    def advance_until(self, condition, step=0.25, limit=30):
+        """Move the clock on a step at a time until `condition` gives something
+        that is not false, which is what it gives, or the clock has moved `limit`
+        seconds: for what the daemon does after a delay of its own."""
+        for _ in range(round(limit / step) + 1):
+            value = condition()
+            if value:
+                return value
+            self.advance(step)
+        return condition()
+
+    def ctl_start(self, *args):
+        """mdnsctl, started, for one that waits on the daemon's clock; the output
+        is read with `finish`."""
+        return subprocess.Popen(
+            [self.ctl_binary, "-s", self.socket_path, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+
     def devices(self, segment):
         return self.request(f"devices {segment}")["devices"]
 
@@ -394,17 +468,37 @@ class Daemon:
 
     def avahi(self, path, line, timeout=15):
         """What the avahi socket at `path` answers a request line with."""
+        return self.avahi_send(path, line).reply(timeout)
+
+    def avahi_send(self, path, line):
+        """Ask the avahi socket at `path`, and read the answer later: one that
+        is waited for is not answered until the clock has moved. The daemon has
+        the request by the time this and a [`Daemon.settle`] are done."""
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(timeout)
         s.connect(path)
         s.sendall(line.encode() + b"\n")
+        return AvahiCall(s)
+
+
+class AvahiCall:
+    """A request to the avahi socket that has been sent."""
+
+    def __init__(self, sock):
+        self.sock = sock
+
+    def answered(self):
+        """Whether the answer has come by now."""
+        return bool(select.select([self.sock], [], [], 0)[0])
+
+    def reply(self, timeout=15):
+        self.sock.settimeout(timeout)
         data = b""
         while not data.endswith(b"\n"):
-            chunk = s.recv(4096)
+            chunk = self.sock.recv(4096)
             if not chunk:
                 break
             data += chunk
-        s.close()
+        self.sock.close()
         return data.decode().strip()
 
 
@@ -442,9 +536,11 @@ class Lab:
         self.binary, self.ctl = binary, ctl
         self.dir = tempfile.mkdtemp(prefix="mdnsd-e2e-")
         self.daemons, self.links, self.tracked = [], [], []
-        ours = os.readlink("/proc/self/ns/net")
-        self.holder = subprocess.Popen(["unshare", "-n", "--", "sleep", "infinity"])
-        if not until(lambda: os.readlink(f"/proc/{self.holder.pid}/ns/net") != ours, 5):
+        # The router's namespace is held by a process that says when it is in it.
+        self.holder = subprocess.Popen(
+            ["unshare", "-n", "--", "sh", "-c", "echo ready; exec sleep infinity"], stdout=subprocess.PIPE, text=True
+        )
+        if self.holder.stdout.readline().strip() != "ready":
             raise RuntimeError("no namespace for the router")
         self.router("ip", "link", "set", "lo", "up")
         # Addresses are there at once, for what is sent from them.

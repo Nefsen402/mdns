@@ -17,6 +17,10 @@ path = "src/ipc_client.rs"
 # interface it came in on. Linux pins a socket to each interface; this is to
 # test the other on it.
 portable-sockets = []
+# A clock that can be moved forward, by the control socket's `advance` request,
+# so that a test of what the daemon does when a time has passed does not wait
+# for it. Not for a daemon that is used: its time would not be the time.
+test-clock = []
 
 [dependencies]
 anyhow = { version = "1.0.104", default-features = false }

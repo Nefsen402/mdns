@@ -4,7 +4,7 @@ that come and go, addresses that change, real sockets, signals, the control
 socket and the avahi socket, all from outside, over the network, in network
 namespaces.
 
-    e2e.py [-v] [-k PATTERN] [--slow] [--ctl MDNSCTL] [--logs DIR] MDNSD
+    e2e.py [-v] [-k PATTERN] [--ctl MDNSCTL] [--logs DIR] MDNSD
 
 It needs `ip`, `unshare` and `nsenter` (iproute2 and util-linux). It makes its
 own user and network namespaces, as the fuzzer and the benchmark do, so it
@@ -28,7 +28,6 @@ def main():
     p.add_argument("--ctl", help="the mdnsctl binary, for the tests that run it")
     p.add_argument("-k", dest="pattern", action="append", default=[], help="only tests whose name has this (may be repeated)")
     p.add_argument("-v", "--verbose", action="store_true", help="name each test as it runs")
-    p.add_argument("--slow", action="store_true", help="also the tests that wait a minute for a timer")
     p.add_argument("--logs", help="write the daemon's log of each test to this directory")
     p.add_argument("--list", action="store_true", help="list the tests and stop")
     args = p.parse_args()
@@ -37,7 +36,7 @@ def main():
         daemon = os.path.abspath(args.daemon)
         if not os.access(daemon, os.X_OK):
             sys.exit(f"{args.daemon} is not an executable")
-        env = dict(os.environ, E2E_INSIDE="1", E2E_DAEMON=daemon, E2E_SLOW="1" if args.slow else "")
+        env = dict(os.environ, E2E_INSIDE="1", E2E_DAEMON=daemon)
         if args.ctl:
             env["E2E_CTL"] = os.path.abspath(args.ctl)
         if args.logs:
@@ -73,7 +72,7 @@ def main():
         for t in walk(suite):
             print(t.id().split(".", 1)[1])
         return
-    result = unittest.TextTestRunner(verbosity=2 if args.verbose else 1).run(suite)
+    result = unittest.TextTestRunner(verbosity=2 if args.verbose else 1, **({"durations": 5} if sys.version_info >= (3, 12) else {})).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
 
 

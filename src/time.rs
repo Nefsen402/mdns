@@ -9,14 +9,38 @@ use core::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Instant(Duration);
 
+/// With the `test-clock` feature the clock is not the system's: it is at a fixed
+/// time when the daemon starts, and moves only when [`advance`] says, by exactly
+/// that much, however long the daemon runs. What happens when a time has passed
+/// then does not depend on how long anything took.
+#[cfg(feature = "test-clock")]
+static CLOCK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(START_OF_TEST_TIME.as_nanos() as u64);
+
+/// Where the test clock starts: an hour in, which is further than any time
+/// the daemon looks back from now.
+#[cfg(feature = "test-clock")]
+const START_OF_TEST_TIME: Duration = Duration::from_secs(3600);
+
+/// Move the test clock forward by `by`.
+#[cfg(feature = "test-clock")]
+pub fn advance(by: Duration) {
+    let nanos = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
+    CLOCK.fetch_add(nanos, core::sync::atomic::Ordering::Relaxed);
+}
+
 impl Instant {
     /// The start of the clock: before anything that has happened.
     pub const START: Instant = Instant(Duration::ZERO);
 
     /// Now.
     pub fn now() -> Instant {
-        let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-        Instant(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+        #[cfg(feature = "test-clock")]
+        return Instant(Duration::from_nanos(CLOCK.load(core::sync::atomic::Ordering::Relaxed)));
+        #[cfg(not(feature = "test-clock"))]
+        {
+            let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+            Instant(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+        }
     }
 
     /// How long after `earlier` this is: zero if it is not after it.
