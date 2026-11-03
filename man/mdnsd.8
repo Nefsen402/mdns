@@ -73,7 +73,7 @@ A probe runs on every interface at startup, and again whenever
 is run, or every
 .B ProbeInterval=
 if one is set for a segment the interface is in, or in the
-.B [Probe]
+.B [Interface]
 section of
 .BR mdnsd.conf (5)
 (it is not by default).
@@ -102,7 +102,7 @@ announced, and asks again until it answers or expires.
 This is the
 .B RefreshBefore=
 setting of the
-.B [Probe]
+.B [Interface]
 section (30 seconds by default); see
 .BR mdnsd.conf (5).
 .SS Advertising

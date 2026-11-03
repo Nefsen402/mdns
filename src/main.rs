@@ -167,14 +167,14 @@ fn daemon(args: Vec<String>) -> Result<()> {
             eprintln!("{interface}: announcing reflected devices again at 80% of their TTL, changed or not");
         }
     }
-    match config.refresh_before {
-        Some(before) => {
-            eprintln!(
-                "asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
+    for interface in config.interfaces() {
+        match config.refresh_before_of(interface) {
+            Some(before) => eprintln!(
+                "{interface}: asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
                 before.as_secs()
-            );
+            ),
+            None => eprintln!("{interface}: refreshing devices before they expire is off"),
         }
-        None => eprintln!("refreshing devices before they expire is off"),
     }
     // Each interface is probed as often as the most frequent of its segments
     // asks.
@@ -187,7 +187,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
                 // devices.
                 // Most devices announce their addresses for two minutes.
                 let kept = config.min_lifetime_of(interface).max(core::time::Duration::from_secs(120));
-                if config.refresh_before.is_none() && interval > kept {
+                if config.refresh_before_of(interface).is_none() && interval > kept {
                     eprintln!(
                         "warning: that is longer than the {}s a device is usually kept without being heard from, \
                          so devices on {interface} whose records all expire sooner will come and go between probes",

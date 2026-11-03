@@ -493,7 +493,7 @@ class Timers(Case):
     def test_a_device_about_to_expire_is_asked_at_its_own_address_and_then_on_the_group(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         ha = la.hearer()
-        d = self.lab.daemon(conf("[Probe]\nRefreshBefore=30s\n[Interface]\nMinimumLifetime=40s\n[Segment]\nName=s\nInterfaces=ra\n"))
+        d = self.lab.daemon(conf("[Interface]\nRefreshBefore=30s\nMinimumLifetime=40s\n[Segment]\nName=s\nInterfaces=ra\n"))
         dev = la.device("10.9.1.50")
         dev.multicast(announcement("dev", "10.9.1.50", ttl=40))
         d.settle()
@@ -523,7 +523,7 @@ class Timers(Case):
     def test_a_device_with_a_short_ttl_is_asked_three_quarters_of_the_way_in_and_not_at_once(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         # No minimum lifetime, so it lives for its TTL, which is less than the margin.
-        d = self.lab.daemon(conf("[Probe]\nRefreshBefore=30s\n[Interface]\nMinimumLifetime=0\n[Segment]\nName=s\nInterfaces=ra\n"))
+        d = self.lab.daemon(conf("[Interface]\nRefreshBefore=30s\nMinimumLifetime=0\n[Segment]\nName=s\nInterfaces=ra\n"))
         dev = la.device("10.9.1.50")
         dev.multicast(announcement("dev", "10.9.1.50", ttl=20))
         d.settle()
@@ -540,7 +540,7 @@ class Timers(Case):
 
     def test_a_ttl_of_a_second_is_kept_the_minute_and_asked_once_in_it(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
-        d = self.lab.daemon(conf("[Probe]\nRefreshBefore=30s\n[Segment]\nName=s\nInterfaces=ra\n"))
+        d = self.lab.daemon(conf("[Interface]\nRefreshBefore=30s\n[Segment]\nName=s\nInterfaces=ra\n"))
         dev = la.device("10.9.1.50")
         dev.multicast(announcement("dev", "10.9.1.50", ttl=1))
         d.settle()

@@ -9,10 +9,6 @@
 //! Socket=/run/mdnsd/mdnsd.sock
 //! Mode=0666           ; who may use it, as an octal mode; 0666 unless set
 //!
-//! [Probe]             ; optional
-//! RefreshBefore=30s
-//! ProbeInterval=4min  ; off unless set
-//!
 //! [Advertise]         ; optional
 //! Hostname=router.local
 //! Interface=br0       ; all of them unless set
@@ -25,7 +21,7 @@
 //! [Segment]
 //! Name="IoT"
 //! Interfaces=wifi
-//! ProbeInterval=1min  ; [Probe] ProbeInterval= unless set
+//! ProbeInterval=1min  ; its interfaces' ProbeInterval= unless set
 //! ForwardQuestions=unknown  ; always, unknown or never; always unless set
 //! ReflectedWhen=address,hostname  ; what a device must have to be reflected; all three unless set
 //!
@@ -33,6 +29,8 @@
 //! MaxAddresses=8      ; 8 unless set
 //! MaxDevices=1024     ; 1024 unless set
 //! MaxServices=64      ; 64 unless set
+//! RefreshBefore=30s   ; how long before a device expires to ask it again; 30s unless set, off turns it off
+//! ProbeInterval=4min  ; how often to browse the interface for devices; off unless set
 //!
 //! [Interface]         ; optional, for each interface that needs its own
 //! Name=wifi
@@ -166,8 +164,9 @@ pub struct SegmentConfig {
     /// Interfaces of the segment that are announced nothing: their devices
     /// are announced to the others, but not the others' to them.
     pub untrusted: Vec<String>,
-    /// How often to probe its interfaces for devices: `None` follows
-    /// `[Probe] ProbeInterval=`, and `Some(None)` is off for this segment.
+    /// How often to probe its interfaces for devices: `None` follows the
+    /// `ProbeInterval=` of each interface, and `Some(None)` is off for this
+    /// segment.
     pub probe_interval: Option<Option<Duration>>,
     /// Which questions asked on one of its interfaces are put to the others.
     pub forward: Forward,
@@ -194,6 +193,13 @@ pub struct InterfaceConfig {
     /// whatever TTLs it announced: the default is [`DEFAULT_MIN_LIFETIME`], and
     /// zero keeps it for exactly its longest TTL.
     pub min_lifetime: Option<Duration>,
+    /// How long before a device heard on it would expire to ask it to answer
+    /// again: the default is [`DEFAULT_REFRESH_BEFORE`], and `Some(None)` is
+    /// off.
+    pub refresh_before: Option<Option<Duration>>,
+    /// How often to probe it for devices, for the segments that do not say:
+    /// `None` is off, and so is `Some(None)`.
+    pub probe_interval: Option<Option<Duration>>,
     /// How many addresses of a family a device heard on it is kept with, at
     /// most: the default is [`DEFAULT_MAX_ADDRS`].
     pub max_addrs: Option<usize>,
@@ -247,13 +253,6 @@ pub struct Config {
     pub avahi_socket: Option<String>,
     /// The names this host announces and answers for, with its own addresses.
     pub advertise: Vec<AdvertiseConfig>,
-    /// How often to probe the interfaces of segments that do not set their
-    /// own; `None` (the default) probes only at startup and on request. See
-    /// [`Config::probe_interval_of`].
-    pub probe_interval: Option<Duration>,
-    /// How long before a device would expire to ask it to answer again;
-    /// `None` leaves that to the periodic probe.
-    pub refresh_before: Option<Duration>,
 }
 
 impl Default for Config {
@@ -267,8 +266,6 @@ impl Default for Config {
             socket_mode: DEFAULT_SOCKET_MODE,
             avahi_socket: None,
             advertise: Vec::new(),
-            probe_interval: None,
-            refresh_before: Some(DEFAULT_REFRESH_BEFORE),
         }
     }
 }
@@ -292,13 +289,21 @@ impl Config {
 
     /// How often to probe `interface` for devices: as often as the most
     /// frequent of the segments it is in asks, each its own `ProbeInterval=`
-    /// or else the one in `[Probe]`; `None` if none of them probes.
+    /// or else that of the interface; `None` if none of them probes.
     pub fn probe_interval_of(&self, interface: &str) -> Option<Duration> {
+        let own = self.setting_of(interface, |i| i.probe_interval).flatten();
         self.segments
             .iter()
             .filter(|seg| seg.interfaces.iter().any(|i| i == interface))
-            .filter_map(|seg| seg.probe_interval.unwrap_or(self.probe_interval))
+            .filter_map(|seg| seg.probe_interval.unwrap_or(own))
             .min()
+    }
+
+    /// How long before a device heard on `interface` would expire to ask it to
+    /// answer again: its `RefreshBefore=`, or else [`DEFAULT_REFRESH_BEFORE`];
+    /// `None` leaves that to the periodic probe.
+    pub fn refresh_before_of(&self, interface: &str) -> Option<Duration> {
+        self.setting_of(interface, |i| i.refresh_before).unwrap_or(Some(DEFAULT_REFRESH_BEFORE))
     }
 
     /// A setting of `interface`: the one in its own `[Interface]`, or else the
@@ -416,6 +421,14 @@ impl Config {
                     ("interface", "maxaddresses") => {
                         config.interface_settings.last_mut().unwrap().max_addrs = Some(parse_limit(&value, lineno, "MaxAddresses")?);
                     }
+                    ("interface", "probeinterval") => {
+                        let interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
+                        config.interface_settings.last_mut().unwrap().probe_interval = Some(interval);
+                    }
+                    ("interface", "refreshbefore") => {
+                        let before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
+                        config.interface_settings.last_mut().unwrap().refresh_before = Some(before);
+                    }
                     ("interface", "minimumlifetime") => {
                         config.interface_settings.last_mut().unwrap().min_lifetime = Some(parse_lifetime(&value, lineno)?);
                     }
@@ -439,18 +452,17 @@ impl Config {
                     }
                     ("listen", "ipv4") => config.ipv4 = parse_listen(entry, lineno, "IPv4")?,
                     ("listen", "ipv6") => config.ipv6 = parse_listen(entry, lineno, "IPv6")?,
-                    ("probe", "probeinterval") => {
-                        config.probe_interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
+                    ("probe", "probeinterval" | "interval") => {
+                        bail!("line {lineno}: ProbeInterval= is now a setting of [Interface]")
                     }
-                    ("probe", "interval") => bail!("line {lineno}: Interval= is now called ProbeInterval="),
+                    ("probe", "refreshbefore") => {
+                        bail!("line {lineno}: RefreshBefore= is now a setting of [Interface]")
+                    }
                     ("devices", "minimumlifetime") => {
                         bail!("line {lineno}: MinimumLifetime= is now a setting of [Interface]")
                     }
                     ("devices", "maxaddresses") => {
                         bail!("line {lineno}: MaxAddresses= is now a setting of [Interface]")
-                    }
-                    ("probe", "refreshbefore") => {
-                        config.refresh_before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
                     }
                     ("advertise", "hostname") => {
                         config.advertise.last_mut().unwrap().name = local_name(&value, lineno)?;
@@ -1398,10 +1410,10 @@ interfaces=br0,wifi
 
     #[test]
     fn the_probe_interval_is_off_by_default_and_takes_systemd_time_spans() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().probe_interval, None);
+        assert_eq!(Config::parse(EXAMPLE).unwrap().probe_interval_of("br0"), None);
 
-        let with = |v: &str| Config::parse(&format!("[Probe]\nProbeInterval={v}\n{EXAMPLE}"));
-        let secs = |v: &str| with(v).unwrap().probe_interval.map(|d| d.as_secs());
+        let with = |v: &str| Config::parse(&format!("[Interface]\nProbeInterval={v}\n{EXAMPLE}"));
+        let secs = |v: &str| with(v).unwrap().probe_interval_of("br0").map(|d| d.as_secs());
         assert_eq!(secs("4min"), Some(240));
         assert_eq!(secs("30s"), Some(30));
         assert_eq!(secs("1h"), Some(3600));
@@ -1415,18 +1427,36 @@ interfaces=br0,wifi
 
     #[test]
     fn bad_probe_intervals_are_rejected_with_their_line() {
-        let with = |v: &str| error_of(&format!("[Probe]\nProbeInterval={v}\n{EXAMPLE}"));
+        let with = |v: &str| error_of(&format!("[Interface]\nProbeInterval={v}\n{EXAMPLE}"));
         assert!(with("soon").contains("line 2") && with("soon").contains("invalid ProbeInterval"));
         assert!(with("5s").contains("at least 10 seconds"));
         assert!(with("").contains("line 2"), "an empty value is not a time span");
         assert!(with("3 fortnights").contains("invalid"));
-        // The old name says what it is called now.
-        let old = error_of(&format!("[Probe]\nInterval=4min\n{EXAMPLE}"));
-        assert!(old.contains("line 2") && old.contains("ProbeInterval="), "{old}");
     }
 
-    /// Three segments over br0: one that follows [Probe], one with its own
-    /// interval, and one that turns probing off for itself.
+    #[test]
+    fn the_probe_settings_are_said_to_be_of_interface_now() {
+        for (setting, key) in [("ProbeInterval=4min", "ProbeInterval="), ("Interval=4min", "ProbeInterval="), ("RefreshBefore=30s", "RefreshBefore=")] {
+            let err = error_of(&format!("[Probe]\n{setting}\n{EXAMPLE}"));
+            assert!(err.contains("line 2") && err.contains(key) && err.contains("[Interface]"), "{setting}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_interface_probes_and_refreshes_as_its_own_section_says_or_else_the_one_for_all() {
+        let c = Config::parse(&format!(
+            "{EXAMPLE}\n[Interface]\nProbeInterval=4min\nRefreshBefore=1min\n[Interface]\nName=wifi\nProbeInterval=off\nRefreshBefore=off\n[Interface]\nName=media\nProbeInterval=1min"
+        ))
+        .unwrap();
+        let probe = |i: &str| c.probe_interval_of(i).map(|d| d.as_secs());
+        let refresh = |i: &str| c.refresh_before_of(i).map(|d| d.as_secs());
+        assert_eq!((probe("br0"), probe("media"), probe("wifi")), (Some(240), Some(60), None));
+        assert_eq!((refresh("br0"), refresh("media"), refresh("wifi")), (Some(60), Some(60), None));
+        assert_eq!(refresh("elsewhere"), Some(60), "an interface with no section of its own has the one for all");
+    }
+
+    /// Three segments over br0: one that follows its interfaces', one with its
+    /// own interval, and one that turns probing off for itself.
     fn probing(probe: &str) -> Config {
         Config::parse(&format!(
             "{probe}
@@ -1447,21 +1477,21 @@ ProbeInterval=off
     }
 
     #[test]
-    fn a_segment_probes_as_often_as_it_says_or_else_as_probe_says() {
-        let c = probing("[Probe]\nProbeInterval=4min");
+    fn a_segment_probes_as_often_as_it_says_or_else_as_its_interfaces_say() {
+        let c = probing("[Interface]\nProbeInterval=4min");
         let secs = |iface: &str| c.probe_interval_of(iface).map(|d| d.as_secs());
         assert_eq!(c.segments.iter().map(|s| s.probe_interval).collect::<Vec<_>>(), [
             None,
             Some(Some(Duration::from_secs(60))),
             Some(None)
         ]);
-        assert_eq!(secs("lan"), Some(240), "from [Probe]");
+        assert_eq!(secs("lan"), Some(240), "from [Interface]");
         assert_eq!(secs("media"), Some(60));
         assert_eq!(secs("br0"), Some(60), "in two segments: the more frequent one");
-        assert_eq!(secs("wifi"), None, "off for its only segment, whatever [Probe] says");
+        assert_eq!(secs("wifi"), None, "off for its only segment, whatever [Interface] says");
         assert_eq!(secs("nonesuch"), None);
 
-        // Without [Probe], only the segment that asks is probed.
+        // Without a setting of the interface, only the segment that asks is probed.
         let c = probing("");
         assert_eq!(c.probe_interval_of("lan"), None);
         assert_eq!(c.probe_interval_of("br0"), Some(Duration::from_secs(60)));
@@ -1479,10 +1509,10 @@ ProbeInterval=off
 
     #[test]
     fn refreshing_before_expiry_defaults_on_and_takes_systemd_time_spans() {
-        assert_eq!(Config::parse(EXAMPLE).unwrap().refresh_before, Some(DEFAULT_REFRESH_BEFORE));
+        assert_eq!(Config::parse(EXAMPLE).unwrap().refresh_before_of("br0"), Some(DEFAULT_REFRESH_BEFORE));
 
-        let with = |v: &str| Config::parse(&format!("[Probe]\nRefreshBefore={v}\n{EXAMPLE}"));
-        let secs = |v: &str| with(v).unwrap().refresh_before.map(|d| d.as_secs());
+        let with = |v: &str| Config::parse(&format!("[Interface]\nRefreshBefore={v}\n{EXAMPLE}"));
+        let secs = |v: &str| with(v).unwrap().refresh_before_of("br0").map(|d| d.as_secs());
         assert_eq!(secs("1min"), Some(60));
         assert_eq!(secs("30s"), Some(30), "the minimum is allowed");
         assert_eq!(secs("45s"), Some(45));
@@ -1491,10 +1521,10 @@ ProbeInterval=off
             assert_eq!(secs(never), None, "{never}");
         }
         // It is independent of the periodic probe, in both directions.
-        let both = Config::parse(&format!("[Probe]\nProbeInterval=off\nRefreshBefore=2min\n{EXAMPLE}")).unwrap();
-        assert_eq!((both.probe_interval, both.refresh_before), (None, Some(Duration::from_secs(120))));
+        let both = Config::parse(&format!("[Interface]\nProbeInterval=off\nRefreshBefore=2min\n{EXAMPLE}")).unwrap();
+        assert_eq!((both.probe_interval_of("br0"), both.refresh_before_of("br0")), (None, Some(Duration::from_secs(120))));
 
-        let err = |v: &str| error_of(&format!("[Probe]\nRefreshBefore={v}\n{EXAMPLE}"));
+        let err = |v: &str| error_of(&format!("[Interface]\nRefreshBefore={v}\n{EXAMPLE}"));
         assert!(err("20s").contains("RefreshBefore= must be at least 30 seconds"), "{}", err("20s"));
         assert!(err("soon").contains("line 2") && err("soon").contains("invalid RefreshBefore"));
     }

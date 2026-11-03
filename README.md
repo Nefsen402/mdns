@@ -232,7 +232,7 @@ Things to know when using it this way:
 - It shares port 5353 with Avahi or systemd-resolved, so they can stay.
 - It still sends a little: a probe at startup, a question to each device about
   to expire, sent to the device itself unless `[Listen]` says `multicast`
-  (`[Probe] RefreshBefore=off` stops that, at the cost of quiet devices dropping
+  (`[Interface] RefreshBefore=off` stops that, at the cost of quiet devices dropping
   off when their records run out), and what `--query` asks.
   Without `[Advertise]` it announces nothing of its own.
 - Interfaces are named, there is no "every interface". A host on several

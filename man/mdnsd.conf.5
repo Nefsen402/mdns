@@ -158,93 +158,6 @@ With the service of the package, a drop-in makes the directory:
 RuntimeDirectory=avahi-daemon
 RuntimeDirectoryMode=0755
 .fi
-.SS [Probe]
-Optional.
-Both settings are systemd time spans, such as
-.BR 30s ,
-.BR 4min ,
-.B "1h 30min"
-or
-.BR 1.5h ,
-or a bare number of seconds (see
-.BR systemd.time (7)).
-.TP
-.B RefreshBefore=
-Ask a device to answer again this long before it would expire, or one of its
-addresses would.
-Default
-.BR 30s ;
-.B 0
-or
-.B off
-turns it off.
-A device lives for as long as the longest TTL it announced, and at least
-.B MinimumLifetime=
-(one minute by default).
-This long before that runs out, or when a quarter of its life is left if that is
-less (see below), the daemon asks that device, and only it, for
-the records it announced, and asks again about every quarter of this margin
-until it answers or expires.
-Where the family of its address is
-.BR on ,
-the first question is sent to the device's own address, not to the group, as
-a device that sleeps may ignore the group and still answer what is sent to it;
-the questions after it go to the group, and with
-.B multicast
-all do.
-.IP
-Each address of a device lives for the TTL it was announced with, at least the
-minimum lifetime if there is one, so one the device stops announcing is dropped on its own, and
-withdrawn from the other networks; a device is asked again this long before one
-of its addresses would run out, too.
-With
-.B RefreshBefore=
-off, a quiet device's addresses lapse after
-.B MinimumLifetime=
-even while its services live on.
-A speaker whose records live seventy-five minutes is asked at about seventy-four
-minutes.
-Devices that are heard from regularly are never asked, and a device known only by
-the address it was heard from has nothing to ask and is left alone.
-It must be at least 30 seconds.
-.IP
-A device whose records live for less than four times this margin (two minutes,
-with the default of 30 seconds, is the shortest that is asked the whole margin
-before) is asked a quarter of its life before it ends instead, that is, three
-quarters of the way through: one that lives for 20 seconds is asked at 15, and
-is not asked the moment it is heard, nor over and over.
-A device that does not answer is asked again about every quarter of the margin
-(at least five seconds), until it expires.
-.IP
-Devices that go to sleep on battery may ignore questions, and what they
-announced runs out as its TTL says: set
-.B MinimumLifetime=
-to keep them listed for longer, at the cost that a device that really vanishes
-stays listed, and announced to the other networks, for up to that long.
-.TP
-.B ProbeInterval=
-Also probe the interfaces of every segment for devices this often: browse for
-service types and instances.
-A segment can set its own (see
-.BR [Segment] ).
-Not set by default.
-It used to be called
-.BR Interval= ,
-which is now an error that names this key.
-It must be at least 10 seconds.
-This is how a new quiet device that never announces itself is found; without it,
-new devices are found at startup, when they announce themselves (most do when
-they join a network) and by
-.BR "mdnsctl probe" .
-With
-.B RefreshBefore=
-off, a
-.B ProbeInterval=
-has to stay under the time devices are kept (their TTL, two minutes for most
-addresses, or
-.B MinimumLifetime=
-if that is longer) to keep devices listed, and the daemon warns about it at
-startup.
 .SS [Advertise]
 Optional, and there may be any number of them: each is a name of this host,
 with its own services, interfaces and TTL.
@@ -476,8 +389,8 @@ of
 Optional.
 How often to probe the interfaces of this segment for devices, in place of the
 .B ProbeInterval=
-of
-.BR [Probe] ;
+of each of its interfaces (see
+.BR [Interface] );
 .B 0
 or
 .B off
@@ -592,6 +505,81 @@ that is less than
 which counts back from the end of this lifetime.
 .IP
 It applies to the devices heard on the interface whichever segment reflects them.
+.TP
+.B RefreshBefore=
+Ask a device heard on this interface to answer again this long before it would
+expire, or one of its addresses would, as a time span like
+.BR MinimumLifetime= .
+Default
+.BR 30s ;
+.B 0
+or
+.B off
+turns it off.
+A device lives for as long as the longest TTL it announced, and at least
+.B MinimumLifetime=
+(one minute by default).
+This long before that runs out, or when a quarter of its life is left if that is
+less (see below), the daemon asks that device, and only it, for
+the records it announced, and asks again about every quarter of this margin
+until it answers or expires.
+Where the family of its address is
+.BR on ,
+the first question is sent to the device's own address, not to the group, as
+a device that sleeps may ignore the group and still answer what is sent to it;
+the questions after it go to the group, and with
+.B multicast
+all do.
+.IP
+Each address of a device lives for the TTL it was announced with, at least the
+minimum lifetime if there is one, so one the device stops announcing is dropped on its own, and
+withdrawn from the other networks; a device is asked again this long before one
+of its addresses would run out, too.
+With
+.B RefreshBefore=
+off, a quiet device's addresses lapse after
+.B MinimumLifetime=
+even while its services live on.
+A speaker whose records live seventy-five minutes is asked at about seventy-four
+minutes.
+Devices that are heard from regularly are never asked, and a device known only by
+the address it was heard from has nothing to ask and is left alone.
+It must be at least 30 seconds.
+.IP
+A device whose records live for less than four times this margin (two minutes,
+with the default of 30 seconds, is the shortest that is asked the whole margin
+before) is asked a quarter of its life before it ends instead, that is, three
+quarters of the way through: one that lives for 20 seconds is asked at 15, and
+is not asked the moment it is heard, nor over and over.
+A device that does not answer is asked again about every quarter of the margin
+(at least five seconds), until it expires.
+.IP
+Devices that go to sleep on battery may ignore questions, and what they
+announced runs out as its TTL says: set
+.B MinimumLifetime=
+to keep them listed for longer, at the cost that a device that really vanishes
+stays listed, and announced to the other networks, for up to that long.
+.TP
+.B ProbeInterval=
+Also probe this interface for devices this often, as a time span: browse for
+service types and instances.
+A segment can set its own for its interfaces (see
+.BR [Segment] ).
+Not set by default.
+It must be at least 10 seconds.
+This is how a new quiet device that never announces itself is found; without it,
+new devices are found at startup, when they announce themselves (most do when
+they join a network) and by
+.BR "mdnsctl probe" .
+With
+.B RefreshBefore=
+off, a
+.B ProbeInterval=
+has to stay under the time devices are kept (their TTL, two minutes for most
+addresses, or
+.B MinimumLifetime=
+if that is longer) to keep devices listed, and the daemon warns about it at
+startup.
 .PP
 .B MinimumLifetime=
 and
@@ -624,9 +612,6 @@ IPv6=on
 [Ipc]
 Socket=/run/mdnsd/mdnsd.sock
 
-[Probe]
-RefreshBefore=30s
-
 [Advertise]
 Hostname=router.local
 TTL=2min
@@ -651,6 +636,7 @@ Untrusted=wifi
 MaxAddresses=8
 MaxDevices=1024
 MaxServices=64
+RefreshBefore=30s
 
 # Some IoT devices sleep and ignore multicast: keep them listed for an hour.
 [Interface]

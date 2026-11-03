@@ -73,7 +73,7 @@ impl Link {
         segment.set_max_devices(config.max_devices_of(interface));
         segment.set_max_services(config.max_services_of(interface));
         segment.set_reannounce(config.reannounce_on(interface));
-        segment.set_refresh_before(config.refresh_before);
+        segment.set_refresh_before(config.refresh_before_of(interface));
 
         Link {
             interface: interface.to_string(),
