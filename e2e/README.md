@@ -16,6 +16,12 @@ forward (see below), so that nothing waits for a timer: the whole suite runs in
 a few seconds. A daemon without it runs the tests that do not need the clock and
 skips the others.
 
+The BSDs cannot pin a socket to an interface, so there is one for each family,
+shared by every interface. The same tests run on a daemon built that way, on
+Linux, with `--features portable-sockets,test-clock`, and CI runs both. What is
+particular to a BSD, such as how it says which interface a datagram came in on,
+is not run here.
+
 | Option | |
 |---|---|
 | `-k PATTERN` | only the tests with this in their name (repeat for more) |
@@ -76,7 +82,8 @@ python3 e2e/coverage.py                                   # all of it, here
 python3 e2e/coverage.py build  --out bin                  # or one step at a time
 python3 e2e/coverage.py unit   --binaries bin --out prof-unit
 python3 e2e/coverage.py e2e    --binaries bin --out prof-e2e
-python3 e2e/coverage.py report --binaries bin --profiles prof-unit prof-e2e --out report
+python3 e2e/coverage.py e2e    --binaries bin --out prof-e2e-portable --sockets portable
+python3 e2e/coverage.py report --binaries bin --profiles prof-unit prof-e2e prof-e2e-portable --out report
 ```
 
 `report` merges the profiles of any number of runs, and writes `summary.md` (a
@@ -85,7 +92,7 @@ line. With `--baseline summary.json` the table says how the figures moved.
 Report from a checkout of the source that was built, at the same path.
 
 CI runs the steps as jobs: `build` once, `test` and `e2e` in parallel on its
-binaries, each keeping its profile, then `coverage`, which runs no test but
+binaries (`e2e` once for each form of the sockets), each keeping its profile, then `coverage`, which runs no test but
 merges the profiles. The table is in the job's summary, on a pull request in a
 comment that is kept up to date and compares with the last run on `master`, and
 the report is an artifact.

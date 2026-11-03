@@ -12,10 +12,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# What is built once, and what every other job runs: the daemon, mdnsctl and
-# the unit tests' executables, built to record what they run. What a profile of
-# coverage says is about the binary that wrote it, so the jobs that run them
-# and the one that reports on them use these and none of their own.
+# What is built once, and what every other job runs: the daemon (with a socket
+# for each interface, and with one shared by every interface, as the BSDs have
+# them), mdnsctl and the unit tests' executables, built to record what they
+# run. What a profile of coverage says is about the binary that wrote it, so the
+# jobs that run them and the one that reports on them use these and none of
+# their own.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -67,10 +69,16 @@ jobs:
 
   # The built daemon, run through what the unit tests cannot: interfaces that
   # come and go, real sockets, signals, the control and avahi sockets. See e2e/.
+  # Once for each form of the sockets: Linux pins one to each interface, and the
+  # BSDs share one between them, which is run here as `portable`.
   e2e:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sockets: [pinned, portable]
     steps:
       - uses: actions/checkout@v4
 
@@ -89,20 +97,20 @@ jobs:
           sudo modprobe veth || true
 
       - name: End-to-end tests
-        run: python3 e2e/coverage.py e2e --binaries binaries --out profile-e2e --logs e2e-logs
+        run: python3 e2e/coverage.py e2e --binaries binaries --sockets ${{ matrix.sockets }} --out profile-e2e --logs e2e-logs
 
       - name: Keep the daemon's logs of a failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs
+          name: e2e-logs-${{ matrix.sockets }}
           path: e2e-logs
           retention-days: 7
 
       - name: Keep the profile
         uses: actions/upload-artifact@v4
         with:
-          name: profile-e2e
+          name: profile-e2e-${{ matrix.sockets }}
           path: profile-e2e
           retention-days: 1
 
@@ -133,15 +141,11 @@ jobs:
           name: binaries
           path: binaries
 
+      # Each profile in a folder of its own, by the name it was kept under.
       - uses: actions/download-artifact@v4
         with:
-          name: profile-unit
-          path: profile-unit
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: profile-e2e
-          path: profile-e2e
+          pattern: profile-*
+          path: profiles
 
       # What master last measured, to say how this moved. Best effort: with none,
       # the table is of this alone.
@@ -160,7 +164,7 @@ jobs:
       - name: Report
         run: |
           python3 e2e/coverage.py report --binaries binaries \
-            --profiles profile-unit profile-e2e --out coverage-report \
+            --profiles profiles/* --out coverage-report \
             $( [ -f baseline/summary.json ] && echo --baseline baseline/summary.json )
 
       # master's figures are what the next pull request is compared with.

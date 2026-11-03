@@ -6,13 +6,16 @@ The steps, which CI runs as jobs of their own, one after another:
     coverage.py build  --out BIN                  build, with instrumentation
     coverage.py unit   --binaries BIN --out PROF  run the unit tests from it
     coverage.py e2e    --binaries BIN --out PROF  run the end-to-end tests on it
-                       [--logs DIR]
+                       [--logs DIR] [--sockets pinned|portable]
     coverage.py report --binaries BIN --profiles PROF... --out REPORT
                                                   merge the profiles, report
 
-`build` makes the daemon, `mdnsctl` and the unit tests' executables, once, for
-everything after it to use: what a profile says is about the binary that wrote
-it. `unit` and `e2e` run those, and keep what they recorded. `report` merges
+`build` makes the daemon, in the two forms its sockets come in (one for each
+interface, as Linux has them, and one shared by every interface, as the BSDs
+have them), `mdnsctl` and the unit tests' executables, once, for everything
+after it to use: what a profile says is about the binary that wrote it. `unit`
+and `e2e` run those, and keep what they recorded; `e2e` is run for each form of
+the sockets. `report` merges
 the profiles of any number of runs, and writes to REPORT:
 
     summary.md    a table by file, to read; with --baseline, how it moved
@@ -81,16 +84,16 @@ def make_executable(paths):
 
 # ---------------------------------------------------------------- the steps
 
-def build(out):
-    """The binaries everything else uses, built to record what they run."""
-    target = os.path.join(ROOT, "target", "coverage")
+def compile(target, features, test_features):
+    """The daemon, `mdnsctl` and the unit tests' executables, built into `target`
+    to record what they run: the daemon with `features`, the tests with
+    `test_features`. Returns where the binaries are, and the tests."""
     env = dict(os.environ, CARGO_TARGET_DIR=target)
     env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -C instrument-coverage").strip()
-    # The daemon has a clock the end-to-end tests move, so that they do not wait
-    # for a timer; the unit tests are of the code without it.
-    run(["cargo", "build", "--locked", "--features", "test-clock"], env)
+    run(["cargo", "build", "--locked", "--features", ",".join(features)], env)
     built = subprocess.run(
-        ["cargo", "test", "--locked", "--no-run", "--message-format=json"], cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True, check=True
+        ["cargo", "test", "--locked", "--no-run", "--message-format=json", "--features", ",".join(test_features)],
+        cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True, check=True,
     )
     tests = []
     for line in built.stdout.splitlines():
@@ -100,13 +103,29 @@ def build(out):
             continue
         if m.get("reason") == "compiler-artifact" and m.get("executable") and m["profile"]["test"]:
             tests.append(m["executable"])
+    return os.path.join(target, "debug"), tests
+
+
+def build(out):
+    """The binaries everything else uses, built to record what they run: the
+    daemon as Linux has it, a socket pinned to each interface, and with
+    `portable-sockets`, one for every interface as the BSDs have, which the
+    end-to-end tests run on as well. The daemon has a clock the end-to-end tests
+    move, so that they do not wait for a timer; the unit tests are of the code
+    without it, and, a second time, with the portable sockets."""
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(os.path.join(out, "tests"))
+    os.makedirs(os.path.join(out, "portable"))
+    pinned, tests = compile(os.path.join(ROOT, "target", "coverage"), ["test-clock"], [])
     for name in ("mdnsd", "mdnsctl"):
-        shutil.copy(os.path.join(target, "debug", name), os.path.join(out, name))
+        shutil.copy(os.path.join(pinned, name), os.path.join(out, name))
     for t in tests:
         shutil.copy(t, os.path.join(out, "tests", os.path.basename(t)))
-    print(f"built {len(tests)} test executables and the binaries in {out}")
+    portable, portable_tests = compile(os.path.join(ROOT, "target", "coverage-portable"), ["portable-sockets", "test-clock"], ["portable-sockets"])
+    shutil.copy(os.path.join(portable, "mdnsd"), os.path.join(out, "portable", "mdnsd"))
+    for t in portable_tests:
+        shutil.copy(t, os.path.join(out, "tests", "portable-" + os.path.basename(t)))
+    print(f"built {len(tests) + len(portable_tests)} test executables and the binaries in {out}")
 
 
 def profile_env(out):
@@ -124,8 +143,10 @@ def unit(binaries, out):
         run([absolute(t)], env)
 
 
-def e2e(binaries, out, logs=None):
-    mdnsd, mdnsctl = absolute(os.path.join(binaries, "mdnsd")), absolute(os.path.join(binaries, "mdnsctl"))
+def e2e(binaries, out, logs=None, sockets="pinned"):
+    """The end-to-end tests on the daemon with `sockets`, `pinned` or `portable`."""
+    daemon = os.path.join(binaries, "portable", "mdnsd") if sockets == "portable" else os.path.join(binaries, "mdnsd")
+    mdnsd, mdnsctl = absolute(daemon), absolute(os.path.join(binaries, "mdnsctl"))
     make_executable([mdnsd, mdnsctl])
     cmd = [sys.executable, os.path.join(ROOT, "e2e", "e2e.py"), "--ctl", mdnsctl, mdnsd]
     if logs:
@@ -143,7 +164,8 @@ def report(binaries, profiles, out, baseline_path=None):
     raw = [f for d in profiles for f in glob.glob(os.path.join(d, "*.profraw"))]
     if not raw:
         sys.exit("no profiles to report on: " + ", ".join(profiles))
-    exes = [os.path.join(binaries, n) for n in ("mdnsd", "mdnsctl")] + sorted(glob.glob(os.path.join(binaries, "tests", "*")))
+    exes = [os.path.join(binaries, n) for n in ("mdnsd", "mdnsctl", os.path.join("portable", "mdnsd"))]
+    exes += sorted(glob.glob(os.path.join(binaries, "tests", "*")))
     merged = os.path.join(os.path.dirname(absolute(out)), "all.profdata")
     os.makedirs(os.path.dirname(merged), exist_ok=True)
     run([profdata, "merge", "-sparse", *raw, "-o", merged])
@@ -223,6 +245,7 @@ def main():
     e.add_argument("--binaries", required=True)
     e.add_argument("--out", required=True)
     e.add_argument("--logs", help="keep the daemon's log of each test here")
+    e.add_argument("--sockets", choices=["pinned", "portable"], default="pinned", help="the daemon with a socket for each interface, or shared by them (as on the BSDs)")
     r = sub.add_parser("report", help="merge profiles and report")
     r.add_argument("--binaries", required=True)
     r.add_argument("--profiles", nargs="+", required=True)
@@ -238,19 +261,20 @@ def main():
     elif args.step == "unit":
         unit(args.binaries, args.out)
     elif args.step == "e2e":
-        e2e(args.binaries, args.out, args.logs)
+        e2e(args.binaries, args.out, args.logs, args.sockets)
     elif args.step == "report":
         report(args.binaries, args.profiles, args.out, args.baseline)
     else:
         work = os.path.join(ROOT, "target", "coverage")
-        binaries, unit_prof, e2e_prof = (os.path.join(work, d) for d in ("bin", "prof-unit", "prof-e2e"))
-        for d in (unit_prof, e2e_prof):
+        binaries, unit_prof, e2e_prof, portable_prof = (os.path.join(work, d) for d in ("bin", "prof-unit", "prof-e2e", "prof-e2e-portable"))
+        for d in (unit_prof, e2e_prof, portable_prof):
             shutil.rmtree(d, ignore_errors=True)
         build(binaries)
         unit(binaries, unit_prof)
         e2e(binaries, e2e_prof)
+        e2e(binaries, portable_prof, sockets="portable")
         out = getattr(args, "out", os.path.join(work, "report"))
-        report(binaries, [unit_prof, e2e_prof], out, getattr(args, "baseline", None))
+        report(binaries, [unit_prof, e2e_prof, portable_prof], out, getattr(args, "baseline", None))
 
 
 if __name__ == "__main__":
