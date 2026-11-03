@@ -151,7 +151,8 @@ impl Default for ReflectedWhen {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
     pub name: String,
-    /// The interfaces of the segment: names, or patterns of them (`enp*`).
+    /// The interfaces of the segment: names, or patterns of them (`enp*`), and
+    /// those kept out of it, with a `!` before (`!br*`).
     pub interfaces: Vec<String>,
     /// Interfaces of the segment that are announced nothing: their devices
     /// are announced to the others, but not the others' to them. Each is one
@@ -177,9 +178,21 @@ pub struct SegmentConfig {
 }
 
 impl SegmentConfig {
-    /// Whether the interface `name` is one of the segment's.
+    /// The names and patterns of `interfaces` that are of it, not those with a
+    /// `!` that are not.
+    fn included(&self) -> impl Iterator<Item = &str> {
+        self.interfaces.iter().map(String::as_str).filter(|i| !i.starts_with('!'))
+    }
+
+    /// The names and patterns of `interfaces` that a `!` keeps out, without it.
+    fn excluded(&self) -> impl Iterator<Item = &str> {
+        self.interfaces.iter().filter_map(|i| i.strip_prefix('!'))
+    }
+
+    /// Whether the interface `name` is one of the segment's: one that
+    /// `Interfaces=` has, and none that it keeps out.
     pub fn has(&self, name: &str) -> bool {
-        self.interfaces.iter().any(|i| glob(i, name))
+        self.included().any(|i| glob(i, name)) && !self.excluded().any(|i| glob(i, name))
     }
 }
 
@@ -333,8 +346,8 @@ impl Config {
     /// The interfaces named by any segment, or patterns of them, once each, in first-seen order.
     fn interface_names(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
-        for iface in self.segments.iter().flat_map(|s| &s.interfaces) {
-            if !out.contains(&iface.as_str()) {
+        for iface in self.segments.iter().flat_map(|s| s.included()) {
+            if !out.contains(&iface) {
                 out.push(iface);
             }
         }
@@ -526,7 +539,7 @@ impl Config {
             if block.name.is_empty() {
                 bail!("[Advertise] at line {at} has no Hostname=");
             }
-            if let Some(stray) = block.interfaces.iter().find(|i| !covered(&listened, i)) {
+            if let Some(stray) = block.interfaces.iter().find(|i| if is_pattern(i) { !covered(&listened, i) } else { !self.wants(i) }) {
                 bail!("[Advertise] at line {at} has Interface={stray}, which is not in any segment's Interfaces=");
             }
             // One name is of one set of addresses on an interface.
@@ -547,6 +560,15 @@ impl Config {
             if seg.interfaces.is_empty() {
                 bail!("segment {:?} (line {at}) has no Interfaces=", seg.name);
             }
+            if seg.interfaces.iter().any(|i| i.strip_prefix('!').is_some_and(str::is_empty)) {
+                bail!("segment {:?} (line {at}) has a ! in Interfaces= that keeps nothing out", seg.name);
+            }
+            if seg.included().next().is_none() {
+                bail!("segment {:?} (line {at}) has only interfaces kept out in Interfaces=", seg.name);
+            }
+            if let Some(both) = seg.included().find(|i| seg.excluded().any(|x| glob(x, i))) {
+                bail!("segment {:?} (line {at}) has Interfaces={both}, which it also keeps out", seg.name);
+            }
             if let Some(dup) = seg
                 .interfaces
                 .iter()
@@ -555,13 +577,14 @@ impl Config {
             {
                 bail!("segment {:?} lists interface {} twice", seg.name, dup.1);
             }
-            if let Some(stray) = seg.untrusted.iter().find(|u| !covered(&seg.interfaces, u)) {
+            let included: Vec<&str> = seg.included().collect();
+            if let Some(stray) = seg.untrusted.iter().find(|u| !covered(&included, u) || (!is_pattern(u) && !seg.has(u))) {
                 bail!("segment {:?} (line {at}) has Untrusted={stray}, which is not in its Interfaces=", seg.name);
             }
             if let Some(dup) = seg.untrusted.iter().enumerate().find(|(n, u)| seg.untrusted[..*n].contains(u)) {
                 bail!("segment {:?} lists {} as untrusted twice", seg.name, dup.1);
             }
-            if seg.interfaces.len() >= 2 && seg.interfaces.iter().all(|i| covered(&seg.untrusted, i)) {
+            if included.len() >= 2 && included.iter().all(|i| covered(&seg.untrusted, i)) {
                 bail!("segment {:?} (line {at}) has no trusted interface to announce to", seg.name);
             }
             for other in &self.segments[..i] {
@@ -571,12 +594,7 @@ impl Config {
                 // Two segments sharing a pair of interfaces would both
                 // reflect between them, and each would withdraw the other's
                 // announcements.
-                let shared: Vec<&str> = seg
-                    .interfaces
-                    .iter()
-                    .filter(|iface| other.interfaces.contains(iface))
-                    .map(String::as_str)
-                    .collect();
+                let shared: Vec<&str> = seg.included().filter(|iface| other.included().any(|o| o == *iface)).collect();
                 if shared.len() >= 2 {
                     bail!(
                         "segments {:?} and {:?} both reflect between {}",
@@ -596,7 +614,7 @@ impl Config {
                 continue;
             };
             // A pattern is for whichever interfaces it matches, if any.
-            if !is_pattern(name) && !covered(&listened, name) {
+            if !is_pattern(name) && !self.wants(name) {
                 bail!("[Interface] {name} (line {at}) is not in the Interfaces= of any segment");
             }
             if settings[..i].iter().any(|other| other.name.as_ref() == Some(name)) {
@@ -1131,6 +1149,36 @@ interfaces=br0,wifi
         assert!(err(&format!("{seg}[Advertise]\nHostname=pc\nInterface=enp*\n[Advertise]\nHostname=pc\nInterface=enp*\n"))
             .contains("same interface"));
         assert!(Config::parse(&format!("{seg}[Advertise]\nHostname=pc\nInterface=enp*\n[Advertise]\nHostname=pc\nInterface=wlan0\n")).is_ok());
+    }
+
+    #[test]
+    fn interfaces_may_be_kept_out_and_that_wins() {
+        let seg = |interfaces: &str| format!("[Segment]\nName=s\nInterfaces={interfaces}\n");
+        let c = Config::parse(&seg("*,!br*,!veth?")).unwrap();
+        let has = |name: &str| c.segments[0].has(name);
+        assert!(has("enp3s0") && has("wlan0") && has("veth10") && !has("br0") && !has("br-lan") && !has("veth1"));
+        // However it is ordered.
+        let c = Config::parse(&seg("!br*,*")).unwrap();
+        assert!(c.segments[0].has("enp3s0") && !c.segments[0].has("br0"));
+        assert!(c.wants("enp3s0") && !c.wants("br0"));
+        // Only what is included is of interfaces to be there.
+        let c = Config::parse(&seg("wlan0,*,!enp*")).unwrap();
+        assert_eq!(c.interfaces().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["wlan0"]);
+        assert!(c.interface("enp3s0").probe_interval.is_none());
+
+        let err = |text: &str| Config::parse(text).unwrap_err().to_string();
+        assert!(err(&seg("!br*")).contains("only interfaces kept out"));
+        assert!(err(&seg("*,!")).contains("keeps nothing out"));
+        assert!(err(&seg("br0,!br*")).contains("also keeps out"));
+        // The segment's interfaces are those that are not kept out, for what is said of them.
+        let with = |extra: &str| format!("{}{extra}", seg("*,!br0"));
+        assert!(err(&with("Untrusted=br0\n")).contains("not in its Interfaces"));
+        assert!(Config::parse(&with("Untrusted=enp3s0\n")).is_ok());
+        assert!(err(&with("[Interface]\nName=br0\n")).contains("not in the Interfaces"));
+        assert!(err(&with("[Advertise]\nHostname=pc\nInterface=br0\n")).contains("not in any segment"));
+        assert!(Config::parse(&with("[Advertise]\nHostname=pc\nInterface=eth0\n")).is_ok());
+        // Another segment may have one that this keeps out.
+        assert!(Config::parse(&format!("{}{}", seg("*,!br0"), "[Segment]\nName=t\nInterfaces=br0,x\n")).is_ok());
     }
 
     #[test]

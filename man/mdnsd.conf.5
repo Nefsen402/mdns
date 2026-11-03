@@ -253,6 +253,17 @@ is every interface whose name begins with
 .BR enp .
 Those that are there when the daemon starts, and those that come after, are
 listened to; one that goes is forgotten, as one named is.
+A name or pattern with a
+.B !
+before it is of interfaces the segment does not have, whatever else matches
+them:
+.B Interfaces=*,!br*
+is every interface but the bridges.
+Where it is written does not matter, a segment needs one that is not kept out,
+and one that is named and kept out is an error.
+What a segment says of its interfaces
+.RB ( Untrusted= ,
+and the other sections' names of them) is of those it has.
 A loopback interface
 .RB ( lo ,
 or
