@@ -227,8 +227,8 @@ socket, if you would rather talk to it directly (see `mdnsctl(1)`).
 
 Things to know when using it this way:
 
-- The control socket is readable only by the `mdnsd` group: add the user the
-  script runs as (`sudo usermod -aG mdnsd $USER`, then log in again).
+- Any user may use the control socket. What it tells is what devices multicast
+  on the link anyway. `[Ipc] Mode=0660` limits it to the `mdnsd` group.
 - It shares port 5353 with Avahi or systemd-resolved, so they can stay.
 - It still sends a little: a probe at startup, a question to each device about
   to expire, sent to the device itself unless `[Listen]` says `multicast`
@@ -397,9 +397,9 @@ Notes on the service:
   (see `mdnsd(8)`). Configuration is read at start, so apply changes with
   `systemctl restart mdnsd`.
 - `systemctl stop` sends `SIGTERM`, so reflected devices are withdrawn cleanly.
-- The control socket lives in `/run/mdnsd/`, readable only by the `mdnsd`
-  group. To use `mdnsctl` without `sudo`:
-  `sudo usermod -aG mdnsd $USER` (then log in again).
+- The control socket lives in `/run/mdnsd/`, and any user may use `mdnsctl`.
+  `[Ipc] Mode=0660` limits it to the `mdnsd` group, which you then join with
+  `sudo usermod -aG mdnsd $USER` (and log in again).
 
 To run it by hand instead, point `Socket=` at a directory you can write to:
 `mdnsd /path/to/mdnsd.conf` as root, or as a normal user with a config whose

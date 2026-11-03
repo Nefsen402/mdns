@@ -7,6 +7,7 @@
 //!
 //! [Ipc]               ; optional
 //! Socket=/run/mdnsd/mdnsd.sock
+//! Mode=0666           ; who may use it, as an octal mode; 0666 unless set
 //!
 //! [Probe]             ; optional
 //! RefreshBefore=30s
@@ -61,6 +62,9 @@ use alloc::vec::Vec;
 
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
+/// Anyone may use it: what it tells is what is multicast on the link, and the
+/// one request that does anything, `probe`, is one a user could send themselves.
+pub const DEFAULT_SOCKET_MODE: u32 = 0o666;
 
 /// Probing more often than this would be a flood, not a probe.
 const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(10);
@@ -234,6 +238,8 @@ pub struct Config {
     pub ipv6: Listen,
     /// Where the IPC server listens.
     pub socket: String,
+    /// The permissions of the control socket.
+    pub socket_mode: u32,
     /// Where to listen as avahi-daemon does, for what asks it for the address
     /// of a name (`nss-mdns`); nowhere unless set.
     pub avahi_socket: Option<String>,
@@ -256,6 +262,7 @@ impl Default for Config {
             ipv4: Listen::default(),
             ipv6: Listen::default(),
             socket: DEFAULT_SOCKET.to_string(),
+            socket_mode: DEFAULT_SOCKET_MODE,
             avahi_socket: None,
             advertise: Vec::new(),
             probe_interval: None,
@@ -477,6 +484,7 @@ impl Config {
                         }
                         config.socket = value;
                     }
+                    ("ipc", "mode") => config.socket_mode = parse_mode(&value, lineno)?,
                     (s, k) => bail!("line {lineno}: unknown setting {k:?} in [{s}]"),
                 }
             }
@@ -671,6 +679,15 @@ fn parse_lifetime(value: &str, lineno: usize) -> Result<Duration> {
 
 /// The TTL of the address records of a name we announce: a time span between
 /// the limits.
+/// A file mode, in octal as systemd's are: `0660`, `660`, `0o660`.
+fn parse_mode(value: &str, lineno: usize) -> Result<u32> {
+    let digits = value.strip_prefix("0o").unwrap_or(value);
+    match u32::from_str_radix(digits, 8) {
+        Ok(mode) if !digits.is_empty() && mode <= 0o777 => Ok(mode),
+        _ => bail!("line {lineno}: Mode= must be an octal mode such as 0660, not {value:?}"),
+    }
+}
+
 fn parse_host_ttl(value: &str, lineno: usize, key: &str) -> Result<Duration> {
     let span = timespan(value, lineno, key)?;
     if span < MIN_HOST_TTL || span > MAX_HOST_TTL {
@@ -1183,6 +1200,18 @@ interfaces=br0,wifi
         .unwrap();
         assert_eq!(c.segments, [seg("a b", &["x", "y", "z", "w"])]);
         assert_eq!((c.ipv4, c.ipv6), (Listen::On, Listen::Off));
+    }
+
+    #[test]
+    fn the_control_socket_is_open_to_all_unless_a_mode_says_otherwise() {
+        let mode = |value: &str| Config::parse(&format!("[Ipc]\nMode={value}\n{EXAMPLE}")).map(|c| c.socket_mode);
+        assert_eq!(Config::parse(EXAMPLE).unwrap().socket_mode, 0o666);
+        assert_eq!(mode("0660").unwrap(), 0o660);
+        assert_eq!(mode("660").unwrap(), 0o660);
+        assert_eq!(mode("0o600").unwrap(), 0o600);
+        for bad in ["", "rw", "0668", "1777", "0o"] {
+            assert!(mode(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

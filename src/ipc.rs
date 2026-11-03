@@ -185,8 +185,8 @@ struct Streaming {
 impl Server {
     /// Bind the control socket at `path`, before anything else happens, so
     /// that a bad path or a second instance is reported at startup.
-    pub fn bind(path: &str) -> Result<Server> {
-        let listener = bind(path, 0o660)?;
+    pub fn bind(path: &str, mode: rustix::fs::RawMode) -> Result<Server> {
+        let listener = bind(path, mode)?;
         eprintln!("ipc: listening on {path}");
         Ok(Server { listener, clients: Vec::new(), next_watch: 0 })
     }
@@ -1233,7 +1233,7 @@ mod tests {
 
     impl Harness {
         fn new(path: &Path, groups: Vec<Group>) -> Harness {
-            Harness { server: Server::bind(path.to_str().unwrap()).unwrap(), groups }
+            Harness { server: Server::bind(path.to_str().unwrap(), 0o660).unwrap(), groups }
         }
 
         /// One turn of the loop.

@@ -21,10 +21,10 @@ Restart=on-abort
 # interface needs no capability on Linux 5.7 or newer.
 User=mdnsd
 Group=mdnsd
-# Creates /run/mdnsd for the control socket; members of the mdnsd group can
-# reach it with mdnsctl.
+# Creates /run/mdnsd for the control socket, which anyone may use with mdnsctl
+# unless [Ipc] Mode= says otherwise: the directory has to be open to them too.
 RuntimeDirectory=mdnsd
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0755
 UMask=0077
 
 NoNewPrivileges=yes

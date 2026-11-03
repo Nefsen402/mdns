@@ -95,9 +95,29 @@ creates
 .I /run/mdnsd
 for it.
 Unix socket paths are limited to about 108 bytes.
-The socket is created with mode 0660 (owner and group only).
 A stale socket left by a crashed run is replaced; a live instance, or a file
 that is not a socket, is never overwritten.
+.TP
+.B Mode=
+Who may use the control socket, as an octal mode, as systemd writes them:
+.IR 0666 ,
+the default, lets every user run
+.BR mdnsctl ;
+.I 0660
+limits it to the daemon's user and group (the service's
+.IR mdnsd ),
+and
+.I 0600
+to the daemon's user.
+What the socket tells is what devices multicast on the link, which any user can
+listen for on port 5353, and the one request that does anything,
+.BR probe ,
+makes the daemon ask its devices again: one asked for while another runs is
+that one, so clients cannot make it send more than the probe's few questions
+every few seconds.
+A directory the socket is in must let its users through: the service's
+.I /run/mdnsd
+is created with mode 0755.
 .TP
 .B AvahiSocket=
 A second socket, with the protocol of avahi-daemon's, for what asks Avahi for
