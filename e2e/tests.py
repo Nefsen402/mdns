@@ -1,5 +1,6 @@
 """The scenarios. See e2e.py for how to run them."""
 import os
+import re
 import subprocess
 import unittest
 
@@ -484,6 +485,87 @@ class Neighbours(Case):
         self.lab.router("ip", "-6", "neigh", "del", "fd00:9::50", "dev", "ra")
         d.settle()
         self.assertTrue(not d.host("s", "tv.local")[0]["neighbour_addresses"], d.host("s", "tv.local"))
+
+    NEIGH = ["ip", "-6", "neigh", "replace"]
+
+    def v6_link(self):
+        """A link with IPv6 on both ends, a device's far end of it and the router's."""
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        self.lab.router("ip", "addr", "add", "fd00:9::1/64", "dev", "ra", "nodad")
+        sh("ip", "addr", "add", "fd00:9::2/64", "dev", la.peer, "nodad")
+        return la
+
+    def known(self, d, host="tv.local"):
+        """What the daemon has of `host`, after what it was sent."""
+        d.settle()
+        listed = d.host("s", host)
+        self.assertTrue(listed, d.devices("s"))
+        return listed[0]
+
+    def test_the_kernel_is_asked_to_find_a_device_with_only_a_link_local_address_and_what_it_has_is_learned(self):
+        la = self.v6_link()
+        sh("ip", "addr", "add", "fe80::50/64", "dev", la.peer, "nodad")
+        mac = re.search(r"link/ether ([0-9a-f:]{17})", sh("ip", "-o", "link", "show", la.peer).stdout).group(1)
+        # The router knows the device at a routable address already, under the
+        # link-layer address its link-local one is to be found at.
+        self.lab.router(*self.NEIGH, "fd00:9::2", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        watch = self.lab.neighbours("ra")
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
+        la.device("10.9.1.50").multicast(response(aaaa("tv.local", "fe80::50"), srv("TV._http._tcp.local", 80, "tv.local"),
+                                                  ptr("_http._tcp.local", "TV._http._tcp.local")))
+        d.settle()
+        # It has no routable address, so the kernel is made to look the link-local one up: the
+        # daemon asks it a question there, and the table has it.
+        self.assertTrue(watch.wait(rf"fe80::50 .*lladdr {mac}"), "the kernel found it\n" + self.logs(d))
+        tv = self.known(d)
+        self.assertEqual(tv["neighbour_addresses"], ["fd00:9::2"], self.logs(d))
+        self.assertEqual(tv["addresses"], ["fd00:9::2", "fe80::50"])
+
+    def test_an_address_in_a_network_the_interface_is_not_on_is_learned_when_it_is(self):
+        la = self.v6_link()
+        mac = "02:00:00:00:00:50"
+        self.lab.router("ip", "-4", "neigh", "replace", "10.9.1.50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        self.lab.router(*self.NEIGH, "fd00:7::50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        self.assertEqual(self.known(d)["neighbour_addresses"], [], "the interface is not on fd00:7::/64")
+        self.lab.router("ip", "addr", "add", "fd00:7::1/64", "dev", "ra", "nodad")
+        self.assertEqual(self.known(d)["neighbour_addresses"], ["fd00:7::50"], "and is, now")
+        self.lab.router("ip", "addr", "del", "fd00:7::1/64", "dev", "ra")
+        self.assertEqual(self.known(d)["neighbour_addresses"], [], "and is not again")
+
+    def test_an_entry_that_comes_after_the_device_was_heard_is_learned_and_forgotten_when_it_changes_hands(self):
+        la = self.v6_link()
+        mac, other = "02:00:00:00:00:50", "02:00:00:00:00:51"
+        self.lab.router("ip", "-4", "neigh", "replace", "10.9.1.50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        self.assertEqual(self.known(d)["neighbour_addresses"], [])
+        # Another address under its link-layer address turns up in the table.
+        self.lab.router(*self.NEIGH, "fd00:9::50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        self.assertEqual(self.known(d)["neighbour_addresses"], ["fd00:9::50"])
+        # It is another device that has it now.
+        self.lab.router(*self.NEIGH, "fd00:9::50", "lladdr", other, "dev", "ra", "nud", "permanent")
+        self.assertEqual(self.known(d)["neighbour_addresses"], [], "no longer the device's")
+        # And it is the device's again, with another beside it.
+        self.lab.router(*self.NEIGH, "fd00:9::50", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        self.lab.router(*self.NEIGH, "fd00:9::51", "lladdr", mac, "dev", "ra", "nud", "permanent")
+        self.assertEqual(self.known(d)["neighbour_addresses"], ["fd00:9::50", "fd00:9::51"])
+
+    def test_nothing_is_learned_of_a_family_the_device_announced_a_routable_address_of(self):
+        la = self.v6_link()
+        mac = "02:00:00:00:00:50"
+        for ip in ("10.9.1.50", "10.9.1.51"):
+            self.lab.router("ip", "-4", "neigh", "replace", ip, "lladdr", mac, "dev", "ra", "nud", "permanent")
+        for ip in ("fd00:9::50", "fd00:9::51"):
+            self.lab.router(*self.NEIGH, ip, "lladdr", mac, "dev", "ra", "nud", "permanent")
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n", ipv6=True))
+        # It says what it has of both families: what it announces is what it has.
+        la.device("10.9.1.50").multicast(response(a("tv.local", "10.9.1.50"), aaaa("tv.local", "fd00:9::50"),
+                                                  srv("TV._http._tcp.local", 80, "tv.local"), ptr("_http._tcp.local", "TV._http._tcp.local")))
+        tv = self.known(d)
+        self.assertEqual(tv["neighbour_addresses"], [], self.logs(d))
+        self.assertEqual(tv["addresses"], ["10.9.1.50", "fd00:9::50"])
 
 
 class Timers(Case):

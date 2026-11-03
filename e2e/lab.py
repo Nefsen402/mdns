@@ -480,6 +480,36 @@ class Daemon:
         return AvahiCall(s)
 
 
+class Watch:
+    """A command that prints what happens, read as it does: `wait` returns the
+    line that has what is waited for, when the command prints it."""
+
+    def __init__(self, cmd):
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.seen = []
+
+    def wait(self, pattern, timeout=5.0):
+        end = time.monotonic() + timeout
+        for line in self.seen:
+            if re.search(pattern, line):
+                return line
+        while True:
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([self.proc.stdout], [], [], left)[0]:
+                return None
+            line = self.proc.stdout.readline()
+            if not line:
+                return None
+            self.seen.append(line.rstrip("\n"))
+            if re.search(pattern, line):
+                return line.rstrip("\n")
+
+    def close(self):
+        self.proc.kill()
+        self.proc.wait()
+        self.proc.stdout.close()
+
+
 class AvahiCall:
     """A request to the avahi socket that has been sent."""
 
@@ -550,6 +580,19 @@ class Lab:
     def router(self, *cmd, check=True):
         """Run a command in the router's namespace."""
         return sh("nsenter", "-t", str(self.holder.pid), "-n", "--", *cmd, check=check)
+
+    def neighbours(self, interface):
+        """A watch of the router's neighbour table on `interface`, which has
+        what the kernel there learns or changes as it does. It is made ready by
+        an entry of its own, which it has seen by the time this returns."""
+        watch = self.track(Watch(["nsenter", "-t", str(self.holder.pid), "-n", "--", "ip", "-6", "monitor", "neigh", "dev", interface]))
+        self.router("ip", "-6", "neigh", "replace", "fd00:ffff::1", "lladdr", "02:ff:ff:ff:ff:01", "dev", interface, "nud", "permanent")
+        if not watch.wait("fd00:ffff::1", 5):
+            raise RuntimeError("the neighbour table cannot be watched")
+        # Taking it away is seen at once, as the entry failing: it is only reported deleted later.
+        self.router("ip", "-6", "neigh", "del", "fd00:ffff::1", "dev", interface)
+        watch.wait("fd00:ffff::1 FAILED", 5)
+        return watch
 
     def link(self, name, router_cidr, peer_cidr):
         link = Link(self, name, router_cidr, peer_cidr)
