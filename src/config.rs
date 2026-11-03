@@ -18,6 +18,37 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+/// Whether `name` is matched by `pattern`: `*` stands for any run of
+/// characters, even none, and `?` for any one; the rest stand for themselves.
+pub fn glob(pattern: &str, name: &str) -> bool {
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    let (mut at_p, mut at_n) = (0, 0);
+    // Where the last `*` was, and how much of the name it has taken.
+    let mut star: Option<(usize, usize)> = None;
+    while at_n < n.len() {
+        if at_p < p.len() && p[at_p] == b'*' {
+            star = Some((at_p, at_n));
+            at_p += 1;
+        } else if at_p < p.len() && (p[at_p] == b'?' || p[at_p] == n[at_n]) {
+            at_p += 1;
+            at_n += 1;
+        } else if let Some((star_p, star_n)) = star {
+            // Let the star take one more.
+            star = Some((star_p, star_n + 1));
+            at_p = star_p + 1;
+            at_n = star_n + 1;
+        } else {
+            return false;
+        }
+    }
+    p[at_p..].iter().all(|&c| c == b'*')
+}
+
+/// Whether `name` has a wildcard in it, so names many interfaces.
+pub fn is_pattern(name: &str) -> bool {
+    name.contains(['*', '?'])
+}
+
 pub const DEFAULT_PATH: &str = "/etc/mdnsd.conf";
 pub const DEFAULT_SOCKET: &str = "/run/mdnsd/mdnsd.sock";
 /// Anyone may use it: what it tells is what is multicast on the link, and the
@@ -120,9 +151,11 @@ impl Default for ReflectedWhen {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
     pub name: String,
+    /// The interfaces of the segment: names, or patterns of them (`enp*`).
     pub interfaces: Vec<String>,
     /// Interfaces of the segment that are announced nothing: their devices
-    /// are announced to the others, but not the others' to them.
+    /// are announced to the others, but not the others' to them. Each is one
+    /// of `interfaces` or a name one of them matches.
     pub untrusted: Vec<String>,
     /// How often to probe its interfaces for devices: `None` follows the
     /// `ProbeInterval=` of each interface, and `Some(None)` is off for this
@@ -141,6 +174,13 @@ pub struct SegmentConfig {
     /// The TTL of the address records of the devices it reflects; `None`
     /// (the default) announces each with the TTL it announced itself with.
     pub reflect_ttl: Option<Duration>,
+}
+
+impl SegmentConfig {
+    /// Whether the interface `name` is one of the segment's.
+    pub fn has(&self, name: &str) -> bool {
+        self.interfaces.iter().any(|i| glob(i, name))
+    }
 }
 
 /// What one `[Interface]` section sets: for one interface, whichever segments
@@ -265,7 +305,7 @@ impl Config {
     /// probed and whether it announces again. An interface that no segment has
     /// has what is set for all of them, and nothing of its segments.
     pub fn interface(&self, name: &str) -> Interface {
-        let mut segments = self.segments.iter().filter(|seg| seg.interfaces.iter().any(|i| i == name));
+        let mut segments = self.segments.iter().filter(|seg| seg.has(name));
         let own_probe = setting_of(&self.settings, name, None, |i| i.probe_interval);
         Interface {
             name: name.to_string(),
@@ -280,12 +320,17 @@ impl Config {
     }
 
     /// What is settled for each interface named by any segment, once each, in
-    /// first-seen order.
+    /// first-seen order: those named, not those a pattern may match.
     pub fn interfaces(&self) -> Vec<Interface> {
-        self.interface_names().into_iter().map(|name| self.interface(name)).collect()
+        self.interface_names().into_iter().filter(|name| !is_pattern(name)).map(|name| self.interface(name)).collect()
     }
 
-    /// The interfaces named by any segment, once each, in first-seen order.
+    /// Whether any segment has the interface `name`.
+    pub fn wants(&self, name: &str) -> bool {
+        self.segments.iter().any(|seg| seg.has(name))
+    }
+
+    /// The interfaces named by any segment, or patterns of them, once each, in first-seen order.
     fn interface_names(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
         for iface in self.segments.iter().flat_map(|s| &s.interfaces) {
@@ -481,11 +526,11 @@ impl Config {
             if block.name.is_empty() {
                 bail!("[Advertise] at line {at} has no Hostname=");
             }
-            if let Some(stray) = block.interfaces.iter().find(|i| !listened.contains(&i.as_str())) {
+            if let Some(stray) = block.interfaces.iter().find(|i| !covered(&listened, i)) {
                 bail!("[Advertise] at line {at} has Interface={stray}, which is not in any segment's Interfaces=");
             }
             // One name is of one set of addresses on an interface.
-            let on = |b: &AdvertiseConfig, iface: &str| b.interfaces.is_empty() || b.interfaces.iter().any(|i| i == iface);
+            let on = |b: &AdvertiseConfig, iface: &str| b.interfaces.is_empty() || b.interfaces.iter().any(|i| glob(i, iface));
             if let Some(other) = self.advertise[..i]
                 .iter()
                 .find(|o| o.name.eq_ignore_ascii_case(&block.name) && listened.iter().any(|&iface| on(o, iface) && on(block, iface)))
@@ -510,13 +555,13 @@ impl Config {
             {
                 bail!("segment {:?} lists interface {} twice", seg.name, dup.1);
             }
-            if let Some(stray) = seg.untrusted.iter().find(|u| !seg.interfaces.contains(u)) {
+            if let Some(stray) = seg.untrusted.iter().find(|u| !covered(&seg.interfaces, u)) {
                 bail!("segment {:?} (line {at}) has Untrusted={stray}, which is not in its Interfaces=", seg.name);
             }
             if let Some(dup) = seg.untrusted.iter().enumerate().find(|(n, u)| seg.untrusted[..*n].contains(u)) {
                 bail!("segment {:?} lists {} as untrusted twice", seg.name, dup.1);
             }
-            if seg.interfaces.len() >= 2 && seg.untrusted.len() == seg.interfaces.len() {
+            if seg.interfaces.len() >= 2 && seg.interfaces.iter().all(|i| covered(&seg.untrusted, i)) {
                 bail!("segment {:?} (line {at}) has no trusted interface to announce to", seg.name);
             }
             for other in &self.segments[..i] {
@@ -550,7 +595,8 @@ impl Config {
                 }
                 continue;
             };
-            if !self.segments.iter().any(|seg| seg.interfaces.contains(name)) {
+            // A pattern is for whichever interfaces it matches, if any.
+            if !is_pattern(name) && !covered(&listened, name) {
                 bail!("[Interface] {name} (line {at}) is not in the Interfaces= of any segment");
             }
             if settings[..i].iter().any(|other| other.name.as_ref() == Some(name)) {
@@ -561,11 +607,27 @@ impl Config {
     }
 }
 
+/// Whether `name`, a name or a pattern, is one of `listed` or is matched by
+/// one of them.
+fn covered(listed: &[impl AsRef<str>], name: &str) -> bool {
+    listed.iter().any(|l| l.as_ref() == name || glob(l.as_ref(), name))
+}
+
 /// A setting of `interface`: the one in its own `[Interface]`, or else the one in
-/// the `[Interface]` without a name, or else `default`.
+/// the first `[Interface]` named for a pattern that matches it that has it, or else
+/// the one in the `[Interface]` without a name, or else `default`.
 fn setting_of<T>(settings: &[InterfaceConfig], interface: &str, default: T, get: impl Fn(&InterfaceConfig) -> Option<T>) -> T {
     let named = settings.iter().find(|i| i.name.as_deref() == Some(interface)).and_then(&get);
-    named.or_else(|| settings.iter().find(|i| i.name.is_none()).and_then(&get)).unwrap_or(default)
+    let matching = || {
+        settings
+            .iter()
+            .filter(|i| i.name.as_deref().is_some_and(|name| is_pattern(name) && glob(name, interface)))
+            .find_map(&get)
+    };
+    named
+        .or_else(matching)
+        .or_else(|| settings.iter().find(|i| i.name.is_none()).and_then(&get))
+        .unwrap_or(default)
 }
 
 /// One `[Advertise]` section: a name, and what it is announced with.
@@ -1015,6 +1077,60 @@ interfaces=br0,wifi
         assert!(parse("Untrusted=media,wifi").is_ok());
         // A segment of one interface reflects nothing anyway.
         assert!(Config::parse("[Segment]\nName=s\nInterfaces=wifi\nUntrusted=wifi\n").is_ok());
+    }
+
+    #[test]
+    fn a_pattern_matches_what_it_says() {
+        assert!(glob("enp*", "enp3s0") && glob("enp*", "enp") && glob("*", "eth0") && glob("*", ""));
+        assert!(glob("eth?", "eth0") && !glob("eth?", "eth") && !glob("eth?", "eth10"));
+        assert!(glob("en*s?", "enp3s0") && glob("*0", "enp3s0") && glob("*p*s*", "enp3s0"));
+        assert!(!glob("enp*", "wlan0") && !glob("*0", "enp3s1") && !glob("eth0", "eth01"));
+        assert!(glob("eth0", "eth0") && !glob("", "x") && glob("", ""));
+        assert!(is_pattern("enp*") && is_pattern("eth?") && !is_pattern("eth0"));
+    }
+
+    #[test]
+    fn interfaces_may_be_patterns() {
+        let c = Config::parse(
+            "[Segment]\nName=s\nInterfaces=enp*,wlan0\nUntrusted=enp3s0,wlan0\n\
+             [Interface]\nName=enp*\nMinimumLifetime=30s\nMaxDevices=9\n\
+             [Interface]\nName=enp3s0\nMinimumLifetime=90s\n\
+             [Interface]\nName=en*\nMinimumLifetime=45s\nMaxDevices=7\nMaxServices=5\n\
+             [Advertise]\nHostname=pc\nInterface=enp*\n",
+        )
+        .unwrap();
+        assert!(c.wants("enp3s0") && c.wants("wlan0") && !c.wants("eth0"));
+        assert!(c.segments[0].has("enp7s0") && !c.segments[0].has("wlan1"));
+        // Only the names are of interfaces to be there; a pattern is of those that are.
+        assert_eq!(c.interfaces().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["wlan0"]);
+        // A name of its own, then the first pattern that sets it, then the one for all.
+        let enp = c.interface("enp3s0");
+        assert_eq!((enp.min_lifetime.as_secs(), enp.max_devices, enp.max_services), (90, 9, 5));
+        assert_eq!(c.interface("enp5s0").min_lifetime.as_secs(), 30);
+        assert_eq!(c.interface("enx1").min_lifetime.as_secs(), 45);
+        assert_eq!(c.interface("wlan0").min_lifetime, DEFAULT_MIN_LIFETIME);
+    }
+
+    #[test]
+    fn what_names_interfaces_is_in_a_segment_by_name_or_pattern() {
+        let err = |text: &str| Config::parse(text).unwrap_err().to_string();
+        let seg = "[Segment]\nName=s\nInterfaces=enp*,wlan0\n";
+        // A name or a pattern of the segment, or a name a pattern of it matches.
+        assert!(Config::parse(&format!("{seg}Untrusted=enp*\n")).is_ok());
+        assert!(Config::parse(&format!("{seg}Untrusted=enp3s0\n")).is_ok());
+        assert!(err(&format!("{seg}Untrusted=eth*\n")).contains("not in its Interfaces"));
+        assert!(err(&format!("{seg}Untrusted=enp*,enp*\n")).contains("twice"));
+        assert!(err("[Segment]\nName=s\nInterfaces=enp*,wlan*\nUntrusted=enp*,wlan*\n").contains("no trusted interface"));
+        assert!(Config::parse(&format!("{seg}[Interface]\nName=enp3s0\n")).is_ok());
+        assert!(Config::parse(&format!("{seg}[Interface]\nName=enp*\n")).is_ok());
+        assert!(err(&format!("{seg}[Interface]\nName=eth0\n")).contains("not in the Interfaces"));
+        assert!(Config::parse(&format!("{seg}[Interface]\nName=eth*\n")).is_ok(), "a pattern may match none");
+        assert!(Config::parse(&format!("{seg}[Advertise]\nHostname=pc\nInterface=enp1\n")).is_ok());
+        assert!(err(&format!("{seg}[Advertise]\nHostname=pc\nInterface=eth0\n")).contains("not in any segment"));
+        // The same hostname on interfaces a pattern and a name both have is the same interface.
+        assert!(err(&format!("{seg}[Advertise]\nHostname=pc\nInterface=enp*\n[Advertise]\nHostname=pc\nInterface=enp*\n"))
+            .contains("same interface"));
+        assert!(Config::parse(&format!("{seg}[Advertise]\nHostname=pc\nInterface=enp*\n[Advertise]\nHostname=pc\nInterface=wlan0\n")).is_ok());
     }
 
     #[test]

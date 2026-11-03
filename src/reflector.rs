@@ -23,7 +23,7 @@ use crate::time::Instant;
 
 use anyhow::{bail, Result};
 
-use crate::config::{Forward, Neighbours, ReflectedWhen};
+use crate::config::{glob, Forward, Neighbours, ReflectedWhen};
 use crate::device::Device;
 use crate::segment::{Asked, Event, Owner, Segment, Source};
 
@@ -58,7 +58,8 @@ struct Inner {
     /// The segments it spans, and whether each is untrusted: it is not
     /// announced anything. They come and go with their interfaces.
     members: RefCell<Vec<Member>>,
-    /// The interfaces whose segments are untrusted, whether they are here or not.
+    /// The interfaces whose segments are untrusted, by name or pattern, whether
+    /// they are here or not.
     untrusted: Vec<String>,
     forward: Forward,
     /// Which of the addresses a device was given from the neighbour table are
@@ -136,7 +137,7 @@ impl Reflector {
         let untrusted: Vec<String> = untrusted.to_vec();
         let members = segments
             .into_iter()
-            .map(|segment| Member { untrusted: untrusted.iter().any(|name| name == segment.interface()), segment })
+            .map(|segment| Member { untrusted: untrusted.iter().any(|name| glob(name, segment.interface())), segment })
             .collect();
 
         let inner = Rc::new(Inner {
@@ -182,7 +183,7 @@ impl Reflector {
     /// announced on it (unless it is untrusted), and what it finds is
     /// announced on them. It must not be on an interface already spanned.
     pub fn add(&self, segment: Segment) -> Result<()> {
-        let untrusted = self.inner.untrusted.iter().any(|name| name == segment.interface());
+        let untrusted = self.inner.untrusted.iter().any(|name| glob(name, segment.interface()));
         {
             let mut members = self.inner.members.borrow_mut();
             if members.iter().any(|m| m.segment.interface() == segment.interface()) {

@@ -406,6 +406,40 @@ pub fn drain(sock: impl AsFd, interface: &str, mut heard: impl FnMut(SocketAddr,
     }
 }
 
+/// Whether the interface called `name` is a loopback one (`lo`, or `lo0` on
+/// the BSDs): it says so itself, and so is not taken by its name.
+pub fn is_loopback(name: &str) -> bool {
+    let mut loopback = false;
+    let _ = each_address(|ifa| {
+        // SAFETY: a NUL-terminated name, as getifaddrs gives it.
+        if unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes() == name.as_bytes() {
+            loopback |= ifa.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
+        }
+    });
+    loopback
+}
+
+/// The names of the interfaces there are.
+pub fn interfaces() -> Result<Vec<alloc::string::String>> {
+    // SAFETY: if_nameindex gives a list ended by an entry of index zero, or null.
+    let list = unsafe { libc::if_nameindex() };
+    if list.is_null() {
+        return Err(Why(errno())).context("listing the interfaces");
+    }
+    let mut names = Vec::new();
+    let mut at = list;
+    // SAFETY: `at` stays within the list, up to its last entry, which is of index zero
+    // and name null; the names are NUL-terminated.
+    unsafe {
+        while (*at).if_index != 0 && !(*at).if_name.is_null() {
+            names.push(CStr::from_ptr((*at).if_name).to_string_lossy().into_owned());
+            at = at.add(1);
+        }
+        libc::if_freenameindex(list);
+    }
+    Ok(names)
+}
+
 pub fn ifindex(name: &str) -> Result<u32> {
     let cname = CString::new(name).context("interface name contains NUL")?;
     // SAFETY: cname is a valid NUL-terminated string.
@@ -810,6 +844,12 @@ mod tests {
         );
         assert_eq!(ordered(&found, &[Family::V4]), [ip("10.0.0.5"), ip("10.0.0.9"), ip("169.254.1.1")]);
         assert_eq!(ordered(&found, &[]), Vec::<IpAddr>::new());
+    }
+
+    #[test]
+    fn a_loopback_interface_says_so() {
+        assert!(is_loopback(LOOPBACK));
+        assert!(!is_loopback("no-such-if0"));
     }
 
     #[test]

@@ -381,7 +381,7 @@ fn hosts(groups: &[Group], host: &Host, name: &str) -> (Vec<Found>, bool) {
 
 /// Whether the advertised `block` is advertised on `interface`.
 fn advertised_on(block: &AdvertiseConfig, interface: &str) -> bool {
-    block.interfaces.is_empty() || block.interfaces.iter().any(|i| i == interface)
+    block.interfaces.is_empty() || block.interfaces.iter().any(|i| crate::config::glob(i, interface))
 }
 
 /// The name `addr` is of, and the interface it is on: of this host, or of a

@@ -151,63 +151,28 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // there yet is waited for.
     let hub = Rc::new(socket::Hub::new(&families, &unicast).context("opening the sockets")?);
     let interfaces = config.interfaces();
-    let mut ifaces = Ifaces { config: &config, families: families.clone(), unicast, hub, groups: &segments, live: Vec::new(), seen: HashSet::new() };
+    let mut ifaces = Ifaces { config: &config, families: families.clone(), unicast, hub, groups: &segments, live: Vec::new(), seen: HashSet::new(), skipped: HashSet::new() };
     for interface in &interfaces {
         if ifaces.add(&interface.name)? == Opened::Absent {
             eprintln!("{}: not there yet; waiting for it", interface.name);
         }
     }
 
-    // Look for devices right away instead of waiting for them to announce
-    // themselves, and then again every `probe_interval`: most devices only
-    // answer when asked, so without this a quiet one expires and is withdrawn
-    // from the other networks. The probes run as rounds in the event loop, so
-    // startup is not held up; `mdnsctl probe` does the same on demand.
+    // What is settled for those named; the others are said when they are
+    // there. Each is looked for as soon as it is there, and then again every
+    // `probe_interval`: most devices only answer when asked, so without this a
+    // quiet one expires and is withdrawn from the other networks. The probes run
+    // as rounds in the event loop, so startup is not held up; `mdnsctl probe`
+    // does the same on demand.
     for interface in &interfaces {
-        let name = &interface.name;
-        match interface.min_lifetime.as_secs() {
-            0 => eprintln!("{name}: keeping a device for as long as its records say"),
-            kept => eprintln!("{name}: keeping a device for at least {kept}s after it was last heard from"),
-        }
-        if interface.reannounce {
-            eprintln!("{name}: announcing reflected devices again at 80% of their TTL, changed or not");
-        }
+        describe(interface);
     }
-    for interface in &interfaces {
-        let name = &interface.name;
-        match interface.refresh_before {
-            Some(before) => eprintln!(
-                "{name}: asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
-                before.as_secs()
-            ),
-            None => eprintln!("{name}: refreshing devices before they expire is off"),
+    // Those already there that a pattern names, which netlink says of too, but
+    // not on a system that has none.
+    for name in socket::interfaces().unwrap_or_default() {
+        if is_pattern_match(&config, &name) {
+            ifaces.add(&name)?;
         }
-    }
-    // Each interface is probed as often as the most frequent of its segments
-    // asks.
-    for interface in &interfaces {
-        let name = &interface.name;
-        match interface.probe_interval {
-            Some(interval) => {
-                eprintln!("{name}: probing every {}s", interval.as_secs());
-                // With refreshing on, each device is asked just before it
-                // would expire, so a long interval only delays finding new
-                // devices.
-                // Most devices announce their addresses for two minutes.
-                let kept = interface.min_lifetime.max(core::time::Duration::from_secs(120));
-                if interface.refresh_before.is_none() && interval > kept {
-                    eprintln!(
-                        "warning: that is longer than the {}s a device is usually kept without being heard from, \
-                         so devices on {name} whose records all expire sooner will come and go between probes",
-                        kept.as_secs()
-                    );
-                }
-            }
-            None => eprintln!("{name}: not probing periodically (no ProbeInterval= for it): only at startup and on request"),
-        }
-    }
-    for iface in &ifaces.live {
-        iface.segment.start_probe("startup");
     }
 
     let mut server = ipc::Server::bind(&config.socket, config.socket_mode as rustix::fs::RawMode)?;
@@ -238,6 +203,50 @@ fn daemon(args: Vec<String>) -> Result<()> {
     }
     let _ = rustix::fs::unlink(config.socket.as_str());
     Ok(())
+}
+
+/// Say what is settled for `interface`.
+fn describe(interface: &Interface) {
+    let name = &interface.name;
+    match interface.min_lifetime.as_secs() {
+        0 => eprintln!("{name}: keeping a device for as long as its records say"),
+        kept => eprintln!("{name}: keeping a device for at least {kept}s after it was last heard from"),
+    }
+    if interface.reannounce {
+        eprintln!("{name}: announcing reflected devices again at 80% of their TTL, changed or not");
+    }
+    match interface.refresh_before {
+        Some(before) => eprintln!(
+            "{name}: asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
+            before.as_secs()
+        ),
+        None => eprintln!("{name}: refreshing devices before they expire is off"),
+    }
+    // Each interface is probed as often as the most frequent of its segments
+    // asks.
+    match interface.probe_interval {
+        Some(interval) => {
+            eprintln!("{name}: probing every {}s", interval.as_secs());
+            // With refreshing on, each device is asked just before it
+            // would expire, so a long interval only delays finding new
+            // devices.
+            // Most devices announce their addresses for two minutes.
+            let kept = interface.min_lifetime.max(core::time::Duration::from_secs(120));
+            if interface.refresh_before.is_none() && interval > kept {
+                eprintln!(
+                    "warning: that is longer than the {}s a device is usually kept without being heard from, \
+                     so devices on {name} whose records all expire sooner will come and go between probes",
+                    kept.as_secs()
+                );
+            }
+        }
+        None => eprintln!("{name}: not probing periodically (no ProbeInterval= for it): only at startup and on request"),
+    }
+}
+
+/// Whether the config has the interface `name` by a pattern, not by name.
+fn is_pattern_match(config: &Config, name: &str) -> bool {
+    config.wants(name) && !config.segments.iter().any(|seg| seg.interfaces.iter().any(|i| i == name))
 }
 
 /// How opening an interface went.
@@ -272,6 +281,8 @@ struct Ifaces<'a> {
     live: Vec<Iface>,
     /// The names of those that have been there, for saying one is back.
     seen: HashSet<String>,
+    /// The names of loopback interfaces a pattern matched and were left, for saying so once.
+    skipped: HashSet<String>,
 }
 
 /// One interface that is there: its list of devices, and the sockets it has
@@ -299,7 +310,7 @@ struct Iface {
 impl Ifaces<'_> {
     /// Whether the config names the interface `name` in a segment.
     fn wants(&self, name: &str) -> bool {
-        self.config.segments.iter().any(|seg| seg.interfaces.iter().any(|i| i == name))
+        self.config.wants(name)
     }
 
     /// Serve the interface `name`, if it is wanted, is there and is not
@@ -313,6 +324,14 @@ impl Ifaces<'_> {
         let Ok(index) = socket::ifindex(name) else {
             return Ok(Opened::Absent);
         };
+        // A pattern is for the networks there are: what a loopback interface hears
+        // is what this host sends itself. One that is named is wanted.
+        if is_pattern_match(self.config, name) && socket::is_loopback(name) {
+            if self.skipped.insert(name.to_string()) {
+                eprintln!("{name}: a loopback interface, which a pattern does not take; name it to listen on it");
+            }
+            return Ok(Opened::Absent);
+        }
         let mut iface = Iface::new(&self.config.interface(name), index, self);
         iface.take_mtu(socket::mtu(name).ok());
         // Of the families it has no address to join the group over, only what is
@@ -325,14 +344,18 @@ impl Ifaces<'_> {
             return Ok(Opened::Waiting);
         }
         iface.open_sockets(self)?;
-        let how = if self.seen.insert(name.to_string()) { "here" } else { "back" };
+        let first = self.seen.insert(name.to_string());
+        let how = if first { "here" } else { "back" };
+        if first && is_pattern_match(self.config, name) {
+            describe(&self.config.interface(name));
+        }
         if how == "back" {
             eprintln!("{name}: up");
         }
         eprintln!("{name}: {how} (index {index}), listening");
         iface.addresses_changed(&self.families);
         for (seg, group) in self.config.segments.iter().zip(self.groups) {
-            if seg.interfaces.iter().any(|i| i == name) {
+            if seg.has(name) {
                 group.reflector.add(iface.segment.clone())?;
             }
         }
@@ -432,7 +455,7 @@ impl Iface {
                 .config
                 .advertise
                 .iter()
-                .filter(|a| a.interfaces.is_empty() || a.interfaces.iter().any(|i| *i == interface.name))
+                .filter(|a| a.interfaces.is_empty() || a.interfaces.iter().any(|i| config::glob(i, &interface.name)))
                 .cloned()
                 .collect(),
             index,

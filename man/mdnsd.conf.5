@@ -193,7 +193,8 @@ The interfaces to announce the name and its services on, and to answer for
 there, separated by spaces or commas; the setting may be repeated, and an
 empty one clears the list.
 Each must be in a segment's
-.BR Interfaces= .
+.BR Interfaces= ,
+or matched by a pattern in it, and may be a pattern.
 Default: all of them.
 Needs
 .BR Hostname= .
@@ -241,6 +242,27 @@ Required.
 The interfaces of the segment, separated by commas and/or whitespace.
 An interface need not exist when the daemon starts: it is waited for, and the
 daemon follows it as it comes and goes.
+.IP
+A name may be a pattern:
+.B *
+stands for any run of characters, and
+.B ?
+for any one, so
+.B enp*
+is every interface whose name begins with
+.BR enp .
+Those that are there when the daemon starts, and those that come after, are
+listened to; one that goes is forgotten, as one named is.
+A loopback interface
+.RB ( lo ,
+or
+.B lo0
+on the BSDs) is not taken by a pattern, as what it hears is what this host
+sends itself: name it to listen on it.
+Two segments that share two or more interfaces are an error where the
+interfaces are named alike, but not where patterns merely overlap: look to that
+yourself, as each would then reflect between them and withdraw what the other
+announced.
 .TP
 .B Untrusted=
 Optional.
@@ -264,7 +286,15 @@ learns nothing about
 .BR br0 .
 Every one must be in
 .BR Interfaces= ,
-and at least one interface of a segment of two or more must be trusted.
+or be matched by a pattern in it, and at least one interface of a segment of
+two or more must be trusted.
+A pattern here is of the interfaces it matches: with
+.B Interfaces=br0,iot*
+it takes
+.B Untrusted=iot*
+to leave
+.B br0
+the one that is told.
 Several untrusted interfaces do not learn about each other either.
 Devices are still tracked on an untrusted interface, and listed by
 .BR mdnsctl (1).
@@ -423,12 +453,14 @@ An interface may be listed only once per segment.
 Optional.
 Settings of an interface, whichever segments it is in: devices are tracked per
 interface, so what is kept of them is too.
-There is at most one section for each interface.
+There is at most one section for each name.
 .TP
 .B Name=
 The interface, as it is written in
 .B Interfaces=
-of a segment, which must have it.
+of a segment, which must have it, or a pattern, for every interface it matches.
+A section named for an interface is used before those named for a pattern; of
+those, the first that sets a setting is the one, as in the order of the file.
 Without a
 .BR Name= ,
 the section is for every interface: a setting it has applies to each interface
