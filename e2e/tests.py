@@ -120,6 +120,56 @@ class Reflecting(Case):
         self.assertTrue(hb.none(asks("_ipp._tcp.local", PTR)))
 
 
+class Topologies(Case):
+    """Which networks hear of which, over several segments: what a segment
+    reflects is what its interfaces heard themselves, not what was reflected
+    onto them."""
+
+    def three_links(self):
+        la, lb = self.two_links()
+        return la, lb, self.lab.link("rc", "10.9.3.1/24", "10.9.3.2/24")
+
+    def test_a_chain_of_segments_is_not_followed_from_one_end_to_the_other(self):
+        la, lb, lc = self.three_links()
+        hb, hc = lb.hearer(), lc.hearer()
+        d = self.lab.daemon(conf(
+            "[Segment]\nName=ab\nInterfaces=ra,rb\nUntrusted=ra\n"
+            "[Segment]\nName=bc\nInterfaces=rb,rc\nUntrusted=rb\n"))
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        self.assertTrue(hb.wait(alive("tv.local", A, "10.9.1.50")), "a is seen from b\n" + self.logs(d))
+        d.settle()
+        self.assertTrue(hc.none(lambda h: h.message.has("tv.local")), "but not from c, through b")
+
+        lb.device("10.9.2.50").multicast(announcement("nas", "10.9.2.50", "NAS"))
+        self.assertTrue(hc.wait(alive("nas.local", A, "10.9.2.50")), "b is seen from c\n" + self.logs(d))
+
+    def test_an_extra_segment_lets_one_end_of_a_chain_see_the_other(self):
+        la, lb, lc = self.three_links()
+        ha, hb, hc = la.hearer(), lb.hearer(), lc.hearer()
+        d = self.lab.daemon(conf(
+            "[Segment]\nName=ab\nInterfaces=ra,rb\nUntrusted=ra\n"
+            "[Segment]\nName=bc\nInterfaces=rb,rc\nUntrusted=rb\n"
+            "[Segment]\nName=ac\nInterfaces=ra,rc\nUntrusted=ra\n"))
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        self.assertTrue(hb.wait(alive("tv.local", A, "10.9.1.50")), self.logs(d))
+        self.assertTrue(hc.wait(alive("tv.local", A, "10.9.1.50")), "a is seen from c\n" + self.logs(d))
+        lc.device("10.9.3.50").multicast(announcement("cam", "10.9.3.50", "Cam"))
+        d.settle()
+        self.assertTrue(ha.none(lambda h: h.message.has("cam.local")), "c is not seen from a")
+
+    def test_two_untrusted_interfaces_are_seen_from_the_trusted_one_and_not_from_each_other(self):
+        la, lb, lc = self.three_links()
+        ha, hb, hc = la.hearer(), lb.hearer(), lc.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,rb,rc\nUntrusted=ra,rb\n"))
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        lb.device("10.9.2.50").multicast(announcement("nas", "10.9.2.50", "NAS"))
+        self.assertTrue(hc.wait(alive("tv.local", A, "10.9.1.50")), self.logs(d))
+        self.assertTrue(hc.wait(alive("nas.local", A, "10.9.2.50")), self.logs(d))
+        d.settle()
+        self.assertTrue(ha.none(lambda h: h.message.has("nas.local")), "b is not seen from a")
+        self.assertTrue(hb.none(lambda h: h.message.has("tv.local")), "a is not seen from b")
+
+
 class Vlans(Case):
     """Interfaces that are VLANs of one link, as a router has them: each a
     network of its own, over the same wire."""
