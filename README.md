@@ -336,11 +336,9 @@ tests (see `e2e/`) run there in CI.
 
 FreeBSD 14.5 builds it and passes the unit tests and the end-to-end tests,
 run by hand in a virtual machine (the router is a VNET jail: see `e2e/`). The
-daemon does not read a BSD's routing socket yet, so it does not follow
-interfaces, addresses or neighbours as they change there, and the tests of that
-are skipped. The other BSDs, NetBSD, OpenBSD and DragonFly, have not been tried.
-The part that differs between the BSDs and Linux is run end to end on Linux as
-well, in CI (`cargo build --features portable-sockets`).
+other BSDs, NetBSD, OpenBSD and DragonFly, have not been tried. The part that
+differs between the BSDs and Linux is run end to end on Linux as well, in CI
+(`cargo build --features portable-sockets`).
 
 What differs is the sockets. Linux pins a socket to each interface
 (`SO_BINDTODEVICE`), so each hears nothing from another. The BSDs cannot, so
@@ -357,10 +355,10 @@ Linux, and then only from a host on the interface's networks or link-local.
 Where it does less than on Linux:
 
 - Interfaces that come and go, and the addresses the neighbour table has for
-  devices, are learned from netlink, which only Linux has. Elsewhere an
-  interface has to be there when the daemon starts, and a device's other
-  addresses are not learned. The routing socket would say the same things; it is
-  not read yet.
+  devices, are learned from netlink, which Linux has and FreeBSD (14 and 15)
+  has of the same messages. On the other BSDs an interface has to be there when
+  the daemon starts, and a device's other addresses are not learned. Their
+  routing sockets would say the same things; they are not read yet.
 - An IPv4 group is joined by the interface's address, which is the first it
   has when the socket is opened.
 - `mdnsctl watchers` cannot say which process holds a watch, only its user, and

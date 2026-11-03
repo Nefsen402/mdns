@@ -3,7 +3,7 @@ import os
 import subprocess
 import unittest
 
-from lab import A, AAAA, LINUX, PTR, SRV, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, until
+from lab import A, AAAA, FOLLOWS_CHANGES, FREEBSD, PTR, SRV, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, until
 
 BINARY = os.environ["E2E_DAEMON"]
 CTL = os.environ.get("E2E_CTL")
@@ -11,9 +11,9 @@ LOGS = os.environ.get("E2E_LOGS")
 
 PROBE = ("_services._dns-sd._udp.local", PTR)
 
-# What the daemon follows as the network changes under it it gets from netlink,
-# and a BSD's routing socket, which says the same, is not read yet.
-follows_changes = unittest.skipUnless(LINUX, "the daemon does not follow changes of the network on this system yet")
+# What the daemon follows as the network changes under it it gets from netlink
+# on Linux and the routing socket on FreeBSD; the other BSDs' is not read yet.
+follows_changes = unittest.skipUnless(FOLLOWS_CHANGES, "the daemon does not follow changes of the network on this system yet")
 
 
 def conf(body, ipv6=False):
@@ -557,11 +557,12 @@ class Neighbours(Case):
         d.settle()
         # It has no routable address, so the kernel is made to look the link-local one up: the
         # daemon asks it a question there, and the table has it.
-        self.assertTrue(watch.wait(rf"fe80::50 .*lladdr {mac}"), "the kernel found it\n" + self.logs(d))
+        self.assertTrue(watch.wait(self.lab.net.neighbour_seen("fe80::50", mac)), "the kernel found it\n" + self.logs(d))
         tv = self.known(d)
         self.assertEqual(tv["neighbour_addresses"], ["fd00:9::2"], self.logs(d))
         self.assertEqual(tv["addresses"], ["fd00:9::2", "fe80::50"])
 
+    @unittest.skipIf(FREEBSD, "FreeBSD's netlink does not tell of an entry for an address that no network of the interface has")
     def test_an_address_in_a_network_the_interface_is_not_on_is_learned_when_it_is(self):
         la = self.v6_link()
         mac = "02:00:00:00:00:50"

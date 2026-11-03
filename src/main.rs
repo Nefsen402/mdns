@@ -94,7 +94,16 @@ fn daemon(args: Vec<String>) -> Result<()> {
 
     // Hear of interfaces coming and going from before the sockets are opened,
     // so that no change in between is missed.
-    let netlink = Netlink::open().context("listening for interface changes (netlink)")?;
+    // On FreeBSD it is an option of the kernel, which one built without it has not:
+    // interfaces are then not followed, as where there is nothing to follow them by.
+    let netlink = match Netlink::open() {
+        Ok(netlink) => Some(netlink),
+        Err(e) if cfg!(target_os = "freebsd") => {
+            eprintln!("netlink: {e}; interfaces are not followed as they come and go (does the kernel have netlink?)");
+            None
+        }
+        Err(e) => return Err(e).context("listening for interface changes (netlink)"),
+    };
 
     // One link per interface, however many segments use it, with a socket
     // for each family and one list of devices for both: mDNS records do not
@@ -260,7 +269,7 @@ fn config_path(args: Vec<String>) -> Result<Option<String>, args::Error> {
 /// wait for is worked out afresh each time round.
 fn event_loop(
     signals: &signal::Signals,
-    netlink: Netlink,
+    netlink: Option<Netlink>,
     hub: &socket::Hub,
     links: &mut [Link],
     groups: &[Group],
@@ -268,8 +277,10 @@ fn event_loop(
     avahi: &mut Option<avahi_compat::Server>,
 ) -> Result<&'static str> {
     let reflectors: Vec<&Reflector> = groups.iter().map(|g| &g.reflector).collect();
-    links::ask_neighbours(&netlink);
-    let mut netlink = Some(netlink);
+    let mut netlink = netlink;
+    if let Some(netlink) = &netlink {
+        links::ask_neighbours(netlink);
+    }
     loop {
         let upkeep = links.iter().filter_map(|l| l.segment().next_due());
         let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).chain(avahi.as_ref().and_then(|a| a.next_due())).min();

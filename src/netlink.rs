@@ -6,9 +6,12 @@
 //! the daemon listens for link and address changes, and acts on those to the
 //! interfaces it serves. Only the few fields it needs are read.
 //!
-//! Only Linux has netlink. Elsewhere [`Netlink`] hears of nothing, and what
-//! reads the messages, with the constants of their format, is not used.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+//! Linux has netlink, and FreeBSD (14 and 15) a netlink of the same messages, so
+//! the same code reads them: only the socket is made another way. FreeBSD says
+//! of ARP what its routing socket does not, which is why it is netlink there too.
+//! Elsewhere [`Netlink`] hears of nothing, and what reads the messages, with the
+//! constants of their format, is not used.
+#![cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code, unused_imports))]
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -42,9 +45,13 @@ pub enum Change {
 }
 
 // rtnetlink, from <linux/rtnetlink.h> and <linux/if.h>.
+#[cfg(target_os = "linux")]
 const RTMGRP_LINK: u32 = 0x1;
+#[cfg(target_os = "linux")]
 const RTMGRP_NEIGH: u32 = 0x4;
+#[cfg(target_os = "linux")]
 const RTMGRP_IPV4_IFADDR: u32 = 0x10;
+#[cfg(target_os = "linux")]
 const RTMGRP_IPV6_IFADDR: u32 = 0x100;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
@@ -60,6 +67,25 @@ const NDA_LLADDR: u16 = 2;
 /// The states of a neighbour entry whose link-layer address can be used:
 /// reachable, stale, delay, probe and permanent.
 const NUD_USABLE: u16 = 0x02 | 0x04 | 0x08 | 0x10 | 0x80;
+/// FreeBSD's netlink, from <netlink/netlink.h> and <netlink/netlink_route.h>: its
+/// address family, the level of its options, the one that joins a group, and the
+/// groups.
+#[cfg(target_os = "freebsd")]
+const AF_NETLINK: libc::c_int = 38;
+#[cfg(target_os = "freebsd")]
+const NETLINK_ROUTE: libc::c_int = 0;
+#[cfg(target_os = "freebsd")]
+const SOL_NETLINK: libc::c_int = 270;
+#[cfg(target_os = "freebsd")]
+const NETLINK_ADD_MEMBERSHIP: libc::c_int = 1;
+#[cfg(target_os = "freebsd")]
+const RTNLGRP_LINK: libc::c_int = 1;
+#[cfg(target_os = "freebsd")]
+const RTNLGRP_NEIGH: libc::c_int = 3;
+#[cfg(target_os = "freebsd")]
+const RTNLGRP_IPV4_IFADDR: libc::c_int = 5;
+#[cfg(target_os = "freebsd")]
+const RTNLGRP_IPV6_IFADDR: libc::c_int = 9;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
 const IFF_UP: u32 = 0x1;
@@ -74,13 +100,14 @@ const NDMSG_LEN: usize = 12;
 const RTA_HDRLEN: usize = 4;
 
 /// A socket that hears of link and address changes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub struct Netlink {
     fd: OwnedFd,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 impl Netlink {
+    #[cfg(target_os = "linux")]
     pub fn open() -> Result<Netlink, Why> {
         // SAFETY: plain socket creation; the result is checked.
         let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
@@ -107,6 +134,35 @@ impl Netlink {
         Ok(Netlink { fd })
     }
 
+    /// FreeBSD's netlink is not bound to the groups it wants, but joined to
+    /// them one by one.
+    #[cfg(target_os = "freebsd")]
+    pub fn open() -> Result<Netlink, Why> {
+        // SAFETY: plain socket creation; the result is checked.
+        let fd = unsafe { libc::socket(AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, NETLINK_ROUTE) };
+        if fd < 0 {
+            return Err(Why(errno()));
+        }
+        // SAFETY: `fd` was just created and is owned by nothing else.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        for group in [RTNLGRP_LINK, RTNLGRP_NEIGH, RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV6_IFADDR] {
+            // SAFETY: the option is an int, of which `group` is one.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    SOL_NETLINK,
+                    NETLINK_ADD_MEMBERSHIP,
+                    (&group as *const libc::c_int).cast(),
+                    core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc < 0 {
+                return Err(Why(errno()));
+            }
+        }
+        Ok(Netlink { fd })
+    }
+
     /// Ask the kernel for every entry of every interface's neighbour table:
     /// they come as [`Change::Neighbour`]s among the next changes. For what
     /// was there before the daemon started, or before changes were lost.
@@ -118,6 +174,11 @@ impl Netlink {
         msg.extend(1u32.to_ne_bytes()); // sequence
         msg.extend(0u32.to_ne_bytes()); // port: the kernel fills it in
         msg.extend([0u8; NDMSG_LEN]); // every family, every interface
+        self.send_to_kernel(&msg)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_to_kernel(&self, msg: &[u8]) -> Result<(), Why> {
         // SAFETY: an all-zero sockaddr_nl is the kernel's address.
         let mut kernel: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
         kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
@@ -133,6 +194,14 @@ impl Netlink {
                 core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
             )
         };
+        if n < 0 { Err(Why(errno())) } else { Ok(()) }
+    }
+
+    /// What is sent on FreeBSD's netlink socket is for the kernel: it needs no address.
+    #[cfg(target_os = "freebsd")]
+    fn send_to_kernel(&self, msg: &[u8]) -> Result<(), Why> {
+        // SAFETY: `msg` is readable for its length.
+        let n = unsafe { libc::send(self.fd.as_raw_fd(), msg.as_ptr().cast(), msg.len(), 0) };
         if n < 0 { Err(Why(errno())) } else { Ok(()) }
     }
 
@@ -166,12 +235,12 @@ impl Netlink {
 /// Where there is no netlink, nothing is heard of links, addresses or
 /// neighbours coming and going: interfaces are those there when the daemon
 /// starts, and what the neighbour table knows of the devices is not learned.
-/// The routing socket of the BSDs says the same things in another way, which
-/// this does not read yet.
-#[cfg(not(target_os = "linux"))]
+/// The routing socket of the other BSDs says the same things in another way,
+/// which this does not read yet.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub struct Netlink;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 impl Netlink {
     pub fn open() -> Result<Netlink, Why> {
         Ok(Netlink)

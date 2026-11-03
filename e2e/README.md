@@ -51,9 +51,10 @@ There are no network namespaces, so each test makes a VNET jail for the router
 and `epair` interfaces for the links (`net.py`), with `ifconfig` and `jexec`.
 That needs root, and it changes the host's network stack: run it on a machine
 that may be changed, such as a virtual machine. It needs Python 3 (`pkg install
-python3`). Where the daemon does not follow interfaces, addresses and neighbours
-as they change, as a BSD's does not yet (it does not read the routing socket),
-the tests of that are skipped, with that as the reason.
+python3`). The daemon follows interfaces, addresses and neighbours through
+FreeBSD's netlink, as it does through Linux's, so the tests of that run; one is
+skipped, for what FreeBSD's netlink does not tell (an entry for an address that
+no network of the interface has).
 
 ## Writing a test
 

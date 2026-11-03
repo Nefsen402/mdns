@@ -16,9 +16,7 @@ recent Ubuntu), run it as root, or allow them:
 
 On FreeBSD it makes a VNET jail for the router and `epair` interfaces for the
 links, and so must be run as root, and changes the host's network stack: it is
-for a machine that may be changed, such as a virtual machine. The daemon does
-not follow interfaces, addresses or neighbours as they change there yet, so the
-tests of that are left out.
+for a machine that may be changed, such as a virtual machine.
 """
 import argparse
 import os

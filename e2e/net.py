@@ -12,15 +12,19 @@ other end, where the devices are. How that is made is the system's:
 Both have the same methods, with `side` either `"router"` or `"peer"`: the
 router's end of a link, or the test's.
 """
+import ipaddress
 import itertools
 import os
 import platform
 import re
 import subprocess
-import unittest
 
 LINUX = platform.system() == "Linux"
 FREEBSD = platform.system() == "FreeBSD"
+
+# Whether there is a daemon that follows interfaces, addresses and neighbours as
+# they change under it, which netlink, of Linux and of FreeBSD, tells it.
+FOLLOWS_CHANGES = LINUX or FREEBSD
 
 
 def sh(*args, check=True):
@@ -37,10 +41,6 @@ def split_cidr(cidr):
 
 class Linux:
     """A network namespace held by a process, and veth pairs."""
-
-    # Whether the daemon follows interfaces, addresses and neighbours as they
-    # change, which it does through netlink.
-    follows_changes = True
 
     def __init__(self):
         # The router's namespace is held by a process that says when it is in it.
@@ -95,6 +95,16 @@ class Linux:
     def neighbour_watch_argv(self, iface):
         return [*self.router_argv(), "ip", "-6", "monitor", "neigh", "dev", iface]
 
+    @staticmethod
+    def neighbour_seen(ip, mac):
+        """What the watch prints when `ip` is at `mac` in the table."""
+        return rf"{re.escape(ip)}\S* .*lladdr {mac}"
+
+    @staticmethod
+    def neighbour_gone(ip):
+        """What it prints when the entry is taken away: it fails, here, and is only reported deleted later."""
+        return rf"{re.escape(ip)} FAILED"
+
     def relax_source_checks(self):
         """A packet from an address that is not on the link is not for the kernel to drop."""
         self.run("router", "sh", "-c", "for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > $f; done")
@@ -114,8 +124,6 @@ _jails = itertools.count()
 
 class FreeBSD:
     """A VNET jail, and epair interfaces."""
-
-    follows_changes = False
 
     def __init__(self):
         if os.geteuid() != 0:
@@ -166,12 +174,38 @@ class FreeBSD:
         return re.search(r"ether ([0-9a-f:]{17})", self.run(side, "ifconfig", iface).stdout).group(1)
 
     def neighbour(self, iface, ip, mac):
-        raise unittest.SkipTest("the daemon does not read the neighbour table of a BSD yet")
+        """A permanent entry of the router's neighbour table. There has to be a
+        route to the address for the table to take it, which an address that is
+        not in a network the interface is on does not have: the interface is
+        given one for the network of it. (The table of the kernel does not tell,
+        by netlink, of an entry that no address of the interface covers.)"""
+        v6 = ":" in ip
+        cmd = ["ndp", "-s"] if v6 else ["arp", "-s"]
+        tried = self.run("router", *cmd, ip, mac, check=False)
+        # It says it cannot find a route for the address, and exits well.
+        if tried.returncode or "cannot locate" in tried.stdout + tried.stderr:
+            network = ipaddress.ip_network(f"{ip}/{64 if v6 else 24}", strict=False)
+            if v6:
+                self.run("router", "route", "add", "-inet6", str(network.network_address), "-prefixlen", "64", "-interface", iface)
+            else:
+                self.run("router", "route", "add", "-net", str(network), "-interface", iface)
+            self.run("router", *cmd, ip, mac)
 
-    forget_neighbour = neighbour
+    def forget_neighbour(self, iface, ip):
+        self.run("router", *(["ndp", "-d"] if ":" in ip else ["arp", "-d"]), ip)
 
     def neighbour_watch_argv(self, iface):
-        raise unittest.SkipTest("the daemon does not read the neighbour table of a BSD yet")
+        # Its output is not for a terminal, and is held back until there is a block of it.
+        return [*self.router_argv(), "stdbuf", "-oL", "route", "-n", "monitor"]
+
+    @staticmethod
+    def neighbour_seen(ip, mac):
+        """What the watch prints when `ip` is at `mac` in the table."""
+        return rf"neigh {re.escape(ip)}\S* .*lladdr {mac}"
+
+    @staticmethod
+    def neighbour_gone(ip):
+        return rf"delete neigh {re.escape(ip)}"
 
     def relax_source_checks(self):
         pass  # no reverse path filter by default

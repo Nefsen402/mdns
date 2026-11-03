@@ -29,7 +29,7 @@ A, PTR, TXT, AAAA, SRV, NSEC = 1, 12, 16, 28, 33, 47
 
 # ---------------------------------------------------------------- running things
 
-from net import LINUX, make as make_net, sh  # noqa: E402  (sh is the tests' too)
+from net import FOLLOWS_CHANGES, FREEBSD, LINUX, make as make_net, sh  # noqa: E402  (sh is the tests' too)
 
 
 # Woken whenever something is heard or the daemon says something: what a wait
@@ -487,7 +487,8 @@ class Watch:
     line that has what is waited for, when the command prints it."""
 
     def __init__(self, cmd):
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        # What it prints on its error output is what it says, too: FreeBSD's route monitor does.
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         self.seen = []
 
     def wait(self, pattern, timeout=5.0):
@@ -611,12 +612,18 @@ class Lab:
         what the kernel there learns or changes as it does. It is made ready by
         an entry of its own, which it has seen by the time this returns."""
         watch = self.track(Watch(self.net.neighbour_watch_argv(interface)))
-        self.net.neighbour(interface, "fd00:ffff::1", "02:ff:ff:ff:ff:01")
-        if not watch.wait("fd00:ffff::1", 5):
+        mac = "02:ff:ff:ff:ff:01"
+        # The watch is a process, which does not say when it listens: the entry is
+        # made again until it has been seen.
+        for _ in range(40):
+            self.net.neighbour(interface, "fd00:ffff::1", mac)
+            if watch.wait(self.net.neighbour_seen("fd00:ffff::1", mac), 0.25):
+                break
+            self.net.forget_neighbour(interface, "fd00:ffff::1")
+        else:
             raise RuntimeError("the neighbour table cannot be watched")
-        # Taking it away is seen at once, as the entry failing: it is only reported deleted later.
         self.net.forget_neighbour(interface, "fd00:ffff::1")
-        watch.wait("fd00:ffff::1 FAILED", 5)
+        watch.wait(self.net.neighbour_gone("fd00:ffff::1"), 5)
         return watch
 
     def link(self, name, router_cidr, peer_cidr):
