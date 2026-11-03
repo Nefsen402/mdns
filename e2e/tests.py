@@ -120,6 +120,59 @@ class Reflecting(Case):
         self.assertTrue(hb.none(asks("_ipp._tcp.local", PTR)))
 
 
+class Vlans(Case):
+    """Interfaces that are VLANs of one link, as a router has them: each a
+    network of its own, over the same wire."""
+
+    def vlans(self):
+        trunk = self.lab.trunk("ra")
+        return trunk, trunk.vlan(10, "10.10.0.1/24", "10.10.0.2/24"), trunk.vlan(20, "10.20.0.1/24", "10.20.0.2/24")
+
+    def test_a_device_on_one_vlan_is_reflected_to_another_and_not_back(self):
+        _, v10, v20 = self.vlans()
+        h10, h20 = v10.hearer(), v20.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra.10,ra.20\n"))
+        v10.device("10.10.0.50").multicast(announcement("tv", "10.10.0.50", "TV"))
+        self.assertTrue(h20.wait(alive("tv.local", A, "10.10.0.50")), self.logs(d))
+        d.settle()
+        self.assertTrue(h10.none(lambda h: h.src == v10.router_addr and h.message.has("tv.local", A)), "reflected back")
+        listed = d.host("s", "tv.local")
+        self.assertEqual([(x["interface"], x["addresses"]) for x in listed], [("ra.10", ["10.10.0.50"])], listed)
+
+    def test_vlans_that_share_no_segment_are_kept_apart(self):
+        _, v10, v20 = self.vlans()
+        h20 = v20.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=a\nInterfaces=ra.10\n[Segment]\nName=b\nInterfaces=ra.20\n"))
+        v10.device("10.10.0.50").multicast(announcement("tv", "10.10.0.50", "TV"))
+        d.settle()
+        self.assertTrue(d.host("a", "tv.local"), "heard where it is\n" + self.logs(d))
+        self.assertEqual(d.host("b", "tv.local"), [], "and not of the other")
+        self.assertTrue(h20.none(lambda h: h.message.has("tv.local")), "told of it on the other VLAN")
+
+    def test_a_name_is_advertised_on_the_vlan_it_names_and_not_on_the_other(self):
+        _, v10, v20 = self.vlans()
+        h10, h20 = v10.hearer(), v20.hearer()
+        d = self.lab.daemon(conf("[Advertise]\nHostname=pc\nInterface=ra.10\n[Segment]\nName=s\nInterfaces=ra.10,ra.20\n"))
+        self.assertTrue(h10.wait(alive("pc.local", A, "10.10.0.1")), self.logs(d))
+        # Asked for on the other, it does not answer.
+        v20.device("10.20.0.50").multicast(query(("pc.local", A)))
+        d.settle()
+        self.assertTrue(h20.none(lambda h: h.message.has("pc.local")), "advertised on the other VLAN")
+
+    @follows_changes
+    def test_a_vlan_that_is_made_after_the_daemon_started_is_listened_to_and_told_what_is_known(self):
+        trunk = self.lab.trunk("ra")
+        v10 = trunk.vlan(10, "10.10.0.1/24", "10.10.0.2/24")
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra.10,ra.20\n"))
+        self.assertTrue(d.wait_log(r"ra\.20: not there yet", 5), self.logs(d))
+        v10.device("10.10.0.50").multicast(announcement("tv", "10.10.0.50", "TV"))
+        d.settle()
+        v20 = trunk.vlan(20, "10.20.0.1/24", "10.20.0.2/24")
+        h20 = v20.hearer()
+        self.assertTrue(d.wait_log(r"ra\.20: here \(index \d+\), listening", 5), self.logs(d))
+        self.assertTrue(d.advance_until(lambda: h20.seen(alive("tv.local", A, "10.10.0.50"))), "what is known is announced on it\n" + self.logs(d))
+
+
 class Interfaces(Case):
     @follows_changes
     def test_an_interface_that_is_not_there_yet_is_waited_for_and_followed_as_it_comes_and_goes(self):

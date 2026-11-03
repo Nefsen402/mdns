@@ -538,20 +538,35 @@ class AvahiCall:
 # ---------------------------------------------------------------- the lab
 
 class Link:
-    """A pair of interfaces: `name` in the router, `peer` where the test is."""
+    """A pair of interfaces: `name` in the router, `peer` where the test is. One
+    may have no addresses, as a trunk has, of which there are VLANs with their
+    own ([`Link.vlan`]), which are links of their own to the tests, named for the
+    link and the tag: `ra.10`."""
 
-    def __init__(self, lab, name, router_cidr, peer_cidr):
-        self.lab, self.name, self.peer = lab, name, "p-" + name
+    def __init__(self, lab, name, router_cidr, peer_cidr, parent=None, tag=None):
+        self.lab, self.net, self.parent, self.vlans = lab, lab.net, parent, []
+        if parent:
+            self.name, self.peer = f"{parent.name}.{tag}", f"{parent.peer}.{tag}"
+            self.net.create_vlan(parent.name, parent.peer, tag)
+        else:
+            self.name, self.peer = name, "p-" + name
+            self.net.create_link(name, self.peer)
         self.router_addr = router_cidr.split("/")[0] if router_cidr else None
-        self.peer_addr = peer_cidr.split("/")[0]
-        self.prefix = peer_cidr.split("/")[1] if "/" in peer_cidr else "24"
-        self.net = lab.net
-        self.net.create_link(name, self.peer)
+        self.peer_addr = peer_cidr.split("/")[0] if peer_cidr else None
+        self.prefix = peer_cidr.split("/")[1] if peer_cidr and "/" in peer_cidr else "24"
         if router_cidr:
-            self.net.add_addr("router", name, router_cidr)
-        self.net.set_up("router", name, True)
-        self.net.add_addr("peer", self.peer, peer_cidr)
+            self.net.add_addr("router", self.name, router_cidr)
+        self.net.set_up("router", self.name, True)
+        if peer_cidr:
+            self.net.add_addr("peer", self.peer, peer_cidr)
         self.net.set_up("peer", self.peer, True)
+
+    def vlan(self, tag, router_cidr, peer_cidr):
+        """The VLAN `tag` of the link, with an address at each end."""
+        vlan = Link(self.lab, None, router_cidr, peer_cidr, parent=self, tag=tag)
+        self.vlans.append(vlan)
+        self.lab.links.append(vlan)
+        return vlan
 
     def add_peer_addr(self, addr):
         if addr != self.peer_addr:
@@ -586,8 +601,14 @@ class Link:
         self.net.forget_neighbour(self.name, ip)
 
     def delete(self):
-        """The link is gone, both ends."""
-        self.net.delete_link(self.name, self.peer)
+        """The link is gone, both ends, and its VLANs."""
+        for vlan in self.vlans:
+            vlan.delete()
+        self.vlans = []
+        if self.parent:
+            self.net.delete_vlan(self.name, self.peer)
+        else:
+            self.net.delete_link(self.name, self.peer)
 
     def hearer(self, group=True):
         return self.lab.track(Hearer(self.net, self.peer, self.peer_addr, group))
@@ -631,6 +652,10 @@ class Lab:
         self.links.append(link)
         return link
 
+    def trunk(self, name):
+        """A link with no address of its own, for VLANs."""
+        return self.link(name, None, None)
+
     def track(self, thing):
         self.tracked.append(thing)
         return thing
@@ -646,7 +671,7 @@ class Lab:
             d.stop()
         for t in self.tracked:
             t.close()
-        for link in self.links:
+        for link in reversed(self.links):
             link.delete()
         self.net.close()
         shutil.rmtree(self.dir, ignore_errors=True)

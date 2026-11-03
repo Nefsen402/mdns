@@ -62,7 +62,9 @@ no network of the interface has).
 with the same methods; the tests do not run `ip` or `ifconfig` themselves.
 `lab.py` has the pieces: `Lab` (the router; `lab.link(...)` makes an interface
 of it and the far end, with methods to add and remove its addresses, take it
-down and up, change its MTU and set its neighbours; `lab.router(...)` runs a
+down and up, change its MTU and set its neighbours; `lab.trunk(name)` makes one
+with no addresses of its own, and `trunk.vlan(tag, router_cidr, peer_cidr)` a VLAN
+of it, `ra.10`, that is a link as far as a test goes; `lab.router(...)` runs a
 command there),
 `Link.hearer()` (what is heard on the link, with `wait` for a message that
 matches), `Link.device(addr)` (a device to send and be sent to), `Daemon`

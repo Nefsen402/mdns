@@ -70,6 +70,15 @@ class Linux:
     def delete_link(self, name, peer):
         sh("ip", "link", "del", peer, check=False)
 
+    def create_vlan(self, parent, peer_parent, tag):
+        """A VLAN of `tag` on each end of a link, named for its end and the tag."""
+        for side, link in (("router", parent), ("peer", peer_parent)):
+            self.run(side, "ip", "link", "add", "link", link, "name", f"{link}.{tag}", "type", "vlan", "id", str(tag))
+
+    def delete_vlan(self, name, peer):
+        sh("ip", "link", "del", peer, check=False)
+        self.run("router", "ip", "link", "del", name, check=False)
+
     def add_addr(self, side, iface, cidr):
         self.run(side, "ip", "addr", "add", cidr, "dev", iface, *(["nodad"] if ":" in cidr else []))
 
@@ -150,6 +159,16 @@ class FreeBSD:
     def delete_link(self, name, peer):
         # Either end takes the other with it.
         sh("ifconfig", peer, "destroy", check=False)
+
+    def create_vlan(self, parent, peer_parent, tag):
+        """A VLAN of `tag` on each end of a link, named for its end and the tag:
+        an interface called `parent.tag` is one of that tag on `parent`."""
+        for side, link in (("router", parent), ("peer", peer_parent)):
+            self.run(side, "ifconfig", f"{link}.{tag}", "create")
+
+    def delete_vlan(self, name, peer):
+        sh("ifconfig", peer, "destroy", check=False)
+        self.run("router", "ifconfig", name, "destroy", check=False)
 
     def add_addr(self, side, iface, cidr):
         ip, prefix = split_cidr(cidr)
