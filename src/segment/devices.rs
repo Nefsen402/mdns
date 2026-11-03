@@ -26,7 +26,7 @@ use hashbrown::{DefaultHashBuilder, HashSet};
 
 pub(super) use super::table::Id;
 use super::table::{hash_addr, hash_name, Multi, Table};
-use super::{refresh_gap, Entry};
+use super::Entry;
 use crate::time::Instant;
 
 /// What the tables hold of a device: the hashes of its addresses and of the
@@ -162,18 +162,7 @@ impl Devices {
     /// the gap has passed since it was last asked. Not if it is to be
     /// dropped by then, nor if there is nothing to ask it.
     fn refresh_at(&self, entry: &Entry) -> Option<Instant> {
-        let before = self.refresh?;
-        if !entry.askable() {
-            return None;
-        }
-        let soonest = entry.soonest();
-        let at = soonest.checked_sub(before).unwrap_or(Instant::START);
-        let at = match entry.refreshed.map(|t| t.checked_add(refresh_gap(before))) {
-            Some(Some(again)) => at.max(again),
-            Some(None) => return None, // never again
-            None => at,
-        };
-        (at < soonest).then_some(at)
+        entry.refresh_due(self.refresh?)
     }
 
     /// What the tables would hold of `entry`.

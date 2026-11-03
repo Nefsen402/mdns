@@ -148,6 +148,9 @@ struct Entry {
     /// as for the device. One that stops being announced, without a goodbye,
     /// is so dropped on its own.
     addr_expires: HashMap<IpAddr, Instant>,
+    /// When what runs out first ([`Entry::soonest`]) began its life: how long
+    /// the device said that would be is what is left of it from here.
+    began: Instant,
     /// When it was last asked to answer again because it was about to expire.
     refreshed: Option<Instant>,
     /// When it was last asked on its link-local address, for the kernel to
@@ -160,7 +163,7 @@ impl Entry {
     /// one.
     fn new(now: Instant, from: IpAddr, hostname: Option<&str>) -> Entry {
         let device = Device { hostname: hostname.map(String::from), ..Device::default() };
-        Entry { device, from, expires: now, addr_expires: HashMap::new(), refreshed: None, nudged: None }
+        Entry { device, from, expires: now, addr_expires: HashMap::new(), began: now, refreshed: None, nudged: None }
     }
 
     /// Its records that answer `q`, each with the time it has left here as
@@ -184,6 +187,32 @@ impl Entry {
     /// The soonest it, or one of its addresses, runs out.
     fn soonest(&self) -> Instant {
         self.addr_expires.values().copied().fold(self.expires, Instant::min)
+    }
+
+    /// How long before what runs out first it is asked to answer again: `before`,
+    /// or a quarter of what the device gave it to live if that is shorter, so
+    /// that one with a short TTL is asked three quarters of the way in and not
+    /// over and over.
+    fn lead(&self, before: Duration) -> Duration {
+        before.min(self.soonest().saturating_duration_since(self.began) / 4)
+    }
+
+    /// When it is next due to be asked to answer again, if it is: `lead`
+    /// before the soonest it or one of its addresses runs out, and not again
+    /// until the gap has passed since it was last asked. Not if it is to be
+    /// dropped by then, nor if there is nothing to ask it.
+    fn refresh_due(&self, before: Duration) -> Option<Instant> {
+        if !self.askable() {
+            return None;
+        }
+        let soonest = self.soonest();
+        let at = soonest.checked_sub(self.lead(before)).unwrap_or(Instant::START);
+        let at = match self.refreshed.map(|t| t.checked_add(refresh_gap(before))) {
+            Some(Some(again)) => at.max(again),
+            Some(None) => return None, // never again
+            None => at,
+        };
+        (at < soonest).then_some(at)
     }
 
     /// Renew those of `addrs` it has, each for its TTL in `ttls` (none if it
@@ -250,6 +279,7 @@ impl Entry {
     fn absorb(&mut self, earlier: Entry, max_services: usize) {
         self.device.absorb(earlier.device, max_services);
         self.expires = self.expires.max(earlier.expires);
+        self.began = self.began.min(earlier.began);
         for (addr, at) in earlier.addr_expires {
             let mine = self.addr_expires.entry(addr).or_insert(at);
             *mine = (*mine).max(at);
@@ -608,7 +638,7 @@ impl State {
             self.neighbours.check();
             // What is due next is what a look at every device says.
             let mut scan: Option<Instant> = None;
-            self.for_each_deadline(Instant::now(), &mut |_, _, at| scan = Some(scan.map_or(at, |n| n.min(at))));
+            self.for_each_deadline(&mut |_, _, at| scan = Some(scan.map_or(at, |n| n.min(at))));
             assert_eq!(self.next_due(Instant::now()), scan);
         }
     }
@@ -713,7 +743,7 @@ impl State {
     /// Every time something is due, as what is to be done (`expire`,
     /// `refresh` or `re-announce`), to whom, and when. What
     /// [`State::next_due`] and [`Segment::pending`] are made of.
-    fn for_each_deadline(&self, now: Instant, f: &mut dyn FnMut(&'static str, &dyn fmt::Display, Instant)) {
+    fn for_each_deadline(&self, f: &mut dyn FnMut(&'static str, &dyn fmt::Display, Instant)) {
         let before = self.upkeep.before;
         for e in self.discovered.iter() {
             let who: &dyn fmt::Display = match &e.device.hostname {
@@ -725,20 +755,7 @@ impl State {
             for (addr, &at) in e.addr_expires.iter().filter(|&(_, at)| *at < e.expires) {
                 f("expire", &Labelled(who, addr), at);
             }
-            let Some(before) = before.filter(|_| !self.outbound.is_empty() && e.askable()) else {
-                continue;
-            };
-            // Due `before` ahead of it or one of its addresses running out,
-            // and not again until the gap has passed since it was last asked.
-            let soonest = e.soonest();
-            let mut at = soonest.checked_sub(before).unwrap_or(now);
-            match e.refreshed.map(|t| t.checked_add(refresh_gap(before))) {
-                Some(Some(again)) => at = at.max(again),
-                Some(None) => continue, // never again
-                None => {}
-            }
-            // What runs out first is dropped, not asked about.
-            if at < soonest {
+            if let Some(at) = before.filter(|_| !self.outbound.is_empty()).and_then(|before| e.refresh_due(before)) {
                 f("refresh", who, at);
             }
         }
@@ -1088,7 +1105,7 @@ impl Segment {
     pub fn pending(&self) -> Vec<Pending> {
         let state = self.state.borrow_mut();
         let mut all = Vec::new();
-        state.for_each_deadline(Instant::now(), &mut |what, who, at| {
+        state.for_each_deadline(&mut |what, who, at| {
             all.push(Pending { what, who: who.to_string(), at });
         });
         all.sort_by_key(|p| p.at);
@@ -1562,11 +1579,15 @@ impl Segment {
             if let Some(earlier) = earlier {
                 entry.absorb(earlier, max_services);
             }
+            let was = entry.soonest();
             let ttl = Duration::from_secs(report.longest_ttl().into());
             entry.expires = entry.expires.max(now + ttl.max(floor));
             entry.make_room(&addrs, &report.flushed, &report.gone, max_addrs);
             entry.device.learn(report, &addrs, max_addrs, max_services);
             entry.renew_addrs(&addrs, &report.ttls, now, floor);
+            if entry.soonest() != was {
+                entry.began = now;
+            }
 
             resolved.extend(report.resolved().map(|instance| (id, instance.to_string())));
             if announced_src && sender.is_none() {
@@ -1600,6 +1621,7 @@ impl Segment {
                 }
             };
             let entry = state.discovered.get_mut(id);
+            let was = entry.soonest();
             let ttl = rest.iter().map(|r| r.ttl).max().unwrap_or(0);
             let ttl = Duration::from_secs(ttl as u64);
             entry.expires = entry.expires.max(now + ttl.max(floor));
@@ -1607,6 +1629,9 @@ impl Segment {
                 entry.make_room(&[src], &[], &[], max_addrs);
                 entry.device.take_addrs(&[src], &[], &[], max_addrs);
                 entry.renew_addrs(&[src], &HashMap::new(), now, floor);
+            }
+            if entry.soonest() != was {
+                entry.began = now;
             }
             entry.device.learn_records(rest.iter().copied(), max_services);
         }
@@ -1888,14 +1913,16 @@ impl Segment {
         for id in discovered.about_to_run_out(now, before) {
             let entry = discovered.get(id);
             let recent = entry.refreshed.is_some_and(|t| now.saturating_duration_since(t) < gap);
-            if !entry.askable() || recent {
+            // Its own time to be asked, which is later than `before` ahead of
+            // it for one with a short TTL.
+            if !entry.askable() || recent || entry.refresh_due(before).is_none_or(|at| at > now) {
                 continue;
             }
             // A device that sleeps may ignore the group, and still answers what
             // is sent to it. If it did not answer that (a retry, as it was asked
             // already in this window), the group is tried, in case it ignores
             // what is sent to it instead.
-            let retry = entry.refreshed.is_some_and(|t| entry.soonest().checked_sub(before).is_none_or(|from| t >= from));
+            let retry = entry.refreshed.is_some_and(|t| entry.soonest().checked_sub(entry.lead(before)).is_none_or(|from| t >= from));
             let device = entry.device.clone();
             discovered.edit(id, |entry| entry.refreshed = Some(now));
             let direct = direct_address(&device, direct).filter(|_| !retry);
@@ -2127,6 +2154,17 @@ mod tests {
         // SAFETY: a descriptor just given up by its owner.
         unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
     }
+    const FLOOR: Duration = Duration::from_secs(300);
+
+    /// A segment that keeps a device at least five minutes, as most of these
+    /// tests are of timings that go by a lifetime that long; the default keeps
+    /// a device for exactly its TTL.
+    fn segment(name: &str, families: &[Family]) -> Segment {
+        let seg = Segment::new(name, families);
+        seg.set_min_lifetime(FLOOR);
+        seg
+    }
+
     use crate::device::{record, Service, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
     use crate::parser::{self, rtype, Header};
     use crate::socket::prefix;
@@ -2212,7 +2250,7 @@ mod tests {
 
     #[test]
     fn observe_adds_once_and_notifies() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let rx = seg.subscribe();
         seg.observe(ip("10.0.1.5"));
         seg.observe(ip("10.0.1.5"));
@@ -2223,12 +2261,12 @@ mod tests {
 
     #[test]
     fn expire_removes_and_notifies() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.observe(ip("10.0.1.5"));
         let rx = seg.subscribe();
         seg.expire(Instant::now());
         assert_eq!(seg.devices().len(), 1);
-        seg.expire(Instant::now() + DEFAULT_MIN_LIFETIME + Duration::from_secs(1));
+        seg.expire(Instant::now() + FLOOR + Duration::from_secs(1));
         assert!(seg.devices().is_empty());
         assert_eq!(rx.try_recv(), Ok(Event::Removed(unnamed("10.0.1.5"))));
     }
@@ -2238,7 +2276,7 @@ mod tests {
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         rx.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.attach(Family::V4, fd(tx), rx.local_addr().unwrap());
         (seg, rx)
     }
@@ -2275,7 +2313,7 @@ mod tests {
 
     #[test]
     fn manual_list_is_separate() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let rx = seg.subscribe();
         assert!(seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap());
         assert!(!seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap());
@@ -2521,7 +2559,7 @@ mod tests {
         while recv(&rx).is_some() {}
 
         // Without a sender, nothing.
-        assert_eq!(Segment::new("quiet", &[Family::V4]).query_question(&questions).unwrap(), 0);
+        assert_eq!(segment("quiet", &[Family::V4]).query_question(&questions).unwrap(), 0);
     }
 
     /// A question asked on another's behalf carries what is known here of
@@ -2583,7 +2621,7 @@ mod tests {
         assert!(probed.iter().any(|n| n == "_hue._tcp.local"), "{probed:?}");
 
         // Without a sender, nothing.
-        assert_eq!(run_probe(&Segment::new("quiet", &[Family::V4]), Some(&kinds)).0, Ok(0));
+        assert_eq!(run_probe(&segment("quiet", &[Family::V4]), Some(&kinds)).0, Ok(0));
     }
 
     /// A way to send over IPv4 that always fails: its group is an IPv6
@@ -2708,7 +2746,7 @@ mod tests {
         // The one that fails comes first, so the other is only tried if
         // sending goes on past a failure.
         let (_, rx) = wired();
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         let (socket, dest) = broken();
         seg.attach(Family::V4, fd(socket), dest);
         seg.attach(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
@@ -2723,7 +2761,7 @@ mod tests {
     /// allows.
     #[test]
     fn the_mtu_sets_what_a_packet_may_hold() {
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         assert_eq!(seg.state.borrow_mut().max_packet, DEFAULT_MAX_PACKET, "a standard frame until told");
         assert_eq!(seg.set_mtu(1500), 1452);
         assert_eq!(seg.set_mtu(1492), 1444, "PPPoE");
@@ -2805,7 +2843,7 @@ mod tests {
         seg.probe_round().unwrap();
         within("a probe", packets());
         // Every device due: a margin longer than any lifetime.
-        seg.refresh(Instant::now(), Duration::from_secs(1_000_000)).unwrap();
+        seg.refresh(Instant::now() + FLOOR * 3 / 4 + Duration::from_secs(1), Duration::from_secs(1_000_000)).unwrap();
         within("a refresh", packets());
         let questions: Vec<Question> = (0..16).map(|i| question(&format!("{}{i}._http._tcp.local", "q".repeat(50)), rtype::SRV)).collect();
         seg.query_question(&questions).unwrap();
@@ -2819,7 +2857,7 @@ mod tests {
     /// address to credit it with, nor one to know a device by.
     #[test]
     fn a_packet_from_an_unusable_address_vouches_for_none() {
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         hear(&seg, "0.0.0.0", vec![aaaa("tv.local", "fe80::9"), srv("TV._http._tcp.local", 80, "tv.local")]);
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still heard of");
         assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("fe80::9")]);
@@ -2838,7 +2876,7 @@ mod tests {
     /// whichever comes first, and loses them with their entries.
     #[test]
     fn a_device_is_given_the_addresses_the_neighbour_table_has_for_it() {
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         let events = seg.subscribe();
         let learned = |seg: &Segment| -> Vec<IpAddr> {
             let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
@@ -2882,7 +2920,7 @@ mod tests {
     /// segment to say.
     #[test]
     fn a_device_is_found_in_the_neighbour_table_by_any_address_it_announced() {
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         seg.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
         seg.neighbour(ip("10.0.1.9"), Some(MAC.to_vec()));
         seg.neighbour(ip("fd00::9"), Some(MAC.to_vec()));
@@ -2901,7 +2939,7 @@ mod tests {
     /// own, in the same packet, the device's.
     #[test]
     fn a_device_known_at_the_address_is_not_taken_for_the_sender_of_a_packet_about_another() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         // The router, heard of by what it announces.
         hear(&seg, "10.0.0.1", vec![a_record("router.local", "10.0.0.1"), ptr("_ssh._tcp.local", "router._ssh._tcp.local"), srv("router._ssh._tcp.local", 22, "router.local")]);
         // Then, from it, the browse answer: one device's services, and a service of its own, no addresses.
@@ -2929,7 +2967,7 @@ mod tests {
     /// added to a device by a guess.
     #[test]
     fn a_service_without_a_host_is_not_given_to_a_device_whose_address_was_guessed() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         hear(&seg, "10.0.0.1", vec![
             ptr("_raop._tcp.local", "Speakers._raop._tcp.local"),
             srv("Speakers._raop._tcp.local", 7000, "speakers.local"),
@@ -2951,7 +2989,7 @@ mod tests {
 
     #[test]
     fn only_neighbour_addresses_on_the_interfaces_networks_are_learned() {
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         let learned = |seg: &Segment| -> Vec<IpAddr> {
             let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
             d.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip).collect()
@@ -2977,7 +3015,7 @@ mod tests {
     /// daemon itself, only of a host on the interface's networks or link-local.
     #[test]
     fn what_is_sent_to_the_daemon_is_only_heard_of_a_host_on_the_interface() {
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         seg.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
         let group = Some(ip("224.0.0.251"));
         let group6 = Some(ip("ff02::fb"));
@@ -3008,7 +3046,7 @@ mod tests {
     #[test]
     fn a_device_unknown_to_the_neighbour_table_is_nudged_once() {
         let rx = UdpSocket::bind("[::1]:0").unwrap();
-        let seg = Segment::new("test", &[Family::V6]);
+        let seg = segment("test", &[Family::V6]);
         seg.attach(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap());
         let nudged = |seg: &Segment| {
             let state = seg.state.borrow();
@@ -3020,7 +3058,7 @@ mod tests {
         assert_eq!(nudged(&seg), Some(first), "not again so soon");
 
         // One with a routable IPv6 address is not.
-        let seg = Segment::new("test", &[Family::V6]);
+        let seg = segment("test", &[Family::V6]);
         seg.attach(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap());
         hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9"), aaaa("speakers.local", "fd00::9")]);
         assert_eq!(nudged(&seg), None);
@@ -3033,7 +3071,7 @@ mod tests {
     /// of a family than it is set to.
     #[test]
     fn a_segment_keeps_as_many_addresses_as_it_is_set_to() {
-        let seg = Segment::new("test", &[Family::V6]);
+        let seg = segment("test", &[Family::V6]);
         seg.set_max_addrs(2);
         let many: Vec<Record> = (1..=5).map(|i| aaaa("tv.local", &format!("2001:db8::{i}"))).collect();
         hear(&seg, "fe80::5", many);
@@ -3046,7 +3084,7 @@ mod tests {
     /// device, with services that live longer, stays.
     #[test]
     fn an_address_not_heard_of_again_runs_out_on_its_own() {
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         let events = seg.subscribe();
         let t0 = Instant::now();
         hear(&seg, "10.0.1.7", vec![
@@ -3090,7 +3128,7 @@ mod tests {
 
     #[test]
     fn one_sender_may_describe_only_so_many_hosts() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         for i in 0..MAX_PER_SENDER + 10 {
             hear(&seg, "10.0.1.1", vec![a_record(&format!("h{i}.local"), &format!("10.0.2.{}", i % 250 + 1))]);
         }
@@ -3107,7 +3145,7 @@ mod tests {
 
     #[test]
     fn a_segment_remembers_only_so_many_devices() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         for i in 0..DEFAULT_MAX_DEVICES + 20 {
             seg.observe(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i as u32 + 1)));
         }
@@ -3116,7 +3154,7 @@ mod tests {
 
     #[test]
     fn the_number_of_services_a_device_is_kept_with_can_be_set() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.set_max_services(3);
         let services: Vec<Record> = (0..10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
         hear(&seg, "10.0.1.7", [vec![a_record("tv.local", "10.0.1.7")], services.clone()].concat());
@@ -3130,7 +3168,7 @@ mod tests {
 
     #[test]
     fn the_number_of_devices_a_segment_remembers_can_be_set() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.set_max_devices(10);
         let host = |i: usize| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i as u32 + 1));
         for i in 0..30 {
@@ -3153,7 +3191,7 @@ mod tests {
     /// announced none at all.
     #[test]
     fn a_host_with_only_unusable_addresses_is_not_given_the_senders() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         hear(&seg, "10.0.1.7", vec![a_record("tv.local", "0.0.0.0"), srv("TV._http._tcp.local", 80, "tv.local")]);
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         assert_eq!((v4(&tv), ll4(&tv)), (None, None));
@@ -3167,13 +3205,13 @@ mod tests {
     /// family it sent over or any: a host has the addresses it announced.
     #[test]
     fn the_sender_is_not_credited_with_an_address_it_did_not_announce() {
-        let seg = Segment::new("test", &[Family::V6]);
+        let seg = segment("test", &[Family::V6]);
         hear(&seg, "fe80::7", vec![a_record("tv.local", "10.0.1.7"), srv("TV._http._tcp.local", 80, "tv.local")]);
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         assert_eq!(v4(&tv), Some(ip("10.0.1.7")));
         assert_eq!(ll6(&tv), None, "not the sender's, over IPv6");
 
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         hear(&seg, "10.0.1.8", vec![a_record("nas.local", "0.0.0.0"), aaaa("nas.local", "fd00::8")]);
         let nas = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         assert_eq!((v4(&nas), v6(&nas)), (None, Some(ip("fd00::8"))));
@@ -3184,7 +3222,7 @@ mod tests {
     /// up the one. Saying goodbye with nothing in its place, it is.
     #[test]
     fn giving_up_a_temporary_address_is_not_leaving() {
-        let seg = Segment::new("test", &[Family::V6]);
+        let seg = segment("test", &[Family::V6]);
         hear(&seg, "2001:db8::5", vec![
             aaaa("tv.local", "2001:db8::5"),
             aaaa("tv.local", "fd00::5"),
@@ -3215,7 +3253,7 @@ mod tests {
             ]
         };
         for (first, second) in [("10.0.2.160", "fe80::160"), ("fe80::160", "10.0.2.160")] {
-            let seg = Segment::new("test", &[Family::V4, Family::V6]);
+            let seg = segment("test", &[Family::V4, Family::V6]);
             hear(&seg, "10.0.2.160", records(120));
             hear(&seg, first, records(0));
             assert!(
@@ -3686,7 +3724,7 @@ mod tests {
 
     #[test]
     fn probe_without_a_sender_does_nothing() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let id = seg.probe();
         assert_eq!(seg.probed(id), Some(Ok(0)), "done at once");
         assert_eq!(seg.probed(id), None, "taken");
@@ -3694,7 +3732,7 @@ mod tests {
 
     #[test]
     fn learned_types_are_capped() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let ptrs = (0..MAX_TYPES + 50)
             .map(|i| record(META_QUERY.into(), false, 4500, RData::Ptr(format!("_t{i}._tcp.local"))))
             .collect();
@@ -3736,7 +3774,7 @@ mod tests {
     fn wired_both() -> (Segment, UdpSocket, UdpSocket) {
         let (_, rx4) = wired();
         let (_, rx6) = wired_family(Family::V6);
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         seg.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx4.local_addr().unwrap());
         seg.attach(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx6.local_addr().unwrap());
         (seg, rx4, rx6)
@@ -3746,7 +3784,7 @@ mod tests {
     /// addresses of both.
     #[test]
     fn a_segment_over_both_families_keeps_one_list() {
-        let seg = Segment::new("test", &[Family::V4, Family::V6]);
+        let seg = segment("test", &[Family::V4, Family::V6]);
         hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), srv("TV._http._tcp.local", 80, "tv.local")]);
         hear(&seg, "fe80::7", vec![aaaa("tv.local", "fd00::7")]);
         let named: Vec<Device> = seg.devices().into_iter().filter(|d| d.hostname.is_some()).collect();
@@ -3793,7 +3831,7 @@ mod tests {
     fn wired_family(family: Family) -> (Segment, UdpSocket) {
         let (_, rx) = wired();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let seg = Segment::new("test", &[family]);
+        let seg = segment("test", &[family]);
         seg.attach(family, fd(tx), rx.local_addr().unwrap());
         (seg, rx)
     }
@@ -3816,7 +3854,7 @@ mod tests {
 
     #[test]
     fn a_device_first_heard_by_address_becomes_the_named_device() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let rx = seg.subscribe();
 
         // A browse answer: an instance, but not yet who or where it is.
@@ -3853,7 +3891,7 @@ mod tests {
     /// is not mistaken for any of them.
     #[test]
     fn a_reflector_announcing_other_devices_is_not_mistaken_for_them() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         hear(&seg, "10.0.0.1", vec![
             a_record("speaker.local", "10.0.2.73"),
             ptr("_airplay._tcp.local", "Speaker._airplay._tcp.local"),
@@ -3873,7 +3911,7 @@ mod tests {
 
     #[test]
     fn packets_that_do_not_name_their_sender_belong_to_the_device_it_is() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         assert_eq!(seg.devices().len(), 1);
 
@@ -3888,7 +3926,7 @@ mod tests {
     #[test]
     fn goodbye_and_expiry_also_forget_the_addresses() {
         for goodbye in [true, false] {
-            let seg = Segment::new("test", &[Family::V4]);
+            let seg = segment("test", &[Family::V4]);
             seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
             if goodbye {
                 seg.handle(sa("10.0.1.7"), &announcement(0)).unwrap();
@@ -3974,7 +4012,7 @@ mod tests {
     /// names, not to whichever host the packet happened to mention first.
     #[test]
     fn a_packet_describing_two_devices_attributes_each_record_to_its_own_device() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let rx = seg.subscribe();
         hear(&seg, "10.0.0.1", vec![
             ptr("_airplay._tcp.local", "OZAL TV._airplay._tcp.local"),
@@ -4006,7 +4044,7 @@ mod tests {
 
     #[test]
     fn the_only_host_a_packet_describes_is_not_given_the_senders_address_when_it_announces_none() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         hear(&seg, "10.0.1.9", vec![srv("Dev._http._tcp.local", 80, "dev.local")]);
         let devices = seg.devices();
         assert_eq!(devices.len(), 1);
@@ -4017,7 +4055,7 @@ mod tests {
     /// later packet resolves them to their hosts they are not kept twice.
     #[test]
     fn resolved_instances_leave_the_unresolved_copy_behind() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         hear(&seg, "10.0.0.1", vec![
             ptr("_x._tcp.local", "A._x._tcp.local"),
             ptr("_x._tcp.local", "B._x._tcp.local"),
@@ -4042,7 +4080,7 @@ mod tests {
     /// the list of devices that may hold one follows them coming and going.
     #[test]
     fn an_unresolved_copy_on_another_device_is_found_and_the_list_of_them_is_kept_clean() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         hear(&seg, "10.0.0.1", vec![ptr("_x._tcp.local", "A._x._tcp.local")]);
         hear(&seg, "10.0.0.5", vec![ptr("_x._tcp.local", "C._x._tcp.local")]);
         assert_eq!(seg.state.borrow().discovered.with_unresolved().count(), 2);
@@ -4070,7 +4108,7 @@ mod tests {
     /// at them, and the ones that do not run out are left alone.
     #[test]
     fn devices_that_run_out_together_are_dropped_and_the_others_kept() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.set_max_devices(500);
         for i in 0..200 {
             let (host, from) = (format!("h{i}.local"), format!("10.1.0.{}", i + 1));
@@ -4241,7 +4279,7 @@ mod tests {
 
     #[test]
     fn refresh_without_a_sender_does_nothing_and_remembers_nothing() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         assert_eq!(seg.refresh(Instant::now() + Duration::from_secs(250), Duration::from_secs(60)).unwrap(), 0);
         // Once there is a sender it still asks, because the earlier call asked nobody.
@@ -4274,18 +4312,50 @@ mod tests {
         assert!(recv(&rx).is_none());
 
         // 30 s before the 5 minute floor ends, it is asked.
-        assert_eq!(seg.refresh(t0 + DEFAULT_MIN_LIFETIME - before + Duration::from_secs(1), before).unwrap(), 3);
+        assert_eq!(seg.refresh(t0 + FLOOR - before + Duration::from_secs(1), before).unwrap(), 3);
         assert!(recv(&rx).is_some());
 
         // And without an answer it is dropped when the floor ends, not before.
         seg.expire(t0 + Duration::from_secs(250));
         assert_eq!(seg.devices().len(), 1);
-        seg.expire(t0 + DEFAULT_MIN_LIFETIME + Duration::from_secs(1));
+        seg.expire(t0 + FLOOR + Duration::from_secs(1));
         assert!(seg.devices().is_empty());
     }
 
-    /// The other extreme: a margin longer than any lifetime makes every device
-    /// due all the time. It must not turn into a flood.
+    /// With no floor, a device whose TTL is shorter than the margin is asked
+    /// three quarters of the way through its TTL, and only once in a gap, not
+    /// over and over.
+    #[test]
+    fn a_ttl_shorter_than_the_margin_is_asked_three_quarters_in_where_there_is_no_floor() {
+        let (seg, rx) = wired();
+        seg.set_min_lifetime(Duration::ZERO);
+        hear(&seg, "10.0.1.20", vec![
+            record("short.local".into(), true, 20, RData::A("10.0.1.20".parse().unwrap())),
+            record("S._x._tcp.local".into(), true, 20, RData::Srv { priority: 0, weight: 0, port: 1, target: "short.local".into() }),
+            record("_x._tcp.local".into(), false, 20, RData::Ptr("S._x._tcp.local".into())),
+        ]);
+        let t0 = Instant::now();
+        let before = Duration::from_secs(30); // more than the 20 s it lives
+
+        assert_eq!(seg.refresh(t0, before).unwrap(), 0, "not the moment it is heard");
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(14), before).unwrap(), 0);
+        assert!(recv(&rx).is_none());
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(16), before).unwrap(), 3, "three quarters in, at 15 s");
+        assert!(recv(&rx).is_some());
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(17), before).unwrap(), 0, "not again at once");
+        assert!(recv(&rx).is_none());
+
+        // One that lives longer than the margin is asked the margin before: a
+        // quarter of its TTL is more than that.
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        let long = Instant::now();
+        assert_eq!(seg.refresh(long + Duration::from_secs(89), before).unwrap(), 0);
+        assert_eq!(seg.refresh(long + Duration::from_secs(91), before).unwrap(), 3);
+    }
+
+    /// The other extreme: a margin longer than any lifetime has every device
+    /// asked three quarters of the way through its life, once. It must not turn
+    /// into a flood.
     #[test]
     fn a_margin_longer_than_the_lifetime_asks_at_a_steady_rate_not_constantly() {
         let (seg, rx) = wired();
@@ -4293,13 +4363,14 @@ mod tests {
         let t0 = Instant::now();
         let before = Duration::from_secs(600); // longer than the 300 s floor; the retry gap is 150 s
 
-        assert_eq!(seg.refresh(t0, before).unwrap(), 3, "due from the start");
+        assert_eq!(seg.refresh(t0, before).unwrap(), 0, "not from the start");
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(224), before).unwrap(), 0);
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(226), before).unwrap(), 3, "three quarters in");
         recv(&rx).unwrap();
-        for secs in [1, 10, 100, 149] {
+        for secs in [227, 250, 299] {
             assert_eq!(seg.refresh(t0 + Duration::from_secs(secs), before).unwrap(), 0, "{secs}s");
         }
         assert!(recv(&rx).is_none());
-        assert_eq!(seg.refresh(t0 + Duration::from_secs(150), before).unwrap(), 3, "then once per gap");
     }
 
     #[test]
@@ -4311,9 +4382,9 @@ mod tests {
 
         // Still alive just before the end: asked. Past the end, but not yet
         // dropped (the next expiry pass has not run): not asked.
-        assert_eq!(seg.refresh(t0 + DEFAULT_MIN_LIFETIME - Duration::from_secs(5), before).unwrap(), 3);
+        assert_eq!(seg.refresh(t0 + FLOOR - Duration::from_secs(5), before).unwrap(), 3);
         recv(&rx).unwrap();
-        assert_eq!(seg.refresh(t0 + DEFAULT_MIN_LIFETIME + Duration::from_secs(10), before).unwrap(), 0);
+        assert_eq!(seg.refresh(t0 + FLOOR + Duration::from_secs(10), before).unwrap(), 0);
         assert!(recv(&rx).is_none());
     }
 
@@ -4322,7 +4393,7 @@ mod tests {
     /// runs out first makes room.
     #[test]
     fn a_new_address_takes_the_place_of_the_stalest_at_the_limit() {
-        let seg = Segment::new("test", &[Family::V6]);
+        let seg = segment("test", &[Family::V6]);
         seg.set_max_addrs(2);
         let aaaa = |a: &str| record("phone.local".into(), false, 120, RData::Aaaa(a.parse().unwrap()));
         for a in ["2001:db8::1", "2001:db8::2", "2001:db8::3"] {
@@ -4336,7 +4407,7 @@ mod tests {
     /// The addresses a packet repeats are not the ones to make room.
     #[test]
     fn making_room_leaves_the_addresses_a_packet_repeats() {
-        let seg = Segment::new("test", &[Family::V6]);
+        let seg = segment("test", &[Family::V6]);
         seg.set_max_addrs(2);
         let aaaa = |a: &str| record("phone.local".into(), false, 120, RData::Aaaa(a.parse().unwrap()));
         hear(&seg, "2001:db8::1", vec![aaaa("2001:db8::1")]);
@@ -4366,27 +4437,27 @@ mod tests {
     #[test]
     fn the_minimum_lifetime_is_a_floor_under_a_devices_ttl_and_can_be_changed() {
         // Default: the 5 minute floor holds a 10 second TTL up to 300 s.
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         hear_a_device_with_ttl(&seg, 10);
         assert!(alive_after(&seg, 290));
         assert!(!alive_after(&seg, 301));
 
         // A shorter floor lets that device go sooner...
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.set_min_lifetime(Duration::from_secs(60));
         hear_a_device_with_ttl(&seg, 10);
         assert!(alive_after(&seg, 50));
         assert!(!alive_after(&seg, 61));
 
         // ...a longer one keeps it longer...
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.set_min_lifetime(Duration::from_secs(900));
         hear_a_device_with_ttl(&seg, 10);
         assert!(alive_after(&seg, 890));
         assert!(!alive_after(&seg, 901));
 
         // ...and zero means no floor: it lives for exactly its TTL.
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.set_min_lifetime(Duration::ZERO);
         hear_a_device_with_ttl(&seg, 10);
         assert!(alive_after(&seg, 8));
@@ -4395,7 +4466,7 @@ mod tests {
 
     #[test]
     fn a_ttl_longer_than_the_floor_still_wins() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.set_min_lifetime(Duration::from_secs(60));
         hear_a_device_with_ttl(&seg, 4500);
         assert!(alive_after(&seg, 4490));
@@ -4412,7 +4483,8 @@ mod tests {
 
         assert_eq!(seg.refresh(t0 + Duration::from_secs(60), before).unwrap(), 0, "not yet within 30 s of 100 s");
         assert!(recv(&rx).is_none());
-        assert_eq!(seg.refresh(t0 + Duration::from_secs(72), before).unwrap(), 3, "within 30 s of it");
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(70), before).unwrap(), 0, "a quarter of 100 s is less than 30 s: asked at 75");
+        assert_eq!(seg.refresh(t0 + Duration::from_secs(76), before).unwrap(), 3, "within a quarter of it");
         assert!(recv(&rx).is_some());
     }
 
@@ -4928,7 +5000,7 @@ mod tests {
 
     #[test]
     fn a_device_known_only_by_address_has_announced_no_ttls() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.observe(ip("10.0.1.99"));
         let bare = seg.devices().remove(0);
         assert_eq!((bare.ttl, bare.services.len()), (None, 0));
@@ -4936,7 +5008,7 @@ mod tests {
 
     #[test]
     fn a_segment_that_cannot_send_has_nothing_to_refresh() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         seg.set_refresh_before(Some(Duration::from_secs(60)));
         // Only the expiry: refresh would return at once without asking, and
@@ -4949,9 +5021,11 @@ mod tests {
         let (seg, rx) = wired();
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         seg.set_refresh_before(Some(Duration::MAX));
-        // Everything is within that margin of its expiry, so it is asked...
-        assert!(next_due(&seg).unwrap() <= Instant::now() + Duration::from_millis(50));
-        assert!(seg.refresh(Instant::now(), Duration::MAX).unwrap() > 0);
+        // Everything is within that margin of its expiry, so it is asked, three
+        // quarters of the way in...
+        let asked_at = Instant::now() + FLOOR * 3 / 4;
+        assert!(next_due(&seg).unwrap() <= asked_at + Duration::from_millis(50));
+        assert!(seg.refresh(asked_at + Duration::from_secs(1), Duration::MAX).unwrap() > 0);
         assert!(recv(&rx).is_some());
         // ...once, and then not again until it has expired.
         assert_eq!(next_due(&seg), Some(expiry_of(&seg, "printer.local")));
@@ -4988,15 +5062,15 @@ mod tests {
     #[test]
     fn a_device_is_asked_the_margin_before_it_expires() {
         let (seg, rx) = wired();
-        seg.set_refresh_before(Some(Duration::from_millis(300)));
+        seg.set_refresh_before(Some(Duration::from_millis(100)));
         let events = seg.subscribe();
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
 
         let start = Instant::now();
         let expires = start + Duration::from_millis(500);
         set_expiry(&seg, "printer.local", expires);
-        assert_eq!(seg.next_due(), Some(start + Duration::from_millis(200)));
-        seg.upkeep(start + Duration::from_millis(200));
+        assert_eq!(seg.next_due(), Some(start + Duration::from_millis(400)));
+        seg.upkeep(start + Duration::from_millis(400));
         let query = recv(&rx).expect("asked");
         assert!(asked(&query).contains(&q("printer.local", rtype::A)));
         // It does not answer, so it goes.
@@ -5010,7 +5084,14 @@ mod tests {
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         let device = seg.devices().remove(0);
         // Its records say 120 seconds, but it is kept for at least the floor.
-        assert_eq!(seg.lifetime_left(&device), DEFAULT_MIN_LIFETIME);
+        assert_eq!(seg.lifetime_left(&device), FLOOR);
+
+        // Where there is no floor, the default, it is kept for its TTL.
+        let (seg, _rx) = wired();
+        seg.set_min_lifetime(Duration::ZERO);
+        seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+        let device = seg.devices().remove(0);
+        assert_eq!(seg.lifetime_left(&device), Duration::from_secs(120));
 
         // One that is gone has no time left, and neither has a stranger.
         seg.expire(Instant::now() + Duration::from_secs(3600));
@@ -5020,19 +5101,19 @@ mod tests {
 
     #[test]
     fn events_wait_to_be_taken() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.observe(ip("10.0.1.5"));
         seg.observe(ip("10.0.1.6"));
         assert_eq!(seg.take_events().len(), 2);
         assert!(seg.take_events().is_empty(), "taken");
-        assert!(seg.is(&seg.clone()) && !seg.is(&Segment::new("test", &[Family::V4])));
+        assert!(seg.is(&seg.clone()) && !seg.is(&segment("test", &[Family::V4])));
     }
 
     /// Service types learned from the enumeration are one per type, whatever
     /// their case.
     #[test]
     fn service_types_are_learned_once_whatever_their_case() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let meta = |kind: &str| ptr("_services._dns-sd._udp.local", kind);
         hear(&seg, "10.0.1.7", vec![meta("_http._tcp.local"), meta("_HTTP._tcp.LOCAL")]);
         assert_eq!(seg.state.borrow_mut().types.len(), 1);
@@ -5084,7 +5165,7 @@ mod tests {
 
     #[test]
     fn ingest_fills_in_hostname_and_services() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let rx = seg.subscribe();
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
 
@@ -5109,7 +5190,7 @@ mod tests {
 
     #[test]
     fn later_packet_updates_and_ttl0_removes_service() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.observe(ip("10.0.1.7"));
         let rx = seg.subscribe();
 
@@ -5131,7 +5212,7 @@ mod tests {
 
     #[test]
     fn address_goodbye_removes_device() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         let rx = seg.subscribe();
         seg.handle(sa("10.0.1.7"), &announcement(0)).unwrap();
@@ -5141,9 +5222,9 @@ mod tests {
 
     #[test]
     fn long_ttl_extends_lifetime() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.handle(sa("10.0.1.7"), &announcement(4500)).unwrap();
-        seg.expire(Instant::now() + DEFAULT_MIN_LIFETIME + Duration::from_secs(1));
+        seg.expire(Instant::now() + FLOOR + Duration::from_secs(1));
         assert_eq!(seg.devices().len(), 1);
         seg.expire(Instant::now() + Duration::from_secs(4501));
         assert!(seg.devices().is_empty());
@@ -5151,14 +5232,14 @@ mod tests {
 
     #[test]
     fn garbage_still_counts_as_alive() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         seg.handle(sa("10.0.1.5"), b"\xff\xff not dns").unwrap();
         assert_eq!(seg.devices().len(), 1);
     }
 
     #[test]
     fn query_records_are_ignored() {
-        let seg = Segment::new("test", &[Family::V4]);
+        let seg = segment("test", &[Family::V4]);
         let mut p = announcement(120);
         p[2] = 0x00; // clear QR: a query carrying known answers
         seg.handle(sa("10.0.1.8"), &p).unwrap();
@@ -5180,7 +5261,7 @@ mod tests {
                 Family::V4 => rustix::net::sockopt::set_ip_multicast_loop(&sock.socket, true).unwrap(),
                 Family::V6 => rustix::net::sockopt::set_ipv6_multicast_loop(&sock.socket, true).unwrap(),
             }
-            let seg = Segment::new(&iface, &[family]);
+            let seg = segment(&iface, &[family]);
             let (tx, dest) = sock.sender().unwrap();
             seg.attach(family, tx, dest);
             let addr = match family {
@@ -5202,7 +5283,7 @@ mod tests {
         let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
         let sock = open(&iface, Family::V4, false).unwrap();
         rustix::net::sockopt::set_ip_multicast_loop(&sock.socket, true).unwrap();
-        let seg = Segment::new(&iface, &[Family::V4]);
+        let seg = segment(&iface, &[Family::V4]);
         let (tx, dest) = sock.sender().unwrap();
         seg.attach(Family::V4, tx, dest);
         seg.add_manual(Owner::Own, tv("10.9.9.9", &["LiveTV"])).unwrap();

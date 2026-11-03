@@ -958,6 +958,14 @@ mod tests {
 
     use super::*;
 
+    /// A segment that keeps a device at least five minutes, which is what these
+    /// tests of what is listed assume; the default keeps one for its TTL.
+    fn segment(name: &str, families: &[Family]) -> Segment {
+        let seg = Segment::new(name, families);
+        seg.set_min_lifetime(Duration::from_secs(300));
+        seg
+    }
+
     /// `socket` as the daemon takes a socket.
     fn fd(socket: impl std::os::fd::IntoRawFd) -> rustix::fd::OwnedFd {
         // SAFETY: a descriptor just given up by its owner.
@@ -967,7 +975,7 @@ mod tests {
     use crate::reflector::{deliver_made, Reflector};
 
     fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Segment>) {
-        let segs: Vec<Segment> = interfaces.iter().map(|i| Segment::new(i, &[family])).collect();
+        let segs: Vec<Segment> = interfaces.iter().map(|i| segment(i, &[family])).collect();
         let reflector = Reflector::new(0, segs.clone()).unwrap();
         (Group { name: name.into(), reflector }, segs)
     }
@@ -1060,7 +1068,7 @@ mod tests {
 
     #[test]
     fn segments_say_which_interfaces_are_untrusted() {
-        let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| Segment::new(i, &[Family::V4])).collect();
+        let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| segment(i, &[Family::V4])).collect();
         let reflector = Reflector::with_untrusted(0, segs, &["wifi".to_string()]).unwrap();
         let groups = [Group { name: "IoT to br0".into(), reflector }];
         assert_eq!(
@@ -1163,9 +1171,9 @@ mod tests {
     #[test]
     fn probes_each_interface_once_even_when_segments_share_it() {
         let (a, b, c) = (
-            Segment::new("a", &[Family::V4]),
-            Segment::new("b", &[Family::V4]),
-            Segment::new("c", &[Family::V4]),
+            segment("a", &[Family::V4]),
+            segment("b", &[Family::V4]),
+            segment("c", &[Family::V4]),
         );
         let groups = [
             Group { name: "x".into(), reflector: Reflector::new(0, vec![a.clone(), b.clone()]).unwrap() },
@@ -1462,7 +1470,7 @@ mod tests {
     fn wired(interface: &str) -> (Segment, std::net::UdpSocket) {
         let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         rx.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        let seg = Segment::new(interface, &[Family::V4]);
+        let seg = segment(interface, &[Family::V4]);
         seg.attach(Family::V4, fd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
         (seg, rx)
     }
@@ -1553,7 +1561,7 @@ mod tests {
         let kinds = ["_http._tcp.local".to_string()];
         let mut shown = HashMap::new();
         let tv = |services: bool| {
-            let seg = Segment::new("wifi", &[Family::V4]);
+            let seg = segment("wifi", &[Family::V4]);
             announce(&seg, "10.0.1.7", "tv.local", "TV");
             let mut d = seg.devices().remove(0);
             if !services {
@@ -1636,7 +1644,7 @@ mod tests {
     /// updated or removed. Questions are not changes, and are not shown.
     #[test]
     fn a_watch_line_says_what_happened() {
-        let seg = Segment::new("wifi", &[Family::V4]);
+        let seg = segment("wifi", &[Family::V4]);
         announce(&seg, "10.0.1.7", "tv.local", "TV");
         let tv = seg.devices().remove(0);
         let line = |event| notice_json("IoT", &Notice { interface: "wifi".into(), event, ttl: Duration::from_secs(120) });

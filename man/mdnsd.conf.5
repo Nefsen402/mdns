@@ -180,8 +180,9 @@ or
 turns it off.
 A device lives for as long as the longest TTL it announced, and at least
 .B MinimumLifetime=
-(five minutes by default).
-This long before that runs out, the daemon asks that device, and only it, for
+(none by default).
+This long before that runs out, or when a quarter of its life is left if that is
+less (see below), the daemon asks that device, and only it, for
 the records it announced, and asks again about every quarter of this margin
 until it answers or expires.
 Where the family of its address is
@@ -193,7 +194,7 @@ the questions after it go to the group, and with
 all do.
 .IP
 Each address of a device lives for the TTL it was announced with, at least the
-minimum lifetime, so one the device stops announcing is dropped on its own, and
+minimum lifetime if there is one, so one the device stops announcing is dropped on its own, and
 withdrawn from the other networks; a device is asked again this long before one
 of its addresses would run out, too.
 With
@@ -202,19 +203,24 @@ off, a quiet device's addresses lapse after
 .B MinimumLifetime=
 even while its services live on.
 A speaker whose records live seventy-five minutes is asked at about seventy-four
-minutes; a device with short records just before its minimum lifetime is up.
+minutes.
 Devices that are heard from regularly are never asked, and a device known only by
 the address it was heard from has nothing to ask and is left alone.
 It must be at least 30 seconds.
 .IP
-Because of the minimum lifetime, a TTL shorter than this margin is not a problem:
-such a device is not due as soon as it is heard, it lives
+A device whose records live for less than four times this margin (two minutes,
+with the default of 30 seconds, is the shortest that is asked the whole margin
+before) is asked a quarter of its life before it ends instead, that is, three
+quarters of the way through: one that lives for 20 seconds is asked at 15, and
+is not asked the moment it is heard, nor over and over.
+A device that does not answer is asked again about every quarter of the margin
+(at least five seconds), until it expires.
+.IP
+Devices that go to sleep on battery may ignore questions, and what they
+announced runs out as its TTL says: set
 .B MinimumLifetime=
-after it was last heard and is asked 30 seconds before that.
-The cost is that a device that really vanishes stays listed, and announced to the
-other networks, for up to that long.
-A margin longer than the lifetime makes every device due all the time; it is then
-asked once per quarter of the margin, not continuously.
+to keep them listed for longer, at the cost that a device that really vanishes
+stays listed, and announced to the other networks, for up to that long.
 .TP
 .B ProbeInterval=
 Also probe the interfaces of every segment for devices this often: browse for
@@ -234,9 +240,11 @@ With
 .B RefreshBefore=
 off, a
 .B ProbeInterval=
-has to stay under
+has to stay under the time devices are kept (their TTL, two minutes for most
+addresses, or
 .B MinimumLifetime=
-to keep devices listed, and the daemon warns about it at startup.
+if that is longer) to keep devices listed, and the daemon warns about it at
+startup.
 .SS [Advertise]
 Optional, and there may be any number of them: each is a name of this host,
 with its own services, interfaces and TTL.
@@ -566,22 +574,19 @@ or
 .BR 1h ,
 at most one day.
 Default
-.BR 5min .
-A device lives for the longest TTL it announced, but never for less than this, so
-a device that announces tiny TTLs is not dropped between two of the daemon's
-checks.
-.B 0
-removes the minimum: each device then lives for exactly its longest TTL.
+.BR 0 :
+none, so each device lives for exactly its longest TTL.
+A device lives for the longest TTL it announced, but never for less than this.
 .IP
-It is also the price of a device that vanishes without saying goodbye: it stays
+It is the price of a device that vanishes without saying goodbye: it stays
 listed, and announced to the other networks, for up to this long.
-A longer one keeps a device that goes quiet (one that sleeps and ignores
-multicast, say) listed through the silence, so it is a setting for the network
-of the devices that do, and a shorter one for a network of laptops and phones.
-Keep
-.B RefreshBefore=
-shorter than it, because that margin is counted back from the end of this
-lifetime; the daemon warns at startup if it is not.
+A longer one keeps a device that goes quiet (one that sleeps on battery and
+ignores questions, say) listed through the silence, so it is a setting for a
+network of the devices that do, and none for a network of laptops and phones.
+A device is asked to answer again a quarter of its life before the end where
+that is less than
+.BR RefreshBefore= ,
+which counts back from the end of this lifetime.
 .IP
 It applies to the devices heard on the interface whichever segment reflects them.
 .PP

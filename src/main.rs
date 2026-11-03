@@ -159,28 +159,20 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // from the other networks. The probes run as rounds in the event loop, so
     // startup is not held up; `mdnsctl probe` does the same on demand.
     for interface in config.interfaces() {
-        eprintln!(
-            "{interface}: keeping a device for at least {}s after it was last heard from",
-            config.min_lifetime_of(interface).as_secs()
-        );
+        match config.min_lifetime_of(interface).as_secs() {
+            0 => eprintln!("{interface}: keeping a device for as long as its records say"),
+            kept => eprintln!("{interface}: keeping a device for at least {kept}s after it was last heard from"),
+        }
         if config.reannounce_on(interface) {
             eprintln!("{interface}: announcing reflected devices again at 80% of their TTL, changed or not");
         }
     }
     match config.refresh_before {
         Some(before) => {
-            eprintln!("asking devices to answer again {}s before they would expire", before.as_secs());
-            for interface in config.interfaces() {
-                let kept = config.min_lifetime_of(interface);
-                if before >= kept {
-                    eprintln!(
-                        "warning: that is not shorter than the {}s a device on {interface} is kept at least, so a \
-                         device whose records expire sooner is always due and is asked about every {}s while it answers",
-                        kept.as_secs(),
-                        (before.as_secs() / 4).max(5)
-                    );
-                }
-            }
+            eprintln!(
+                "asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
+                before.as_secs()
+            );
         }
         None => eprintln!("refreshing devices before they expire is off"),
     }
@@ -193,10 +185,11 @@ fn daemon(args: Vec<String>) -> Result<()> {
                 // With refreshing on, each device is asked just before it
                 // would expire, so a long interval only delays finding new
                 // devices.
-                let kept = config.min_lifetime_of(interface);
+                // Most devices announce their addresses for two minutes.
+                let kept = config.min_lifetime_of(interface).max(core::time::Duration::from_secs(120));
                 if config.refresh_before.is_none() && interval > kept {
                     eprintln!(
-                        "warning: that is longer than the {}s a device is kept without being heard from, \
+                        "warning: that is longer than the {}s a device is usually kept without being heard from, \
                          so devices on {interface} whose records all expire sooner will come and go between probes",
                         kept.as_secs()
                     );
