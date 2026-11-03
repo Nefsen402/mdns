@@ -556,6 +556,43 @@ class Timers(Case):
         d.advance(5)
         self.assertFalse(d.host("s", "dev.local"))
 
+    def probing(self, d):
+        """What of a probe is still to be done: its rounds, not the next one's start."""
+        timers = d.request("timers")["timers"]
+        return [p for t in timers for p in t["pending"] if p["what"] == "probe" and "as configured" not in p["who"]]
+
+    def test_an_interface_is_probed_again_every_probe_interval(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        ha = la.hearer()
+        d = self.lab.daemon(conf("[Interface]\nProbeInterval=1min\n[Segment]\nName=s\nInterfaces=ra\n"))
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE))), "probed at startup\n" + self.logs(d))
+        self.assertTrue(d.advance_until(lambda: not self.probing(d), step=1), "and the rounds of that are done")
+        heard = ha.count()
+        # The interval is between the starts of two probes: a minute from the first.
+        d.advance(30)
+        self.assertTrue(ha.none(asks(*PROBE), since=heard), "not yet")
+        d.advance(30)
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE), heard), step=1, limit=10), "and again\n" + self.logs(d))
+        # And again after that.
+        self.assertTrue(d.advance_until(lambda: not self.probing(d), step=1))
+        heard = ha.count()
+        d.advance(60)
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE), heard), step=1, limit=10), "every time")
+
+    def test_an_interface_with_no_probe_interval_is_only_probed_at_startup_and_on_request(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        ha = la.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra\n"))
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE))), "probed at startup\n" + self.logs(d))
+        self.assertTrue(d.advance_until(lambda: not self.probing(d), step=1))
+        heard = ha.count()
+        d.advance(600)
+        self.assertTrue(ha.none(asks(*PROBE), since=heard), "and not again by itself")
+        ctl = d.ctl_start("probe", "s")
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE), heard)), "but when asked")
+        self.assertTrue(d.advance_until(lambda: ctl.poll() is not None, step=1, limit=30))
+        ctl.communicate(timeout=10)
+
 
 if __name__ == "__main__":
     unittest.main()
