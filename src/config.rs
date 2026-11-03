@@ -1,51 +1,11 @@
-//! systemd-style (INI) configuration.
+//! systemd-style (INI) configuration, read once at startup.
 //!
-//! ```ini
-//! [Listen]            ; optional
-//! IPv4=multicast      ; off, multicast or on (which also hears what is sent to the
-//! IPv6=multicast      ; daemon itself); multicast unless set
+//! The settings, their defaults and an example are in `man/mdnsd.conf.5`, which
+//! a test here keeps in step: every key is in it, and its example parses.
 //!
-//! [Ipc]               ; optional
-//! Socket=/run/mdnsd/mdnsd.sock
-//! Mode=0666           ; who may use it, as an octal mode; 0666 unless set
-//!
-//! [Advertise]         ; optional
-//! Hostname=router.local
-//! Interface=br0       ; all of them unless set
-//! Services=_ssh._tcp:22
-//!
-//! [Segment]
-//! Name=media_stuff
-//! Interfaces=br0,media
-//!
-//! [Segment]
-//! Name="IoT"
-//! Interfaces=wifi
-//! ProbeInterval=1min  ; its interfaces' ProbeInterval= unless set
-//! ForwardQuestions=unknown  ; always, unknown or never; always unless set
-//! ReflectedWhen=address,hostname  ; what a device must have to be reflected; all three unless set
-//!
-//! [Interface]         ; optional: without a Name=, for every interface
-//! MaxAddresses=8      ; 8 unless set
-//! MaxDevices=1024     ; 1024 unless set
-//! MaxServices=64      ; 64 unless set
-//! RefreshBefore=30s   ; how long before a device expires to ask it again; 30s unless set, off turns it off
-//! ProbeInterval=4min  ; how often to browse the interface for devices; off unless set
-//!
-//! [Interface]         ; optional, for each interface that needs its own
-//! Name=wifi
-//! MinimumLifetime=1h  ; 1min unless set; 0 keeps a device for exactly its TTL
-//! ```
-//!
-//! Each `[Segment]` is a group of interfaces whose devices are reflected
-//! between every pair of them; a segment of one interface only tracks. An
-//! interface may appear in several segments, which is how `br0` can see both
-//! `media` and `wifi` while those two never see each other.
-//!
-//! Section and key names are case-insensitive. Like systemd, `#` and `;`
-//! start comment lines, repeated keys append (an empty assignment resets),
-//! and values may be quoted. Interface lists are separated by commas or
-//! whitespace.
+//! [`Config::parse`] turns the text into a [`Config`] and checks it as a whole.
+//! What is set for an interface is gathered from the `[Interface]` sections
+//! and the segments it is in into one [`Interface`], by [`Config::interface`].
 
 use core::fmt;
 use core::time::Duration;
