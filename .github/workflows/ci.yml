@@ -11,6 +11,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The FreeBSD that is built for and run on.
+  FREEBSD: '14.5'
 
 # What is built once, and what every other job runs: the daemon (with a socket
 # for each interface, and with one shared by every interface, as the BSDs have
@@ -204,44 +206,75 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
+  # The daemon for FreeBSD, built here, for the job that follows to run: Rust is
+  # slow to install in a virtual machine, and to build with there. It is linked
+  # against the release's own C library, which the script fetches; see
+  # e2e/cross_freebsd.py.
+  freebsd-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable), and its FreeBSD target
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-freebsd --no-self-update
+          rustup default stable
+
+      # The linker, and what it is driven by.
+      - name: Install clang and lld
+        run: sudo apt-get install -y --no-install-recommends clang lld
+
+      - name: Build for FreeBSD
+        run: python3 e2e/cross_freebsd.py ${{ env.FREEBSD }} --out freebsd-binaries
+
+      - name: Keep the binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-binaries
+          path: freebsd-binaries
+          retention-days: 1
+
   # The daemon on FreeBSD, in a virtual machine, which is what pfSense and OPNsense
   # are: its unit tests, and the end-to-end tests, where the router is a VNET jail
   # and the links epair interfaces (see e2e/). They are run as root, and change the
-  # network of the machine, which is why it is a virtual machine. It builds in the
-  # machine, and not from the build job's binaries, which are for Linux; so it
-  # records no coverage. What is built there is not synchronised back, so it is all
-  # one step. The action is pinned by its commit, as it is not GitHub's.
+  # network of the machine, which is why it is a virtual machine. What it runs is
+  # built by the job before it, so it records no coverage. The action is pinned by
+  # its commit, as it is not GitHub's.
   freebsd:
+    needs: freebsd-build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     defaults:
       run:
         shell: cpa.sh {0} --sync-files runner-to-vm
-    strategy:
-      fail-fast: false
-      matrix:
-        version: ['14.5', '15.1']
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: freebsd-binaries
+          path: freebsd-binaries
+
       - name: Start the virtual machine
         uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
         with:
           operating_system: freebsd
-          version: ${{ matrix.version }}
+          version: ${{ env.FREEBSD }}
           architecture: x86_64
 
-      - name: Build, and run the unit tests and the end-to-end tests
+      # Python is what the end-to-end tests are written in. The files are
+      # synchronised to the machine, which does not keep what makes a file run.
+      - name: Run the unit tests and the end-to-end tests
         run: |
           set -eux
           freebsd-version
-          sudo pkg install -y rust python3
-          rustc --version
-          cargo test --locked
-          # Last, and with the clock the end-to-end tests move: without it they
-          # skip what needs it, and still pass.
-          cargo build --locked --features test-clock
-          strings target/debug/mdnsd | grep -q 'advance <milliseconds>'
-          sudo python3 e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd
+          sudo pkg install -y python3
+          chmod +x freebsd-binaries/mdnsd freebsd-binaries/mdnsctl freebsd-binaries/tests/*
+          for t in freebsd-binaries/tests/*; do "$t"; done
+          # With the clock the end-to-end tests move: without it they skip what
+          # needs it, and still pass.
+          strings freebsd-binaries/mdnsd | grep -q 'advance <milliseconds>'
+          sudo python3 e2e/e2e.py --ctl freebsd-binaries/mdnsctl freebsd-binaries/mdnsd

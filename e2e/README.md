@@ -121,9 +121,16 @@ merges the profiles. The table is in the job's summary, on a pull request in a
 comment that is kept up to date and compares with the last run on `master`, and
 the report is an artifact.
 
-A `freebsd` job runs alongside them, for each of the FreeBSD releases that are
-supported (14.5 and 15.1): in a virtual machine, which
+Two jobs are for FreeBSD (14.5). `freebsd-build` cross-builds the daemon, `mdnsctl`
+and the unit tests here, with `cross_freebsd.py`; and `freebsd`, in a virtual
+machine that
 [cross-platform-actions](https://github.com/cross-platform-actions/action) starts,
-it builds the daemon, runs the unit tests, and runs these tests as root, with the
-router a VNET jail. What it builds is its own, not the build job's, so it records
-no coverage.
+runs the unit tests and these tests as root, with the router a VNET jail. Rust is
+slow to install and build with in a virtual machine, which is why it is built
+here. Neither records coverage.
+
+`cross_freebsd.py VERSION --out DIR` is what builds for FreeBSD, from Linux, and
+can be run by hand. It links against that release's own C library, which it
+downloads (and checks against the release's MANIFEST), and needs `rustup target
+add x86_64-unknown-freebsd`, `clang` and `lld`. The compiler has to be an official
+one: a distribution's will not take the target's standard library.
