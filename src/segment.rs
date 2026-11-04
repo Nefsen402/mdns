@@ -34,7 +34,7 @@ use crate::parser::{Message, Question, Record};
 use crate::prelude::*;
 
 mod manuals;
-use crate::tracker::{refresh_gap, Id, Touched, Tracker, MAX_TYPES};
+use crate::tracker::{names_of, refresh_gap, Change, Id, Touched, Tracker, MAX_TYPES};
 use manuals::Manuals;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
@@ -478,10 +478,10 @@ impl State {
         for (ll, device) in core::mem::take(&mut touched.nudges) {
             nudge(&self.outbound, ll, &Device::refresh_queries(core::slice::from_ref(&device), self.max_packet));
         }
-        let names = touched.names(&self.tracker.discovered);
-        let events = touched.events(&self.tracker.discovered);
+        let changes = touched.changes(&self.tracker.discovered);
+        let events: Vec<Event> = changes.iter().filter_map(Change::event).collect();
         if !events.is_empty() {
-            self.settle_for(&names, now);
+            self.settle_for(&names_of(&changes), now);
         }
         for event in events {
             self.notify(event);
