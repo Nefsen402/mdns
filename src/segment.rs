@@ -34,7 +34,7 @@ use crate::parser::{Message, Question, Record};
 use crate::prelude::*;
 
 mod manuals;
-use crate::tracker::{names_of, refresh_gap, Change, Id, Touched, Tracker, MAX_TYPES};
+use crate::tracker::{refresh_gap, Id, Touched, Tracker, MAX_TYPES};
 use manuals::Manuals;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
@@ -85,19 +85,7 @@ const MIN_MAX_PACKET: usize = 512;
 /// mDNS's own limit (RFC 6762 section 17).
 const MAX_MAX_PACKET: usize = 9000;
 
-/// A change to the *discovered* list (manual devices never produce events),
-/// or questions asked on the segment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    Added(Device),
-    /// Hostname or services changed.
-    Updated(Device),
-    Removed(Device),
-    /// The questions of a query that no device here owns the name of: for
-    /// the reflector to put to the segments whose devices it announces here
-    /// ([`Segment::query_question`]), as it is configured to.
-    Question(Vec<Asked>),
-}
+pub use crate::tracker::Event;
 
 /// A question asked on a segment, as passed on to the reflector.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -478,10 +466,10 @@ impl State {
         for (ll, device) in core::mem::take(&mut touched.nudges) {
             nudge(&self.outbound, ll, &Device::refresh_queries(core::slice::from_ref(&device), self.max_packet));
         }
-        let changes = touched.changes(&self.tracker.discovered);
-        let events: Vec<Event> = changes.iter().filter_map(Change::event).collect();
+        let names = touched.names(&self.tracker.discovered);
+        let events = touched.events(&self.tracker.discovered);
         if !events.is_empty() {
-            self.settle_for(&names_of(&changes), now);
+            self.settle_for(&names, now);
         }
         for event in events {
             self.notify(event);
@@ -1119,7 +1107,7 @@ impl Segment {
         }
         for id in ids {
             if let Some(entry) = state.tracker.discovered.remove(id) {
-                state.notify(Event::Removed(entry.device));
+                state.notify(Event::Removed(Rc::new(entry.device)));
             }
         }
         let names = touched.names(&state.tracker.discovered);
@@ -1570,8 +1558,9 @@ impl Segment {
             state.tracker.discovered.running_out(now).into_iter().partition(|&id| state.tracker.discovered.get(id).expires <= now);
         let mut lost = Vec::new();
         for id in running {
+            let before = state.tracker.discovered.get(id).device.clone();
             if state.tracker.discovered.edit(id, |entry| entry.expire_addrs(now)) == Some(true) {
-                lost.push(id);
+                lost.push((id, before));
             }
         }
         if stale.is_empty() && lost.is_empty() {
@@ -1583,12 +1572,12 @@ impl Segment {
         }
         for id in stale {
             if let Some(entry) = state.tracker.discovered.remove(id) {
-                state.notify(Event::Removed(entry.device));
+                state.notify(Event::Removed(Rc::new(entry.device)));
             }
         }
-        for id in lost {
-            if let Some(device) = state.tracker.discovered.try_get(id).map(|e| e.device.clone()) {
-                state.notify(Event::Updated(device));
+        for (id, before) in lost {
+            if let Some(after) = state.tracker.discovered.try_get(id).map(|e| e.device.clone()) {
+                state.notify(Event::Updated { before: Rc::new(before), after: Rc::new(after) });
             }
         }
         // What they had here may be shown again. `now` may be ahead of the
@@ -1815,7 +1804,7 @@ mod tests {
         seg.observe(ip("10.0.1.5"));
         seg.observe(ip("10.0.1.5"));
         assert_eq!(seg.devices().len(), 1);
-        assert_eq!(rx.try_recv(), Ok(Event::Added(unnamed("10.0.1.5"))));
+        assert_eq!(rx.try_recv(), Ok(Event::Added(Rc::new(unnamed("10.0.1.5")))));
         assert!(rx.try_recv().is_err());
     }
 
@@ -1828,7 +1817,7 @@ mod tests {
         assert_eq!(seg.devices().len(), 1);
         seg.expire(Instant::now() + FLOOR + Duration::from_secs(1));
         assert!(seg.devices().is_empty());
-        assert_eq!(rx.try_recv(), Ok(Event::Removed(unnamed("10.0.1.5"))));
+        assert_eq!(rx.try_recv(), Ok(Event::Removed(Rc::new(unnamed("10.0.1.5")))));
     }
 
     /// A v4 segment whose "multicast group" is a local socket we can read.
@@ -2458,7 +2447,7 @@ mod tests {
         // Then more of it: added, and told.
         seg.neighbour(ip("2001:db8:2::73"), Some(MAC.to_vec()));
         assert_eq!(learned(&seg), [ip("2001:db8:2::73"), ip("fd00:0:2::73")]);
-        assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.has_addr(&ip("2001:db8:2::73"))));
+        assert!(matches!(events.try_recv(), Ok(Event::Updated { after: d, .. }) if d.has_addr(&ip("2001:db8:2::73"))));
         // A packet from a learned address is the device's.
         let state = seg.state.borrow();
         let holder = state.tracker.discovered.holder_of(&ip("2001:db8:2::73")).map(|id| state.tracker.discovered.get(id).device.hostname.clone());
@@ -2469,7 +2458,7 @@ mod tests {
         seg.neighbour(ip("2001:db8:2::73"), None);
         assert_eq!(learned(&seg), [ip("fd00:0:2::73")]);
         assert!(!seg.state.borrow_mut().tracker.discovered.holder_of(&ip("2001:db8:2::73")).is_some());
-        assert!(matches!(events.try_recv(), Ok(Event::Updated(_))));
+        assert!(matches!(events.try_recv(), Ok(Event::Updated { .. })));
         // The same entry again changes nothing, and says nothing.
         seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
         assert!(events.try_recv().is_err());
@@ -2666,7 +2655,7 @@ mod tests {
         seg.expire(t0 + Duration::from_secs(400));
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still there");
         assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("fd00::7")]);
-        assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.addrs().eq([ip("fd00::7")])));
+        assert!(matches!(events.try_recv(), Ok(Event::Updated { after: d, .. }) if d.addrs().eq([ip("fd00::7")])));
         assert!(!seg.state.borrow_mut().tracker.discovered.holder_of(&ip("10.0.1.7")).is_some(), "nor found by it");
     }
 
@@ -3688,7 +3677,7 @@ mod tests {
         let left = seg.devices();
         assert_eq!(left.len(), 1, "{left:?}");
         assert_eq!(left[0].hostname.as_deref(), Some(keep));
-        assert!(matches!(seg.take_events().last(), Some(Event::Updated(_) | Event::Removed(_))));
+        assert!(matches!(seg.take_events().last(), Some(Event::Updated { .. } | Event::Removed(_))));
         assert_eq!(seg.state.borrow().tracker.discovered.addrs_held(), 1, "only the survivor's address is still attributed");
         seg.state.borrow().tracker.discovered.check();
     }
@@ -4792,7 +4781,7 @@ mod tests {
         ptr.extend(labels(&["_http", "_tcp", "local"]));
         rr(&mut p, &["_http", "_tcp", "local"], 12, 0, &ptr);
         seg.handle(sa("10.0.1.7"), &p).unwrap();
-        assert!(matches!(rx.try_recv(), Ok(Event::Updated(d)) if d.services.is_empty()));
+        assert!(matches!(rx.try_recv(), Ok(Event::Updated { after: d, .. }) if d.services.is_empty()));
         assert_eq!(seg.devices().len(), 1);
     }
 

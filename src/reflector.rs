@@ -276,7 +276,7 @@ fn deliver_to(inners: &[&Inner]) {
 fn log(interface: &str, event: &Event) {
     let (what, device) = match event {
         Event::Added(d) => ("added", d),
-        Event::Updated(d) => ("updated", d),
+        Event::Updated { after: d, .. } => ("updated", d),
         Event::Removed(d) => ("removed", d),
         Event::Question(_) => return,
     };
@@ -355,7 +355,7 @@ impl Inner {
         let seg = self.snapshot().swap_remove(src).segment;
         let ttl = match event {
             Event::Removed(_) | Event::Question(_) => Duration::ZERO,
-            Event::Added(device) | Event::Updated(device) => seg.lifetime_left(device),
+            Event::Added(device) | Event::Updated { after: device, .. } => seg.lifetime_left(device),
         };
         let mut notices = self.notices.borrow_mut();
         if notices.len() >= MAX_NOTICES {
@@ -369,7 +369,7 @@ impl Inner {
             return self.forward(src, questions);
         }
         self.notify(src, &event);
-        let (Event::Added(device) | Event::Updated(device) | Event::Removed(device)) = &event else { return };
+        let Some(device) = event.device() else { return };
         // A device that never had a name was never reflected. What the event
         // says of the device is not looked at: the segments are, as they are
         // now, which is where it is reflected from.
