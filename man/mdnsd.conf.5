@@ -271,9 +271,21 @@ or
 on the BSDs) is not taken by a pattern, as what it hears is what this host
 sends itself: name it to listen on it.
 Two segments that share two or more interfaces are an error where the
-interfaces are named alike, but not where patterns merely overlap: look to that
-yourself, as each would then reflect between them and withdraw what the other
-announced.
+interfaces are named alike, a mistake that is certain.
+Where patterns merely overlap it is not: an interface may come that makes them
+so, or never.
+The segments then act as one that reflects what either would: a device is
+reflected between two interfaces if any segment that has both says so, and one
+segment cannot hold back what another reflects, whatever
+.BR Untrusted= ,
+.B ReflectedWhen=
+and
+.B ReflectedServices=
+say.
+Where more than one would reflect a device the same way, the earlier one in the
+file decides how: its filter, its TTL, its addresses.
+List a segment with a narrower set of interfaces first if its settings are to
+be those used between them, and not one that is broader as well.
 .TP
 .B Untrusted=
 Optional.
