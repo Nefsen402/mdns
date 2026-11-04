@@ -678,12 +678,11 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
         for seg in links_of(groups, name) {
             for device in seg.devices().iter().filter_map(|d| d.only_kinds(&query.kinds)) {
                 let ttl = seg.lifetime_left(&device);
-                let notice = Notice { interface: seg.interface().to_string(), event: Event::Added(device), ttl };
-                present.push(event_json("present", name, &notice));
+                present.push(event_json("present", name, seg.interface(), &device, ttl));
             }
             // Nothing is heard of this host: it is here as it advertises itself.
             for (device, ttl) in seg.own_devices().iter().filter_map(|(d, ttl)| Some((d.only_kinds(&query.kinds)?, *ttl))) {
-                let mut line = event_json("present", name, &Notice { interface: seg.interface().to_string(), event: Event::Added(device), ttl });
+                let mut line = event_json("present", name, seg.interface(), &device, ttl);
                 line["device"]["own"] = Value::Bool(true);
                 present.push(line);
             }
@@ -707,16 +706,13 @@ fn ask_for_types(groups: &[Group], name: &str, kinds: &[String]) {
 /// it added: one listed as present when the watch started can be told of again
 /// as it is filed.
 fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashMap<(String, String), Value>) -> Option<Value> {
-    let (removed, device) = match &notice.event {
-        Event::Added(d) | Event::Updated(d) => (false, d),
-        Event::Removed(d) => (true, d),
-        Event::Question(_) => return None,
-    };
+    let removed = matches!(notice.event, Event::Removed(_));
+    let device = notice.event.device()?;
     let key = device.key().map(|k| (notice.interface.clone(), k));
     let was_shown = key.as_ref().is_some_and(|k| shown.contains_key(k));
     match device.only_kinds(kinds) {
         Some(narrow) if !removed => {
-            let line = event_json(if was_shown { "updated" } else { "added" }, segment, &Notice { event: Event::Updated(narrow), ..notice });
+            let line = event_json(if was_shown { "updated" } else { "added" }, segment, &notice.interface, &narrow, notice.ttl);
             if let Some(key) = key {
                 if shown.get(&key) == Some(&line["device"]) {
                     return None;
@@ -733,7 +729,7 @@ fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashMap
                 shown.remove(key);
             }
             let gone = narrow.unwrap_or_else(|| Device { services: Vec::new(), ..device.clone() });
-            Some(event_json("removed", segment, &Notice { event: Event::Removed(gone), ttl: Duration::ZERO, ..notice }))
+            Some(event_json("removed", segment, &notice.interface, &gone, Duration::ZERO))
         }
         _ => None,
     }
@@ -743,20 +739,16 @@ fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashMap
 fn notice_json(segment: &str, notice: &Notice) -> Option<Value> {
     let event = match &notice.event {
         Event::Added(_) => "added",
-        Event::Updated(_) => "updated",
+        Event::Updated { .. } => "updated",
         Event::Removed(_) => "removed",
         Event::Question(_) => return None,
     };
-    Some(event_json(event, segment, notice))
+    Some(event_json(event, segment, &notice.interface, notice.event.device()?, notice.ttl))
 }
 
-/// A watch line saying `event` of the device of `notice`.
-fn event_json(event: &str, segment: &str, notice: &Notice) -> Value {
-    let device = match &notice.event {
-        Event::Added(d) | Event::Updated(d) | Event::Removed(d) => device_json(&notice.interface, d),
-        Event::Question(_) => Value::Null,
-    };
-    json!({ "event": event, "segment": segment, "ttl": notice.ttl.as_secs(), "device": device })
+/// A watch line saying `event` of `device`, which has `ttl` left, on `interface`.
+fn event_json(event: &str, segment: &str, interface: &str, device: &Device, ttl: Duration) -> Value {
+    json!({ "event": event, "segment": segment, "ttl": ttl.as_secs(), "device": device_json(interface, device) })
 }
 
 /// Answer one request line with one line of JSON.
@@ -991,6 +983,22 @@ fn error(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    fn added(device: Device) -> Event {
+        Event::Added(Rc::new(device))
+    }
+
+    /// An update to `device`, from just as it is: how it changed is not
+    /// what a watch shows.
+    fn updated(device: Device) -> Event {
+        Event::Updated { before: Rc::new(device.clone()), after: Rc::new(device) }
+    }
+
+    fn removed(device: Device) -> Event {
+        Event::Removed(Rc::new(device))
+    }
+
     use std::fs;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1621,24 +1629,24 @@ mod tests {
             d
         };
 
-        assert_eq!(show(Event::Updated(tv(false))), None);
-        assert_eq!(show(Event::Updated(tv(true))).as_deref(), Some("added"));
-        assert_eq!(show(Event::Updated(tv(true))), None, "nothing of it shown changed");
-        assert_eq!(show(Event::Updated(moved())).as_deref(), Some("updated"));
+        assert_eq!(show(updated(tv(false))), None);
+        assert_eq!(show(updated(tv(true))).as_deref(), Some("added"));
+        assert_eq!(show(updated(tv(true))), None, "nothing of it shown changed");
+        assert_eq!(show(updated(moved())).as_deref(), Some("updated"));
         // Added again while shown, as one listed as present can be: an update,
         // or nothing at all if it is just as shown.
-        assert_eq!(show(Event::Added(tv(true))).as_deref(), Some("updated"));
-        assert_eq!(show(Event::Added(tv(true))), None);
-        assert_eq!(show(Event::Updated(tv(false))).as_deref(), Some("removed"));
-        assert_eq!(show(Event::Updated(tv(false))), None);
-        assert_eq!(show(Event::Added(tv(true))).as_deref(), Some("added"));
-        assert_eq!(show(Event::Removed(tv(true))).as_deref(), Some("removed"));
-        assert_eq!(show(Event::Removed(tv(true))), None, "not shown since");
+        assert_eq!(show(added(tv(true))).as_deref(), Some("updated"));
+        assert_eq!(show(added(tv(true))), None);
+        assert_eq!(show(updated(tv(false))).as_deref(), Some("removed"));
+        assert_eq!(show(updated(tv(false))), None);
+        assert_eq!(show(added(tv(true))).as_deref(), Some("added"));
+        assert_eq!(show(removed(tv(true))).as_deref(), Some("removed"));
+        assert_eq!(show(removed(tv(true))), None, "not shown since");
 
         // One without a hostname cannot be told apart: its going is shown.
         let mut nameless = tv(true);
         nameless.hostname = None;
-        assert_eq!(show(Event::Removed(nameless)).as_deref(), Some("removed"));
+        assert_eq!(show(removed(nameless)).as_deref(), Some("removed"));
     }
 
     #[test]
@@ -1698,9 +1706,9 @@ mod tests {
         let tv = seg.devices().remove(0);
         let line = |event| notice_json("IoT", &Notice { interface: "wifi".into(), event, ttl: Duration::from_secs(120) });
         for (event, said) in [
-            (Event::Added(tv.clone()), "added"),
-            (Event::Updated(tv.clone()), "updated"),
-            (Event::Removed(tv.clone()), "removed"),
+            (added(tv.clone()), "added"),
+            (updated(tv.clone()), "updated"),
+            (removed(tv.clone()), "removed"),
         ] {
             let json = line(event).unwrap();
             assert_eq!((json["event"].as_str(), json["segment"].as_str()), (Some(said), Some("IoT")));

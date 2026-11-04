@@ -11,7 +11,7 @@ use hashbrown::HashMap;
 use crate::device::{addr_of, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
 use alloc::rc::Rc;
 
-use crate::segment::Event;
+use crate::segment::Asked;
 use crate::parser::{Message, Question, RData, Record};
 use crate::prelude::*;
 use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
@@ -354,61 +354,67 @@ impl Touched {
         }
     }
 
-    /// What was done to each device noted, in the order they were: as it
-    /// was before and as it is now.
-    pub fn changes(&self, discovered: &Devices) -> Vec<Change> {
-        self.order
-            .iter()
-            .map(|&id| Change {
-                before: self.before[&id].clone().map(Rc::new),
-                after: discovered.try_get(id).map(|e| Rc::new(e.device.clone())),
-            })
-            .collect()
+    /// What was done to each device noted, in the order they were: the
+    /// devices that came, are not as they were, or went.
+    pub fn events(&self, discovered: &Devices) -> Vec<Event> {
+        let mut events = Vec::new();
+        for id in &self.order {
+            let before = self.before[id].clone().map(Rc::new);
+            let after = discovered.try_get(*id).map(|e| Rc::new(e.device.clone()));
+            match (before, after) {
+                (None, Some(after)) => events.push(Event::Added(after)),
+                (Some(before), Some(after)) if before != after => events.push(Event::Updated { before, after }),
+                (Some(before), None) => events.push(Event::Removed(before)),
+                _ => {}
+            }
+        }
+        events
     }
 
     /// The hostnames and instance names, in lowercase, of the devices as they
     /// were and as they are: those that whoever is announcing the same may
     /// have to give way to.
     pub fn names(&self, discovered: &Devices) -> Vec<String> {
-        names_of(&self.changes(discovered))
+        let mut names = Vec::new();
+        for id in &self.order {
+            let now = discovered.try_get(*id).map(|e| &e.device);
+            for device in self.before[id].iter().chain(now) {
+                names.extend(device.hostname.iter().map(|host| host.to_ascii_lowercase()));
+                names.extend(device.services.iter().map(|svc| svc.instance.to_ascii_lowercase()));
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 }
 
-/// What a change did to one device, as it was before and as it is now: no
-/// `before` for one that came, no `after` for one that went.
-#[derive(Clone, Debug)]
-pub struct Change {
-    pub before: Option<Rc<Device>>,
-    pub after: Option<Rc<Device>>,
+/// A change to the devices of a segment, or a question asked on it: what
+/// the tracker has to say of what it heard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A device came.
+    Added(Rc<Device>),
+    /// A device is not as it was: its hostname, addresses or services.
+    Updated { before: Rc<Device>, after: Rc<Device> },
+    /// A device went, as it was.
+    Removed(Rc<Device>),
+    /// The questions of a query that no device here owns the name of: for
+    /// the reflector to put to the segments whose devices it announces here
+    /// ([`Segment::query_question`](crate::segment::Segment::query_question)),
+    /// as it is configured to.
+    Question(Vec<Asked>),
 }
 
-impl Change {
-    /// The event it is, if it is one: a device that came, or went, or is not
-    /// as it was.
-    pub fn event(&self) -> Option<Event> {
-        match (&self.before, &self.after) {
-            (None, Some(after)) => Some(Event::Added(Device::clone(after))),
-            (Some(before), Some(after)) if before != after => Some(Event::Updated(Device::clone(after))),
-            (Some(before), None) => Some(Event::Removed(Device::clone(before))),
-            _ => None,
+impl Event {
+    /// The device it is of: as it is, or as it was if it went. None for a
+    /// question.
+    pub fn device(&self) -> Option<&Device> {
+        match self {
+            Event::Added(device) | Event::Updated { after: device, .. } | Event::Removed(device) => Some(device),
+            Event::Question(_) => None,
         }
     }
-}
-
-/// The hostnames and instance names, in lowercase, of the devices of
-/// `changes`, as they were and as they are: those that whoever is announcing
-/// the same may have to give way to.
-pub fn names_of(changes: &[Change]) -> Vec<String> {
-    let mut names = Vec::new();
-    for change in changes {
-        for device in change.before.iter().chain(&change.after) {
-            names.extend(device.hostname.iter().map(|host| host.to_ascii_lowercase()));
-            names.extend(device.services.iter().map(|svc| svc.instance.to_ascii_lowercase()));
-        }
-    }
-    names.sort_unstable();
-    names.dedup();
-    names
 }
 
 /// A discovered device, and when to drop it or ask it again.
@@ -679,5 +685,31 @@ mod tests {
         told(&mut tracker, "10.0.1.5", &msg);
         assert!(knows(&tracker, "tv.local") && knows(&tracker, "nas.local"));
         assert_eq!(tracker.discovered.len(), 2, "one device for each, and none for the leftover");
+    }
+
+    /// What happened to a device is one event of it: that it came, what it was
+    /// before it changed and what it is, and that it went as it was.
+    #[test]
+    fn an_event_says_what_a_device_was_and_what_it_is() {
+        let mut tracker = Tracker::default();
+        let hear = |tracker: &mut Tracker, src: &str, msg: &Message| {
+            let touched = tracker.track(src.parse().unwrap(), Instant::now(), Some(msg));
+            touched.events(&tracker.discovered)
+        };
+        let events = hear(&mut tracker, "10.0.1.5", &message(true, vec![a("tv.local", "10.0.1.5", 120)]));
+        let [Event::Added(came)] = &events[..] else { panic!("{events:?}") };
+        assert_eq!(came.addrs().count(), 1);
+
+        let events = hear(&mut tracker, "10.0.1.5", &message(true, vec![a("tv.local", "10.0.1.5", 120)]));
+        assert!(events.is_empty(), "heard again just as it was: {events:?}");
+
+        let both = message(true, vec![a("tv.local", "10.0.1.5", 120), a("tv.local", "10.0.1.6", 120)]);
+        let events = hear(&mut tracker, "10.0.1.5", &both);
+        let [Event::Updated { before, after }] = &events[..] else { panic!("{events:?}") };
+        assert_eq!((before.addrs().count(), after.addrs().count()), (1, 2));
+
+        let events = hear(&mut tracker, "10.0.1.5", &message(true, vec![a("tv.local", "10.0.1.5", 0)]));
+        let [Event::Removed(went)] = &events[..] else { panic!("{events:?}") };
+        assert_eq!(went.addrs().count(), 2, "gone as it was");
     }
 }
