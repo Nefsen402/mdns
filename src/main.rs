@@ -24,6 +24,7 @@ mod segment;
 mod signal;
 mod socket;
 mod time;
+mod tracker;
 
 use alloc::rc::Rc;
 use core::ffi::c_int;
