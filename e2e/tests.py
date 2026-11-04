@@ -378,11 +378,12 @@ class ServiceTypes(Case):
         d.settle()
         return hb.seen(alive("Shell._ssh._tcp.local", SRV)) is not None, hb.seen(alive("Office._ipp._tcp.local", SRV)) is not None
 
-    def test_overlapping_segments_reflect_what_either_would_and_the_earlier_one_decides_how(self):
-        self.assertEqual(self.overlapping(narrow_first=False), (True, True), "the broader one is first, and its settings are the ones")
+    def test_overlapping_segments_reflect_what_either_would_with_the_broader_one_first(self):
+        self.assertEqual(self.overlapping(narrow_first=False), (True, True))
 
-    def test_a_narrower_segment_first_decides_how_but_cannot_hold_back_what_a_broader_one_reflects(self):
-        self.assertEqual(self.overlapping(narrow_first=True), (False, True), "a device with a service the filter lets through has only that")
+    def test_overlapping_segments_reflect_what_either_would_with_the_narrower_one_first(self):
+        # Where they are in the file does not matter.
+        self.assertEqual(self.overlapping(narrow_first=True), (True, True))
 
     def test_only_the_service_types_named_are_reflected_and_a_device_with_none_of_them_not_at_all(self):
         d, hb = self.world("ReflectedServices=_ipp._tcp")

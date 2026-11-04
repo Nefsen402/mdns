@@ -275,17 +275,17 @@ interfaces are named alike, a mistake that is certain.
 Where patterns merely overlap it is not: an interface may come that makes them
 so, or never.
 The segments then act as one that reflects what either would: a device is
-reflected between two interfaces if any segment that has both says so, and one
-segment cannot hold back what another reflects, whatever
+reflected between two interfaces if any segment that has both says so, and what
+is reflected of it is what any of them reflects of it together, whichever is
+first in the file.
+One segment cannot hold back what another reflects, whatever
 .BR Untrusted= ,
 .B ReflectedWhen=
 and
 .B ReflectedServices=
-say.
-Where more than one would reflect a device the same way, the earlier one in the
-file decides how: its filter, its TTL, its addresses.
-List a segment with a narrower set of interfaces first if its settings are to
-be those used between them, and not one that is broader as well.
+say: keep a segment that is to be narrower than another out of its interfaces
+with
+.BR ! .
 .TP
 .B Untrusted=
 Optional.
