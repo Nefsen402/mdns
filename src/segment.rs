@@ -25,11 +25,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::config::{AdvertiseConfig, Neighbours, ReflectedWhen, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
 use crate::runtime::Why;
 use crate::device::{
-    addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Service, Report,
-    DEFAULT_MAX_PACKET, HOST_TTL, META_QUERY, MIN_REFLECT_TTL, OTHER_TTL,
+    addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Service,
+    DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
 };
 use crate::socket::{Family, Prefix, Sender, MDNS_PORT};
-use crate::parser::{Message, Question, RData, Record};
+use crate::tracker::Heard;
+use crate::parser::{Message, Question, Record};
 
 use crate::prelude::*;
 
@@ -1520,25 +1521,14 @@ impl Segment {
     }
 
     fn apply(&self, src: IpAddr, now: Instant, msg: Option<&Message>) {
-        // Records in a query are other devices' known answers, not the
-        // sender's own data.
-        let msg = msg.filter(|m| m.header.response);
+        let Heard { leaving, types, reports, rest, .. } = Heard::of(src, msg);
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let (floor, max_addrs, max_services) = (state.min_lifetime, state.max_addrs, state.max_services);
         let mut touched = Touched::default();
 
-        // A response saying goodbye (TTL 0) to the address it came from, and
-        // announcing none for that name still, is a device leaving: the
-        // device that owns that name, and anything the sender was only known
-        // by. One that announces others in its place (a temporary IPv6
-        // address giving way to the next) is not; it only loses the one.
-        let records = || msg.into_iter().flat_map(|m| m.records());
-        let still = |name: &str| records().any(|r| r.ttl > 0 && addr_of(&r.data).is_some() && r.name.eq_ignore_ascii_case(name));
-        let leaving: Vec<&str> = records()
-            .filter(|r| r.ttl == 0 && addr_of(&r.data) == Some(src) && !still(&r.name))
-            .map(|r| r.name.as_str())
-            .collect();
+        // A device leaving: the device that owns the name, and anything the
+        // sender was only known by.
         if !leaving.is_empty() {
             let mut gone: Vec<Id> = leaving.iter().filter_map(|name| state.discovered.find_host(name)).collect();
             gone.extend(state.discovered.find_nameless(&src));
@@ -1560,25 +1550,15 @@ impl Segment {
             return;
         }
 
-        for rec in msg.into_iter().flat_map(|m| m.records()) {
-            if let RData::Ptr(kind) = &rec.data
-                && rec.ttl > 0
-                && rec.name.eq_ignore_ascii_case(META_QUERY)
-                && rec.class == 1
-                && is_type(kind)
-                && state.types.len() < MAX_TYPES
-            {
-                state.types.insert(kind.to_ascii_lowercase());
+        for kind in types {
+            if state.types.len() < MAX_TYPES {
+                state.types.insert(kind);
             }
         }
 
         // A response may describe several devices (a reflector answering a
         // browse query does), so attribute each record to the device it names
         // instead of the whole packet to one.
-        let (reports, rest) = match msg {
-            Some(m) => Report::all(m),
-            None => (Vec::new(), Vec::new()),
-        };
 
         // The host that turns out to be the sender, if any: the one that
         // announced the address the packet came from, or the only one
@@ -2195,6 +2175,8 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::device::META_QUERY;
+    use crate::parser::RData;
 
     /// `socket` as the segment takes a socket.
     fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
