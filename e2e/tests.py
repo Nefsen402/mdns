@@ -353,14 +353,31 @@ class ServiceTypes(Case):
             records += [ptr(f"{kind}.local", full, 120), srv(full, 631, f"{host}.local", 120), txt(full, "k=v", ttl=120)]
         return response(*records)
 
-    def world(self, filtering):
+    def world(self, filtering, segments=None):
         la, lb = self.two_links()
         hb = lb.hearer()
-        d = self.lab.daemon(conf(f"[Segment]\nName=s\nInterfaces=ra,rb\n{filtering}\n"))
+        d = self.lab.daemon(conf(segments or f"[Segment]\nName=s\nInterfaces=ra,rb\n{filtering}\n"))
         dev = la.device("10.9.1.50")
         dev.multicast(self.device("office", "10.9.1.50", ("Office", "_ipp._tcp"), ("Shell", "_ssh._tcp")))
         dev.multicast(self.device("box", "10.9.1.51", ("Box", "_ssh._tcp")))
         return d, hb
+
+    def overlapping(self, narrow_first):
+        """A segment of every interface and one of two of them with a filter,
+        in the order given: what the other network hears of the two devices."""
+        everything = "[Segment]\nName=all\nInterfaces=r*\n"
+        narrow = "[Segment]\nName=ipp\nInterfaces=ra,rb\nReflectedServices=_ipp._tcp\n"
+        d, hb = self.world("", (narrow + everything) if narrow_first else (everything + narrow))
+        self.assertTrue(hb.wait(alive("office.local", A, "10.9.1.50")), self.logs(d))
+        self.assertTrue(hb.wait(alive("box.local", A, "10.9.1.51")), "the broader segment reflects what the narrower would not\n" + self.logs(d))
+        d.settle()
+        return hb.seen(alive("Shell._ssh._tcp.local", SRV)) is not None, hb.seen(alive("Office._ipp._tcp.local", SRV)) is not None
+
+    def test_overlapping_segments_reflect_what_either_would_and_the_earlier_one_decides_how(self):
+        self.assertEqual(self.overlapping(narrow_first=False), (True, True), "the broader one is first, and its settings are the ones")
+
+    def test_a_narrower_segment_first_decides_how_but_cannot_hold_back_what_a_broader_one_reflects(self):
+        self.assertEqual(self.overlapping(narrow_first=True), (False, True), "a device with a service the filter lets through has only that")
 
     def test_only_the_service_types_named_are_reflected_and_a_device_with_none_of_them_not_at_all(self):
         d, hb = self.world("ReflectedServices=_ipp._tcp")
