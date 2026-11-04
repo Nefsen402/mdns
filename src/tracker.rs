@@ -9,6 +9,8 @@ use alloc::collections::BTreeSet;
 use hashbrown::HashMap;
 
 use crate::device::{addr_of, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
+use alloc::rc::Rc;
+
 use crate::segment::Event;
 use crate::parser::{Message, Question, RData, Record};
 use crate::prelude::*;
@@ -352,40 +354,62 @@ impl Touched {
         }
     }
 
+    /// What was done to each device noted, in the order they were: as it
+    /// was before and as it is now.
+    pub fn changes(&self, discovered: &Devices) -> Vec<Change> {
+        self.order
+            .iter()
+            .map(|&id| Change {
+                before: self.before[&id].clone().map(Rc::new),
+                after: discovered.try_get(id).map(|e| Rc::new(e.device.clone())),
+            })
+            .collect()
+    }
+
     /// The hostnames and instance names, in lowercase, of the devices as they
     /// were and as they are: those that whoever is announcing the same may
     /// have to give way to.
     pub fn names(&self, discovered: &Devices) -> Vec<String> {
-        let mut names = Vec::new();
-        for id in &self.order {
-            let now = discovered.try_get(*id).map(|e| &e.device);
-            for device in self.before[id].iter().chain(now) {
-                names.extend(device.hostname.iter().map(|host| host.to_ascii_lowercase()));
-                names.extend(device.services.iter().map(|svc| svc.instance.to_ascii_lowercase()));
-            }
-        }
-        names.sort_unstable();
-        names.dedup();
-        names
-    }
-
-    pub fn events(self, discovered: &Devices) -> Vec<Event> {
-        let Touched { order, mut before, .. } = self;
-        let mut events = Vec::new();
-        for id in order {
-            let was = before.remove(&id).flatten();
-            let now = discovered.try_get(id).map(|e| e.device.clone());
-            match (was, now) {
-                (None, Some(now)) => events.push(Event::Added(now)),
-                (Some(was), Some(now)) if was != now => events.push(Event::Updated(now)),
-                (Some(was), None) => events.push(Event::Removed(was)),
-                _ => {}
-            }
-        }
-        events
+        names_of(&self.changes(discovered))
     }
 }
 
+/// What a change did to one device, as it was before and as it is now: no
+/// `before` for one that came, no `after` for one that went.
+#[derive(Clone, Debug)]
+pub struct Change {
+    pub before: Option<Rc<Device>>,
+    pub after: Option<Rc<Device>>,
+}
+
+impl Change {
+    /// The event it is, if it is one: a device that came, or went, or is not
+    /// as it was.
+    pub fn event(&self) -> Option<Event> {
+        match (&self.before, &self.after) {
+            (None, Some(after)) => Some(Event::Added(Device::clone(after))),
+            (Some(before), Some(after)) if before != after => Some(Event::Updated(Device::clone(after))),
+            (Some(before), None) => Some(Event::Removed(Device::clone(before))),
+            _ => None,
+        }
+    }
+}
+
+/// The hostnames and instance names, in lowercase, of the devices of
+/// `changes`, as they were and as they are: those that whoever is announcing
+/// the same may have to give way to.
+pub fn names_of(changes: &[Change]) -> Vec<String> {
+    let mut names = Vec::new();
+    for change in changes {
+        for device in change.before.iter().chain(&change.after) {
+            names.extend(device.hostname.iter().map(|host| host.to_ascii_lowercase()));
+            names.extend(device.services.iter().map(|svc| svc.instance.to_ascii_lowercase()));
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
 
 /// A discovered device, and when to drop it or ask it again.
 #[derive(Debug)]
