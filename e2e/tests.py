@@ -110,6 +110,7 @@ class Reflecting(Case):
 
         def told():
             """How many times the other network was told of the device."""
+            hb.flush()
             return sum(1 for h in hb.heard if h.src == lb.router_addr and h.message.has("tv.local"))
 
         tv.multicast(chatter)
@@ -171,6 +172,7 @@ class Topologies(Case):
 
     def told(self, hearer, link, host, **kind):
         """How many times `link`'s router told what `hearer` is on of `host`."""
+        hearer.flush()
         return sum(1 for h in hearer.heard if h.src == link.router_addr and h.message.response and h.message.has(f"{host}.local", **kind))
 
     def test_a_triangle_of_trusted_segments_tells_each_network_of_a_device_as_two_do_and_no_more(self):
@@ -222,7 +224,10 @@ class Topologies(Case):
             "[Segment]\nName=bc\nInterfaces=rb,rc\nForwardQuestions=always\n"
             "[Segment]\nName=ac\nInterfaces=ra,rc\nForwardQuestions=always\n"))
         question = ("_ipp._tcp.local", PTR)
-        asked = lambda link, hearer: sum(1 for h in hearer.heard if h.src == link.router_addr and h.message.asks(*question) and not h.message.response)
+        def asked(link, hearer):
+            hearer.flush()
+            return sum(1 for h in hearer.heard if h.src == link.router_addr and h.message.asks(*question) and not h.message.response)
+
         self.assertTrue(hb.wait(asks(*PROBE)), self.logs(d))
         d.settle()
         before = [asked(la, ha), asked(lb, hb), asked(lc, hc)]
