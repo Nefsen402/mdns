@@ -169,6 +169,72 @@ class Topologies(Case):
         lb.device("10.9.2.50").multicast(announcement("nas", "10.9.2.50", "NAS"))
         self.assertTrue(hc.wait(alive("nas.local", A, "10.9.2.50")), "b is seen from c\n" + self.logs(d))
 
+    def told(self, hearer, link, host, **kind):
+        """How many times `link`'s router told what `hearer` is on of `host`."""
+        return sum(1 for h in hearer.heard if h.src == link.router_addr and h.message.response and h.message.has(f"{host}.local", **kind))
+
+    def test_a_triangle_of_trusted_segments_tells_each_network_of_a_device_as_two_do_and_no_more(self):
+        la, lb, lc = self.three_links()
+        ha, hb, hc = la.hearer(), lb.hearer(), lc.hearer()
+        d = self.lab.daemon(conf(
+            "[Segment]\nName=ab\nInterfaces=ra,rb\n"
+            "[Segment]\nName=bc\nInterfaces=rb,rc\n"
+            "[Segment]\nName=ac\nInterfaces=ra,rc\n"))
+        devices = [("tv", la, "10.9.1.50"), ("nas", lb, "10.9.2.50"), ("cam", lc, "10.9.3.50")]
+        for host, link, addr in devices:
+            link.device(addr).multicast(announcement(host, addr, host.upper()))
+        links = [(la, ha), (lb, hb), (lc, hc)]
+        for host, origin, addr in devices:
+            for link, hearer in links:
+                if link is not origin:
+                    self.assertTrue(hearer.wait(alive(f"{host}.local", A, addr)), f"{host} on {link.router_addr}\n" + self.logs(d))
+        # A device is announced twice, a second apart, as it is to one network.
+        d.settle()
+        d.advance(2)
+
+        def counts():
+            return {(host, link.router_addr): self.told(hearer, link, host) for host, _, _ in devices for link, hearer in links}
+
+        first = counts()
+        for host, origin, _ in devices:
+            for link, _ in links:
+                expected = 0 if link is origin else 2
+                self.assertEqual(first[host, link.router_addr], expected, f"{host} on {link.router_addr}: {first}\n" + self.logs(d))
+
+        # Nothing goes round: it stays quiet while the devices are fresh.
+        d.advance(20)
+        self.assertEqual(counts(), first, self.logs(d))
+
+        # And when they are not, each network is told of a device's going once.
+        d.advance(300)
+        for host, origin, _ in devices:
+            for link, hearer in links:
+                if link is not origin:
+                    self.assertEqual(self.told(hearer, link, host, goodbye=True), 1, f"{host} on {link.router_addr}\n" + self.logs(d))
+                    self.assertEqual(self.told(hearer, link, host, alive=True), first[host, link.router_addr])
+        self.assertEqual(self.told(ha, la, "tv"), 0, "never of where it is")
+
+    def test_a_question_is_put_to_each_other_network_once_in_a_triangle_and_never_back(self):
+        la, lb, lc = self.three_links()
+        ha, hb, hc = la.hearer(), lb.hearer(), lc.hearer()
+        d = self.lab.daemon(conf(
+            "[Segment]\nName=ab\nInterfaces=ra,rb\nForwardQuestions=always\n"
+            "[Segment]\nName=bc\nInterfaces=rb,rc\nForwardQuestions=always\n"
+            "[Segment]\nName=ac\nInterfaces=ra,rc\nForwardQuestions=always\n"))
+        question = ("_ipp._tcp.local", PTR)
+        asked = lambda link, hearer: sum(1 for h in hearer.heard if h.src == link.router_addr and h.message.asks(*question) and not h.message.response)
+        self.assertTrue(hb.wait(asks(*PROBE)), self.logs(d))
+        d.settle()
+        before = [asked(la, ha), asked(lb, hb), asked(lc, hc)]
+
+        la.device("10.9.1.50").multicast(query(question))
+        self.assertTrue(hb.wait(asks(*question, src=lb.router_addr), 5), self.logs(d))
+        self.assertTrue(hc.wait(asks(*question, src=lc.router_addr), 5), self.logs(d))
+        d.settle()
+        d.advance(20)
+        after = [asked(la, ha), asked(lb, hb), asked(lc, hc)]
+        self.assertEqual([x - y for x, y in zip(after, before)], [0, 1, 1], "once to each of the others, never back\n" + self.logs(d))
+
     def test_an_extra_segment_lets_one_end_of_a_chain_see_the_other(self):
         la, lb, lc = self.three_links()
         ha, hb, hc = la.hearer(), lb.hearer(), lc.hearer()
@@ -770,6 +836,7 @@ class Startup(Case):
             ("[Advertise]\nHostname=router.lan\n[Segment]\nName=s\nInterfaces=ra\n", r"not under \.local"),
             ("[Segment]\nName=s\nInterfaces=ra\nReflectedWhen=hostname\nReflectedServices=_ipp._tcp\n", r"without enabling service filtering"),
             ("[Segment]\nName=s\nInterfaces=ra\nReflectedServices=ipp\n", r"invalid ReflectedServices"),
+            ("[Segment]\nName=s\nInterfaces=ra,rb\n[Segment]\nName=t\nInterfaces=rb,rc,ra\n", r'segments "s" and "t" both reflect between (ra and rb|rb and ra)'),
             ("", r"no \[Segment\]"),
         ]
         for text, pattern in cases:
