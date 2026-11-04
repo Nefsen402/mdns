@@ -1,11 +1,21 @@
-//! What a packet said, read once and apart from what is known: the changes
-//! it makes to the devices of a segment, for them to be brought up to date by.
+//! The devices heard on a segment: what a packet said ([`Heard`]), read once
+//! and apart from what is known, and the devices it brings up to date.
 
 use core::net::IpAddr;
+use core::time::Duration;
 
-use crate::device::{addr_of, is_type, Report, META_QUERY};
-use crate::parser::{Message, RData, Record};
+use hashbrown::HashMap;
+
+use crate::device::{addr_of, family_of, is_type, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
+use crate::parser::{Message, Question, RData, Record};
 use crate::prelude::*;
+use crate::socket::Family;
+use crate::time::Instant;
+
+mod devices;
+mod neighbours;
+pub(crate) use devices::{Devices, Id, Indexed};
+pub(crate) use neighbours::NeighbourTable;
 
 /// What one packet said. A query says nothing of its sender's: the records in
 /// it are other devices' known answers.
@@ -55,6 +65,162 @@ impl<'a> Heard<'a> {
         };
         Heard { leaving, types, reports, rest }
     }
+}
+
+/// A discovered device, and when to drop it or ask it again.
+#[derive(Debug)]
+pub struct Entry {
+    pub device: Device,
+    /// The address of the packet it was first heard of in.
+    pub from: IpAddr,
+    pub expires: Instant,
+    /// When each of its addresses runs out if it is not heard of again: its
+    /// own TTL after it was last heard, but not before the minimum lifetime,
+    /// as for the device. One that stops being announced, without a goodbye,
+    /// is so dropped on its own.
+    pub addr_expires: HashMap<IpAddr, Instant>,
+    /// When what runs out first ([`Entry::soonest`]) began its life: how long
+    /// the device said that would be is what is left of it from here.
+    pub began: Instant,
+    /// When it was last asked to answer again because it was about to expire.
+    pub refreshed: Option<Instant>,
+    /// When it was last asked on its link-local address, for the kernel to
+    /// find its link-layer address ([`NUDGE_GAP`]).
+    pub nudged: Option<Instant>,
+}
+
+impl Entry {
+    /// A device first heard from `from`, with the hostname it has, if it has
+    /// one.
+    pub fn new(now: Instant, from: IpAddr, hostname: Option<&str>) -> Entry {
+        let device = Device { hostname: hostname.map(String::from), ..Device::default() };
+        Entry { device, from, expires: now, addr_expires: HashMap::new(), began: now, refreshed: None, nudged: None }
+    }
+
+    /// Its records that answer `q`, each with the time it has left here as
+    /// its TTL, as known answers to a query asking `q` (RFC 6762 section 7.1).
+    /// None of one without a hostname, which has no records of its own.
+    pub fn known_answers(&self, q: &Question, now: Instant) -> Vec<Record> {
+        if self.device.hostname.is_none() {
+            return Vec::new();
+        }
+        let host_ttl = self.device.ttl.unwrap_or(HOST_TTL);
+        let mut records = self.device.records_for(q, host_ttl, OTHER_TTL);
+        for rec in &mut records {
+            let until = addr_of(&rec.data).and_then(|a| self.addr_expires.get(&a)).unwrap_or(&self.expires);
+            let left = until.saturating_duration_since(now).as_secs();
+            rec.ttl = rec.ttl.min(u32::try_from(left).unwrap_or(u32::MAX));
+        }
+        records.retain(|r| r.ttl > 0);
+        records
+    }
+
+    /// The soonest it, or one of its addresses, runs out.
+    pub fn soonest(&self) -> Instant {
+        self.addr_expires.values().copied().fold(self.expires, Instant::min)
+    }
+
+    /// How long before what runs out first it is asked to answer again: `before`,
+    /// or a quarter of what the device gave it to live if that is shorter, so
+    /// that one with a short TTL is asked three quarters of the way in and not
+    /// over and over.
+    pub fn lead(&self, before: Duration) -> Duration {
+        before.min(self.soonest().saturating_duration_since(self.began) / 4)
+    }
+
+    /// When it is next due to be asked to answer again, if it is: `lead`
+    /// before the soonest it or one of its addresses runs out, and not again
+    /// until the gap has passed since it was last asked. Not if it is to be
+    /// dropped by then, nor if there is nothing to ask it.
+    pub fn refresh_due(&self, before: Duration) -> Option<Instant> {
+        if !self.askable() {
+            return None;
+        }
+        let soonest = self.soonest();
+        let at = soonest.checked_sub(self.lead(before)).unwrap_or(Instant::START);
+        let at = match self.refreshed.map(|t| t.checked_add(refresh_gap(before))) {
+            Some(Some(again)) => at.max(again),
+            Some(None) => return None, // never again
+            None => at,
+        };
+        (at < soonest).then_some(at)
+    }
+
+    /// Renew those of `addrs` it has, each for its TTL in `ttls` (none if it
+    /// did not say) but at least `floor` from `now`, and forget when the
+    /// addresses it no longer has run out.
+    pub fn renew_addrs(&mut self, addrs: &[IpAddr], ttls: &HashMap<IpAddr, u32>, now: Instant, floor: Duration) {
+        for addr in addrs.iter().filter(|a| self.device.has_addr(a)) {
+            let ttl = Duration::from_secs(ttls.get(addr).copied().unwrap_or(0).into());
+            self.addr_expires.insert(*addr, now + ttl.max(floor));
+        }
+        let device = &self.device;
+        self.addr_expires.retain(|addr, _| device.has_addr(addr));
+    }
+
+    /// Before `incoming` are taken in, drop the announced addresses of a
+    /// family that would keep them out at `max_addrs`, the one that runs out
+    /// first at a time: a device that moves on to a new temporary address
+    /// without saying goodbye to the last is known by its newest. Not those
+    /// `incoming` repeats, those in `gone` or of a family in `flushed`, which
+    /// go as it is taken in.
+    pub fn make_room(&mut self, incoming: &[IpAddr], flushed: &[Family], gone: &[IpAddr], max_addrs: usize) {
+        for family in [Family::V4, Family::V6] {
+            if flushed.contains(&family) {
+                continue;
+            }
+            let new = incoming
+                .iter()
+                .filter(|a| family_of(**a) == family && !gone.contains(a) && !self.device.has_addr(a))
+                .count();
+            let mut held: Vec<IpAddr> = self
+                .device
+                .addresses
+                .iter()
+                .filter(|a| a.origin == Origin::Announced)
+                .map(|a| a.ip)
+                .filter(|a| family_of(*a) == family && !gone.contains(a))
+                .collect();
+            let excess = (held.len() + new).saturating_sub(max_addrs);
+            // Oldest first, and those it did not repeat before those it did.
+            held.sort_by_key(|a| (incoming.contains(a), self.addr_expires.get(a).copied()));
+            for addr in held.into_iter().filter(|a| !incoming.contains(a)).take(excess) {
+                self.device.addresses.retain(|a| a.ip != addr);
+                self.addr_expires.remove(&addr);
+            }
+        }
+    }
+
+    /// Drop the addresses that have run out by `now`. Returns whether any had.
+    pub fn expire_addrs(&mut self, now: Instant) -> bool {
+        let gone: Vec<IpAddr> = self.addr_expires.iter().filter(|&(_, at)| *at <= now).map(|(a, _)| *a).collect();
+        for addr in &gone {
+            self.addr_expires.remove(addr);
+        }
+        self.device.addresses.retain(|a| !gone.contains(&a.ip));
+        !gone.is_empty()
+    }
+
+    /// Whether there is anything to ask it about: a name or a service.
+    pub fn askable(&self) -> bool {
+        self.device.hostname.is_some() || !self.device.services.is_empty()
+    }
+
+    /// Take over what was learned about this device before its name was known.
+    pub fn absorb(&mut self, earlier: Entry, max_services: usize) {
+        self.device.absorb(earlier.device, max_services);
+        self.expires = self.expires.max(earlier.expires);
+        self.began = self.began.min(earlier.began);
+        for (addr, at) in earlier.addr_expires {
+            let mine = self.addr_expires.entry(addr).or_insert(at);
+            *mine = (*mine).max(at);
+        }
+    }
+}
+
+/// How long to wait before asking a device again that has not answered.
+pub fn refresh_gap(before: Duration) -> Duration {
+    (before / 4).max(Duration::from_secs(5))
 }
 
 #[cfg(test)]

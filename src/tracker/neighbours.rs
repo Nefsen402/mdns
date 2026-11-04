@@ -12,7 +12,7 @@ use core::net::IpAddr;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 
 #[derive(Default)]
-pub(super) struct NeighbourTable {
+pub(crate) struct NeighbourTable {
     /// Each address it has a link-layer address for, and that address.
     macs: HashMap<IpAddr, Vec<u8>>,
     /// The addresses, by the hash of their link-layer address.
