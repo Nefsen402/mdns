@@ -79,12 +79,9 @@ impl Manuals {
         let hasher = &self.hasher;
         let mut add = |device: &Device| device.for_each_name(|name| names.push(hash_name(hasher, name)));
         manual.shown.iter().for_each(&mut add);
-        // What is wanted, as it is now: of another segment, it may have changed
-        // since, which the reflector will say.
+        // What is wanted, by everyone who wants it.
         for claim in manual.claims.values() {
-            if let Some((device, _)) = claim.resolve() {
-                add(&device);
-            }
+            add(&claim.resolve().0);
         }
         names.sort_unstable();
         names.dedup();
@@ -144,7 +141,7 @@ impl Manuals {
     pub fn with_claimed_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Manual> + 'a {
         let hash = hash_name(&self.hasher, name);
         self.by_name.under(hash).map(|id| self.table.get(id)).filter(move |manual| {
-            manual.claims.values().any(|claim| claim.resolve().is_some_and(|(device, _)| device.has_name(name)))
+            manual.claims.values().any(|claim| claim.resolve().0.has_name(name))
                 || manual.shown.as_ref().is_some_and(|shown| shown.has_name(name))
         })
     }

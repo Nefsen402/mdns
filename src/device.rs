@@ -537,6 +537,43 @@ impl Device {
         fit.then_some(device)
     }
 
+    /// This device together with `other`, of the same host: what either has,
+    /// whichever is which. It is what is announced of a device that more than
+    /// one reflector reflects from the same segment, each as it is to show it.
+    pub fn union(&self, other: &Device) -> Device {
+        let mut device = self.clone();
+        for address in &other.addresses {
+            match device.addresses.iter_mut().find(|a| a.ip == address.ip) {
+                Some(mine) => {
+                    if address.origin == Origin::Announced {
+                        mine.origin = Origin::Announced;
+                    }
+                }
+                None => device.addresses.push(*address),
+            }
+        }
+        device.addresses.sort_by_key(|a| addr_order(&a.ip));
+        for service in &other.services {
+            if device.service(&service.instance).is_none() {
+                device.insert_service(service.clone());
+            }
+        }
+        device.ttl = device.ttl.max(other.ttl);
+        device.nsec = match (device.nsec.take(), &other.nsec) {
+            (None, None) => None,
+            (mine, theirs) => {
+                let mut types: Vec<u16> = mine.into_iter().chain(theirs.clone()).flatten().collect();
+                types.sort_unstable();
+                types.dedup();
+                Some(types)
+            }
+        };
+        device.reverse.extend(other.reverse.iter().copied());
+        device.reverse.sort_unstable();
+        device.reverse.dedup();
+        device
+    }
+
     /// What identifies it in the manual list and to the reflector: its
     /// hostname, case-insensitively.
     pub fn key(&self) -> Option<String> {
