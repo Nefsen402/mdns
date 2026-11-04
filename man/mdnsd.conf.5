@@ -384,6 +384,29 @@ other means.
 cannot be left out: a device is announced, and tracked, by its name.
 An empty assignment resets it.
 .TP
+.B ReflectedServices=
+Optional: service types, such as
+.BR _ipp._tcp ,
+separated by commas or spaces; the setting may be repeated.
+Which of a device's services are reflected with it onto the other networks.
+If any are named, only those are; a type with a
+.B !
+before it, as in
+.BR !_ssh._tcp ,
+is never reflected, and wins over naming it.
+Default: every type.
+The device itself is reflected with the services that are left, by its name and
+addresses; when none is left it is not reflected at all.
+It is an error to set it and leave
+.B service
+out of
+.BR ReflectedWhen= :
+every device would then be reflected, filtered out or not, by its name alone.
+A type is written without
+.BR .local ,
+and without regard to case.
+An empty assignment resets it.
+.TP
 .B Reannounce=
 Optional boolean, default
 .BR no .

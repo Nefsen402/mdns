@@ -22,7 +22,7 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::{AdvertiseConfig, Neighbours, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
+use crate::config::{AdvertiseConfig, Neighbours, ServiceKinds, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
 use crate::runtime::Why;
 use crate::device::{
     addr_of, family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Service, Report,
@@ -383,8 +383,8 @@ enum Claim {
     /// A device of another segment, announced as it is there now, with the
     /// addresses it was given from the neighbour table that `neighbours` lets
     /// through, and with the TTL of its address `host_ttl` if given, or else
-    /// its own.
-    Reflected { source: Source, neighbours: Neighbours, host_ttl: Option<u32> },
+    /// its own, and only the services of the types `kinds` lets through.
+    Reflected { source: Source, neighbours: Neighbours, host_ttl: Option<u32>, kinds: ServiceKinds },
 }
 
 impl Claim {
@@ -393,8 +393,8 @@ impl Claim {
     fn resolve(&self) -> Option<(Device, u32)> {
         match self {
             Claim::Owned { device, host_ttl } => Some(((**device).clone(), *host_ttl)),
-            Claim::Reflected { source, neighbours, host_ttl } => source.with(|device| {
-                let device = device.with_neighbours_as(*neighbours).for_reflecting();
+            Claim::Reflected { source, neighbours, host_ttl, kinds } => source.with(|device| {
+                let device = device.with_neighbours_as(*neighbours).for_reflecting().with_kinds(kinds);
                 let ttl = host_ttl.unwrap_or_else(|| device.ttl.map_or(HOST_TTL, |ttl| ttl.max(MIN_REFLECT_TTL)));
                 (device, ttl)
             }),
@@ -1164,11 +1164,12 @@ impl Segment {
     /// Announce the device of another segment `from` on this one for `owner`,
     /// as it is there from now on, not as it is now: with the addresses it was
     /// given from the neighbour table that `neighbours` lets through, and with
-    /// the TTL `host_ttl` for its address records, if given, or else its own.
+    /// the TTL `host_ttl` for its address records, if given, or else its own,
+    /// and with only the services of the types `kinds` reflects.
     /// It is the reflector's to say when what is announced is to be looked at
     /// again, as the device changes, or to withdraw it with
     /// [`remove_manual`](Segment::remove_manual).
-    pub fn reflect(&self, owner: Owner, from: Source, neighbours: Neighbours, host_ttl: Option<Duration>) -> Result<bool> {
+    pub fn reflect(&self, owner: Owner, from: Source, neighbours: Neighbours, host_ttl: Option<Duration>, kinds: &ServiceKinds) -> Result<bool> {
         let Some(Some(host)) = from.with(|device| device.key()) else {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
         };
@@ -1176,7 +1177,7 @@ impl Segment {
         if host_ttl == Some(0) {
             bail!("a TTL of zero would withdraw the device");
         }
-        self.claim(owner, &host, Claim::Reflected { source: from, neighbours, host_ttl })
+        self.claim(owner, &host, Claim::Reflected { source: from, neighbours, host_ttl, kinds: kinds.clone() })
     }
 
     /// The device discovered here with the hostname `host`, ignoring case, as
@@ -4580,7 +4581,7 @@ mod tests {
         assert!(a.source_of("nas.local").is_none());
         assert_eq!(source.with(|d| d.services.len()), Some(1));
 
-        assert!(b.reflect(Owner::Reflector(0), source.clone(), Neighbours::default(), None).unwrap());
+        assert!(b.reflect(Owner::Reflector(0), source.clone(), Neighbours::default(), None, &ServiceKinds::default()).unwrap());
         assert_eq!(b.manual_devices().len(), 1);
         let m = recv(&rx).expect("announced");
         assert!(m.answers.iter().any(|r| r.name == "tv.local" && r.ttl > 0));
@@ -4589,14 +4590,14 @@ mod tests {
         hear(&a, "10.0.1.5", vec![srv("Web._http._tcp.local", 81, "tv.local")]);
         assert_eq!(source.with(|d| d.services.len()), Some(2), "read as it is now");
         assert_eq!(b.manual_devices()[0].services.len(), 1, "announced as last settled");
-        assert!(b.reflect(Owner::Reflector(0), source.clone(), Neighbours::default(), None).unwrap());
+        assert!(b.reflect(Owner::Reflector(0), source.clone(), Neighbours::default(), None, &ServiceKinds::default()).unwrap());
         assert_eq!(b.manual_devices()[0].services.len(), 2);
         assert!(recv(&rx).is_some(), "the change is announced");
         b.state.borrow().manual.check();
 
         // Settled again with nothing changed, it says nothing more.
         age(&b, 2);
-        b.reflect(Owner::Reflector(0), source, Neighbours::default(), None).unwrap();
+        b.reflect(Owner::Reflector(0), source, Neighbours::default(), None, &ServiceKinds::default()).unwrap();
         assert!(recv(&rx).is_none() || recv(&rx).is_none());
     }
 
@@ -4620,7 +4621,7 @@ mod tests {
         assert!(of_c.with(|d| d.clone()).is_some());
         drop(c);
         assert!(of_c.with(|d| d.clone()).is_none(), "the segment is gone");
-        assert!(a.reflect(Owner::Reflector(0), of_c, Neighbours::default(), None).is_err(), "nothing to announce");
+        assert!(a.reflect(Owner::Reflector(0), of_c, Neighbours::default(), None, &ServiceKinds::default()).is_err(), "nothing to announce");
     }
 
     /// A segment that acts before the reflector hears that the device is gone
@@ -4631,7 +4632,7 @@ mod tests {
         let (a, _arx) = wired();
         let (b, rx) = wired();
         tv_on(&a);
-        b.reflect(Owner::Reflector(0), a.source_of("tv.local").unwrap(), Neighbours::default(), None).unwrap();
+        b.reflect(Owner::Reflector(0), a.source_of("tv.local").unwrap(), Neighbours::default(), None, &ServiceKinds::default()).unwrap();
         recv(&rx).unwrap();
         b.set_reannounce(true);
 
@@ -4656,7 +4657,7 @@ mod tests {
         tv_on(&a);
         hear(&a, "10.0.1.6", vec![a_record("nas.local", "10.0.1.6"), srv("NAS._smb._tcp.local", 445, "nas.local")]);
         for host in ["tv.local", "nas.local"] {
-            b.reflect(Owner::Reflector(0), a.source_of(host).unwrap(), Neighbours::default(), None).unwrap();
+            b.reflect(Owner::Reflector(0), a.source_of(host).unwrap(), Neighbours::default(), None, &ServiceKinds::default()).unwrap();
         }
         b.add_manual(Owner::Reflector(1), tv("10.0.9.9", &["Other"])).unwrap();
         assert_eq!(b.manual_devices().len(), 2, "tv.local has two who want it, the first one's is announced");
@@ -4678,11 +4679,11 @@ mod tests {
         let bare = a.state.borrow().discovered.find_nameless(&ip("10.0.1.5"));
         assert!(bare.is_none(), "heard from the address of a named device");
         let named = a.source_of("tv.local").unwrap();
-        let err = b.reflect(Owner::Reflector(0), named.clone(), Neighbours::default(), Some(Duration::ZERO)).unwrap_err();
+        let err = b.reflect(Owner::Reflector(0), named.clone(), Neighbours::default(), Some(Duration::ZERO), &ServiceKinds::default()).unwrap_err();
         assert!(format!("{err}").contains("zero"));
         assert!(b.manual_devices().is_empty());
         // The TTL it is given is the one its address is announced with.
-        b.reflect(Owner::Reflector(0), named, Neighbours::default(), Some(Duration::from_secs(900))).unwrap();
+        b.reflect(Owner::Reflector(0), named, Neighbours::default(), Some(Duration::from_secs(900)), &ServiceKinds::default()).unwrap();
         assert_eq!(b.state.borrow().manual["tv.local"].host_ttl, 900);
     }
 
@@ -4855,7 +4856,7 @@ mod tests {
             let (reflected_from, _) = heap();
             for i in 0..n {
                 let source = other.source_of(&format!("m{i}.local")).unwrap();
-                seg.reflect(Owner::Reflector(0), source, Neighbours::default(), None).unwrap();
+                seg.reflect(Owner::Reflector(0), source, Neighbours::default(), None, &ServiceKinds::default()).unwrap();
             }
             seg.take_events();
             let (b, _) = heap();

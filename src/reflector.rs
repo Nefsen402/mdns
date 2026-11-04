@@ -428,7 +428,7 @@ impl Inner {
             .map(|m| &m.segment)
             .map(|seg| {
                 let source = seg.source_of(host)?;
-                let reflectable = source.with(|device| reflectable(&device.with_neighbours_as(self.neighbours), self.when));
+                let reflectable = source.with(|device| reflectable(&device.with_neighbours_as(self.neighbours), &self.when));
                 reflectable.unwrap_or(false).then_some(source)
             })
             .collect();
@@ -438,7 +438,7 @@ impl Inner {
             let winner = sources.iter().enumerate().find(|(src, source)| *src != target && source.is_some());
             let result = match winner {
                 Some((_, Some(source))) if !untrusted => {
-                    seg.reflect(self.owner, source.clone(), self.neighbours, self.reflect_ttl)
+                    seg.reflect(self.owner, source.clone(), self.neighbours, self.reflect_ttl, &self.when.kinds)
                 }
                 _ => seg.remove_manual(self.owner, host),
             };
@@ -472,10 +472,10 @@ impl Inner {
 /// (a device known only by a link-local address cannot be reached from another
 /// network), and a resolved service to give clients a reason to care (bare
 /// chatty clients such as phones are skipped): of these, what `when` asks for.
-fn reflectable(device: &Device, when: ReflectedWhen) -> bool {
+fn reflectable(device: &Device, when: &ReflectedWhen) -> bool {
     (!when.hostname || device.hostname.is_some())
         && (!when.address || device.routable().next().is_some())
-        && (!when.service || device.services.iter().any(|s| s.is_resolved()))
+        && (!when.service || device.services.iter().any(|s| s.is_resolved() && when.kinds.allows(&s.kind)))
 }
 
 #[cfg(test)]
@@ -756,6 +756,73 @@ mod tests {
                 assert!(reflected[0].services.is_empty());
             }
         }
+    }
+
+    /// Make `seg` hear `host` at `from` announce a service of each of `services`
+    /// (an instance name and a type, such as `_ipp._tcp`).
+    fn announce_kinds(seg: &Segment, from: &str, host: &str, services: &[(&str, &str)]) {
+        let addr: Ipv4Addr = from.parse().unwrap();
+        let mut answers = vec![rec_ttl(host, RData::A(addr), 120)];
+        for (instance, kind) in services {
+            answers.push(rec_ttl(&format!("{kind}.local"), RData::Ptr(format!("{instance}.{kind}.local")), 120));
+            answers.push(rec_ttl(
+                &format!("{instance}.{kind}.local"),
+                RData::Srv { priority: 0, weight: 0, port: 631, target: host.into() },
+                120,
+            ));
+        }
+        let msg = Message {
+            header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
+            questions: vec![],
+            answers,
+            authorities: vec![],
+            additionals: vec![],
+        };
+        seg.handle(SocketAddr::new(IpAddr::V4(addr), 5353), &msg.encode().unwrap()).unwrap();
+    }
+
+    /// `ReflectedServices=` keeps services of some types from other networks:
+    /// a device is reflected with the others, and not at all (`service` is
+    /// asked for) if none is left.
+    #[test]
+    fn only_the_services_of_the_types_asked_for_are_reflected() {
+        let kinds_of = |kinds: &str, service: bool| {
+            // The config refuses this; the reflector does what it is told.
+            let (a, _arx) = wired("a");
+            let (b, _brx) = wired("b");
+            let when = ReflectedWhen {
+                service,
+                kinds: crate::config::Config::parse(&format!("[Segment]\nName=s\nInterfaces=a,b\nReflectedServices={kinds}"))
+                    .unwrap()
+                    .segments[0]
+                    .reflected_when
+                    .kinds
+                    .clone(),
+                ..ReflectedWhen::default()
+            };
+            let _r =
+                Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), when, None)
+                    .unwrap();
+            announce_kinds(&a, "10.0.1.7", "mixed.local", &[("Office", "_ipp._tcp"), ("Shell", "_ssh._tcp")]);
+            announce_kinds(&a, "10.0.1.8", "shell.local", &[("Box", "_ssh._tcp")]);
+            deliver_made();
+            let mut seen: Vec<(String, Vec<String>)> = b
+                .manual_devices()
+                .into_iter()
+                .map(|d| (d.hostname.clone().unwrap(), d.services.iter().map(|s| s.kind.clone()).collect()))
+                .collect();
+            seen.sort();
+            seen
+        };
+        let (mixed, shell) = ("mixed.local".to_string(), "shell.local".to_string());
+        let ipp = vec!["_ipp._tcp.local".to_string()];
+        let ssh = vec!["_ssh._tcp.local".to_string()];
+        assert_eq!(kinds_of("", true), vec![(mixed.clone(), vec![ipp[0].clone(), ssh[0].clone()]), (shell.clone(), ssh.clone())]);
+        assert_eq!(kinds_of("_ipp._tcp", true), vec![(mixed.clone(), ipp.clone())]);
+        assert_eq!(kinds_of("!_ipp._tcp", true), vec![(mixed.clone(), ssh.clone()), (shell.clone(), ssh.clone())]);
+        assert_eq!(kinds_of("_ipp._tcp,_ssh._tcp,!_ssh._tcp", true), vec![(mixed.clone(), ipp.clone())]);
+        // Found by name alone, if that is enough.
+        assert_eq!(kinds_of("_ipp._tcp", false), vec![(mixed, ipp), (shell, vec![])]);
     }
 
     /// A device known only by a link-local address is reflected, if

@@ -11,7 +11,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use hashbrown::{HashMap, HashSet};
 use core::net::IpAddr;
 
-use crate::config::{Neighbours, DEFAULT_MAX_ADDRS};
+use crate::config::{Neighbours, ServiceKinds, DEFAULT_MAX_ADDRS};
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_SERVICES;
 use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
@@ -523,6 +523,13 @@ impl Device {
     pub fn for_reflecting(&self) -> Device {
         let services = self.services.iter().filter(|s| s.is_resolved()).cloned().collect();
         Device { services, ..self.without_link_local() }
+    }
+
+    /// This device with only the services of the types `kinds` reflects.
+    pub fn with_kinds(&self, kinds: &ServiceKinds) -> Device {
+        let mut device = self.clone();
+        device.services.retain(|s| kinds.allows(&s.kind));
+        device
     }
 
     /// What identifies it in the manual list and to the reflector: its

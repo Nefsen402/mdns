@@ -14,6 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::runtime::Why;
 
+use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -135,16 +136,49 @@ pub enum Neighbours {
 /// (`ReflectedWhen=`): a routable address, a hostname, and a service whose
 /// host and port are known. Everything unless set; a device with no service,
 /// say, is then found by name alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReflectedWhen {
     pub address: bool,
     pub hostname: bool,
     pub service: bool,
+    /// Which of a device's services are reflected with it
+    /// (`ReflectedServices=`).
+    pub kinds: ServiceKinds,
 }
 
 impl Default for ReflectedWhen {
     fn default() -> ReflectedWhen {
-        ReflectedWhen { address: true, hostname: true, service: true }
+        ReflectedWhen { address: true, hostname: true, service: true, kinds: ServiceKinds::default() }
+    }
+}
+
+/// The service types that are reflected (`ReflectedServices=`), such as
+/// `_ipp._tcp`: only those in `only` if it has any, and never those in `not`.
+/// Types are kept in lowercase, without the `.local`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceKinds {
+    only: BTreeSet<String>,
+    not: BTreeSet<String>,
+}
+
+impl ServiceKinds {
+    /// Whether the service type `kind`, as devices have it (`_ipp._tcp.local`),
+    /// is reflected.
+    pub fn allows(&self, kind: &str) -> bool {
+        let kind = kind.trim_end_matches('.');
+        let kind = kind.strip_suffix(".local").unwrap_or(kind).to_ascii_lowercase();
+        !self.not.contains(&kind) && (self.only.is_empty() || self.only.contains(&kind))
+    }
+
+    /// Whether every type is.
+    pub fn is_all(&self) -> bool {
+        self.only.is_empty() && self.not.is_empty()
+    }
+
+    /// The types as they were written: those named, and those kept out with a
+    /// `!` before.
+    pub fn words(&self) -> Vec<String> {
+        self.only.iter().cloned().chain(self.not.iter().map(|k| format!("!{k}"))).collect()
     }
 }
 
@@ -450,7 +484,21 @@ impl Config {
                         config.segments.last_mut().unwrap().reannounce = !value.is_empty() && parse_bool(entry, lineno)?;
                     }
                     ("segment", "reflectedwhen") => {
-                        config.segments.last_mut().unwrap().reflected_when = parse_reflected_when(&value, lineno)?;
+                        // The services are `ReflectedServices=`'s, whichever comes first.
+                        let when = &mut config.segments.last_mut().unwrap().reflected_when;
+                        let kinds = core::mem::take(&mut when.kinds);
+                        *when = ReflectedWhen { kinds, ..parse_reflected_when(&value, lineno)? };
+                    }
+                    ("segment", "reflectedservices") => {
+                        // Repeated, it adds; an empty assignment resets, as everywhere.
+                        let more = parse_service_kinds(&value, lineno)?;
+                        let kinds = &mut config.segments.last_mut().unwrap().reflected_when.kinds;
+                        if value.is_empty() {
+                            *kinds = more;
+                        } else {
+                            kinds.only.extend(more.only);
+                            kinds.not.extend(more.not);
+                        }
                     }
                     ("segment", "reflectttl") => {
                         config.segments.last_mut().unwrap().reflect_ttl = match value.to_ascii_lowercase().as_str() {
@@ -568,6 +616,12 @@ impl Config {
             }
             if let Some(both) = seg.included().find(|i| seg.excluded().any(|x| glob(x, i))) {
                 bail!("segment {:?} (line {at}) has Interfaces={both}, which it also keeps out", seg.name);
+            }
+            if !seg.reflected_when.kinds.is_all() && !seg.reflected_when.service {
+                bail!(
+                    "segment {:?} (line {at}) has ReflectedServices= without enabling service filtering: add service to ReflectedWhen=",
+                    seg.name
+                );
             }
             if let Some(dup) = seg
                 .interfaces
@@ -792,7 +846,7 @@ fn parse_reflected_when(value: &str, lineno: usize) -> Result<ReflectedWhen> {
     if value.is_empty() {
         return Ok(ReflectedWhen::default());
     }
-    let mut when = ReflectedWhen { address: false, hostname: false, service: false };
+    let mut when = ReflectedWhen { address: false, hostname: false, service: false, kinds: ServiceKinds::default() };
     for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()) {
         match word.to_ascii_lowercase().as_str() {
             "address" => when.address = true,
@@ -806,6 +860,29 @@ fn parse_reflected_when(value: &str, lineno: usize) -> Result<ReflectedWhen> {
         bail!("line {lineno}: ReflectedWhen= must include hostname: a device is announced by its name");
     }
     Ok(when)
+}
+
+fn parse_service_kinds(value: &str, lineno: usize) -> Result<ServiceKinds> {
+    let mut kinds = ServiceKinds::default();
+    for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()) {
+        let (excluded, name) = match word.strip_prefix('!') {
+            Some(name) => (true, name),
+            None => (false, word),
+        };
+        let name = name.trim_end_matches('.');
+        let name = name.strip_suffix(".local").unwrap_or(name).to_ascii_lowercase();
+        // A service type: `_name._tcp` or `_name._udp`.
+        let valid = name
+            .strip_suffix("._tcp")
+            .or_else(|| name.strip_suffix("._udp"))
+            .and_then(|service| service.strip_prefix('_'))
+            .is_some_and(|service| !service.is_empty() && !service.contains(['.', '*', '?']));
+        if !valid {
+            bail!("line {lineno}: invalid ReflectedServices {word:?}: a service type such as _ipp._tcp, or !_ssh._tcp to keep one out");
+        }
+        if excluded { kinds.not.insert(name) } else { kinds.only.insert(name) };
+    }
+    Ok(kinds)
 }
 
 fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
@@ -1310,7 +1387,7 @@ interfaces=br0,wifi
         for key in [
             "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
             "ReflectTTL=", "MaxAddresses=", "MaxDevices=", "MaxServices=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
-            "Reannounce=", "ReflectedWhen=",
+            "Reannounce=", "ReflectedWhen=", "ReflectedServices=",
         ] {
             assert!(man.contains(&format!(".B {key}")), "{key}");
         }
@@ -1486,20 +1563,48 @@ interfaces=br0,wifi
     fn segments_choose_what_a_device_needs_to_be_reflected() {
         let when = |extra: &str| {
             let c = Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=z")).unwrap();
-            (c.segments[0].reflected_when, c.segments[1].reflected_when)
+            (c.segments[0].reflected_when.clone(), c.segments[1].reflected_when.clone())
         };
         let all = ReflectedWhen::default();
-        assert_eq!(when(""), (all, all));
-        assert_eq!(when("ReflectedWhen=address,hostname,service"), (all, all));
-        let named = ReflectedWhen { service: false, ..all };
-        assert_eq!(when("ReflectedWhen=address, Hostname"), (named, all));
-        let nameless = ReflectedWhen { address: false, ..all };
-        assert_eq!(when("ReflectedWhen=hostname,service"), (nameless, all));
-        assert_eq!(when("reflectedwhen=address hostname"), (named, all));
-        assert_eq!(when("ReflectedWhen=hostname\nReflectedWhen="), (all, all));
+        assert_eq!(when(""), (all.clone(), all.clone()));
+        assert_eq!(when("ReflectedWhen=address,hostname,service"), (all.clone(), all.clone()));
+        let named = ReflectedWhen { service: false, ..all.clone() };
+        assert_eq!(when("ReflectedWhen=address, Hostname"), (named.clone(), all.clone()));
+        let nameless = ReflectedWhen { address: false, ..all.clone() };
+        assert_eq!(when("ReflectedWhen=hostname,service"), (nameless.clone(), all.clone()));
+        assert_eq!(when("reflectedwhen=address hostname"), (named.clone(), all.clone()));
+        assert_eq!(when("ReflectedWhen=hostname\nReflectedWhen="), (all.clone(), all.clone()));
         for (bad, message) in [("name", "address, hostname or service"), ("address,service", "must include hostname")] {
             let err = error_of(&format!("[Segment]\nName=a\nInterfaces=x\nReflectedWhen={bad}"));
             assert!(err.contains("line 4") && err.contains(message), "{err}");
+        }
+    }
+
+    /// `ReflectedServices=` names the service types to reflect, or to keep out
+    /// (which wins), whatever the case and whether or not `.local` is there.
+    #[test]
+    fn segments_choose_which_service_types_are_reflected() {
+        let kinds = |extra: &str| {
+            Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}")).unwrap().segments[0].reflected_when.kinds.clone()
+        };
+        assert!(kinds("").is_all());
+        let only = kinds("ReflectedServices=_IPP._tcp, _airplay._tcp.local.");
+        assert!(only.allows("_ipp._tcp.local") && only.allows("_airplay._tcp.local") && !only.allows("_ssh._tcp.local"));
+        let not = kinds("ReflectedServices=!_ssh._tcp");
+        assert!(not.allows("_ipp._tcp.local") && !not.allows("_SSH._tcp.local"));
+        let both = kinds("ReflectedServices=_ssh._tcp,_ipp._tcp,!_ssh._tcp");
+        assert!(both.allows("_ipp._tcp.local") && !both.allows("_ssh._tcp.local"));
+        assert_eq!(both.words(), ["_ipp._tcp", "_ssh._tcp", "!_ssh._tcp"]);
+        // Repeated, it adds to what is named; empty, it resets; ReflectedWhen= leaves it.
+        assert!(kinds("ReflectedServices=_ipp._tcp\nReflectedServices=").is_all());
+        assert!(!kinds("ReflectedServices=_ipp._tcp\nReflectedWhen=hostname,service").allows("_ssh._tcp.local"));
+        assert!(!kinds("ReflectedWhen=hostname,service\nReflectedServices=_ipp._tcp").allows("_ssh._tcp.local"));
+        let err = error_of("[Segment]\nName=a\nInterfaces=x\nReflectedWhen=hostname,address\nReflectedServices=_ipp._tcp");
+        assert!(err.contains("without enabling service filtering"), "{err}");
+        assert!(Config::parse("[Segment]\nName=a\nInterfaces=x\nReflectedWhen=hostname,address").is_ok());
+        for bad in ["_ipp", "ipp._tcp", "_ipp._sctp", "_*._tcp", "!", "_a.b._tcp"] {
+            let err = error_of(&format!("[Segment]\nName=a\nInterfaces=x\nReflectedServices={bad}"));
+            assert!(err.contains("line 4") && err.contains("a service type"), "{bad}: {err}");
         }
     }
 
