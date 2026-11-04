@@ -8,7 +8,7 @@
 //! it.
 
 use core::fmt;
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::VecDeque;
 
 use hashbrown::{HashMap, HashSet};
 use core::net::{IpAddr, SocketAddr, SocketAddrV6};
@@ -22,20 +22,19 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::{AdvertiseConfig, Neighbours, ReflectedWhen, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
+use crate::config::{AdvertiseConfig, Neighbours, ReflectedWhen};
 use crate::runtime::Why;
 use crate::device::{
     family_of, is_link_local, is_type, is_usable, responses, service_ttl, Device, Origin, Service,
     DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
 };
 use crate::socket::{Family, Prefix, Sender, MDNS_PORT};
-use crate::tracker::Heard;
 use crate::parser::{Message, Question, Record};
 
 use crate::prelude::*;
 
 mod manuals;
-use crate::tracker::{refresh_gap, Devices, Entry, Id, Indexed, NeighbourTable};
+use crate::tracker::{refresh_gap, Devices, Entry, Heard, Id, Indexed, Tracker};
 use manuals::Manuals;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
@@ -217,7 +216,7 @@ impl Source {
     pub fn with<R>(&self, f: impl FnOnce(&Device) -> R) -> Option<R> {
         let state = self.state.upgrade()?;
         let state = state.borrow();
-        state.discovered.try_get(self.id).map(|entry| f(&entry.device))
+        state.tracker.discovered.try_get(self.id).map(|entry| f(&entry.device))
     }
 }
 
@@ -421,7 +420,8 @@ pub struct UpkeepInfo {
 
 #[derive(Default)]
 struct State {
-    discovered: Devices,
+    /// What is known of the devices heard here.
+    tracker: Tracker,
     /// Devices we announce on this segment on behalf of somewhere else, by
     /// lowercase hostname.
     manual: Manuals,
@@ -437,36 +437,19 @@ struct State {
     next_routine: Option<Instant>,
     /// How to send, over each family the segment has a socket of.
     outbound: Vec<Outbound>,
-    /// Service types devices on this segment have said they offer, learned
-    /// from answers to the type enumeration query.
-    types: BTreeSet<String>,
-    /// The least a device is kept after it was last heard from.
-    min_lifetime: Duration,
     /// Whether what is announced here is announced again before its TTL runs
     /// out though it has not changed. It need not be: whoever still wants it
     /// asks again (RFC 6762 section 5.2), and is answered.
     reannounce: bool,
-    /// How many addresses of a family a discovered device is kept with.
-    max_addrs: usize,
     /// The families a device is asked directly over, to refresh it: those that
     /// hear what is sent to the daemon.
     direct: Vec<Family>,
-    /// How many devices it remembers, at most.
-    max_devices: usize,
-    /// How many services a device is kept with, at most.
-    max_services: usize,
     /// The most a packet sent here may hold: what the interface's MTU leaves.
     max_packet: usize,
     upkeep: Upkeep,
     /// The questions put to this segment on another's behalf, in lowercase,
     /// and when, for [`FORWARD_GAP`].
     forwarded: HashMap<(String, u16), Instant>,
-    /// The kernel's neighbour table for the interface: each address it has a
-    /// link-layer address for, and that link-layer address.
-    neighbours: NeighbourTable,
-    /// The networks the interface is on: of the neighbour table, only
-    /// addresses in one of them are learned.
-    prefixes: Vec<Prefix>,
 }
 
 impl State {
@@ -474,10 +457,10 @@ impl State {
     /// neighbour table are, for tests to ask after anything that changes them.
     #[cfg(test)]
     fn check(&self) {
-        if CHECKING.with(|checking| checking.get()) && self.discovered.len() <= 1100 {
-            self.discovered.check();
+        if CHECKING.with(|checking| checking.get()) && self.tracker.discovered.len() <= 1100 {
+            self.tracker.discovered.check();
             self.manual.check();
-            self.neighbours.check();
+            self.tracker.neighbours.check();
             // What is due next is what a look at every device says.
             let mut scan: Option<Instant> = None;
             self.for_each_deadline(&mut |_, _, at| scan = Some(scan.map_or(at, |n| n.min(at))));
@@ -496,31 +479,31 @@ impl State {
     /// it, for the kernel to look up its link-layer address.
     fn learn_neighbours(&mut self, ids: &[Id], touched: &mut Touched, now: Instant) {
         for &id in ids {
-            let Some(entry) = self.discovered.try_get(id) else { continue };
+            let Some(entry) = self.tracker.discovered.try_get(id) else { continue };
             // Its link-layer address, by any address it announced.
             let announced = entry.device.addresses.iter().filter(|a| a.origin == Origin::Announced);
-            let mut macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
+            let mut macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.tracker.neighbours.get(&a.ip)).collect();
             macs.sort_unstable();
             macs.dedup();
-            let on_link = |ip: &IpAddr| self.prefixes.iter().any(|p| p.contains(ip));
+            let on_link = |ip: &IpAddr| self.tracker.prefixes.iter().any(|p| p.contains(ip));
             let learned: Vec<IpAddr> = macs
                 .iter()
-                .flat_map(|mac| self.neighbours.with_mac(mac))
+                .flat_map(|mac| self.tracker.neighbours.with_mac(mac))
                 .filter(|ip| !is_link_local(ip) && on_link(ip))
                 .collect();
 
-            let unresolved = entry.device.link_local().find(|ll| ll.is_ipv6() && !self.neighbours.contains_key(ll));
+            let unresolved = entry.device.link_local().find(|ll| ll.is_ipv6() && !self.tracker.neighbours.contains_key(ll));
             let has_v6 = entry.device.routable().any(|a| a.is_ipv6());
             let due = entry.nudged.is_none_or(|t| now.saturating_duration_since(t) >= NUDGE_GAP);
             if let Some(ll) = unresolved.filter(|_| !has_v6 && due) {
                 nudge(&self.outbound, ll, &Device::refresh_queries(core::slice::from_ref(&entry.device), self.max_packet));
-                self.discovered.get_mut(id).nudged = Some(now);
+                self.tracker.discovered.get_mut(id).nudged = Some(now);
             }
 
-            let mut device = self.discovered.get(id).device.clone();
-            if device.take_neighbours(&learned, self.max_addrs) {
-                touched.note(&self.discovered, id);
-                self.discovered.get_mut(id).device = device;
+            let mut device = self.tracker.discovered.get(id).device.clone();
+            if device.take_neighbours(&learned, self.tracker.max_addrs) {
+                touched.note(&self.tracker.discovered, id);
+                self.tracker.discovered.get_mut(id).device = device;
             }
         }
     }
@@ -530,7 +513,7 @@ impl State {
     /// changed.
     fn relearn_neighbours(&mut self, now: Instant) {
         let ids: Vec<Id> =
-            self.discovered.ids().filter(|&id| !self.discovered.get(id).device.addresses.is_empty()).collect();
+            self.tracker.discovered.ids().filter(|&id| !self.tracker.discovered.get(id).device.addresses.is_empty()).collect();
         self.relearn(&ids, now);
     }
 
@@ -539,9 +522,9 @@ impl State {
     fn relearn(&mut self, ids: &[Id], now: Instant) {
         let mut touched = Touched::default();
         self.learn_neighbours(ids, &mut touched, now);
-        touched.sync(&mut self.discovered);
-        let names = touched.names(&self.discovered);
-        let events = touched.events(&self.discovered);
+        touched.sync(&mut self.tracker.discovered);
+        let names = touched.names(&self.tracker.discovered);
+        let events = touched.events(&self.tracker.discovered);
         if !events.is_empty() {
             self.settle_for(&names, now);
         }
@@ -561,7 +544,7 @@ impl State {
     /// in the past means it is due now. Every time returned is one at which
     /// one of them acts, so that running them moves it on.
     fn next_due(&self, _now: Instant) -> Option<Instant> {
-        let mut next = self.discovered.next_due();
+        let mut next = self.tracker.discovered.next_due();
         let mut see = |at: Instant| next = Some(next.map_or(at, |n| n.min(at)));
         for p in &self.probing {
             see(p.next);
@@ -579,7 +562,7 @@ impl State {
     /// answer again, when that, or whether there is a way to ask, changed.
     fn sync_refresh(&mut self) {
         let before = self.upkeep.before.filter(|_| !self.outbound.is_empty());
-        self.discovered.set_refresh(before);
+        self.tracker.discovered.set_refresh(before);
     }
 
     /// Every time something is due, as what is to be done (`expire`,
@@ -587,7 +570,7 @@ impl State {
     /// [`State::next_due`] and [`Segment::pending`] are made of.
     fn for_each_deadline(&self, f: &mut dyn FnMut(&'static str, &dyn fmt::Display, Instant)) {
         let before = self.upkeep.before;
-        for e in self.discovered.iter() {
+        for e in self.tracker.discovered.iter() {
             let who: &dyn fmt::Display = match &e.device.hostname {
                 Some(host) => host,
                 None => &e.from,
@@ -620,11 +603,11 @@ impl State {
     /// the second.
     fn lifetime_left(&self, device: &Device) -> Duration {
         let id = match (&device.hostname, device.addrs().next()) {
-            (Some(host), _) => self.discovered.find_host(host),
-            (None, Some(addr)) => self.discovered.find_nameless(&addr),
+            (Some(host), _) => self.tracker.discovered.find_host(host),
+            (None, Some(addr)) => self.tracker.discovered.find_nameless(&addr),
             (None, None) => return Duration::ZERO,
         };
-        id.map(|id| self.discovered.get(id)).map_or(Duration::ZERO, |entry| {
+        id.map(|id| self.tracker.discovered.get(id)).map_or(Duration::ZERO, |entry| {
             let left = entry.expires.saturating_duration_since(Instant::now());
             // To the nearest second, a half up.
             Duration::from_secs(left.saturating_add(Duration::from_millis(500)).as_secs())
@@ -635,13 +618,13 @@ impl State {
     /// fewer than it is set to remember, and `src` first described fewer than
     /// [`MAX_PER_SENDER`] of them.
     fn room_for(&self, src: IpAddr) -> bool {
-        self.discovered.len() < self.max_devices && self.discovered.described_by(&src) < MAX_PER_SENDER
+        self.tracker.discovered.len() < self.tracker.max_devices && self.tracker.discovered.described_by(&src) < MAX_PER_SENDER
     }
 
     /// Whether a device on this segment offers a service called `instance`,
     /// ignoring case.
     fn is_local(&self, instance: &str) -> bool {
-        self.discovered.with_name(instance).any(|e| e.device.service(instance).is_some())
+        self.tracker.discovered.with_name(instance).any(|e| e.device.service(instance).is_some())
     }
 
     /// What should be announced as `key`: the winning claim, less the
@@ -655,7 +638,7 @@ impl State {
         if *owner == Owner::Own {
             return Some((device, host_ttl));
         }
-        if self.discovered.contains_host(key) {
+        if self.tracker.discovered.contains_host(key) {
             return None;
         }
         Some((device.without(&|instance| self.is_local(instance)), host_ttl))
@@ -673,7 +656,7 @@ impl State {
         // Each with the TTL its address is announced with.
         let old = m.shown.as_ref().map(|d| Device { ttl: Some(m.host_ttl), ..d.clone() });
         let new = want.as_ref().map(|(device, host_ttl)| Device { ttl: Some(*host_ttl), ..device.clone() });
-        let host_here = self.discovered.contains_host(key);
+        let host_here = self.tracker.discovered.contains_host(key);
         let records = Device::transition(old.as_ref(), new.as_ref(), &|instance| self.is_local(instance), host_here);
         let sent = !records.is_empty();
         if sent {
@@ -710,7 +693,7 @@ impl State {
         query
             .questions
             .iter()
-            .filter(|q| !(self.is_local(&q.name) || self.discovered.contains_host(&q.name)))
+            .filter(|q| !(self.is_local(&q.name) || self.tracker.discovered.contains_host(&q.name)))
             .map(|q| {
                 let answered = self.manual.with_shown_name(&q.name).any(|m| m.shown.as_ref().is_some_and(|d| d.knows(q)));
                 Asked { question: q.clone(), answered }
@@ -783,11 +766,7 @@ impl Segment {
             interface: interface.into(),
             families: families.into(),
             state: Rc::new(RefCell::new(State {
-                min_lifetime: DEFAULT_MIN_LIFETIME,
-                max_addrs: DEFAULT_MAX_ADDRS,
                 direct: vec![Family::V4, Family::V6],
-                max_devices: DEFAULT_MAX_DEVICES,
-                max_services: DEFAULT_MAX_SERVICES,
                 max_packet: DEFAULT_MAX_PACKET,
                 ..State::default()
             })),
@@ -800,7 +779,7 @@ impl Segment {
     /// two of the daemon's checks. The default is [`DEFAULT_MIN_LIFETIME`].
     /// Applies to what is heard from now on.
     pub fn set_min_lifetime(&self, min_lifetime: Duration) {
-        self.state.borrow_mut().min_lifetime = min_lifetime;
+        self.state.borrow_mut().tracker.min_lifetime = min_lifetime;
     }
 
     /// The families a device is asked directly over, to refresh it, rather than
@@ -815,19 +794,19 @@ impl Segment {
     /// most: more are not taken. The default is [`DEFAULT_MAX_ADDRS`].
     /// Applies to what is heard from now on.
     pub fn set_max_addrs(&self, max_addrs: usize) {
-        self.state.borrow_mut().max_addrs = max_addrs.max(1);
+        self.state.borrow_mut().tracker.max_addrs = max_addrs.max(1);
     }
 
     /// How many devices it remembers, at most: a host beyond that is not
     /// learned of. The default is [`DEFAULT_MAX_DEVICES`].
     pub fn set_max_devices(&self, max_devices: usize) {
-        self.state.borrow_mut().max_devices = max_devices.max(1);
+        self.state.borrow_mut().tracker.max_devices = max_devices.max(1);
     }
 
     /// How many services a device is kept with, at most: more are not taken.
     /// The default is [`DEFAULT_MAX_SERVICES`].
     pub fn set_max_services(&self, max_services: usize) {
-        self.state.borrow_mut().max_services = max_services.max(1);
+        self.state.borrow_mut().tracker.max_services = max_services.max(1);
     }
 
     /// Take the interface's MTU: no packet sent here is bigger than it leaves
@@ -925,7 +904,7 @@ impl Segment {
     /// Devices currently active on this segment (excludes manual ones).
     pub fn devices(&self) -> Vec<Device> {
         let state = self.state.borrow_mut();
-        state.discovered.iter().map(|e| e.device.clone()).collect()
+        state.tracker.discovered.iter().map(|e| e.device.clone()).collect()
     }
 
     // 2. Change notifications for the discovered list.
@@ -1026,7 +1005,7 @@ impl Segment {
     /// another segment may hold it.
     pub fn source_of(&self, host: &str) -> Option<Source> {
         let state = self.state.borrow();
-        state.discovered.find_host(host).map(|id| Source { state: Rc::downgrade(&self.state), id })
+        state.tracker.discovered.find_host(host).map(|id| Source { state: Rc::downgrade(&self.state), id })
     }
 
     /// Put `claim` among what `owner` wants announced as `key` (lowercase),
@@ -1184,17 +1163,17 @@ impl Segment {
     /// withdrawn. They are found again once it is back.
     pub fn forget_discovered(&self) {
         let mut state = self.state.borrow_mut();
-        let ids: Vec<Id> = state.discovered.ids().collect();
+        let ids: Vec<Id> = state.tracker.discovered.ids().collect();
         let mut touched = Touched::default();
         for &id in &ids {
-            touched.note(&state.discovered, id);
+            touched.note(&state.tracker.discovered, id);
         }
         for id in ids {
-            if let Some(entry) = state.discovered.remove(id) {
+            if let Some(entry) = state.tracker.discovered.remove(id) {
                 state.notify(Event::Removed(entry.device));
             }
         }
-        let names = touched.names(&state.discovered);
+        let names = touched.names(&state.tracker.discovered);
         state.settle_for(&names, Instant::now());
     }
 
@@ -1333,7 +1312,7 @@ impl Segment {
                 fresh.push(q);
             }
         }
-        let known = |q: &Question| state.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
+        let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
         ask(&state.outbound, &Device::forward_queries(fresh, known, state.max_packet))
     }
 
@@ -1364,21 +1343,21 @@ impl Segment {
         let Heard { leaving, types, reports, rest, .. } = Heard::of(src, msg);
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let (floor, max_addrs, max_services) = (state.min_lifetime, state.max_addrs, state.max_services);
+        let (floor, max_addrs, max_services) = (state.tracker.min_lifetime, state.tracker.max_addrs, state.tracker.max_services);
         let mut touched = Touched::default();
 
         // A device leaving: the device that owns the name, and anything the
         // sender was only known by.
         if !leaving.is_empty() {
-            let mut gone: Vec<Id> = leaving.iter().filter_map(|name| state.discovered.find_host(name)).collect();
-            gone.extend(state.discovered.find_nameless(&src));
+            let mut gone: Vec<Id> = leaving.iter().filter_map(|name| state.tracker.discovered.find_host(name)).collect();
+            gone.extend(state.tracker.discovered.find_nameless(&src));
             gone.dedup();
             for id in gone {
-                touched.note(&state.discovered, id);
-                state.discovered.remove(id);
+                touched.note(&state.tracker.discovered, id);
+                state.tracker.discovered.remove(id);
             }
-            let names = touched.names(&state.discovered);
-            let events = touched.events(&state.discovered);
+            let names = touched.names(&state.tracker.discovered);
+            let events = touched.events(&state.tracker.discovered);
             if !events.is_empty() {
                 state.settle_for(&names, now);
             }
@@ -1391,8 +1370,8 @@ impl Segment {
         }
 
         for kind in types {
-            if state.types.len() < MAX_TYPES {
-                state.types.insert(kind);
+            if state.tracker.types.len() < MAX_TYPES {
+                state.tracker.types.insert(kind);
             }
         }
 
@@ -1407,7 +1386,7 @@ impl Segment {
         let mut resolved: Vec<(Id, String)> = Vec::new();
 
         for report in &reports {
-            let known = state.discovered.find_host(&report.host);
+            let known = state.tracker.discovered.find_host(&report.host);
             if known.is_none() && !state.room_for(src) {
                 continue;
             }
@@ -1426,24 +1405,24 @@ impl Segment {
 
             // A device first heard only by address becomes the named device, if
             // it announced the address.
-            let nameless = state.discovered.find_nameless(&src).filter(|_| announced_src);
+            let nameless = state.tracker.discovered.find_nameless(&src).filter(|_| announced_src);
             let earlier = nameless.and_then(|id| {
-                touched.note(&state.discovered, id);
-                state.discovered.remove(id)
+                touched.note(&state.tracker.discovered, id);
+                state.tracker.discovered.remove(id)
             });
 
             let id = match known {
                 Some(id) => {
-                    touched.note(&state.discovered, id);
+                    touched.note(&state.tracker.discovered, id);
                     id
                 }
                 None => {
-                    let id = state.discovered.create(Entry::new(now, src, Some(&report.host)));
+                    let id = state.tracker.discovered.create(Entry::new(now, src, Some(&report.host)));
                     touched.note_new(id);
                     id
                 }
             };
-            let entry = state.discovered.get_mut(id);
+            let entry = state.tracker.discovered.get_mut(id);
             if let Some(earlier) = earlier {
                 entry.absorb(earlier, max_services);
             }
@@ -1470,25 +1449,25 @@ impl Segment {
         // One known only by an address no device can be reached at is not
         // known at all.
         let usable = is_usable(src);
-        touched.sync(&mut state.discovered);
+        touched.sync(&mut state.tracker.discovered);
         let known = sender
-            .or_else(|| state.discovered.holder_of(&src))
-            .or_else(|| state.discovered.find_nameless(&src).filter(|_| usable));
+            .or_else(|| state.tracker.discovered.holder_of(&src))
+            .or_else(|| state.tracker.discovered.find_nameless(&src).filter(|_| usable));
         // One heard by its address if it is not known at all, and there is room.
-        let room = known.is_some() || (usable && state.discovered.len() < state.max_devices);
+        let room = known.is_some() || (usable && state.tracker.discovered.len() < state.tracker.max_devices);
         if (known.is_some() || usable) && room && (reports.is_empty() || !rest.is_empty()) {
             let id = match known {
                 Some(id) => {
-                    touched.note(&state.discovered, id);
+                    touched.note(&state.tracker.discovered, id);
                     id
                 }
                 None => {
-                    let id = state.discovered.create(Entry::new(now, src, None));
+                    let id = state.tracker.discovered.create(Entry::new(now, src, None));
                     touched.note_new(id);
                     id
                 }
             };
-            let entry = state.discovered.get_mut(id);
+            let entry = state.tracker.discovered.get_mut(id);
             let was = entry.soonest();
             let ttl = rest.iter().map(|r| r.ttl).max().unwrap_or(0);
             let ttl = Duration::from_secs(ttl as u64);
@@ -1506,28 +1485,29 @@ impl Segment {
 
         // An instance that has now been resolved to its host no longer needs
         // the unresolved copy learned from a bare browse answer.
-        touched.sync(&mut state.discovered);
+        touched.sync(&mut state.tracker.discovered);
         for (owner, instance) in resolved {
             let others: Vec<Id> = state
+                .tracker
                 .discovered
                 .with_unresolved()
                 .filter(|&(id, e)| id != owner && e.device.service(&instance).is_some_and(|s| s.target.is_none()))
                 .map(|(id, _)| id)
                 .collect();
             for id in others {
-                touched.note(&state.discovered, id);
-                state.discovered.get_mut(id).device.forget_service(&instance);
+                touched.note(&state.tracker.discovered, id);
+                state.tracker.discovered.get_mut(id).device.forget_service(&instance);
             }
-            touched.sync(&mut state.discovered);
+            touched.sync(&mut state.tracker.discovered);
         }
 
         // What the neighbour table knows of the devices just heard of.
         let heard = touched.order.clone();
         state.learn_neighbours(&heard, &mut touched, now);
 
-        touched.sync(&mut state.discovered);
-        let names = touched.names(&state.discovered);
-        let events = touched.events(&state.discovered);
+        touched.sync(&mut state.tracker.discovered);
+        let names = touched.names(&state.tracker.discovered);
+        let events = touched.events(&state.tracker.discovered);
         if !events.is_empty() {
             state.settle_for(&names, now);
         }
@@ -1544,10 +1524,10 @@ impl Segment {
     pub fn set_prefixes(&self, prefixes: Vec<Prefix>) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        if state.prefixes == prefixes {
+        if state.tracker.prefixes == prefixes {
             return;
         }
-        state.prefixes = prefixes;
+        state.tracker.prefixes = prefixes;
         state.relearn_neighbours(Instant::now());
     }
 
@@ -1560,7 +1540,7 @@ impl Segment {
         match to {
             None => true,
             Some(to) if to.is_multicast() => true,
-            Some(_) => is_link_local(&from) || self.state.borrow().prefixes.iter().any(|p| p.contains(&from)),
+            Some(_) => is_link_local(&from) || self.state.borrow().tracker.prefixes.iter().any(|p| p.contains(&from)),
         }
     }
 
@@ -1572,10 +1552,10 @@ impl Segment {
     pub fn neighbour(&self, ip: IpAddr, mac: Option<Vec<u8>>) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let was = state.neighbours.get(&ip).cloned();
+        let was = state.tracker.neighbours.get(&ip).cloned();
         let changed = match &mac {
-            Some(mac) => state.neighbours.insert(ip, mac.clone()).as_ref() != Some(mac),
-            None => state.neighbours.remove(&ip).is_some(),
+            Some(mac) => state.tracker.neighbours.insert(ip, mac.clone()).as_ref() != Some(mac),
+            None => state.tracker.neighbours.remove(&ip).is_some(),
         };
         if changed {
             // What it learns of a device follows the addresses that share a
@@ -1584,11 +1564,11 @@ impl Segment {
             // address it was at, or is at now.
             let mut ips = vec![ip];
             for mac in was.iter().chain(&mac) {
-                ips.extend(state.neighbours.with_mac(mac));
+                ips.extend(state.tracker.neighbours.with_mac(mac));
             }
             let mut seen = HashSet::new();
             let ids: Vec<Id> =
-                ips.iter().flat_map(|ip| state.discovered.ids_with_addr(ip)).filter(|id| seen.insert(*id)).collect();
+                ips.iter().flat_map(|ip| state.tracker.discovered.ids_with_addr(ip)).filter(|id| seen.insert(*id)).collect();
             state.relearn(&ids, Instant::now());
         }
     }
@@ -1730,8 +1710,8 @@ impl Segment {
             return Ok(0);
         }
 
-        let devices: Vec<Device> = state.discovered.iter().map(|e| e.device.clone()).collect();
-        ask(&state.outbound, &Device::probe_queries(&devices, &state.types, state.max_packet))
+        let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.clone()).collect();
+        ask(&state.outbound, &Device::probe_queries(&devices, &state.tracker.types, state.max_packet))
     }
 
     fn query_types_round(&self, kinds: &[String]) -> Result<usize> {
@@ -1741,13 +1721,13 @@ impl Segment {
             return Ok(0);
         }
         for kind in kinds.iter().filter(|k| is_type(k)) {
-            if state.types.len() < MAX_TYPES {
-                state.types.insert(kind.to_ascii_lowercase());
+            if state.tracker.types.len() < MAX_TYPES {
+                state.tracker.types.insert(kind.to_ascii_lowercase());
             }
         }
         let now = Instant::now();
-        let devices: Vec<Device> = state.discovered.iter().map(|e| e.device.clone()).collect();
-        let known = |q: &Question| state.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
+        let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.clone()).collect();
+        let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
         ask(&state.outbound, &Device::type_queries(&devices, kinds, known, state.max_packet))
     }
 
@@ -1768,7 +1748,7 @@ impl Segment {
     /// many questions were sent.
     pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
         let mut guard = self.state.borrow_mut();
-        let State { discovered, outbound, max_packet, direct, .. } = &mut *guard;
+        let State { tracker: Tracker { discovered, .. }, outbound, max_packet, direct, .. } = &mut *guard;
         if outbound.is_empty() {
             return Ok(0);
         }
@@ -1810,10 +1790,10 @@ impl Segment {
         // Those of which something has run out: the devices themselves, and
         // of the others, the addresses that ran out on their own.
         let (stale, running): (Vec<Id>, Vec<Id>) =
-            state.discovered.running_out(now).into_iter().partition(|&id| state.discovered.get(id).expires <= now);
+            state.tracker.discovered.running_out(now).into_iter().partition(|&id| state.tracker.discovered.get(id).expires <= now);
         let mut lost = Vec::new();
         for id in running {
-            if state.discovered.edit(id, |entry| entry.expire_addrs(now)) == Some(true) {
+            if state.tracker.discovered.edit(id, |entry| entry.expire_addrs(now)) == Some(true) {
                 lost.push(id);
             }
         }
@@ -1822,21 +1802,21 @@ impl Segment {
         }
         let mut touched = Touched::default();
         for &id in &stale {
-            touched.note(&state.discovered, id);
+            touched.note(&state.tracker.discovered, id);
         }
         for id in stale {
-            if let Some(entry) = state.discovered.remove(id) {
+            if let Some(entry) = state.tracker.discovered.remove(id) {
                 state.notify(Event::Removed(entry.device));
             }
         }
         for id in lost {
-            if let Some(device) = state.discovered.try_get(id).map(|e| e.device.clone()) {
+            if let Some(device) = state.tracker.discovered.try_get(id).map(|e| e.device.clone()) {
                 state.notify(Event::Updated(device));
             }
         }
         // What they had here may be shown again. `now` may be ahead of the
         // clock, but what is announced is announced now.
-        let names = touched.names(&state.discovered);
+        let names = touched.names(&state.tracker.discovered);
         state.settle_for(&names, Instant::now());
         #[cfg(test)]
         state.check();
@@ -2015,7 +1995,9 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::config::{DEFAULT_MAX_DEVICES, DEFAULT_MIN_LIFETIME};
     use crate::device::{addr_of, META_QUERY};
+    use std::collections::BTreeSet;
     use crate::parser::RData;
 
     /// `socket` as the segment takes a socket.
@@ -2061,7 +2043,7 @@ mod tests {
 
     /// Which device has this hostname.
     fn host_id(state: &State, host: &str) -> Id {
-        state.discovered.find_host(host).expect("no such device")
+        state.tracker.discovered.find_host(host).expect("no such device")
     }
 
     fn sa(s: &str) -> SocketAddr {
@@ -2448,11 +2430,11 @@ mod tests {
         {
             let mut state = seg.state.borrow_mut();
             let (tv, nas) = (host_id(&state, "tv.local"), host_id(&state, "nas.local"));
-            state.discovered.edit(tv, |tv| {
+            state.tracker.discovered.edit(tv, |tv| {
                 tv.addr_expires.insert(ip("10.0.1.7"), now + Duration::from_secs(50));
                 tv.expires = now + Duration::from_secs(70);
             });
-            state.discovered.edit(nas, |nas| nas.expires = now);
+            state.tracker.discovered.edit(nas, |nas| nas.expires = now);
         }
 
         let questions = [question("_http._tcp.local", rtype::PTR), question("tv.local", rtype::A)];
@@ -2483,7 +2465,7 @@ mod tests {
             assert_eq!(m.answers[0].data, RData::Ptr("Plug._shelly._tcp.local".into()));
         }
         assert!(recv(&rx).is_none());
-        let types = seg.state.borrow_mut().types.clone();
+        let types = seg.state.borrow_mut().tracker.types.clone();
         assert!(types.contains("_hue._tcp.local") && types.contains("_shelly._tcp.local") && !types.contains("bogus"));
 
         seg.probe_round().unwrap();
@@ -2709,7 +2691,7 @@ mod tests {
         seg.handle(sa("10.0.1.200"), &query("_http._tcp.local", rtype::PTR, vec![])).unwrap();
         within("a reply", packets());
         // Types with long names, so that size, not the count, splits a probe.
-        seg.state.borrow_mut().types.extend((0..20).map(|i| format!("_{}{i}._tcp.local", "t".repeat(40))));
+        seg.state.borrow_mut().tracker.types.extend((0..20).map(|i| format!("_{}{i}._tcp.local", "t".repeat(40))));
         seg.probe_round().unwrap();
         within("a probe", packets());
         // Every device due: a margin longer than any lifetime.
@@ -2736,7 +2718,7 @@ mod tests {
         // A mere query from it makes no device of it.
         seg.handle(sa("0.0.0.0"), &query("tv.local", rtype::A, vec![])).unwrap();
         assert_eq!(seg.devices().len(), 1);
-        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("0.0.0.0")).is_some());
+        assert!(!seg.state.borrow_mut().tracker.discovered.holder_of(&ip("0.0.0.0")).is_some());
     }
 
     const MAC: [u8; 6] = [0x04, 0x09, 0x86, 0x43, 0xe3, 0xf6];
@@ -2771,14 +2753,14 @@ mod tests {
         assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.has_addr(&ip("2001:db8:2::73"))));
         // A packet from a learned address is the device's.
         let state = seg.state.borrow();
-        let holder = state.discovered.holder_of(&ip("2001:db8:2::73")).map(|id| state.discovered.get(id).device.hostname.clone());
+        let holder = state.tracker.discovered.holder_of(&ip("2001:db8:2::73")).map(|id| state.tracker.discovered.get(id).device.hostname.clone());
         assert_eq!(holder, Some(Some("speakers.local".to_string())));
         drop(state);
 
         // An entry that goes takes its address with it.
         seg.neighbour(ip("2001:db8:2::73"), None);
         assert_eq!(learned(&seg), [ip("fd00:0:2::73")]);
-        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("2001:db8:2::73")).is_some());
+        assert!(!seg.state.borrow_mut().tracker.discovered.holder_of(&ip("2001:db8:2::73")).is_some());
         assert!(matches!(events.try_recv(), Ok(Event::Updated(_))));
         // The same entry again changes nothing, and says nothing.
         seg.neighbour(ip("fd00:0:2::73"), Some(MAC.to_vec()));
@@ -2870,12 +2852,12 @@ mod tests {
         seg.neighbour(ip("2001:db8:1::73"), Some(MAC.to_vec())); // the old prefix
         hear(&seg, "10.0.2.73", vec![a_record("tv.local", "10.0.2.73"), aaaa("tv.local", "fe80::73")]);
         assert_eq!(learned(&seg), [ip("2001:db8:2::73")]);
-        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("2001:db8:1::73")).is_some());
+        assert!(!seg.state.borrow_mut().tracker.discovered.holder_of(&ip("2001:db8:1::73")).is_some());
 
         // The interface moves to the other prefix: so do its devices.
         seg.set_prefixes(vec![prefix("10.0.2.0/24"), prefix("2001:db8:1::/64")]);
         assert_eq!(learned(&seg), [ip("2001:db8:1::73")]);
-        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("2001:db8:2::73")).is_some());
+        assert!(!seg.state.borrow_mut().tracker.discovered.holder_of(&ip("2001:db8:2::73")).is_some());
         // With no network known, nothing is.
         seg.set_prefixes(vec![]);
         assert_eq!(learned(&seg), Vec::<IpAddr>::new());
@@ -2920,7 +2902,7 @@ mod tests {
         seg.attach(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap());
         let nudged = |seg: &Segment| {
             let state = seg.state.borrow();
-            state.discovered.get(host_id(&state, "speakers.local")).nudged
+            state.tracker.discovered.get(host_id(&state, "speakers.local")).nudged
         };
         hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9")]);
         let first = nudged(&seg).expect("nudged");
@@ -2977,7 +2959,7 @@ mod tests {
         let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still there");
         assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("fd00::7")]);
         assert!(matches!(events.try_recv(), Ok(Event::Updated(d)) if d.addrs().eq([ip("fd00::7")])));
-        assert!(!seg.state.borrow_mut().discovered.holder_of(&ip("10.0.1.7")).is_some(), "nor found by it");
+        assert!(!seg.state.borrow_mut().tracker.discovered.holder_of(&ip("10.0.1.7")).is_some(), "nor found by it");
     }
 
     /// A device whose services live long is still asked again before its
@@ -3607,7 +3589,7 @@ mod tests {
             .map(|i| record(META_QUERY.into(), false, 4500, RData::Ptr(format!("_t{i}._tcp.local"))))
             .collect();
         hear(&seg, "10.0.2.73", ptrs);
-        assert_eq!(seg.state.borrow_mut().types.len(), MAX_TYPES);
+        assert_eq!(seg.state.borrow_mut().tracker.types.len(), MAX_TYPES);
     }
 
     /// `router.local` is advertised as a reflected device that has a hostname
@@ -3953,7 +3935,7 @@ mod tests {
         let seg = segment("test", &[Family::V4]);
         hear(&seg, "10.0.0.1", vec![ptr("_x._tcp.local", "A._x._tcp.local")]);
         hear(&seg, "10.0.0.5", vec![ptr("_x._tcp.local", "C._x._tcp.local")]);
-        assert_eq!(seg.state.borrow().discovered.with_unresolved().count(), 2);
+        assert_eq!(seg.state.borrow().tracker.discovered.with_unresolved().count(), 2);
 
         // The host announces itself, and the first sender's copy goes; the other's stays.
         hear(&seg, "10.0.0.2", vec![srv("A._x._tcp.local", 1, "a.local"), a_record("a.local", "10.0.0.2")]);
@@ -3962,16 +3944,16 @@ mod tests {
         let by_addr = |addr: &str| devices.iter().find(|d| d.hostname.is_none() && v4(d) == Some(ip(addr))).unwrap().clone();
         assert!(by_addr("10.0.0.1").services.is_empty(), "{:?}", by_addr("10.0.0.1"));
         assert_eq!(by_addr("10.0.0.5").services.len(), 1);
-        assert_eq!(seg.state.borrow().discovered.with_unresolved().count(), 1, "the one that has none is no longer listed");
+        assert_eq!(seg.state.borrow().tracker.discovered.with_unresolved().count(), 1, "the one that has none is no longer listed");
 
         // One that goes is not kept listed.
         seg.expire(Instant::now() + Duration::from_secs(2 * 3600));
         assert!(seg.devices().is_empty());
-        assert_eq!(seg.state.borrow().discovered.with_unresolved().count(), 0);
+        assert_eq!(seg.state.borrow().tracker.discovered.with_unresolved().count(), 0);
         hear(&seg, "10.0.0.5", vec![ptr("_x._tcp.local", "C._x._tcp.local")]);
         seg.forget_discovered();
-        assert!(seg.state.borrow().discovered.with_unresolved().count() == 0 && seg.state.borrow().discovered.addrs_held() == 0);
-        seg.state.borrow().discovered.check();
+        assert!(seg.state.borrow().tracker.discovered.with_unresolved().count() == 0 && seg.state.borrow().tracker.discovered.addrs_held() == 0);
+        seg.state.borrow().tracker.discovered.check();
     }
 
     /// Many devices running out together are all dropped, with what pointed
@@ -3989,7 +3971,7 @@ mod tests {
         {
             let mut state = seg.state.borrow_mut();
             let kept = host_id(&state, keep);
-            state.discovered.edit(kept, |entry| {
+            state.tracker.discovered.edit(kept, |entry| {
                 entry.expires = longer;
                 entry.addr_expires.values_mut().for_each(|at| *at = longer);
             });
@@ -3999,8 +3981,8 @@ mod tests {
         assert_eq!(left.len(), 1, "{left:?}");
         assert_eq!(left[0].hostname.as_deref(), Some(keep));
         assert!(matches!(seg.take_events().last(), Some(Event::Updated(_) | Event::Removed(_))));
-        assert_eq!(seg.state.borrow().discovered.addrs_held(), 1, "only the survivor's address is still attributed");
-        seg.state.borrow().discovered.check();
+        assert_eq!(seg.state.borrow().tracker.discovered.addrs_held(), 1, "only the survivor's address is still attributed");
+        seg.state.borrow().tracker.discovered.check();
     }
 
     #[test]
@@ -4027,6 +4009,7 @@ mod tests {
         let mut state = seg.state.borrow_mut();
         let id = host_id(&state, host);
         state
+            .tracker
             .discovered
             .edit(id, |entry| {
                 entry.expires = at;
@@ -4499,7 +4482,7 @@ mod tests {
         let (b, _brx) = wired();
         hear(&a, "10.0.1.5", vec![ptr("_http._tcp.local", "Bare._http._tcp.local")]);
         tv_on(&a);
-        let bare = a.state.borrow().discovered.find_nameless(&ip("10.0.1.5"));
+        let bare = a.state.borrow().tracker.discovered.find_nameless(&ip("10.0.1.5"));
         assert!(bare.is_none(), "heard from the address of a named device");
         let named = a.source_of("tv.local").unwrap();
         let err = b.reflect(Owner::Reflector(0), named.clone(), Neighbours::default(), Some(Duration::ZERO), &ReflectedWhen::default()).unwrap_err();
@@ -4728,7 +4711,7 @@ mod tests {
 
     fn expiry_of(seg: &Segment, host: &str) -> Instant {
         let state = seg.state.borrow();
-        state.discovered.get(host_id(&state, host)).expires
+        state.tracker.discovered.get(host_id(&state, host)).expires
     }
 
     fn next_due(seg: &Segment) -> Option<Instant> {
@@ -5011,7 +4994,7 @@ mod tests {
         let seg = segment("test", &[Family::V4]);
         let meta = |kind: &str| ptr("_services._dns-sd._udp.local", kind);
         hear(&seg, "10.0.1.7", vec![meta("_http._tcp.local"), meta("_HTTP._tcp.LOCAL")]);
-        assert_eq!(seg.state.borrow_mut().types.len(), 1);
+        assert_eq!(seg.state.borrow_mut().tracker.types.len(), 1);
     }
 
     /// Subtypes are not sent in answers to a browse of their type, so a probe

@@ -4,18 +4,58 @@
 use core::net::IpAddr;
 use core::time::Duration;
 
+use alloc::collections::BTreeSet;
+
 use hashbrown::HashMap;
 
 use crate::device::{addr_of, family_of, is_type, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
 use crate::parser::{Message, Question, RData, Record};
 use crate::prelude::*;
-use crate::socket::Family;
+use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
+use crate::socket::{Family, Prefix};
 use crate::time::Instant;
 
 mod devices;
 mod neighbours;
 pub(crate) use devices::{Devices, Id, Indexed};
 pub(crate) use neighbours::NeighbourTable;
+
+/// What is known of the devices heard on a segment.
+pub struct Tracker {
+    pub discovered: Devices,
+    /// Service types devices on this segment have said they offer, learned
+    /// from answers to the type enumeration query.
+    pub types: BTreeSet<String>,
+    /// The least a device is kept after it was last heard from.
+    pub min_lifetime: Duration,
+    /// How many addresses of a family a discovered device is kept with.
+    pub max_addrs: usize,
+    /// How many devices it remembers, at most.
+    pub max_devices: usize,
+    /// How many services a device is kept with, at most.
+    pub max_services: usize,
+    /// The kernel's neighbour table for the interface: each address it has a
+    /// link-layer address for, and that link-layer address.
+    pub neighbours: NeighbourTable,
+    /// The networks the interface is on: of the neighbour table, only
+    /// addresses in one of them are learned.
+    pub prefixes: Vec<Prefix>,
+}
+
+impl Default for Tracker {
+    fn default() -> Tracker {
+        Tracker {
+            discovered: Devices::default(),
+            types: BTreeSet::new(),
+            min_lifetime: DEFAULT_MIN_LIFETIME,
+            max_addrs: DEFAULT_MAX_ADDRS,
+            max_devices: DEFAULT_MAX_DEVICES,
+            max_services: DEFAULT_MAX_SERVICES,
+            neighbours: NeighbourTable::default(),
+            prefixes: Vec::new(),
+        }
+    }
+}
 
 /// What one packet said. A query says nothing of its sender's: the records in
 /// it are other devices' known answers.
