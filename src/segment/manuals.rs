@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use hashbrown::DefaultHashBuilder;
 
-use super::table::{hash_name, Id, Multi, Table};
+use crate::table::{hash_name, Id, Multi, Table};
 use super::Manual;
 use crate::device::Device;
 use crate::time::Instant;

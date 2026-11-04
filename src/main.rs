@@ -23,6 +23,7 @@ mod reflector;
 mod segment;
 mod signal;
 mod socket;
+mod table;
 mod time;
 mod tracker;
 

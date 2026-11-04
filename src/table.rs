@@ -18,7 +18,7 @@ use hashbrown::{hash_map::Entry as MapEntry, DefaultHashBuilder, HashMap, HashSe
 
 /// Which thing, and where it is kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) struct Id {
+pub(crate) struct Id {
     slot: u32,
     /// How many things the slot has held before this one.
     generation: u32,
@@ -31,7 +31,7 @@ impl Id {
 
 /// The hash of `name` as it is in lowercase, whatever its case, and without
 /// copying it whole.
-pub(super) fn hash_name(hasher: &DefaultHashBuilder, name: &str) -> u64 {
+pub(crate) fn hash_name(hasher: &DefaultHashBuilder, name: &str) -> u64 {
     let mut h = hasher.build_hasher();
     let mut lower = [0u8; 64];
     for chunk in name.as_bytes().chunks(lower.len()) {
@@ -44,7 +44,7 @@ pub(super) fn hash_name(hasher: &DefaultHashBuilder, name: &str) -> u64 {
     h.finish()
 }
 
-pub(super) fn hash_addr(hasher: &DefaultHashBuilder, addr: &IpAddr) -> u64 {
+pub(crate) fn hash_addr(hasher: &DefaultHashBuilder, addr: &IpAddr) -> u64 {
     hasher.hash_one(addr)
 }
 
@@ -54,7 +54,7 @@ enum Slot<T> {
     Free(Option<u32>),
 }
 
-pub(super) struct Table<T> {
+pub(crate) struct Table<T> {
     slots: Vec<Slot<T>>,
     /// How many things each slot has held.
     generations: Vec<u32>,
@@ -168,7 +168,7 @@ enum Holders {
 
 /// Things by hash, each under every hash it has, as many as have it.
 #[derive(Default)]
-pub(super) struct Multi {
+pub(crate) struct Multi {
     by_hash: HashMap<u64, Holders>,
     /// How many (hash, thing) pairs it holds.
     pub pairs: usize,

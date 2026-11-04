@@ -24,15 +24,15 @@ use core::time::Duration;
 
 use hashbrown::{DefaultHashBuilder, HashSet};
 
-pub(super) use super::table::Id;
-use super::table::{hash_addr, hash_name, Multi, Table};
+pub(crate) use crate::table::Id;
+use crate::table::{hash_addr, hash_name, Multi, Table};
 use super::Entry;
 use crate::time::Instant;
 
 /// What the tables hold of a device: the hashes of its addresses and of the
 /// names it answers for, each once, in order, and the times it is held under.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
-pub(super) struct Indexed {
+pub(crate) struct Indexed {
     addrs: Vec<u64>,
     names: Vec<u64>,
     soonest: Option<Instant>,
@@ -40,7 +40,7 @@ pub(super) struct Indexed {
 }
 
 #[derive(Default)]
-pub(super) struct Devices {
+pub(crate) struct Devices {
     table: Table<Entry>,
     /// Each address a device has, and the device, by the hash of the address.
     by_addr: Multi,
