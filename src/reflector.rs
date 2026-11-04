@@ -24,7 +24,6 @@ use crate::time::Instant;
 use anyhow::{bail, Result};
 
 use crate::config::{glob, Forward, Neighbours, ReflectedWhen};
-use crate::device::Device;
 use crate::segment::{Asked, Event, Owner, Segment, Source};
 
 use crate::prelude::*;
@@ -411,7 +410,7 @@ impl Inner {
     }
 
     /// Bring what every segment announces as `host` (in lowercase) in line
-    /// with the segments' devices: every reflectable device with that
+    /// with the segments' devices: every device [that is reflected](crate::device::Device::reflected) with that
     /// hostname, from the other segments, is announced, nothing if the
     /// segment is untrusted. If two segments have a device with it (the
     /// cache-flush bit would make them overwrite each other), the one from
@@ -428,8 +427,8 @@ impl Inner {
             .map(|m| &m.segment)
             .map(|seg| {
                 let source = seg.source_of(host)?;
-                let reflectable = source.with(|device| reflectable(&device.with_neighbours_as(self.neighbours), &self.when));
-                reflectable.unwrap_or(false).then_some(source)
+                let reflected = source.with(|device| device.reflected(self.neighbours, &self.when).is_some());
+                reflected.unwrap_or(false).then_some(source)
             })
             .collect();
 
@@ -438,7 +437,7 @@ impl Inner {
             let winner = sources.iter().enumerate().find(|(src, source)| *src != target && source.is_some());
             let result = match winner {
                 Some((_, Some(source))) if !untrusted => {
-                    seg.reflect(self.owner, source.clone(), self.neighbours, self.reflect_ttl, &self.when.kinds)
+                    seg.reflect(self.owner, source.clone(), self.neighbours, self.reflect_ttl, &self.when)
                 }
                 _ => seg.remove_manual(self.owner, host),
             };
@@ -467,22 +466,12 @@ impl Inner {
     }
 }
 
-/// Only devices that can actually be announced elsewhere are reflected: that
-/// takes a hostname for the address record and a routable address to put in it
-/// (a device known only by a link-local address cannot be reached from another
-/// network), and a resolved service to give clients a reason to care (bare
-/// chatty clients such as phones are skipped): of these, what `when` asks for.
-fn reflectable(device: &Device, when: &ReflectedWhen) -> bool {
-    (!when.hostname || device.hostname.is_some())
-        && (!when.address || device.routable().next().is_some())
-        && (!when.service || device.services.iter().any(|s| s.is_resolved() && when.kinds.allows(&s.kind)))
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
     use super::*;
+    use crate::device::Device;
 
     /// `socket` as the segment takes a socket.
     fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {

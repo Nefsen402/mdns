@@ -11,7 +11,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use hashbrown::{HashMap, HashSet};
 use core::net::IpAddr;
 
-use crate::config::{Neighbours, ServiceKinds, DEFAULT_MAX_ADDRS};
+use crate::config::{Neighbours, ReflectedWhen, DEFAULT_MAX_ADDRS};
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_SERVICES;
 use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
@@ -516,20 +516,25 @@ impl Device {
         }
     }
 
-    /// This device as it is announced on another network: a link-local
-    /// address only means something on the link the device is on, and on any
-    /// other it names nobody, and a service whose host and port are not known
-    /// would have a copy make up the rest.
-    pub fn for_reflecting(&self) -> Device {
-        let services = self.services.iter().filter(|s| s.is_resolved()).cloned().collect();
-        Device { services, ..self.without_link_local() }
-    }
-
-    /// This device with only the services of the types `kinds` reflects.
-    pub fn with_kinds(&self, kinds: &ServiceKinds) -> Device {
-        let mut device = self.clone();
-        device.services.retain(|s| kinds.allows(&s.kind));
-        device
+    /// This device as it is announced on another network, or nothing if it is
+    /// not to be: with the addresses it was given from the neighbour table
+    /// that `neighbours` lets through, but no link-local one (it only means
+    /// something on the link the device is on, and on any other names
+    /// nobody), and only those services whose host and port are known (a copy
+    /// would have to make up the rest) and whose type `when` reflects. It is
+    /// reflected only if it has what `when` asks for: a hostname for the
+    /// address record, a routable address to put in it (a device known only by
+    /// a link-local one cannot be reached from another network), and a
+    /// service to give clients a reason to care (bare chatty clients such as
+    /// phones are skipped).
+    pub fn reflected(&self, neighbours: Neighbours, when: &ReflectedWhen) -> Option<Device> {
+        let mut device = self.with_neighbours_as(neighbours);
+        device.addresses.retain(|a| !is_link_local(&a.ip));
+        device.services.retain(|s| s.is_resolved() && when.kinds.allows(&s.kind));
+        let fit = (!when.hostname || device.hostname.is_some())
+            && (!when.address || device.routable().next().is_some())
+            && (!when.service || !device.services.is_empty());
+        fit.then_some(device)
     }
 
     /// What identifies it in the manual list and to the reflector: its
