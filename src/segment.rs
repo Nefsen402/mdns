@@ -10,7 +10,7 @@
 use core::fmt;
 use alloc::collections::VecDeque;
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use core::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 use core::cell::RefCell;
@@ -442,22 +442,6 @@ impl State {
         }
     }
 
-
-    /// Bring the learned addresses of every device with an address up to
-    /// date, as the interface's networks changed, and tell of those that
-    /// changed.
-    fn relearn_neighbours(&mut self, now: Instant) {
-        let ids: Vec<Id> =
-            self.tracker.discovered.ids().filter(|&id| !self.tracker.discovered.get(id).device.addresses.is_empty()).collect();
-        self.relearn(&ids, now);
-    }
-
-    /// Bring the learned addresses of the devices of `ids` up to date, and
-    /// tell of those that changed.
-    fn relearn(&mut self, ids: &[Id], now: Instant) {
-        let touched = self.tracker.relearn(ids, now);
-        self.report(touched, now);
-    }
 
     /// Tell of what a change to the devices made, once: ask on the link-local
     /// addresses it noted, let the announced devices that have to give way do,
@@ -1099,19 +1083,10 @@ impl Segment {
     /// they cannot be reached through it, and their copies elsewhere are
     /// withdrawn. They are found again once it is back.
     pub fn forget_discovered(&self) {
-        let mut state = self.state.borrow_mut();
-        let ids: Vec<Id> = state.tracker.discovered.ids().collect();
-        let mut touched = Touched::default();
-        for &id in &ids {
-            touched.note(&state.tracker.discovered, id);
-        }
-        for id in ids {
-            if let Some(entry) = state.tracker.discovered.remove(id) {
-                state.notify(Event::Removed(Rc::new(entry.device)));
-            }
-        }
-        let names = touched.names(&state.tracker.discovered);
-        state.settle_for(&names, Instant::now());
+        let mut guard = self.state.borrow_mut();
+        let state = &mut *guard;
+        let touched = state.tracker.forget();
+        state.report(touched, Instant::now());
     }
 
     /// The devices this daemon advertises as its own here (`[Advertise]`), as
@@ -1289,11 +1264,9 @@ impl Segment {
     pub fn set_prefixes(&self, prefixes: Vec<Prefix>) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        if state.tracker.prefixes == prefixes {
-            return;
-        }
-        state.tracker.prefixes = prefixes;
-        state.relearn_neighbours(Instant::now());
+        let now = Instant::now();
+        let touched = state.tracker.set_prefixes(prefixes, now);
+        state.report(touched, now);
     }
 
     /// Whether a datagram from `from`, sent to `to` if that is known, is to be
@@ -1317,25 +1290,9 @@ impl Segment {
     pub fn neighbour(&self, ip: IpAddr, mac: Option<Vec<u8>>) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let was = state.tracker.neighbours.get(&ip).cloned();
-        let changed = match &mac {
-            Some(mac) => state.tracker.neighbours.insert(ip, mac.clone()).as_ref() != Some(mac),
-            None => state.tracker.neighbours.remove(&ip).is_some(),
-        };
-        if changed {
-            // What it learns of a device follows the addresses that share a
-            // link-layer address with one it announced: the devices to bring up
-            // to date are those with the address, or with one at the link-layer
-            // address it was at, or is at now.
-            let mut ips = vec![ip];
-            for mac in was.iter().chain(&mac) {
-                ips.extend(state.tracker.neighbours.with_mac(mac));
-            }
-            let mut seen = HashSet::new();
-            let ids: Vec<Id> =
-                ips.iter().flat_map(|ip| state.tracker.discovered.ids_with_addr(ip)).filter(|id| seen.insert(*id)).collect();
-            state.relearn(&ids, Instant::now());
-        }
+        let now = Instant::now();
+        let touched = state.tracker.neighbour(ip, mac, now);
+        state.report(touched, now);
     }
 
     /// Actively look for devices: ask what service types exist, browse each
@@ -1552,40 +1509,10 @@ impl Segment {
     pub fn expire(&self, now: Instant) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        // Those of which something has run out: the devices themselves, and
-        // of the others, the addresses that ran out on their own.
-        let (stale, running): (Vec<Id>, Vec<Id>) =
-            state.tracker.discovered.running_out(now).into_iter().partition(|&id| state.tracker.discovered.get(id).expires <= now);
-        let mut lost = Vec::new();
-        for id in running {
-            let before = state.tracker.discovered.get(id).device.clone();
-            if state.tracker.discovered.edit(id, |entry| entry.expire_addrs(now)) == Some(true) {
-                lost.push((id, before));
-            }
-        }
-        if stale.is_empty() && lost.is_empty() {
-            return;
-        }
-        let mut touched = Touched::default();
-        for &id in &stale {
-            touched.note(&state.tracker.discovered, id);
-        }
-        for id in stale {
-            if let Some(entry) = state.tracker.discovered.remove(id) {
-                state.notify(Event::Removed(Rc::new(entry.device)));
-            }
-        }
-        for (id, before) in lost {
-            if let Some(after) = state.tracker.discovered.try_get(id).map(|e| e.device.clone()) {
-                state.notify(Event::Updated { before: Rc::new(before), after: Rc::new(after) });
-            }
-        }
+        let touched = state.tracker.expire(now);
         // What they had here may be shown again. `now` may be ahead of the
         // clock, but what is announced is announced now.
-        let names = touched.names(&state.tracker.discovered);
-        state.settle_for(&names, Instant::now());
-        #[cfg(test)]
-        state.check();
+        state.report(touched, Instant::now());
     }
 }
 

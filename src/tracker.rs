@@ -6,7 +6,7 @@ use core::time::Duration;
 
 use alloc::collections::BTreeSet;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::device::{addr_of, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
 use alloc::rc::Rc;
@@ -128,6 +128,81 @@ impl Tracker {
         let mut touched = Touched::default();
         self.learn_neighbours(ids, &mut touched, now);
         touched.sync(&mut self.discovered);
+        touched
+    }
+
+    /// Take the networks the interface is on, as its addresses change: of the
+    /// neighbour table, only addresses in one of them are learned, and those
+    /// learned of one it is no longer on are dropped. Noted in what is
+    /// returned are the devices that changed.
+    pub fn set_prefixes(&mut self, prefixes: Vec<Prefix>, now: Instant) -> Touched {
+        if self.prefixes == prefixes {
+            return Touched::default();
+        }
+        self.prefixes = prefixes;
+        let ids: Vec<Id> = self.discovered.ids().filter(|&id| !self.discovered.get(id).device.addresses.is_empty()).collect();
+        self.relearn(&ids, now)
+    }
+
+    /// Take in an entry of the interface's neighbour table, as the kernel
+    /// reports it: `ip` is at link-layer address `mac`, or with `None`, no
+    /// longer (it went, or could not be reached). The devices it may concern,
+    /// those with any address, have their learned addresses brought up to
+    /// date, and those that changed are noted in what is returned.
+    pub fn neighbour(&mut self, ip: IpAddr, mac: Option<Vec<u8>>, now: Instant) -> Touched {
+        let was = self.neighbours.get(&ip).cloned();
+        let changed = match &mac {
+            Some(mac) => self.neighbours.insert(ip, mac.clone()).as_ref() != Some(mac),
+            None => self.neighbours.remove(&ip).is_some(),
+        };
+        if !changed {
+            return Touched::default();
+        }
+        // What it learns of a device follows the addresses that share a
+        // link-layer address with one it announced: the devices to bring up
+        // to date are those with the address, or with one at the link-layer
+        // address it was at, or is at now.
+        let mut ips = vec![ip];
+        for mac in was.iter().chain(&mac) {
+            ips.extend(self.neighbours.with_mac(mac));
+        }
+        let mut seen = HashSet::new();
+        let ids: Vec<Id> = ips.iter().flat_map(|ip| self.discovered.ids_with_addr(ip)).filter(|id| seen.insert(*id)).collect();
+        self.relearn(&ids, now)
+    }
+
+    /// Forget every device, as when the interface is gone: they cannot be
+    /// reached through it. They are found again once it is back.
+    pub fn forget(&mut self) -> Touched {
+        let mut touched = Touched::default();
+        let ids: Vec<Id> = self.discovered.ids().collect();
+        for &id in &ids {
+            touched.note(&self.discovered, id);
+        }
+        for id in ids {
+            self.discovered.remove(id);
+        }
+        touched
+    }
+
+    /// Drop the devices that have run out by `now`, and the addresses of the
+    /// others that have, noting them in what is returned.
+    pub fn expire(&mut self, now: Instant) -> Touched {
+        let mut touched = Touched::default();
+        // Those of which something has run out: the devices themselves, and
+        // of the others, the addresses that ran out on their own.
+        let (stale, running): (Vec<Id>, Vec<Id>) =
+            self.discovered.running_out(now).into_iter().partition(|&id| self.discovered.get(id).expires <= now);
+        for &id in &stale {
+            touched.note(&self.discovered, id);
+        }
+        for id in running {
+            touched.note(&self.discovered, id);
+            self.discovered.edit(id, |entry| entry.expire_addrs(now));
+        }
+        for id in stale {
+            self.discovered.remove(id);
+        }
         touched
     }
 
