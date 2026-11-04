@@ -34,7 +34,7 @@ use crate::parser::{Message, Question, Record};
 use crate::prelude::*;
 
 mod manuals;
-use crate::tracker::{refresh_gap, Heard, Id, Touched, Tracker, MAX_TYPES};
+use crate::tracker::{refresh_gap, Id, Touched, Tracker, MAX_TYPES};
 use manuals::Manuals;
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
@@ -1291,7 +1291,7 @@ impl Segment {
     fn apply(&self, src: IpAddr, now: Instant, msg: Option<&Message>) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let touched = state.tracker.track(Heard::of(src, now, msg));
+        let touched = state.tracker.track(src, now, msg);
         state.report(touched, now);
     }
 

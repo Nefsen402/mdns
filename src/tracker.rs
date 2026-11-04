@@ -129,15 +129,27 @@ impl Tracker {
         touched
     }
 
-    /// Bring the devices up to date with what a packet said, noting what
-    /// changed in what is returned, for it to be told of.
-    pub fn track(&mut self, heard: Heard<'_>) -> Touched {
-        let Heard { src, at: now, leaving, types, reports, rest } = heard;
+    /// Bring the devices up to date with what `msg`, a packet from `src` at
+    /// `now`, said, noting what changed in what is returned, for it to be told
+    /// of. Nothing is said by one that could not be read (`None`), but that
+    /// `src` is there, nor by a query: the records in it are other devices'
+    /// known answers.
+    pub fn track(&mut self, src: IpAddr, now: Instant, msg: Option<&Message>) -> Touched {
+        let msg = msg.filter(|m| m.header.response);
+        let records = || msg.into_iter().flat_map(|m| m.records());
         let (floor, max_addrs, max_services) = (self.min_lifetime, self.max_addrs, self.max_services);
         let mut touched = Touched::default();
 
-        // A device leaving: the device that owns the name, and anything the
-        // sender was only known by.
+        // A response saying goodbye (TTL 0) to the address it came from, and
+        // announcing none for that name still, is a device leaving: the device
+        // that owns the name, and anything the sender was only known by. One
+        // that announces others in its place (a temporary IPv6 address giving
+        // way to the next) is not; it only loses the one.
+        let still = |name: &str| records().any(|r| r.ttl > 0 && addr_of(&r.data).is_some() && r.name.eq_ignore_ascii_case(name));
+        let leaving: Vec<&str> = records()
+            .filter(|r| r.ttl == 0 && addr_of(&r.data) == Some(src) && !still(&r.name))
+            .map(|r| r.name.as_str())
+            .collect();
         if !leaving.is_empty() {
             let mut gone: Vec<Id> = leaving.iter().filter_map(|name| self.discovered.find_host(name)).collect();
             gone.extend(self.discovered.find_nameless(&src));
@@ -149,15 +161,27 @@ impl Tracker {
             return touched;
         }
 
-        for kind in types {
-            if self.types.len() < MAX_TYPES {
-                self.types.insert(kind);
+        // The service types it said exist: the answers to the question of what
+        // types there are.
+        for rec in records() {
+            if let RData::Ptr(kind) = &rec.data
+                && rec.ttl > 0
+                && rec.name.eq_ignore_ascii_case(META_QUERY)
+                && rec.class == 1
+                && is_type(kind)
+                && self.types.len() < MAX_TYPES
+            {
+                self.types.insert(kind.to_ascii_lowercase());
             }
         }
 
         // A response may describe several devices (a reflector answering a
         // browse query does), so attribute each record to the device it names
         // instead of the whole packet to one.
+        let (reports, rest) = match msg {
+            Some(m) => Report::all(m),
+            None => (Vec::new(), Vec::new()),
+        };
 
         // The host that turns out to be the sender, if any: the one that
         // announced the address the packet came from, or the only one
@@ -363,58 +387,6 @@ impl Touched {
 }
 
 
-/// What one packet, from `src` at `at`, said. A query says nothing of its sender's: the records in
-/// it are other devices' known answers.
-pub struct Heard<'a> {
-    pub src: IpAddr,
-    pub at: Instant,
-    /// The hosts that left: a response saying goodbye (TTL 0) to the address
-    /// it came from, and announcing none for that name still, is a device
-    /// leaving, whatever else is known by that name or by the sender's
-    /// address. One that announces others in its place (a temporary IPv6
-    /// address giving way to the next) is not; it only loses the one.
-    pub leaving: Vec<&'a str>,
-    /// The service types it said exist, in lowercase: the answers to the
-    /// question of what types there are.
-    pub types: Vec<String>,
-    /// What it said of each host it describes, and the records that tie to
-    /// none ([`Report::all`]), which are the sender's own, if any.
-    pub reports: Vec<Report<'a>>,
-    pub rest: Vec<&'a Record>,
-}
-
-impl<'a> Heard<'a> {
-    /// Read `msg`, from `src` at `at`, if it was a message at all: nothing is
-    /// said by one that could not be read.
-    pub fn of(src: IpAddr, at: Instant, msg: Option<&'a Message>) -> Heard<'a> {
-        let msg = msg.filter(|m| m.header.response);
-        let records = || msg.into_iter().flat_map(|m| m.records());
-
-        let still = |name: &str| records().any(|r| r.ttl > 0 && addr_of(&r.data).is_some() && r.name.eq_ignore_ascii_case(name));
-        let leaving = records()
-            .filter(|r| r.ttl == 0 && addr_of(&r.data) == Some(src) && !still(&r.name))
-            .map(|r| r.name.as_str())
-            .collect();
-
-        let types = records()
-            .filter_map(|rec| match &rec.data {
-                RData::Ptr(kind)
-                    if rec.ttl > 0 && rec.name.eq_ignore_ascii_case(META_QUERY) && rec.class == 1 && is_type(kind) =>
-                {
-                    Some(kind.to_ascii_lowercase())
-                }
-                _ => None,
-            })
-            .collect();
-
-        let (reports, rest) = match msg {
-            Some(m) => Report::all(m),
-            None => (Vec::new(), Vec::new()),
-        };
-        Heard { src, at, leaving, types, reports, rest }
-    }
-}
-
 /// A discovered device, and when to drop it or ask it again.
 #[derive(Debug)]
 pub struct Entry {
@@ -595,40 +567,51 @@ mod tests {
         Message { header, questions: vec![], answers, authorities: vec![], additionals: vec![] }
     }
 
-    fn heard<'a>(src: &str, msg: &'a Message) -> Heard<'a> {
-        Heard::of(src.parse().unwrap(), Instant::now(), Some(msg))
+    /// A tracker that has been told what `msg` said, sent from `src`.
+    fn told(tracker: &mut Tracker, src: &str, msg: &Message) {
+        tracker.track(src.parse().unwrap(), Instant::now(), Some(msg));
+    }
+
+    fn knows(tracker: &Tracker, host: &str) -> bool {
+        tracker.discovered.find_host(host).is_some()
     }
 
     /// What is not a message, or a query, says nothing: the records of a
     /// query are other devices' known answers.
     #[test]
     fn a_query_and_what_is_not_a_message_say_nothing() {
+        let mut tracker = Tracker::default();
         let known = message(false, vec![a("tv.local", "10.0.1.5", 120), a("gone.local", "10.0.1.5", 0)]);
-        for heard in [heard("10.0.1.5", &known), Heard::of("10.0.1.5".parse().unwrap(), Instant::now(), None)] {
-            assert!(heard.leaving.is_empty() && heard.types.is_empty() && heard.reports.is_empty() && heard.rest.is_empty());
-        }
+        told(&mut tracker, "10.0.1.5", &known);
+        tracker.track("10.0.1.5".parse().unwrap(), Instant::now(), None);
+        assert!(!knows(&tracker, "tv.local") && !knows(&tracker, "gone.local"));
     }
 
-    /// A host leaves when it says goodbye to the address the packet came
-    /// from; to another's, it is only saying the other left.
+    /// A host leaves by saying goodbye to the address the packet came from; to
+    /// another's, it is only saying the other left.
     #[test]
     fn a_host_leaves_by_saying_goodbye_to_the_address_it_came_from() {
-        let msg = message(true, vec![a("tv.local", "10.0.1.5", 0)]);
-        assert_eq!(heard("10.0.1.5", &msg).leaving, ["tv.local"]);
-        assert!(heard("10.0.1.9", &msg).leaving.is_empty(), "a router saying so of another");
-        let alive = message(true, vec![a("tv.local", "10.0.1.5", 120)]);
-        assert!(heard("10.0.1.5", &alive).leaving.is_empty());
+        let mut tracker = Tracker::default();
+        told(&mut tracker, "10.0.1.5", &message(true, vec![a("tv.local", "10.0.1.5", 120)]));
+        assert!(knows(&tracker, "tv.local"));
+        let goodbye = message(true, vec![a("tv.local", "10.0.1.5", 0)]);
+        told(&mut tracker, "10.0.1.9", &goodbye);
+        assert!(knows(&tracker, "tv.local"), "a router saying so of another");
+        told(&mut tracker, "10.0.1.5", &goodbye);
+        assert!(!knows(&tracker, "tv.local"));
     }
 
     /// One that announces another address in its place is not leaving: it only
     /// loses the one, as a temporary IPv6 address gives way to the next.
     #[test]
     fn a_host_that_announces_another_address_in_its_place_is_not_leaving() {
-        let msg = message(true, vec![aaaa("tv.local", "fd00::1", 0), aaaa("tv.local", "fd00::2", 120)]);
-        assert!(heard("fd00::1", &msg).leaving.is_empty());
+        let mut tracker = Tracker::default();
+        told(&mut tracker, "fd00::1", &message(true, vec![aaaa("tv.local", "fd00::1", 120)]));
+        told(&mut tracker, "fd00::1", &message(true, vec![aaaa("tv.local", "fd00::1", 0), aaaa("tv.local", "fd00::2", 120)]));
+        assert!(knows(&tracker, "tv.local"));
         // And not in another's name.
-        let msg = message(true, vec![aaaa("tv.local", "fd00::1", 0), aaaa("other.local", "fd00::2", 120)]);
-        assert_eq!(heard("fd00::1", &msg).leaving, ["tv.local"]);
+        told(&mut tracker, "fd00::2", &message(true, vec![aaaa("tv.local", "fd00::2", 0), aaaa("other.local", "fd00::3", 120)]));
+        assert!(!knows(&tracker, "tv.local"));
     }
 
     /// The types it names are those of live answers to the question of what
@@ -639,6 +622,7 @@ mod tests {
             class,
             ..record(owner, ttl, RData::Ptr(target.into()))
         };
+        let mut tracker = Tracker::default();
         let msg = message(
             true,
             vec![
@@ -650,13 +634,16 @@ mod tests {
                 ptr("_ipp._tcp.local", 4500, 1, "Printer._ipp._tcp.local"),
             ],
         );
-        assert_eq!(heard("10.0.1.5", &msg).types, ["_ipp._tcp.local", "_http._tcp.local"]);
+        told(&mut tracker, "10.0.1.5", &msg);
+        let types: Vec<&str> = tracker.types.iter().map(String::as_str).collect();
+        assert_eq!(types, ["_http._tcp.local", "_ipp._tcp.local"]);
     }
 
-    /// What it says of hosts is told by the host it concerns, and what ties to
-    /// none is left over: a bare browse answer.
+    /// What it says is told by the host it concerns: a response may describe
+    /// several, and what ties to none is the sender's.
     #[test]
-    fn what_it_says_is_told_by_host_and_the_rest_is_left_over() {
+    fn what_it_says_is_told_by_host_and_what_ties_to_none_is_the_senders() {
+        let mut tracker = Tracker::default();
         let msg = message(
             true,
             vec![
@@ -665,9 +652,8 @@ mod tests {
                 record("_ipp._tcp.local", 4500, RData::Ptr("Printer._ipp._tcp.local".into())),
             ],
         );
-        let heard = heard("10.0.1.5", &msg);
-        let hosts: Vec<&str> = heard.reports.iter().map(|r| r.host.as_str()).collect();
-        assert_eq!(hosts, ["tv.local", "nas.local"]);
-        assert_eq!(heard.rest.len(), 1);
+        told(&mut tracker, "10.0.1.5", &msg);
+        assert!(knows(&tracker, "tv.local") && knows(&tracker, "nas.local"));
+        assert_eq!(tracker.discovered.len(), 2, "one device for each, and none for the leftover");
     }
 }
