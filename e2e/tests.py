@@ -3,7 +3,7 @@ import os
 import subprocess
 import unittest
 
-from lab import A, AAAA, FOLLOWS_CHANGES, FREEBSD, PTR, SRV, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, until
+from lab import A, AAAA, FOLLOWS_CHANGES, FREEBSD, PTR, SRV, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, txt, until
 
 BINARY = os.environ["E2E_DAEMON"]
 CTL = os.environ.get("E2E_CTL")
@@ -247,6 +247,52 @@ class Patterns(Case):
         d.settle()
         self.assertIsNone(d.proc.poll(), self.logs(d))
         self.assertEqual(d.request("segments")["segments"][0]["interfaces"], ["ra"])
+
+
+class ServiceTypes(Case):
+    """Which of a device's services are reflected: ReflectedServices=."""
+
+    def device(self, host, addr, *services):
+        """What a device that has `host` at `addr` announces: a service of each
+        of `services`, (instance, type)."""
+        records = [a(f"{host}.local", addr)]
+        for instance, kind in services:
+            full = f"{instance}.{kind}.local"
+            records += [ptr(f"{kind}.local", full, 120), srv(full, 631, f"{host}.local", 120), txt(full, "k=v", ttl=120)]
+        return response(*records)
+
+    def world(self, filtering):
+        la, lb = self.two_links()
+        hb = lb.hearer()
+        d = self.lab.daemon(conf(f"[Segment]\nName=s\nInterfaces=ra,rb\n{filtering}\n"))
+        dev = la.device("10.9.1.50")
+        dev.multicast(self.device("office", "10.9.1.50", ("Office", "_ipp._tcp"), ("Shell", "_ssh._tcp")))
+        dev.multicast(self.device("box", "10.9.1.51", ("Box", "_ssh._tcp")))
+        return d, hb
+
+    def test_only_the_service_types_named_are_reflected_and_a_device_with_none_of_them_not_at_all(self):
+        d, hb = self.world("ReflectedServices=_ipp._tcp")
+        self.assertTrue(hb.wait(alive("office.local", A, "10.9.1.50")), self.logs(d))
+        self.assertTrue(hb.wait(alive("Office._ipp._tcp.local", SRV, "631 office.local")), self.logs(d))
+        d.settle()
+        self.assertTrue(hb.none(lambda h: h.message.has("Shell._ssh._tcp.local")), "its other service is kept back")
+        self.assertTrue(hb.none(lambda h: h.message.has("_ssh._tcp.local")))
+        self.assertTrue(hb.none(lambda h: h.message.has("box.local")), "a device with only that is not reflected")
+        self.assertEqual([x["addresses"] for x in d.host("s", "box.local")], [["10.9.1.51"]], "though it is known")
+
+    def test_a_service_type_that_is_kept_out_is_not_reflected_whatever_else_is(self):
+        d, hb = self.world("ReflectedServices=_ipp._tcp, _ssh._tcp, !_SSH._tcp")
+        self.assertTrue(hb.wait(alive("Office._ipp._tcp.local", SRV, "631 office.local")), self.logs(d))
+        d.settle()
+        self.assertTrue(hb.none(lambda h: h.message.has("_ssh._tcp.local")))
+        self.assertTrue(hb.none(lambda h: h.message.has("box.local")))
+
+    def test_every_type_but_the_ones_kept_out_is_reflected(self):
+        d, hb = self.world("ReflectedServices=!_ssh._tcp")
+        self.assertTrue(hb.wait(alive("Office._ipp._tcp.local", SRV, "631 office.local")), self.logs(d))
+        d.settle()
+        self.assertTrue(hb.none(lambda h: h.message.has("_ssh._tcp.local")))
+        self.assertTrue(hb.none(lambda h: h.message.has("box.local")))
 
 
 class Vlans(Case):
@@ -696,6 +742,8 @@ class Startup(Case):
             ("[Advertise]\nHostname=pc\nInterface=other\n[Segment]\nName=s\nInterfaces=ra\n", r"not in any segment"),
             ("[Advertise]\nHostname=pc\n[Advertise]\nHostname=pc\n[Segment]\nName=s\nInterfaces=ra\n", r"same interface"),
             ("[Advertise]\nHostname=router.lan\n[Segment]\nName=s\nInterfaces=ra\n", r"not under \.local"),
+            ("[Segment]\nName=s\nInterfaces=ra\nReflectedWhen=hostname\nReflectedServices=_ipp._tcp\n", r"without enabling service filtering"),
+            ("[Segment]\nName=s\nInterfaces=ra\nReflectedServices=ipp\n", r"invalid ReflectedServices"),
             ("", r"no \[Segment\]"),
         ]
         for text, pattern in cases:
