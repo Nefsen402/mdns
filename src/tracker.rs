@@ -8,7 +8,8 @@ use alloc::collections::BTreeSet;
 
 use hashbrown::HashMap;
 
-use crate::device::{addr_of, family_of, is_type, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
+use crate::device::{addr_of, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
+use crate::segment::Event;
 use crate::parser::{Message, Question, RData, Record};
 use crate::prelude::*;
 use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
@@ -19,6 +20,20 @@ mod devices;
 mod neighbours;
 pub(crate) use devices::{Devices, Id, Indexed};
 pub(crate) use neighbours::NeighbourTable;
+
+/// Service types remembered per segment, so a hostile device cannot grow it
+/// without bound by announcing endless made-up types.
+pub const MAX_TYPES: usize = 256;
+
+/// Hosts first described by any one sender, so that one inventing endless
+/// devices (or many forged ones) cannot fill the segment, which has room for
+/// [`DEFAULT_MAX_DEVICES`] unless set otherwise. A sleep proxy or Thread
+/// border router speaks for several hosts, but not for this many.
+pub const MAX_PER_SENDER: usize = 64;
+
+/// How long after asking a device on its link-local address, so that the
+/// kernel looks up its link-layer address, it is not asked so again.
+const NUDGE_GAP: Duration = Duration::from_secs(60);
 
 /// What is known of the devices heard on a segment.
 pub struct Tracker {
@@ -57,9 +72,302 @@ impl Default for Tracker {
     }
 }
 
-/// What one packet said. A query says nothing of its sender's: the records in
+impl Tracker {
+    /// Whether a new host may be learned of from `src`: the segment has
+    /// fewer than it is set to remember, and `src` first described fewer than
+    /// [`MAX_PER_SENDER`] of them.
+    pub fn room_for(&self, src: IpAddr) -> bool {
+        self.discovered.len() < self.max_devices && self.discovered.described_by(&src) < MAX_PER_SENDER
+    }
+
+    /// Bring the addresses learned from the neighbour table up to date for
+    /// the devices of `keys`, noting in `touched` those that change: the
+    /// routable addresses listed under the link-layer address of one it
+    /// announced, in a network the interface is on (an entry left over from
+    /// one it is no longer on is not the device's to be reached at), of a
+    /// family it announced no routable address of
+    /// ([`Device::take_neighbours`]). A device with a link-local IPv6 address
+    /// the table has not got yet, and no routable one, is asked a question on
+    /// it, for the kernel to look up its link-layer address.
+    pub fn learn_neighbours(&mut self, ids: &[Id], touched: &mut Touched, now: Instant) {
+        for &id in ids {
+            let Some(entry) = self.discovered.try_get(id) else { continue };
+            // Its link-layer address, by any address it announced.
+            let announced = entry.device.addresses.iter().filter(|a| a.origin == Origin::Announced);
+            let mut macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
+            macs.sort_unstable();
+            macs.dedup();
+            let on_link = |ip: &IpAddr| self.prefixes.iter().any(|p| p.contains(ip));
+            let learned: Vec<IpAddr> = macs
+                .iter()
+                .flat_map(|mac| self.neighbours.with_mac(mac))
+                .filter(|ip| !is_link_local(ip) && on_link(ip))
+                .collect();
+
+            let unresolved = entry.device.link_local().find(|ll| ll.is_ipv6() && !self.neighbours.contains_key(ll));
+            let has_v6 = entry.device.routable().any(|a| a.is_ipv6());
+            let due = entry.nudged.is_none_or(|t| now.saturating_duration_since(t) >= NUDGE_GAP);
+            if let Some(ll) = unresolved.filter(|_| !has_v6 && due) {
+                touched.nudges.push((ll, entry.device.clone()));
+                self.discovered.get_mut(id).nudged = Some(now);
+            }
+
+            let mut device = self.discovered.get(id).device.clone();
+            if device.take_neighbours(&learned, self.max_addrs) {
+                touched.note(&self.discovered, id);
+                self.discovered.get_mut(id).device = device;
+            }
+        }
+    }
+
+    /// Bring the learned addresses of the devices of `ids` up to date, noting
+    /// in what is returned those that changed.
+    pub fn relearn(&mut self, ids: &[Id], now: Instant) -> Touched {
+        let mut touched = Touched::default();
+        self.learn_neighbours(ids, &mut touched, now);
+        touched.sync(&mut self.discovered);
+        touched
+    }
+
+    /// Bring the devices up to date with what a packet said, noting what
+    /// changed in what is returned, for it to be told of.
+    pub fn track(&mut self, heard: Heard<'_>) -> Touched {
+        let Heard { src, at: now, leaving, types, reports, rest } = heard;
+        let (floor, max_addrs, max_services) = (self.min_lifetime, self.max_addrs, self.max_services);
+        let mut touched = Touched::default();
+
+        // A device leaving: the device that owns the name, and anything the
+        // sender was only known by.
+        if !leaving.is_empty() {
+            let mut gone: Vec<Id> = leaving.iter().filter_map(|name| self.discovered.find_host(name)).collect();
+            gone.extend(self.discovered.find_nameless(&src));
+            gone.dedup();
+            for id in gone {
+                touched.note(&self.discovered, id);
+                self.discovered.remove(id);
+            }
+            return touched;
+        }
+
+        for kind in types {
+            if self.types.len() < MAX_TYPES {
+                self.types.insert(kind);
+            }
+        }
+
+        // A response may describe several devices (a reflector answering a
+        // browse query does), so attribute each record to the device it names
+        // instead of the whole packet to one.
+
+        // The host that turns out to be the sender, if any: the one that
+        // announced the address the packet came from, or the only one
+        // described when it announced no address at all.
+        let mut sender: Option<Id> = None;
+        let mut resolved: Vec<(Id, String)> = Vec::new();
+
+        for report in &reports {
+            let known = self.discovered.find_host(&report.host);
+            if known.is_none() && !self.room_for(src) {
+                continue;
+            }
+            // Goodbyes alone for a device not known here (one that already
+            // left by its other family's goodbye) leave nothing to forget, and
+            // are not to bring it back.
+            if report.addrs.is_empty() && !report.gone.is_empty() && known.is_none() {
+                continue;
+            }
+            // The sender, if it announced the address the packet came from. A
+            // device has the addresses it announced and no other: that a packet
+            // about it came from one is not its saying so (a router answers for
+            // what is behind it).
+            let announced_src = report.addrs.contains(&src);
+            let addrs = report.addrs.clone();
+
+            // A device first heard only by address becomes the named device, if
+            // it announced the address.
+            let nameless = self.discovered.find_nameless(&src).filter(|_| announced_src);
+            let earlier = nameless.and_then(|id| {
+                touched.note(&self.discovered, id);
+                self.discovered.remove(id)
+            });
+
+            let id = match known {
+                Some(id) => {
+                    touched.note(&self.discovered, id);
+                    id
+                }
+                None => {
+                    let id = self.discovered.create(Entry::new(now, src, Some(&report.host)));
+                    touched.note_new(id);
+                    id
+                }
+            };
+            let entry = self.discovered.get_mut(id);
+            if let Some(earlier) = earlier {
+                entry.absorb(earlier, max_services);
+            }
+            let was = entry.soonest();
+            let ttl = Duration::from_secs(report.longest_ttl().into());
+            entry.expires = entry.expires.max(now + ttl.max(floor));
+            entry.make_room(&addrs, &report.flushed, &report.gone, max_addrs);
+            entry.device.learn(report, &addrs, max_addrs, max_services);
+            entry.renew_addrs(&addrs, &report.ttls, now, floor);
+            if entry.soonest() != was {
+                entry.began = now;
+            }
+
+            resolved.extend(report.resolved().map(|instance| (id, instance.to_string())));
+            if announced_src && sender.is_none() {
+                sender = Some(id);
+            }
+        }
+
+        // What is left is about the sender itself: records tied to no host (a
+        // bare browse answer, text records), or just a sign of life such as a
+        // query. A packet that only describes other devices says nothing about
+        // its sender, which is then not recorded at all.
+        // One known only by an address no device can be reached at is not
+        // known at all.
+        let usable = is_usable(src);
+        touched.sync(&mut self.discovered);
+        let known = sender
+            .or_else(|| self.discovered.holder_of(&src))
+            .or_else(|| self.discovered.find_nameless(&src).filter(|_| usable));
+        // One heard by its address if it is not known at all, and there is room.
+        let room = known.is_some() || (usable && self.discovered.len() < self.max_devices);
+        if (known.is_some() || usable) && room && (reports.is_empty() || !rest.is_empty()) {
+            let id = match known {
+                Some(id) => {
+                    touched.note(&self.discovered, id);
+                    id
+                }
+                None => {
+                    let id = self.discovered.create(Entry::new(now, src, None));
+                    touched.note_new(id);
+                    id
+                }
+            };
+            let entry = self.discovered.get_mut(id);
+            let was = entry.soonest();
+            let ttl = rest.iter().map(|r| r.ttl).max().unwrap_or(0);
+            let ttl = Duration::from_secs(ttl as u64);
+            entry.expires = entry.expires.max(now + ttl.max(floor));
+            if usable {
+                entry.make_room(&[src], &[], &[], max_addrs);
+                entry.device.take_addrs(&[src], &[], &[], max_addrs);
+                entry.renew_addrs(&[src], &HashMap::new(), now, floor);
+            }
+            if entry.soonest() != was {
+                entry.began = now;
+            }
+            entry.device.learn_records(rest.iter().copied(), max_services);
+        }
+
+        // An instance that has now been resolved to its host no longer needs
+        // the unresolved copy learned from a bare browse answer.
+        touched.sync(&mut self.discovered);
+        for (owner, instance) in resolved {
+            let others: Vec<Id> = self
+                .discovered
+                .with_unresolved()
+                .filter(|&(id, e)| id != owner && e.device.service(&instance).is_some_and(|s| s.target.is_none()))
+                .map(|(id, _)| id)
+                .collect();
+            for id in others {
+                touched.note(&self.discovered, id);
+                self.discovered.get_mut(id).device.forget_service(&instance);
+            }
+            touched.sync(&mut self.discovered);
+        }
+
+        // What the neighbour table knows of the devices just heard of.
+        let heard = touched.order.clone();
+        self.learn_neighbours(&heard, &mut touched, now);
+
+        touched.sync(&mut self.discovered);
+        touched
+    }
+}
+
+/// The discovered devices an `apply` touched, as they were before, so that
+/// what changed can be reported once, however many devices a packet affects.
+#[derive(Default)]
+pub struct Touched {
+    pub order: Vec<Id>,
+    before: HashMap<Id, Option<Device>>,
+    /// What the tables that find devices hold of each, as of when they were
+    /// last made to follow it: what it was before, until then.
+    indexed: HashMap<Id, Indexed>,
+    /// The devices to ask on their link-local addresses, for the kernel to
+    /// look up their link-layer addresses, with the device each is of.
+    pub nudges: Vec<(IpAddr, Device)>,
+}
+
+impl Touched {
+    /// A device is about to be changed, or to go: say so before it is, once.
+    pub fn note(&mut self, discovered: &Devices, id: Id) {
+        if !self.before.contains_key(&id) {
+            self.order.push(id);
+            self.before.insert(id, discovered.try_get(id).map(|e| e.device.clone()));
+            self.indexed.insert(id, discovered.indexed_of(id));
+        }
+    }
+
+    /// A device was just made.
+    pub fn note_new(&mut self, id: Id) {
+        self.order.push(id);
+        self.before.insert(id, None);
+        self.indexed.insert(id, Indexed::default());
+    }
+
+    /// Have the tables that find devices follow the changes made so far.
+    pub fn sync(&mut self, discovered: &mut Devices) {
+        for id in &self.order {
+            let was = self.indexed.get(id).cloned().unwrap_or_default();
+            self.indexed.insert(*id, discovered.reindex(*id, &was));
+        }
+    }
+
+    /// The hostnames and instance names, in lowercase, of the devices as they
+    /// were and as they are: those that whoever is announcing the same may
+    /// have to give way to.
+    pub fn names(&self, discovered: &Devices) -> Vec<String> {
+        let mut names = Vec::new();
+        for id in &self.order {
+            let now = discovered.try_get(*id).map(|e| &e.device);
+            for device in self.before[id].iter().chain(now) {
+                names.extend(device.hostname.iter().map(|host| host.to_ascii_lowercase()));
+                names.extend(device.services.iter().map(|svc| svc.instance.to_ascii_lowercase()));
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    pub fn events(self, discovered: &Devices) -> Vec<Event> {
+        let Touched { order, mut before, .. } = self;
+        let mut events = Vec::new();
+        for id in order {
+            let was = before.remove(&id).flatten();
+            let now = discovered.try_get(id).map(|e| e.device.clone());
+            match (was, now) {
+                (None, Some(now)) => events.push(Event::Added(now)),
+                (Some(was), Some(now)) if was != now => events.push(Event::Updated(now)),
+                (Some(was), None) => events.push(Event::Removed(was)),
+                _ => {}
+            }
+        }
+        events
+    }
+}
+
+
+/// What one packet, from `src` at `at`, said. A query says nothing of its sender's: the records in
 /// it are other devices' known answers.
 pub struct Heard<'a> {
+    pub src: IpAddr,
+    pub at: Instant,
     /// The hosts that left: a response saying goodbye (TTL 0) to the address
     /// it came from, and announcing none for that name still, is a device
     /// leaving, whatever else is known by that name or by the sender's
@@ -76,9 +384,9 @@ pub struct Heard<'a> {
 }
 
 impl<'a> Heard<'a> {
-    /// Read `msg`, from `src`, if it was a message at all: nothing is said by
-    /// one that could not be read.
-    pub fn of(src: IpAddr, msg: Option<&'a Message>) -> Heard<'a> {
+    /// Read `msg`, from `src` at `at`, if it was a message at all: nothing is
+    /// said by one that could not be read.
+    pub fn of(src: IpAddr, at: Instant, msg: Option<&'a Message>) -> Heard<'a> {
         let msg = msg.filter(|m| m.header.response);
         let records = || msg.into_iter().flat_map(|m| m.records());
 
@@ -103,7 +411,7 @@ impl<'a> Heard<'a> {
             Some(m) => Report::all(m),
             None => (Vec::new(), Vec::new()),
         };
-        Heard { leaving, types, reports, rest }
+        Heard { src, at, leaving, types, reports, rest }
     }
 }
 
@@ -288,7 +596,7 @@ mod tests {
     }
 
     fn heard<'a>(src: &str, msg: &'a Message) -> Heard<'a> {
-        Heard::of(src.parse().unwrap(), Some(msg))
+        Heard::of(src.parse().unwrap(), Instant::now(), Some(msg))
     }
 
     /// What is not a message, or a query, says nothing: the records of a
@@ -296,7 +604,7 @@ mod tests {
     #[test]
     fn a_query_and_what_is_not_a_message_say_nothing() {
         let known = message(false, vec![a("tv.local", "10.0.1.5", 120), a("gone.local", "10.0.1.5", 0)]);
-        for heard in [heard("10.0.1.5", &known), Heard::of("10.0.1.5".parse().unwrap(), None)] {
+        for heard in [heard("10.0.1.5", &known), Heard::of("10.0.1.5".parse().unwrap(), Instant::now(), None)] {
             assert!(heard.leaving.is_empty() && heard.types.is_empty() && heard.reports.is_empty() && heard.rest.is_empty());
         }
     }
