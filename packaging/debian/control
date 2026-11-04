@@ -1,0 +1,18 @@
+Source: mdnsd
+Section: net
+Priority: optional
+Maintainer: Alex <alex@mapleprecision.com>
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.88), rustc (>= 1.88)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: mdnsd
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: mDNS discovery and per-segment reflection daemon
+ mdnsd discovers mDNS devices and reflects them between network segments,
+ and can track devices for scripts. mdnsctl is the client for its control
+ socket.
+ .
+ No configuration is installed: the service does not start until
+ /etc/mdnsd.conf exists.

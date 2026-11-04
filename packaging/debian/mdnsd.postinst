@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+    # mdnsctl access is membership of this group.
+    if ! getent passwd mdnsd >/dev/null; then
+        adduser --system --group --no-create-home --home /nonexistent \
+            --gecos "mDNS discovery daemon" mdnsd
+    fi
+fi
+
+#DEBHELPER#

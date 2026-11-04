@@ -408,6 +408,22 @@ To run it by hand instead, point `Socket=` at a directory you can write to:
 `mdnsd /path/to/mdnsd.conf` as root, or as a normal user with a config whose
 `[Ipc] Socket=` is somewhere under your home or `/tmp`.
 
+## Installing (Debian, Ubuntu)
+
+`packaging/debian/` builds a `.deb` from the working tree. It needs
+`build-essential`, `debhelper`, and `cargo` and `rustc` 1.88 or newer:
+
+```sh
+./packaging/debian/build.sh     # builds, runs the test suite, creates packaging/debian/out/mdnsd_*.deb
+sudo apt install ./packaging/debian/out/mdnsd_*.deb
+```
+
+Set `DEB_BUILD_OPTIONS=nocheck` to skip the tests. The package installs the
+same files as the Arch one, and its post-install script creates the `mdnsd`
+user and group. Configure and start it as described above (`/etc/mdnsd.conf`,
+then `systemctl enable --now mdnsd`; the package enables the unit but it does
+not run until the config exists).
+
 ## Documentation
 
 The man pages are the reference, and are installed with the package:

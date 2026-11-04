@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+# Not a standalone source tree: build.sh links this directory to ./debian at
+# the project root, which is where dpkg-buildpackage looks for it.
+
+export CARGO_TARGET_DIR = $(CURDIR)/target
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --frozen --release
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --frozen --release
+endif
+
+override_dh_auto_install:
+	install -Dm755 target/release/mdnsd debian/mdnsd/usr/bin/mdnsd
+	install -Dm755 target/release/mdnsctl debian/mdnsd/usr/bin/mdnsctl
+	install -Dm644 systemd/mdnsd.service debian/mdnsd/lib/systemd/system/mdnsd.service
+
+override_dh_auto_clean:

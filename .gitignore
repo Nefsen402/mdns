@@ -9,3 +9,13 @@
 # The fuzzer builds on its own
 /fuzz/target
 __pycache__/
+
+# packaging/debian/build.sh output and scratch
+/debian
+/packaging/debian/out/
+/.debhelper/
+/packaging/debian/mdnsd/
+/packaging/debian/files
+/packaging/debian/*.substvars
+/packaging/debian/*.debhelper*
+/packaging/debian/debhelper-build-stamp
