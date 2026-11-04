@@ -102,6 +102,32 @@ class Reflecting(Case):
         d.settle()
         self.assertTrue(hb.none(lambda h: h.message.has("laptop.local", A)), "and it is told of nothing")
 
+    def test_a_device_that_says_the_same_again_and_again_is_reflected_once(self):
+        la, lb = self.two_links()
+        hb = lb.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,rb\n"))
+        tv, chatter = la.device("10.9.1.50"), announcement("tv", "10.9.1.50", "TV")
+
+        def told():
+            """How many times the other network was told of the device."""
+            return sum(1 for h in hb.heard if h.src == lb.router_addr and h.message.has("tv.local"))
+
+        tv.multicast(chatter)
+        self.assertTrue(hb.wait(alive("tv.local", A, "10.9.1.50")), self.logs(d))
+        d.settle()
+        once = told()
+        self.assertGreater(once, 0)
+
+        for _ in range(30):
+            tv.multicast(chatter)
+        d.settle()
+        self.assertEqual(told(), once, "what is the same is not said again\n" + self.logs(d))
+
+        # What changes is, so it was not that the device was not listened to.
+        tv.multicast(response(a("tv.local", "10.9.1.51")))
+        self.assertTrue(hb.wait(alive("tv.local", A, "10.9.1.51")), self.logs(d))
+        self.assertGreater(told(), once)
+
     def test_a_question_is_forwarded_to_the_other_interfaces_when_the_segment_says_so(self):
         la, lb = self.two_links()
         hb = lb.hearer()
