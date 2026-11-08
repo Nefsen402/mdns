@@ -946,7 +946,8 @@ fn device_json(interface: &str, d: &Device) -> Value {
                 "type": s.kind,
                 "port": s.port,
                 "target": s.target,
-                "txt": s.txt,
+                // Text where it is: a value that is not is shown as the nearest.
+                "txt": s.txt.iter().map(|t| String::from_utf8_lossy(t)).collect::<Vec<_>>(),
                 "subtypes": s.subtypes,
                 "ttl": (s.ttl != 0).then_some(s.ttl),
             })

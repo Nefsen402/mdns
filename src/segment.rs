@@ -2054,7 +2054,7 @@ mod tests {
                     kind: "_http._tcp.local".into(),
                     port: 8080,
                     target: None,
-                    txt: vec!["a=b".into()],
+                    txt: vec![b"a=b".to_vec()],
                     ttl: 0,
                     ..Service::default()
                 })
@@ -2539,7 +2539,7 @@ mod tests {
         let names: Vec<&str> = instances.iter().map(String::as_str).collect();
         let mut device = tv("10.0.2.9", &names);
         for svc in &mut device.services {
-            svc.txt = vec!["k=".to_string() + &"v".repeat(60)];
+            svc.txt = vec![format!("k={}", "v".repeat(60)).into_bytes()];
         }
         let expected = device.announcement(HOST_TTL, OTHER_TTL).len();
         seg.add_manual_ttl(Owner::Reflector(0), device, Duration::from_secs(HOST_TTL.into())).unwrap();
@@ -3787,13 +3787,13 @@ mod tests {
         let tv = find(&devices, "LGwebOSTV.local");
         let names: Vec<&str> = tv.services.iter().map(|s| s.instance.as_str()).collect();
         assert_eq!(names, ["OZAL TV._airplay._tcp.local"]);
-        assert_eq!(tv.services[0].txt, ["model=TV"]);
+        assert_eq!(tv.services[0].txt, [b"model=TV"]);
         assert_eq!(v4(tv), None, "no address was announced, and the sender is not credited with one");
 
         let speaker = find(&devices, "OZAL-Speakers.local");
         let names: Vec<&str> = speaker.services.iter().map(|s| s.instance.as_str()).collect();
         assert_eq!(names, ["OZAL Speakers._airplay._tcp.local"]);
-        assert_eq!(speaker.services[0].txt, ["model=RX"]);
+        assert_eq!(speaker.services[0].txt, [b"model=RX"]);
         assert_eq!(v4(speaker), Some(ip("10.0.2.73")));
 
         assert_eq!(rx.try_iter().filter(|e| matches!(e, Event::Added(d) if d.hostname.is_some())).count(), 2);
@@ -4986,7 +4986,7 @@ mod tests {
         assert_eq!(s.instance, "Printer._http._tcp.local");
         assert_eq!(s.kind, "_http._tcp.local");
         assert_eq!((s.port, s.target.as_deref()), (631, Some("printer.local")));
-        assert_eq!(s.txt, ["ty=hp"]);
+        assert_eq!(s.txt, [b"ty=hp"]);
 
         assert!(matches!(rx.try_recv(), Ok(Event::Added(_))));
         assert!(rx.try_recv().is_err());
