@@ -22,6 +22,7 @@ import time
 import unittest
 
 GROUP = "224.0.0.251"
+GROUP6 = "ff02::fb"
 PORT = 5353
 
 A, PTR, TXT, AAAA, SRV, NSEC = 1, 12, 16, 28, 33, 47
@@ -349,6 +350,29 @@ class Device:
         self.hearer.close()
 
 
+class Device6:
+    """A device on a link that speaks IPv6: an address of the far end of it, and
+    a socket to send from, to the group of the link."""
+
+    def __init__(self, link, addr):
+        self.link, self.addr = link, addr
+        link.add_peer_cidr(f"{addr}/64")
+        self.index = socket.if_nametoindex(link.peer)
+        self.sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, self.index)
+        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
+        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_LOOP, 0)
+        self.sock.bind((addr, PORT, 0, 0))
+
+    def multicast(self, data):
+        self.sock.sendto(data, (GROUP6, PORT, 0, self.index))
+
+    def close(self):
+        self.sock.close()
+
+
 # ---------------------------------------------------------------- the daemon
 
 class Daemon:
@@ -659,6 +683,9 @@ class Link:
 
     def device(self, addr):
         return self.lab.track(Device(self, addr))
+
+    def device6(self, addr):
+        return self.lab.track(Device6(self, addr))
 
 
 class Bridge:
