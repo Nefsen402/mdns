@@ -68,6 +68,9 @@ enum Change {
     /// link-layer address `mac`, or with `None`, no longer (the entry went,
     /// or the neighbour could not be reached).
     Neighbour { index: u32, ip: IpAddr, mac: Option<Vec<u8>> },
+    /// The kernel would not do what was asked for with sequence number `seq`,
+    /// and said why, as the error number `errno`.
+    Refused { seq: u32, errno: i32 },
     /// The kernel has said everything of the dump asked for with sequence
     /// number `seq`.
     Done { seq: u32 },
@@ -90,6 +93,7 @@ const RTM_DELADDR: u16 = 21;
 const RTM_NEWNEIGH: u16 = 28;
 const RTM_DELNEIGH: u16 = 29;
 const RTM_GETNEIGH: u16 = 30;
+const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_DUMP: u16 = 0x300;
@@ -139,6 +143,13 @@ const LINK_DUMP: u32 = 2;
 pub struct Netlink {
     fd: OwnedFd,
     tracker: Tracker,
+    /// Whether a dump asked for is not done yet. The kernel makes one at a time
+    /// on a socket and refuses another, in a message that is lost if the socket
+    /// has no room for it.
+    asking: bool,
+    /// Whether what is there is to be asked for again, as soon as the dump that
+    /// is under way is done.
+    again: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -167,7 +178,7 @@ impl Netlink {
         if rc < 0 {
             return Err(Why(errno()));
         }
-        Ok(Netlink { fd, tracker: Tracker::default() })
+        Ok(Netlink { fd, tracker: Tracker::default(), asking: false, again: false })
     }
 
     /// FreeBSD's netlink is not bound to the groups it wants, but joined to
@@ -196,7 +207,7 @@ impl Netlink {
                 return Err(Why(errno()));
             }
         }
-        Ok(Netlink { fd, tracker: Tracker::default() })
+        Ok(Netlink { fd, tracker: Tracker::default(), asking: false, again: false })
     }
 
     /// Ask the kernel for every interface and then every entry of every
@@ -205,6 +216,11 @@ impl Netlink {
     /// started, or before changes were lost; an interface that is not among
     /// them is down.
     pub fn resync(&mut self) -> Result<(), Why> {
+        // One dump at a time: when this is done, it is made again.
+        if self.asking {
+            self.again = true;
+            return Ok(());
+        }
         let mut msg = Vec::with_capacity(NLMSG_HDRLEN + IFINFOMSG_LEN);
         msg.extend(((NLMSG_HDRLEN + IFINFOMSG_LEN) as u32).to_ne_bytes());
         msg.extend(RTM_GETLINK.to_ne_bytes());
@@ -213,13 +229,14 @@ impl Netlink {
         msg.extend(0u32.to_ne_bytes()); // port: the kernel fills it in
         msg.extend([0u8; IFINFOMSG_LEN]); // every family, every interface
         self.tracker.dumping = Some(HashSet::new());
-        self.send_to_kernel(&msg)
+        self.asking = true;
+        self.send_to_kernel(&msg).inspect_err(|_| self.asking = false)
     }
 
     /// Ask the kernel for every entry of every interface's neighbour table.
     /// Only one dump is made at a time on a socket: this is for when the one
     /// of the links is done.
-    fn request_neighbours(&self) -> Result<(), Why> {
+    fn request_neighbours(&mut self) -> Result<(), Why> {
         let mut msg = Vec::with_capacity(NLMSG_HDRLEN + NDMSG_LEN);
         msg.extend(((NLMSG_HDRLEN + NDMSG_LEN) as u32).to_ne_bytes());
         msg.extend(RTM_GETNEIGH.to_ne_bytes());
@@ -227,7 +244,27 @@ impl Netlink {
         msg.extend(NEIGHBOUR_DUMP.to_ne_bytes());
         msg.extend(0u32.to_ne_bytes());
         msg.extend([0u8; NDMSG_LEN]); // every family, every interface
-        self.send_to_kernel(&msg)
+        self.asking = true;
+        self.send_to_kernel(&msg).inspect_err(|_| self.asking = false)
+    }
+
+    /// A dump is over, one way or the other: what is there is asked for again
+    /// if that was wanted while it was under way, or, after the links, the
+    /// neighbours are asked for.
+    fn dump_over(&mut self, seq: u32, refused: Option<i32>) {
+        self.asking = false;
+        if let Some(errno) = refused {
+            eprintln!("netlink: the kernel would not say what is there ({}): {}", seq, Why(Errno::from_raw_os_error(errno)));
+        }
+        if core::mem::take(&mut self.again) {
+            if let Err(e) = self.resync() {
+                eprintln!("netlink: asking for what is there failed: {e}");
+            }
+        } else if seq == LINK_DUMP && refused.is_none() {
+            if let Err(e) = self.request_neighbours() {
+                eprintln!("netlink: asking for the neighbour tables failed: {e}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -273,13 +310,15 @@ impl Netlink {
             let n = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
             if n >= 0 {
                 for change in parse(&buf[..n as usize]) {
-                    // The neighbours are asked for when the links are all said.
-                    let links_done = change == Change::Done { seq: LINK_DUMP };
+                    let over = match &change {
+                        Change::Done { seq } => Some((*seq, None)),
+                        Change::Refused { seq, errno } => Some((*seq, Some(*errno))),
+                        _ => None,
+                    };
                     self.tracker.apply(change, &mut events);
-                    if links_done {
-                        if let Err(e) = self.request_neighbours() {
-                            eprintln!("netlink: asking for the neighbour tables failed: {e}");
-                        }
+                    // The neighbours are asked for when the links are all said.
+                    if let Some((seq, refused)) = over {
+                        self.dump_over(seq, refused);
                     }
                 }
                 continue;
@@ -401,13 +440,17 @@ impl Tracker {
                 }
             }
             Change::Done { seq: LINK_DUMP } => {
-                let said = self.dumping.take().unwrap_or_default();
+                // With none under way, nothing was said, and nothing is to be taken from it.
+                let Some(said) = self.dumping.take() else { return };
                 let gone: Vec<u32> = self.links.keys().copied().filter(|i| !said.contains(i)).collect();
                 for index in gone {
                     self.forget(index, events);
                 }
             }
             Change::Done { .. } => {}
+            // What was to be said is not coming: nothing is known by what came of it.
+            Change::Refused { seq: LINK_DUMP, .. } => self.dumping = None,
+            Change::Refused { .. } => {}
         }
     }
 
@@ -448,6 +491,11 @@ fn parse(buf: &[u8]) -> Vec<Change> {
                 }
             }
             NLMSG_DONE => out.push(Change::Done { seq: u32_at(buf, at + 8) }),
+            // An error number of zero acknowledges: nothing here asks for that.
+            NLMSG_ERROR if body.len() >= 4 && i32::from_ne_bytes([body[0], body[1], body[2], body[3]]) < 0 => {
+                let errno = -i32::from_ne_bytes([body[0], body[1], body[2], body[3]]);
+                out.push(Change::Refused { seq: u32_at(buf, at + 8), errno });
+            }
             RTM_NEWADDR | RTM_DELADDR if body.len() >= IFADDRMSG_LEN => {
                 out.push(Change::Address { index: u32_at(body, 4) });
             }
