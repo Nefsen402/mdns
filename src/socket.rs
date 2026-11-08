@@ -175,7 +175,7 @@ mod pinned {
     }
 
     /// Pin `fd` to `interface`: it hears and sends nothing elsewhere.
-    fn bind_device(fd: impl AsFd, interface: &str) -> Result<()> {
+    pub(super) fn bind_device(fd: impl AsFd, interface: &str) -> Result<()> {
         let name = interface.as_bytes();
         // SAFETY: the descriptor is open, and `name` is readable for its length;
         // the kernel takes the name without a NUL.
