@@ -842,7 +842,7 @@ class Ctl(Case):
         heard = ha.count()
         ctl = d.ctl_start("probe", "lan")
         self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE), heard)), "the types are asked for")
-        self.assertTrue(d.advance_until(lambda: ctl.poll() is not None, step=1, limit=30), "and it is told when it is done")
+        self.assertTrue(d.advance_until_exits(ctl), "and it is told when it is done")
         stdout, stderr = ctl.communicate(timeout=10)
         self.assertEqual(ctl.returncode, 0, stderr)
         out = d.ctl("timers")
@@ -1120,7 +1120,7 @@ class Timers(Case):
         self.assertTrue(ha.none(asks(*PROBE), since=heard), "and not again by itself")
         ctl = d.ctl_start("probe", "s")
         self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE), heard)), "but when asked")
-        self.assertTrue(d.advance_until(lambda: ctl.poll() is not None, step=1, limit=30))
+        self.assertTrue(d.advance_until_exits(ctl))
         ctl.communicate(timeout=10)
 
 
