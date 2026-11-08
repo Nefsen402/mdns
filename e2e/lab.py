@@ -297,6 +297,9 @@ class Hearer(threading.Thread):
         return until(look, timeout)
 
     def count(self):
+        """How many messages there are among what has been sent by now: for
+        what is heard after to be what is sent after."""
+        self.flush()
         return len(self.heard)
 
     def seen(self, condition, since=0):
@@ -454,6 +457,20 @@ class Daemon:
                 return value
             self.advance(step)
         return condition()
+
+    def advance_until_exits(self, proc, step=1, limit=30, patience=0.2):
+        """Move the clock on a step at a time until `proc`, which waits on it,
+        has exited, which is true then, or the clock has moved `limit` seconds.
+        The process runs in real time, not the daemon's: after each step it has
+        `patience` seconds to take what the daemon told it and exit, so that a
+        busy machine does not use up the clock before it has had the time."""
+        for _ in range(round(limit / step) + 1):
+            try:
+                proc.wait(timeout=patience)
+                return True
+            except subprocess.TimeoutExpired:
+                self.advance(step)
+        return False
 
     def ctl_start(self, *args):
         """mdnsctl, started, for one that waits on the daemon's clock; the output
