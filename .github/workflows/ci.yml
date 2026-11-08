@@ -38,7 +38,7 @@ jobs:
       # --locked fails if Cargo.lock is out of date, so a dependency change
       # that was not committed with its lock file is caught here.
       - name: Build
-        run: python3 e2e/coverage.py build --out binaries
+        run: python3 tests/e2e/coverage.py build --out binaries
 
       - name: Keep the binaries
         uses: actions/upload-artifact@v4
@@ -60,7 +60,7 @@ jobs:
           path: binaries
 
       - name: Test
-        run: python3 e2e/coverage.py unit --binaries binaries --out profile-unit
+        run: python3 tests/e2e/coverage.py unit --binaries binaries --out profile-unit
 
       - name: Keep the profile
         uses: actions/upload-artifact@v4
@@ -70,7 +70,7 @@ jobs:
           retention-days: 1
 
   # The built daemon, run through what the unit tests cannot: interfaces that
-  # come and go, real sockets, signals, the control and avahi sockets. See e2e/.
+  # come and go, real sockets, signals, the control and avahi sockets. See tests/e2e/.
   # Once for each form of the sockets: Linux pins one to each interface, and the
   # BSDs share one between them, which is run here as `portable`.
   e2e:
@@ -99,7 +99,7 @@ jobs:
           sudo modprobe veth || true
 
       - name: End-to-end tests
-        run: python3 e2e/coverage.py e2e --binaries binaries --sockets ${{ matrix.sockets }} --out profile-e2e --logs e2e-logs
+        run: python3 tests/e2e/coverage.py e2e --binaries binaries --sockets ${{ matrix.sockets }} --out profile-e2e --logs e2e-logs
 
       - name: Keep the daemon's logs of a failure
         if: failure()
@@ -165,7 +165,7 @@ jobs:
 
       - name: Report
         run: |
-          python3 e2e/coverage.py report --binaries binaries \
+          python3 tests/e2e/coverage.py report --binaries binaries \
             --profiles profiles/* --out coverage-report \
             $( [ -f baseline/summary.json ] && echo --baseline baseline/summary.json )
 
@@ -209,7 +209,7 @@ jobs:
   # The daemon for FreeBSD, built here, for the job that follows to run: Rust is
   # slow to install in a virtual machine, and to build with there. It is linked
   # against the release's own C library, which the script fetches; see
-  # e2e/cross_freebsd.py.
+  # tests/e2e/cross_freebsd.py.
   freebsd-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -226,7 +226,7 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends clang lld
 
       - name: Build for FreeBSD
-        run: python3 e2e/cross_freebsd.py ${{ env.FREEBSD }} --out freebsd-binaries
+        run: python3 tests/e2e/cross_freebsd.py ${{ env.FREEBSD }} --out freebsd-binaries
 
       - name: Keep the binaries
         uses: actions/upload-artifact@v4
@@ -237,7 +237,7 @@ jobs:
 
   # The daemon on FreeBSD, in a virtual machine, which is what pfSense and OPNsense
   # are: its unit tests, and the end-to-end tests, where the router is a VNET jail
-  # and the links epair interfaces (see e2e/). They are run as root, and change the
+  # and the links epair interfaces (see tests/e2e/). They are run as root, and change the
   # network of the machine, which is why it is a virtual machine. What it runs is
   # built by the job before it, so it records no coverage. The action is pinned by
   # its commit, as it is not GitHub's.
@@ -277,4 +277,4 @@ jobs:
           # With the clock the end-to-end tests move: without it they skip what
           # needs it, and still pass.
           strings freebsd-binaries/mdnsd | grep -q 'advance <milliseconds>'
-          sudo python3 e2e/e2e.py --ctl freebsd-binaries/mdnsctl freebsd-binaries/mdnsd
+          sudo python3 tests/e2e/e2e.py --ctl freebsd-binaries/mdnsctl freebsd-binaries/mdnsd

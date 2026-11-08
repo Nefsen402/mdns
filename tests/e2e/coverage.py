@@ -43,7 +43,7 @@ import shutil
 import subprocess
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # What is not the daemon: what the compiler brings, and the unit tests, which are
 # files of their own, in tests/unit, for the report to leave out.
 IGNORE = r"/\.cargo/|/rustc/|/registry/|/usr/src/|/rustlib/|/tests/unit/"
@@ -151,7 +151,7 @@ def e2e(binaries, out, logs=None, sockets="pinned"):
     daemon = os.path.join(binaries, "portable", "mdnsd") if sockets == "portable" else os.path.join(binaries, "mdnsd")
     mdnsd, mdnsctl = absolute(daemon), absolute(os.path.join(binaries, "mdnsctl"))
     make_executable([mdnsd, mdnsctl])
-    cmd = [sys.executable, os.path.join(ROOT, "e2e", "e2e.py"), "--ctl", mdnsctl, mdnsd]
+    cmd = [sys.executable, os.path.join(ROOT, "tests", "e2e", "e2e.py"), "--ctl", mdnsctl, mdnsd]
     if logs:
         cmd[2:2] = ["--logs", absolute(logs)]
     # Where user namespaces are forbidden, as root.
