@@ -3,7 +3,7 @@ import os
 import subprocess
 import unittest
 
-from lab import A, AAAA, FOLLOWS_CHANGES, FREEBSD, PTR, SRV, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, txt, until
+from lab import A, AAAA, FOLLOWS_CHANGES, FREEBSD, PTR, SRV, TXT, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, txt, until
 
 BINARY = os.environ["E2E_DAEMON"]
 CTL = os.environ.get("E2E_CTL")
@@ -76,6 +76,18 @@ class Reflecting(Case):
 
         self.assertEqual(d.stop(), 0, self.logs(d))
         self.assertTrue(hb.wait(goodbye("tv.local", A, "10.9.1.50")), "withdrawn from the other interface on shutdown")
+
+    def test_a_txt_value_that_is_not_text_is_reflected_as_it_came(self):
+        la, lb = self.two_links()
+        hb = lb.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,rb\n"))
+        binary = [b"\xff" * 100, b"k=\x80\x81v"]
+        instance = "Dev._x._tcp.local"
+        la.device("10.9.1.50").multicast(response(
+            a("dev.local", "10.9.1.50"), ptr("_x._tcp.local", instance, 120), srv(instance, 80, "dev.local"),
+            txt(instance, *binary, ttl=120)))
+        said = b"".join(bytes([len(s)]) + s for s in binary).hex()
+        self.assertTrue(hb.wait(alive(instance, TXT, said)), self.logs(d))
 
     def test_a_device_that_says_goodbye_is_forgotten_and_withdrawn(self):
         la, lb = self.two_links()
