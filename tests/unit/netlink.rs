@@ -108,6 +108,27 @@ fn reads_neighbour_entries() {
     assert!(parse(&neighbour(RTM_NEWNEIGH, 5, 0x02, &[1, 2, 3], None)).is_empty());
 }
 
+/// A neighbour's attributes are read whole or not at all: one that says it is
+/// longer than what is left, or shorter than its own header, is not to be
+/// believed of the ones before it either.
+#[test]
+fn a_neighbour_attribute_that_is_not_what_it_says_gives_nothing() {
+    let mut whole = attr(NDA_DST, &[10, 0, 1, 5]);
+    whole.extend(attr(NDA_LLADDR, &[2, 0, 0, 0, 0, 1]));
+    assert_eq!(neighbour_attrs(&whole), (Some(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5))), Some(vec![2, 0, 0, 0, 0, 1])));
+
+    let mut over = attr(NDA_DST, &[10, 0, 1, 5]);
+    over.extend(20u16.to_ne_bytes()); // it says 20 bytes, and 6 are there
+    over.extend(NDA_LLADDR.to_ne_bytes());
+    over.extend([2u8; 2]);
+    assert_eq!(neighbour_attrs(&over), (None, None));
+
+    let mut short = attr(NDA_DST, &[10, 0, 1, 5]);
+    short.extend(2u16.to_ne_bytes()); // less than the header it is in
+    short.extend(NDA_LLADDR.to_ne_bytes());
+    assert_eq!(neighbour_attrs(&short), (None, None));
+}
+
 #[test]
 fn what_cannot_be_read_is_skipped() {
     assert!(parse(&[]).is_empty());
@@ -193,6 +214,72 @@ fn asking_again_finds_what_was_lost() {
     assert_eq!(events, [up("rc", 7, 1500, false), down("rb", 4)]);
     // The dump of neighbours ending says nothing.
     assert_eq!(said(&mut t, vec![Change::Done { seq: NEIGHBOUR_DUMP }]), []);
+}
+
+/// What the kernel answers with an error number is a refusal, and a dump that
+/// is refused is not waited for, which only an acknowledgement, of which nothing
+/// here asks for one, does not say.
+#[test]
+fn a_dump_the_kernel_refuses_is_not_waited_for() {
+    let error = |code: i32, seq: u32| {
+        let mut body = code.to_ne_bytes().to_vec();
+        body.extend([0u8; NLMSG_HDRLEN]); // the request it is of
+        let mut message = message(NLMSG_ERROR, &body);
+        message[8..12].copy_from_slice(&seq.to_ne_bytes());
+        message
+    };
+    assert_eq!(parse(&error(-16, LINK_DUMP)), [Change::Refused { seq: LINK_DUMP, errno: 16 }]);
+    assert!(parse(&error(0, LINK_DUMP)).is_empty());
+
+    let mut t = Tracker::default();
+    said(&mut t, vec![link_change(3, "ra", true, 1500)]);
+    t.dumping = Some(HashSet::new());
+    said(&mut t, vec![Change::Refused { seq: LINK_DUMP, errno: 16 }]);
+    assert!(t.dumping.is_none(), "nothing is known by what was not said");
+    assert_eq!(said(&mut t, vec![Change::Done { seq: LINK_DUMP }]), [], "so no interface is down for it");
+}
+
+/// One dump at a time is made on a socket, and what is asked for while one is
+/// under way is asked for when it is done, not refused by the kernel in a
+/// message that is lost if the socket has no room for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn asking_for_what_is_there_while_it_is_being_said_waits_until_it_has_been() {
+    let Ok(mut netlink) = Netlink::open() else { return };
+    netlink.resync().unwrap();
+    assert!(netlink.asking && !netlink.again);
+    netlink.resync().unwrap();
+    assert!(netlink.asking && netlink.again, "waits");
+    // The links are said, the neighbours asked for, and what is there is asked
+    // for again; and then it is over.
+    let mut rounds = 0;
+    while (netlink.asking || netlink.again) && rounds < 2000 {
+        std::thread::sleep(core::time::Duration::from_millis(5));
+        netlink.events().unwrap();
+        rounds += 1;
+    }
+    assert!(!netlink.asking && !netlink.again, "{rounds} rounds");
+}
+
+/// What the kernel does when a dump is asked for while another is under way,
+/// which `resync` does not do: it refuses, with an error, which is read as one;
+/// and what is under way goes on, and ends.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dump_asked_for_while_another_is_under_way_is_refused_and_the_other_goes_on() {
+    let Ok(mut netlink) = Netlink::open() else { return };
+    netlink.resync().unwrap();
+    netlink.request_neighbours().unwrap();
+    let mut rounds = 0;
+    let mut told = Vec::new();
+    while (netlink.asking || netlink.again) && rounds < 2000 {
+        std::thread::sleep(core::time::Duration::from_millis(5));
+        told.extend(netlink.events().unwrap());
+        rounds += 1;
+    }
+    assert!(!netlink.asking && !netlink.again, "{rounds} rounds");
+    // The interfaces were said all the same: there is at least the loopback one.
+    assert!(told.iter().any(|event| matches!(event, Event::Up { .. } | Event::Down { .. })), "{told:?}");
 }
 
 #[test]
