@@ -8,7 +8,7 @@ checked from outside, as a device on the other end of a link would see it.
 
 ```
 cargo build --features test-clock
-python3 e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd
+python3 tests/e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd
 ```
 
 The daemon is built with `test-clock`, a clock of its own that the tests move
@@ -44,7 +44,7 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
 ```
 cargo build --features test-clock
-doas python3 e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd
+doas python3 tests/e2e/e2e.py --ctl target/debug/mdnsctl target/debug/mdnsd
 ```
 
 There are no network namespaces, so each test makes a VNET jail for the router
@@ -101,13 +101,13 @@ once, with coverage instrumentation, and everything else runs those:
 
 ```
 rustup component add llvm-tools-preview
-python3 e2e/coverage.py                                   # all of it, here
+python3 tests/e2e/coverage.py                                   # all of it, here
 
-python3 e2e/coverage.py build  --out bin                  # or one step at a time
-python3 e2e/coverage.py unit   --binaries bin --out prof-unit
-python3 e2e/coverage.py e2e    --binaries bin --out prof-e2e
-python3 e2e/coverage.py e2e    --binaries bin --out prof-e2e-portable --sockets portable
-python3 e2e/coverage.py report --binaries bin --profiles prof-unit prof-e2e prof-e2e-portable --out report
+python3 tests/e2e/coverage.py build  --out bin                  # or one step at a time
+python3 tests/e2e/coverage.py unit   --binaries bin --out prof-unit
+python3 tests/e2e/coverage.py e2e    --binaries bin --out prof-e2e
+python3 tests/e2e/coverage.py e2e    --binaries bin --out prof-e2e-portable --sockets portable
+python3 tests/e2e/coverage.py report --binaries bin --profiles prof-unit prof-e2e prof-e2e-portable --out report
 ```
 
 `report` merges the profiles of any number of runs, and writes `summary.md` (a

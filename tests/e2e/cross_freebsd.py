@@ -30,7 +30,7 @@ import subprocess
 import sys
 import urllib.request
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TARGET = "x86_64-unknown-freebsd"
 BASE = "https://download.freebsd.org/releases/amd64/{version}-RELEASE"
 

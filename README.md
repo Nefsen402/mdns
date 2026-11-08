@@ -332,10 +332,10 @@ with goodbyes (see `mdnsd(8)`).
 ## Other systems
 
 Linux is what it is made for and tested on: the unit tests and the end-to-end
-tests (see `e2e/`) run there in CI.
+tests (see `tests/e2e/`) run there in CI.
 
 FreeBSD builds it and passes the unit tests and the end-to-end tests, which CI
-runs in a virtual machine on 14.5 (the router is a VNET jail: see `e2e/`). The other BSDs, NetBSD, OpenBSD and DragonFly, have not been tried. The
+runs in a virtual machine on 14.5 (the router is a VNET jail: see `tests/e2e/`). The other BSDs, NetBSD, OpenBSD and DragonFly, have not been tried. The
 part that differs between the BSDs and Linux is run end to end on Linux as well,
 in CI (`cargo build --features portable-sockets`).
 
