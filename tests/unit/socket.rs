@@ -101,3 +101,95 @@ fn the_loopback_interface_is_on_its_network() {
     assert!(nets.contains(&prefix("127.0.0.1/8")), "{nets:?}");
     assert!(prefixes("no-such-interface").unwrap().is_empty());
 }
+
+/// A std socket as the crate's own descriptor type holds it.
+fn owned(socket: impl std::os::fd::IntoRawFd) -> OwnedFd {
+    // SAFETY: a descriptor just given up by its owner.
+    unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
+}
+
+/// Who sent a datagram is read of either family, off a real one.
+#[test]
+fn the_sender_of_a_datagram_is_read_of_either_family() {
+    use std::net::UdpSocket;
+    for (bind, v6) in [("127.0.0.1:0", false), ("[::1]:0", true)] {
+        let Ok(rx) = UdpSocket::bind(bind) else {
+            assert!(v6, "IPv4 on the loopback interface");
+            continue; // no IPv6 here
+        };
+        let tx = UdpSocket::bind(bind).unwrap();
+        tx.send_to(b"hi", rx.local_addr().unwrap()).unwrap();
+        let from = tx.local_addr().unwrap();
+        let rx = owned(rx);
+        let mut buf = [0u8; 16];
+        let got = recv(&rx, &mut buf).expect("a datagram");
+        assert_eq!((got.from, &buf[..got.len]), (Some(from), &b"hi"[..]));
+    }
+}
+
+/// A datagram from something that has no IP address is read, and not given:
+/// there is nobody it can be said to be from.
+#[test]
+fn a_datagram_from_no_ip_address_is_read_and_not_given() {
+    use std::os::unix::net::UnixDatagram;
+    let (tx, rx) = UnixDatagram::pair().unwrap();
+    rx.set_nonblocking(true).unwrap();
+    tx.send(b"hi").unwrap();
+    let rx = owned(rx);
+    let mut buf = [0u8; 16];
+    let got = recv(&rx, &mut buf).unwrap();
+    assert_eq!((got.len, got.from), (2, None));
+    tx.send(b"again").unwrap();
+    let mut heard = 0;
+    drain(&rx, "lo", |_, _, _| heard += 1);
+    assert_eq!(heard, 0, "and it is not waited for either");
+}
+
+/// Where the socket is not pinned to an interface that has an IPv4 address,
+/// what is sent to an IPv4 destination is sent, with nothing said of the
+/// interface to send it out of.
+#[test]
+fn a_sender_with_no_ipv4_address_for_its_interface_still_sends_to_an_ipv4_destination() {
+    use std::net::UdpSocket;
+    let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tx = Sender { fd: owned(UdpSocket::bind("127.0.0.1:0").unwrap()), out: Some((1, None)) };
+    tx.send_to(b"hi", rx.local_addr().unwrap()).unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(rx.recv(&mut buf).unwrap(), 2);
+}
+
+/// Everything is read until there is no more; and what the system reports
+/// instead of a datagram (an ICMP error, say) is said once, and ends it.
+#[test]
+fn what_a_socket_reports_in_place_of_a_datagram_is_said_once_and_ends_the_reading() {
+    use std::net::UdpSocket;
+    let gone = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let to = gone.local_addr().unwrap();
+    drop(gone);
+    let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+    tx.set_nonblocking(true).unwrap();
+    tx.connect(to).unwrap();
+    // Nothing listens there, so the system tells this socket so, on the loopback
+    // interface, at once.
+    tx.send(b"anyone?").unwrap();
+    let tx = owned(tx);
+    let mut heard = 0;
+    drain(&tx, "lo", |_, _, _| heard += 1);
+    assert_eq!(heard, 0);
+    // And it is cleared: there is nothing more to read.
+    drain(&tx, "lo", |_, _, _| heard += 1);
+    assert_eq!(heard, 0);
+}
+
+/// A socket cannot be pinned to an interface that is not there.
+#[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
+#[test]
+fn a_socket_is_not_pinned_to_an_interface_that_is_not_there() {
+    let socket = owned(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let err = pinned::bind_device(&socket, "nosuchif0").unwrap_err();
+    assert!(format!("{err:#}").contains("binding to nosuchif0"), "{err:#}");
+    // Where sockets are pinned, there is nothing shared to read.
+    let hub = Hub::new(&[Family::V4], &[]).unwrap();
+    assert_eq!(hub.fds().count(), 0);
+    hub.receive(3, |_, _, _, _| panic!("nothing to give"));
+}
