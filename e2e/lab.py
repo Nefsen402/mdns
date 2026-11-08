@@ -308,6 +308,12 @@ class Hearer(threading.Thread):
         self.flush()
         return next((h for h in self.heard[since:] if condition(h)), None)
 
+    def matching(self, condition, since=0):
+        """Every message from index `since` that `condition` says yes to, among
+        what has been sent by now."""
+        self.flush()
+        return [h for h in self.heard[since:] if condition(h)]
+
     def none(self, condition, since=0):
         """Whether nothing from index `since` that `condition` says yes to has
         been heard. It is what has been sent by now: the daemon has to have
@@ -447,15 +453,19 @@ class Daemon:
             raise unittest.SkipTest("the daemon has no clock to move: build it with --features test-clock")
         self.settle()
 
-    def advance_until(self, condition, step=0.25, limit=30):
+    def advance_until(self, condition, step=0.25, limit=30, patience=0.01):
         """Move the clock on a step at a time until `condition` gives something
         that is not false, which is what it gives, or the clock has moved `limit`
-        seconds: for what the daemon does after a delay of its own."""
+        seconds: for what the daemon does after a delay of its own. What it
+        sends in a step is on its way to whoever listens: after each, `patience`
+        seconds, or until something arrives, for it to be there to be looked at."""
         for _ in range(round(limit / step) + 1):
             value = condition()
             if value:
                 return value
             self.advance(step)
+            with _changed:
+                _changed.wait(patience)
         return condition()
 
     def advance_until_exits(self, proc, step=1, limit=30, patience=0.2):
@@ -512,8 +522,12 @@ class Watch:
 
     def __init__(self, cmd):
         # What it prints on its error output is what it says, too: FreeBSD's route monitor does.
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        # Unbuffered, and read from the pipe itself: a buffered reader that has
+        # taken several lines to give one leaves the rest where a wait for the
+        # pipe to have something will not find them.
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         self.seen = []
+        self.partial = b""
 
     def wait(self, pattern, timeout=5.0):
         end = time.monotonic() + timeout
@@ -524,12 +538,18 @@ class Watch:
             left = end - time.monotonic()
             if left <= 0 or not select.select([self.proc.stdout], [], [], left)[0]:
                 return None
-            line = self.proc.stdout.readline()
-            if not line:
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+            if not chunk:
                 return None
-            self.seen.append(line.rstrip("\n"))
-            if re.search(pattern, line):
-                return line.rstrip("\n")
+            *lines, self.partial = (self.partial + chunk).split(b"\n")
+            found = None
+            for raw in lines:
+                line = raw.decode(errors="replace")
+                self.seen.append(line)
+                if found is None and re.search(pattern, line):
+                    found = line
+            if found is not None:
+                return found
 
     def close(self):
         self.proc.kill()
