@@ -83,8 +83,9 @@ pub struct Service {
     pub kind: String,
     pub port: u16,
     pub target: Option<String>,
-    /// TXT strings, usually `key=value`.
-    pub txt: Vec<String>,
+    /// TXT strings, usually `key=value`, as they came: a value is any bytes,
+    /// only often text.
+    pub txt: Vec<Vec<u8>>,
     /// The subtypes it said it is of, by the name of their PTR record, such as
     /// `_universal._sub._ipp._tcp.local` (an AirPrint printer).
     pub subtypes: Vec<String>,
@@ -752,11 +753,7 @@ impl Device {
                     if rec.ttl != 0
                         && let Some(svc) = self.service_mut(&rec.name, max_services)
                     {
-                        svc.txt = strings
-                            .iter()
-                            .filter(|s| !s.is_empty())
-                            .map(|s| String::from_utf8_lossy(s).into_owned())
-                            .collect();
+                        svc.txt = strings.iter().filter(|s| !s.is_empty()).cloned().collect();
                         if svc.ttl == 0 {
                             svc.ttl = rec.ttl;
                         }
@@ -932,7 +929,7 @@ impl Device {
                 svc.instance.clone(),
                 true,
                 ttl,
-                RData::Txt(svc.txt.iter().map(|t| t.as_bytes().to_vec()).collect()),
+                RData::Txt(svc.txt.clone()),
             ),
         ];
         records.extend(subtypes);
@@ -1553,7 +1550,7 @@ mod tests {
                     instance: format!("{i}._http._tcp.local"),
                     kind: "_http._tcp.local".into(),
                     port: 8080,
-                    txt: vec!["a=b".into()],
+                    txt: vec![b"a=b".to_vec()],
                     ..Service::default()
                 })
                 .collect(),
@@ -1618,7 +1615,7 @@ mod tests {
                 let mut d = tv(&format!("10.0.1.{}", i + 1), &[&format!("Device {i}")]);
                 d.hostname = Some(format!("dev{i}.local"));
                 d.services[0].target = d.hostname.clone();
-                d.services[0].txt = vec!["k=".to_string() + &"v".repeat(txt)];
+                d.services[0].txt = vec![format!("k={}", "v".repeat(txt)).into_bytes()];
                 d
             })
             .collect()
@@ -1708,7 +1705,7 @@ mod tests {
         // One device: its answer fits, but not all its additional records
         // (its TXT record is too big), and leaving those out is no truncation.
         let mut one = many(1, 0);
-        one[0].services[0].txt = vec!["a=".to_string() + &"x".repeat(240), "b=".to_string() + &"x".repeat(240)];
+        one[0].services[0].txt = vec![format!("a={}", "x".repeat(240)).into_bytes(), format!("b={}", "x".repeat(240)).into_bytes()];
         let whole = only(Device::query_response(&one, &browse, false, 1452).unwrap().0);
         let reply = only(Device::query_response(&one, &browse, true, 1452).unwrap().0);
         assert_eq!(reply.answers.len(), 1);

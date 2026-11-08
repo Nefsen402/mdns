@@ -1148,6 +1148,27 @@ mod tests {
         assert_eq!(tracker.discovered.len(), 2, "one device for each, and none for the leftover");
     }
 
+    /// A TXT value is any bytes, and is kept, and announced again, as it came:
+    /// these are not text, and would be changed, and grow past what a string
+    /// may be, if they were made into it.
+    #[test]
+    fn a_txt_value_that_is_not_text_is_kept_as_it_came() {
+        let mut tracker = Tracker::default();
+        let binary = vec![vec![0xff; 100], b"k=\x80\x81v".to_vec()];
+        let txt = record("Dev._x._tcp.local", 120, RData::Txt(binary.clone()));
+        let srv = record("Dev._x._tcp.local", 120, RData::Srv { priority: 0, weight: 0, port: 1, target: "d.local".into() });
+        told(&mut tracker, "10.0.1.5", &message(true, vec![a("d.local", "10.0.1.5", 120), srv, txt]));
+        let id = tracker.discovered.find_host("d.local").unwrap();
+        let device = &tracker.discovered.get(id).device;
+        assert_eq!(device.services[0].txt, binary);
+
+        // And said again as it was, over the wire and back.
+        let announced = message(true, device.announcement(120, 120)).encode().expect("it can be announced");
+        let again = Message::parse(&announced).unwrap();
+        let said: Vec<&RData> = again.answers.iter().map(|r| &r.data).filter(|d| matches!(d, RData::Txt(_))).collect();
+        assert_eq!(said, [&RData::Txt(binary)]);
+    }
+
     /// What happened to a device is one event of it: that it came, what it was
     /// before it changed and what it is, and that it went as it was.
     #[test]
