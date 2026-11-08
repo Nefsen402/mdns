@@ -1141,7 +1141,7 @@ mod tests {
     fn a_device_named_like_the_advertised_name_leaves_it_alone() {
         let (br0, br0_rx) = wired("br0");
         let (media, _media_rx) = wired("media");
-        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.0.1").into()], ..Device::default() };
+        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.0.1").into()].into(), ..Device::default() };
         br0.add_manual_ttl(Owner::Own, router.clone(), Duration::from_secs(120)).unwrap();
         let _r = Reflector::new(0, vec![br0.clone(), media.clone()]).unwrap();
         drain(&br0_rx);

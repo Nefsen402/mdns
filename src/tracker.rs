@@ -10,7 +10,7 @@ use alloc::collections::BTreeSet;
 
 use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
 
-use crate::device::{addr_of, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
+use crate::device::{addr_of, edit, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
 use alloc::rc::Rc;
 
 use crate::segment::Asked;
@@ -608,7 +608,7 @@ impl Entry {
             // Oldest first, and those it did not repeat before those it did.
             held.sort_by_key(|a| (incoming.contains(a), self.addr_expires.get(a).copied()));
             for addr in held.into_iter().filter(|a| !incoming.contains(a)).take(excess) {
-                self.device.addresses.retain(|a| a.ip != addr);
+                edit(&mut self.device.addresses).retain(|a| a.ip != addr);
                 self.addr_expires.remove(&addr);
             }
         }
@@ -620,7 +620,7 @@ impl Entry {
         for addr in &gone {
             self.addr_expires.remove(addr);
         }
-        self.device.addresses.retain(|a| !gone.contains(&a.ip));
+        edit(&mut self.device.addresses).retain(|a| !gone.contains(&a.ip));
         !gone.is_empty()
     }
 
@@ -1160,7 +1160,7 @@ mod tests {
         told(&mut tracker, "10.0.1.5", &message(true, vec![a("d.local", "10.0.1.5", 120), srv, txt]));
         let id = tracker.discovered.find_host("d.local").unwrap();
         let device = &tracker.discovered.get(id).device;
-        assert_eq!(device.services[0].txt, binary);
+        assert_eq!(device.services[0].txt, crate::device::txt_of(binary.clone()));
 
         // And said again as it was, over the wire and back.
         let announced = message(true, device.announcement(120, 120)).encode().expect("it can be announced");
@@ -1290,18 +1290,18 @@ mod device_table_tests {
                         let addr: IpAddr = format!("10.5.{}.{}", pick >> 16 & 7, pick >> 24 & 7).parse().unwrap();
                         match pick >> 32 & 7 {
                             0 | 1 => entry.device.add_addrs(&[addr]),
-                            2 => entry.device.addresses.retain(|a| a.ip != addr),
+                            2 => edit(&mut entry.device.addresses).retain(|a| a.ip != addr),
                             3 | 4 => {
                                 let instance = format!("S{}._x{}._tcp.local", pick >> 40 & 3, pick >> 44 & 1);
                                 let kind = format!("_x{}._tcp.local", pick >> 44 & 1);
                                 let target = (pick >> 48 & 1 == 0).then(|| "somewhere.local".to_string());
                                 if !entry.device.services.iter().any(|s| s.instance == instance) {
-                                    entry.device.services.push(Service { instance, kind, target, ..Default::default() });
+                                    edit(&mut entry.device.services).push(Service { instance, kind, target, ..Default::default() });
                                 }
                             }
-                            5 => entry.device.services.clear(),
+                            5 => edit(&mut entry.device.services).clear(),
                             6 => entry.refreshed = Some(start + Duration::from_secs(pick >> 8 & 63)),
-                            _ => entry.device.services.retain(|s| s.target.is_none()),
+                            _ => edit(&mut entry.device.services).retain(|s| s.target.is_none()),
                         }
                     });
                     devices.reindex(id, &was);
