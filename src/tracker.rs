@@ -369,7 +369,7 @@ impl Tracker {
             let others: Vec<Id> = self
                 .discovered
                 .with_unresolved()
-                .filter(|&(id, e)| id != owner && e.device.service(&instance).is_some_and(|s| s.target.is_none()))
+                .filter(|&(id, e)| id != owner && e.device.service(&instance).is_some_and(|s| s.target().is_none()))
                 .map(|(id, _)| id)
                 .collect();
             for id in others {
@@ -453,7 +453,7 @@ impl Touched {
             let now = discovered.try_get(*id).map(|e| &e.device);
             for device in self.before[id].iter().chain(now) {
                 names.extend(device.hostname.iter().map(|host| host.to_ascii_lowercase()));
-                names.extend(device.services.iter().map(|svc| svc.instance.to_ascii_lowercase()));
+                names.extend(device.services.iter().map(|svc| svc.instance().to_ascii_lowercase()));
             }
         }
         names.sort_unstable();
@@ -829,7 +829,7 @@ impl Devices {
         let now = self.indexed(entry);
         self.by_addr.move_between(id, &was.addrs, &now.addrs);
         self.by_name.move_between(id, &was.names, &now.names);
-        if entry.device.services.iter().any(|s| s.target.is_none()) {
+        if entry.device.services.iter().any(|s| s.target().is_none()) {
             self.unresolved.insert(id);
         } else {
             self.unresolved.remove(&id);
@@ -931,7 +931,7 @@ impl Devices {
             names += indexed.names.len();
             assert!(indexed.addrs.iter().all(|&h| self.by_addr.holds(h, id)), "an address is indexed: {entry:?}");
             assert!(indexed.names.iter().all(|&h| self.by_name.holds(h, id)), "a name is indexed: {entry:?}");
-            let unresolved_here = entry.device.services.iter().any(|s| s.target.is_none());
+            let unresolved_here = entry.device.services.iter().any(|s| s.target().is_none());
             assert_eq!(self.unresolved.contains(&id), unresolved_here, "unresolved: {entry:?}");
             unresolved += usize::from(unresolved_here);
             for addr in entry.device.addrs() {
@@ -1160,7 +1160,7 @@ mod tests {
         told(&mut tracker, "10.0.1.5", &message(true, vec![a("d.local", "10.0.1.5", 120), srv, txt]));
         let id = tracker.discovered.find_host("d.local").unwrap();
         let device = &tracker.discovered.get(id).device;
-        assert_eq!(device.services[0].txt, crate::device::txt_of(binary.clone()));
+        assert_eq!(device.services[0].txt().collect::<Vec<_>>(), binary.clone());
 
         // And said again as it was, over the wire and back.
         let announced = message(true, device.announcement(120, 120)).encode().expect("it can be announced");
@@ -1203,7 +1203,7 @@ mod device_table_tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::device::Service;
+    use crate::device::ServiceParts;
     use crate::time::Instant;
 
     fn named(host: &str, from: &str) -> Entry {
@@ -1295,13 +1295,13 @@ mod device_table_tests {
                                 let instance = format!("S{}._x{}._tcp.local", pick >> 40 & 3, pick >> 44 & 1);
                                 let kind = format!("_x{}._tcp.local", pick >> 44 & 1);
                                 let target = (pick >> 48 & 1 == 0).then(|| "somewhere.local".to_string());
-                                if !entry.device.services.iter().any(|s| s.instance == instance) {
-                                    edit(&mut entry.device.services).push(Service { instance, kind, target, ..Default::default() });
+                                if !entry.device.services.iter().any(|s| s.instance() == instance) {
+                                    edit(&mut entry.device.services).push(ServiceParts { instance, kind, target, ..Default::default() }.into());
                                 }
                             }
                             5 => edit(&mut entry.device.services).clear(),
                             6 => entry.refreshed = Some(start + Duration::from_secs(pick >> 8 & 63)),
-                            _ => edit(&mut entry.device.services).retain(|s| s.target.is_none()),
+                            _ => edit(&mut entry.device.services).retain(|s| s.target().is_none()),
                         }
                     });
                     devices.reindex(id, &was);
@@ -1337,7 +1337,7 @@ mod device_table_tests {
         }
         same(
             ptrs(devices.with_unresolved().map(|(_, e)| e).collect()),
-            ptrs(devices.iter().filter(|e| e.device.services.iter().any(|s| s.target.is_none())).collect()),
+            ptrs(devices.iter().filter(|e| e.device.services.iter().any(|s| s.target().is_none())).collect()),
         );
         assert!(devices.with_name("_services._dns-sd._udp.local").count() > 0, "the test finds some");
         assert!(devices.with_unresolved().count() > 0 && devices.ids_with_addr(&"10.5.1.1".parse().unwrap()).count() > 0);

@@ -75,9 +75,25 @@ const MAX_REVERSE: usize = 8;
 /// of its TTL, and a few seconds would be a flood.
 pub const MIN_REFLECT_TTL: u32 = 10;
 
-/// A DNS-SD service advertised by a device.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+/// A DNS-SD service advertised by a device, held in one block of bytes with
+/// nothing to spare, and not to be changed in place: [`Service::edit`] makes
+/// the block again if what it is made of is not as it was.
+///
+/// The block is its port and TTL, then its names, each ended by a NUL (which
+/// no name can hold, as it is not one of the characters a name may have: see
+/// `proper`): the instance, the type, the host it is on (empty if it is not
+/// known), and the subtypes, which an empty name ends; and then its TXT data,
+/// as it is on the wire, each string after its length, to the end of the
+/// block.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Service {
+    block: Box<[u8]>,
+}
+
+/// What a [`Service`] is made of, as a plain value, for making one and for
+/// changing one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceParts {
     /// Full instance name, e.g. `Printer._http._tcp.local`.
     pub instance: String,
     /// Service type, e.g. `_http._tcp.local`.
@@ -86,21 +102,190 @@ pub struct Service {
     pub target: Option<String>,
     /// TXT strings, usually `key=value`, as they came: a value is any bytes,
     /// only often text.
-    pub txt: Box<[Box<[u8]>]>,
+    pub txt: Vec<Vec<u8>>,
     /// The subtypes it said it is of, by the name of their PTR record, such as
     /// `_universal._sub._ipp._tcp.local` (an AirPrint printer).
-    pub subtypes: Box<[String]>,
+    pub subtypes: Vec<String>,
     /// The TTL its records were last announced with, in seconds: that of the
     /// SRV record, or else of the PTR or TXT; 0 if not known.
     pub ttl: u32,
 }
 
+/// The port and the TTL, which come first in a block.
+const SERVICE_HEADER: usize = 6;
+
+/// A name as a block holds it: up to a NUL, which only a name that was not
+/// checked has.
+fn name_of(name: &str) -> &str {
+    name.split('\0').next().unwrap_or_default()
+}
+
+impl ServiceParts {
+    /// The block they make.
+    fn encode(&self) -> Vec<u8> {
+        let target = self.target.as_deref().map_or("", name_of);
+        let subtypes = || self.subtypes.iter().map(|s| name_of(s)).filter(|s| !s.is_empty());
+        // A string of TXT data is at most 255 bytes, and not empty: it would not be said.
+        let txt = || self.txt.iter().map(|s| &s[..s.len().min(255)]).filter(|s| !s.is_empty());
+        let size = SERVICE_HEADER
+            + [name_of(&self.instance), name_of(&self.kind), target].iter().map(|n| n.len() + 1).sum::<usize>()
+            + subtypes().map(|s| s.len() + 1).sum::<usize>()
+            + 1
+            + txt().map(|s| s.len() + 1).sum::<usize>();
+        let mut out = Vec::with_capacity(size);
+        out.extend(self.port.to_le_bytes());
+        out.extend(self.ttl.to_le_bytes());
+        for name in [name_of(&self.instance), name_of(&self.kind), target].into_iter().chain(subtypes()) {
+            out.extend(name.as_bytes());
+            out.push(0);
+        }
+        out.push(0);
+        for string in txt() {
+            out.push(string.len() as u8);
+            out.extend(string);
+        }
+        debug_assert_eq!(out.len(), size);
+        out
+    }
+}
+
+impl From<ServiceParts> for Service {
+    fn from(parts: ServiceParts) -> Service {
+        Service { block: parts.encode().into_boxed_slice() }
+    }
+}
+
+impl Default for Service {
+    fn default() -> Service {
+        ServiceParts::default().into()
+    }
+}
+
+impl core::fmt::Debug for Service {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Service")
+            .field("instance", &self.instance())
+            .field("kind", &self.kind())
+            .field("port", &self.port())
+            .field("target", &self.target())
+            .field("txt", &self.txt().collect::<Vec<_>>())
+            .field("subtypes", &self.subtypes().collect::<Vec<_>>())
+            .field("ttl", &self.ttl())
+            .finish()
+    }
+}
+
+/// The bytes up to a NUL, and those after it.
+fn until_nul(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let at = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    (&bytes[..at], bytes.get(at + 1..).unwrap_or_default())
+}
+
+/// A name from the block it was written into, which holds only what was text.
+fn text(bytes: &[u8]) -> &str {
+    core::str::from_utf8(bytes).unwrap_or_default()
+}
+
 impl Service {
+    /// Its instance, the type, the host, the subtypes and the TXT data,
+    /// each as the bytes it is in the block.
+    fn fields(&self) -> [&[u8]; 5] {
+        let (instance, rest) = until_nul(&self.block[SERVICE_HEADER.min(self.block.len())..]);
+        let (kind, rest) = until_nul(rest);
+        let (target, rest) = until_nul(rest);
+        // The subtypes are the names up to the empty one.
+        let mut after = rest;
+        let mut len = 0;
+        loop {
+            let (name, next) = until_nul(after);
+            after = next;
+            if name.is_empty() {
+                break;
+            }
+            len += name.len() + 1;
+        }
+        [instance, kind, target, &rest[..len.min(rest.len())], after]
+    }
+
+    /// Its port, 0 if it is not known.
+    pub fn port(&self) -> u16 {
+        self.block.get(0..2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    /// The TTL its records were last announced with, in seconds, or 0.
+    pub fn ttl(&self) -> u32 {
+        self.block.get(2..SERVICE_HEADER).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Full instance name, e.g. `Printer._http._tcp.local`.
+    pub fn instance(&self) -> &str {
+        text(self.fields()[0])
+    }
+
+    /// Service type, e.g. `_http._tcp.local`.
+    pub fn kind(&self) -> &str {
+        text(self.fields()[1])
+    }
+
+    /// The host it is on, if that is known.
+    pub fn target(&self) -> Option<&str> {
+        Some(text(self.fields()[2])).filter(|t| !t.is_empty())
+    }
+
+    /// The subtypes it said it is of, by the name of their PTR record, such as
+    /// `_universal._sub._ipp._tcp.local` (an AirPrint printer).
+    pub fn subtypes(&self) -> impl Iterator<Item = &str> {
+        let mut rest = self.fields()[3];
+        core::iter::from_fn(move || {
+            let (name, next) = until_nul(rest);
+            rest = next;
+            (!name.is_empty()).then(|| text(name))
+        })
+    }
+
+    /// Its TXT strings, usually `key=value`, as they came: a value is any
+    /// bytes, only often text.
+    pub fn txt(&self) -> impl Iterator<Item = &[u8]> {
+        let mut rest = self.fields()[4];
+        core::iter::from_fn(move || {
+            let (&len, tail) = rest.split_first()?;
+            let (string, tail) = tail.split_at(usize::from(len).min(tail.len()));
+            rest = tail;
+            Some(string)
+        })
+    }
+
+    /// What it is made of.
+    pub fn parts(&self) -> ServiceParts {
+        ServiceParts {
+            instance: self.instance().to_string(),
+            kind: self.kind().to_string(),
+            port: self.port(),
+            target: self.target().map(String::from),
+            txt: self.txt().map(<[u8]>::to_vec).collect(),
+            subtypes: self.subtypes().map(String::from).collect(),
+            ttl: self.ttl(),
+        }
+    }
+
+    /// Change what it is made of with `f`; the block is made again only if
+    /// that is not as it was. Returns whether it was changed.
+    pub fn edit(&mut self, f: impl FnOnce(&mut ServiceParts)) -> bool {
+        let mut parts = self.parts();
+        f(&mut parts);
+        let block = parts.encode();
+        if *block == *self.block {
+            return false;
+        }
+        self.block = block.into_boxed_slice();
+        true
+    }
+
     /// Whether it is known where it is, by its SRV record: a host and a port.
     /// One known only by name from a browse answer or a TXT record is not,
     /// and a copy of it would have to make up the rest.
     pub fn is_resolved(&self) -> bool {
-        self.target.is_some() && self.port != 0
+        self.target().is_some() && self.port() != 0
     }
 }
 
@@ -167,12 +352,6 @@ impl<T> Drop for Listed<'_, T> {
     fn drop(&mut self) {
         *self.list = core::mem::take(&mut self.items).into_boxed_slice();
     }
-}
-
-/// TXT strings, as a service holds them, for tests.
-#[cfg(test)]
-pub fn txt_of(strings: Vec<Vec<u8>>) -> Box<[Box<[u8]>]> {
-    strings.into_iter().map(Vec::into_boxed_slice).collect()
 }
 
 /// An address of a device, with what is known of it besides.
@@ -574,7 +753,7 @@ impl Device {
     pub fn reflected(&self, neighbours: Neighbours, when: &ReflectedWhen) -> Option<Device> {
         let mut device = self.with_neighbours_as(neighbours);
         edit(&mut device.addresses).retain(|a| !is_link_local(&a.ip));
-        edit(&mut device.services).retain(|s| s.is_resolved() && when.kinds.allows(&s.kind));
+        edit(&mut device.services).retain(|s| s.is_resolved() && when.kinds.allows(&s.kind()));
         let fit = (!when.hostname || device.hostname.is_some())
             && (!when.address || device.routable().next().is_some())
             && (!when.service || !device.services.is_empty());
@@ -598,7 +777,7 @@ impl Device {
         }
         device.addresses.sort_by_key(|a| addr_order(&a.ip));
         for service in &other.services {
-            if device.service(&service.instance).is_none() {
+            if device.service(&service.instance()).is_none() {
                 device.insert_service(service.clone());
             }
         }
@@ -626,12 +805,12 @@ impl Device {
 
     /// Its service called `instance`, ignoring case.
     pub fn service(&self, instance: &str) -> Option<&Service> {
-        self.services.iter().find(|s| s.instance.eq_ignore_ascii_case(instance))
+        self.services.iter().find(|s| s.instance().eq_ignore_ascii_case(instance))
     }
 
     /// Forget its service called `instance`, ignoring case.
     pub fn forget_service(&mut self, instance: &str) {
-        edit(&mut self.services).retain(|s| !s.instance.eq_ignore_ascii_case(instance));
+        edit(&mut self.services).retain(|s| !s.instance().eq_ignore_ascii_case(instance));
     }
 
     /// Take in what `report` says about it, with the addresses that vouch for
@@ -757,34 +936,42 @@ impl Device {
                     if rec.name.to_ascii_lowercase().contains("._sub.") {
                         let same = |sub: &String| sub.eq_ignore_ascii_case(&rec.name);
                         if rec.ttl == 0 {
-                            if let Some(svc) = self.services.iter_mut().find(|s| s.instance.eq_ignore_ascii_case(instance)) {
-                                edit(&mut svc.subtypes).retain(|sub| !same(sub));
+                            if let Some(svc) = self.services.iter_mut().find(|s| s.instance().eq_ignore_ascii_case(instance)) {
+                                svc.edit(|p| p.subtypes.retain(|sub| !same(sub)));
                             }
                         } else if let Some(svc) = self.service_mut(instance, max_services)
-                            && !svc.subtypes.iter().any(same)
-                            && svc.subtypes.len() < MAX_SUBTYPES
+                            && !svc.subtypes().any(|sub| rec.name.eq_ignore_ascii_case(sub))
+                            && svc.subtypes().count() < MAX_SUBTYPES
                         {
-                            edit(&mut svc.subtypes).push(rec.name.clone());
+                            svc.edit(|p| p.subtypes.push(rec.name.clone()));
                         }
                         continue;
                     }
                     if rec.ttl == 0 {
                         self.forget_service(instance);
-                    } else if let Some(svc) = self.service_mut(instance, max_services) {
-                        svc.kind = rec.name.clone();
-                        // The SRV record's TTL is the one that counts, if known.
-                        if svc.ttl == 0 {
-                            svc.ttl = rec.ttl;
-                        }
+                    } else if let Some(svc) = self.service_mut(instance, max_services)
+                        && (svc.kind() != rec.name || svc.ttl() == 0)
+                    {
+                        svc.edit(|p| {
+                            p.kind = rec.name.clone();
+                            // The SRV record's TTL is the one that counts, if known.
+                            if p.ttl == 0 {
+                                p.ttl = rec.ttl;
+                            }
+                        });
                     }
                 }
                 RData::Srv { port, target, .. } => {
                     if rec.ttl == 0 {
                         self.forget_service(&rec.name);
-                    } else if let Some(svc) = self.service_mut(&rec.name, max_services) {
-                        svc.port = *port;
-                        svc.target = Some(target.clone());
-                        svc.ttl = rec.ttl;
+                    } else if let Some(svc) = self.service_mut(&rec.name, max_services)
+                        && (svc.port() != *port || svc.target() != Some(target.as_str()) || svc.ttl() != rec.ttl)
+                    {
+                        svc.edit(|p| {
+                            p.port = *port;
+                            p.target = Some(target.clone());
+                            p.ttl = rec.ttl;
+                        });
                     }
                 }
                 RData::Nsec { types, .. } => {
@@ -795,11 +982,14 @@ impl Device {
                 RData::Txt(strings) => {
                     if rec.ttl != 0
                         && let Some(svc) = self.service_mut(&rec.name, max_services)
+                        && (svc.ttl() == 0 || !svc.txt().eq(strings.iter().filter(|s| !s.is_empty()).map(Vec::as_slice)))
                     {
-                        svc.txt = strings.iter().filter(|s| !s.is_empty()).map(|s| Box::from(&s[..])).collect();
-                        if svc.ttl == 0 {
-                            svc.ttl = rec.ttl;
-                        }
+                        svc.edit(|p| {
+                            p.txt = strings.iter().filter(|s| !s.is_empty()).cloned().collect();
+                            if p.ttl == 0 {
+                                p.ttl = rec.ttl;
+                            }
+                        });
                     }
                 }
                 _ => {}
@@ -811,7 +1001,7 @@ impl Device {
     /// to `max_services`.
     pub fn absorb(&mut self, earlier: Device, max_services: usize) {
         for svc in earlier.services {
-            if self.service(&svc.instance).is_none() && self.services.len() < max_services {
+            if self.service(&svc.instance()).is_none() && self.services.len() < max_services {
                 self.insert_service(svc);
             }
         }
@@ -822,22 +1012,25 @@ impl Device {
     /// first heard with, whatever the case of later records. `None` if it is
     /// new and the device has `max_services` already.
     fn service_mut(&mut self, instance: &str, max_services: usize) -> Option<&mut Service> {
-        let at = match self.services.iter().position(|s| s.instance.eq_ignore_ascii_case(instance)) {
+        let at = match self.services.iter().position(|s| s.instance().eq_ignore_ascii_case(instance)) {
             Some(at) => at,
             None if self.services.len() >= max_services => return None,
-            None => self.insert_service(Service {
-                instance: instance.to_string(),
-                kind: codec::split_instance(instance).map(|(_, kind)| kind.to_string()).unwrap_or_default(),
-                ..Service::default()
-            }),
+            None => self.insert_service(
+                ServiceParts {
+                    instance: instance.to_string(),
+                    kind: codec::split_instance(instance).map(|(_, kind)| kind.to_string()).unwrap_or_default(),
+                    ..ServiceParts::default()
+                }
+                .into(),
+            ),
         };
         Some(&mut self.services[at])
     }
 
     /// Add `svc` in its place among the services, and return where that is.
     fn insert_service(&mut self, svc: Service) -> usize {
-        let key = svc.instance.to_ascii_lowercase();
-        let at = self.services.partition_point(|s| s.instance.to_ascii_lowercase() < key);
+        let key = svc.instance().to_ascii_lowercase();
+        let at = self.services.partition_point(|s| s.instance().to_ascii_lowercase() < key);
         edit(&mut self.services).insert(at, svc);
         at
     }
@@ -846,7 +1039,7 @@ impl Device {
     /// are taken.
     pub fn without(&self, taken: &dyn Fn(&str) -> bool) -> Device {
         let mut device = self.clone();
-        edit(&mut device.services).retain(|s| !taken(&s.instance));
+        edit(&mut device.services).retain(|s| !taken(&s.instance()));
         device
     }
 
@@ -862,9 +1055,9 @@ impl Device {
             f(&codec::reverse_name(addr));
         }
         for svc in &self.services {
-            f(&svc.kind);
-            f(&svc.instance);
-            for sub in &svc.subtypes {
+            f(&svc.kind());
+            f(&svc.instance());
+            for sub in svc.subtypes() {
                 f(sub);
             }
         }
@@ -894,10 +1087,9 @@ impl Device {
             records.extend(self.service_records(svc, service_ttl(svc, other_ttl)));
         }
         // DNS-SD service type enumeration, once per distinct type.
-        let kinds: BTreeMap<String, &String> =
-            self.services.iter().map(|s| (s.kind.to_ascii_lowercase(), &s.kind)).collect();
+        let kinds: BTreeMap<String, &str> = self.services.iter().map(|s| (s.kind().to_ascii_lowercase(), s.kind())).collect();
         for kind in kinds.into_values() {
-            records.push(record(SERVICE_ENUMERATION.into(), false, other_ttl, RData::Ptr(kind.clone())));
+            records.push(record(SERVICE_ENUMERATION.into(), false, other_ttl, RData::Ptr(kind.to_string())));
         }
         records
     }
@@ -908,14 +1100,14 @@ impl Device {
     pub fn replacement(&self, new: &Device, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
         let mut records = new.announcement(host_ttl, other_ttl);
         let kept: HashMap<String, &Service> =
-            new.services.iter().map(|s| (s.instance.to_ascii_lowercase(), s)).collect();
+            new.services.iter().map(|s| (s.instance().to_ascii_lowercase(), s)).collect();
         for svc in &self.services {
-            match kept.get(&svc.instance.to_ascii_lowercase()) {
+            match kept.get(&svc.instance().to_ascii_lowercase()) {
                 None => records.extend(self.service_records(svc, 0)),
                 Some(now) => {
                     let gone =
-                        svc.subtypes.iter().filter(|sub| !now.subtypes.iter().any(|n| n.eq_ignore_ascii_case(sub)));
-                    records.extend(gone.map(|sub| record(sub.clone(), false, 0, RData::Ptr(svc.instance.clone()))));
+                        svc.subtypes().filter(|sub| !now.subtypes().any(|n| n.eq_ignore_ascii_case(sub)));
+                    records.extend(gone.map(|sub| record(sub.to_string(), false, 0, RData::Ptr(svc.instance().to_string()))));
                 }
             }
         }
@@ -962,17 +1154,17 @@ impl Device {
     }
 
     fn service_records(&self, svc: &Service, ttl: u32) -> Vec<Record> {
-        let target = svc.target.clone().or_else(|| self.hostname.clone()).unwrap_or_default();
+        let target = svc.target().map(String::from).or_else(|| self.hostname.clone()).unwrap_or_default();
         let subtypes =
-            svc.subtypes.iter().map(|sub| record(sub.clone(), false, ttl, RData::Ptr(svc.instance.clone())));
+            svc.subtypes().map(|sub| record(sub.to_string(), false, ttl, RData::Ptr(svc.instance().to_string())));
         let mut records = vec![
-            record(svc.kind.clone(), false, ttl, RData::Ptr(svc.instance.clone())),
-            record(svc.instance.clone(), true, ttl, RData::Srv { priority: 0, weight: 0, port: svc.port, target }),
+            record(svc.kind().to_string(), false, ttl, RData::Ptr(svc.instance().to_string())),
+            record(svc.instance().to_string(), true, ttl, RData::Srv { priority: 0, weight: 0, port: svc.port(), target }),
             record(
-                svc.instance.clone(),
+                svc.instance().to_string(),
                 true,
                 ttl,
-                RData::Txt(svc.txt.iter().map(|t| t.to_vec()).collect()),
+                RData::Txt(svc.txt().map(|t| t.to_vec()).collect()),
             ),
         ];
         records.extend(subtypes);
@@ -991,7 +1183,7 @@ impl Device {
 
         let services = || devices.iter().flat_map(|d| &d.services);
         let mut kinds: BTreeSet<&str> = types.iter().map(String::as_str).collect();
-        kinds.extend(services().map(|s| s.kind.as_str()).filter(|k| !k.is_empty()));
+        kinds.extend(services().map(|s| s.kind()).filter(|k| !k.is_empty()));
         let known: HashSet<String> = kinds.iter().map(|k| k.to_ascii_lowercase()).collect();
         for kind in kinds {
             qs.ask(kind, rtype::PTR);
@@ -1000,12 +1192,12 @@ impl Device {
         let wanted = KNOWN_SUBTYPES.into_iter().filter(|sub| {
             sub.split_once("._sub.").is_some_and(|(_, kind)| known.contains(&kind.to_ascii_lowercase()))
         });
-        for sub in wanted.chain(services().flat_map(|s| &s.subtypes).map(String::as_str)) {
+        for sub in wanted.chain(services().flat_map(|s| s.subtypes())) {
             qs.ask(sub, rtype::PTR);
         }
-        for svc in services().filter(|s| s.target.is_none()) {
-            qs.ask(&svc.instance, rtype::SRV);
-            qs.ask(&svc.instance, rtype::TXT);
+        for svc in services().filter(|s| s.target().is_none()) {
+            qs.ask(&svc.instance(), rtype::SRV);
+            qs.ask(&svc.instance(), rtype::TXT);
         }
         for host in devices.iter().filter(|d| d.routable().next().is_none()).filter_map(|d| d.hostname.as_deref()) {
             qs.ask(host, rtype::A);
@@ -1046,10 +1238,10 @@ impl Device {
         for kind in kinds {
             qs.ask(kind, rtype::PTR);
         }
-        let of_kind = |s: &&Service| kinds.iter().any(|k| s.kind.eq_ignore_ascii_case(k));
-        for svc in devices.iter().flat_map(|d| &d.services).filter(of_kind).filter(|s| s.target.is_none()) {
-            qs.ask(&svc.instance, rtype::SRV);
-            qs.ask(&svc.instance, rtype::TXT);
+        let of_kind = |s: &&Service| kinds.iter().any(|k| s.kind().eq_ignore_ascii_case(k));
+        for svc in devices.iter().flat_map(|d| &d.services).filter(of_kind).filter(|s| s.target().is_none()) {
+            qs.ask(&svc.instance(), rtype::SRV);
+            qs.ask(&svc.instance(), rtype::TXT);
         }
         let unreachable = devices.iter().filter(|d| d.services.iter().any(|s| of_kind(&s)) && d.routable().next().is_none());
         for host in unreachable.filter_map(|d| d.hostname.as_deref()) {
@@ -1063,7 +1255,7 @@ impl Device {
     /// one of them, or `None` if it has none.
     pub fn only_kinds(&self, kinds: &[String]) -> Option<Device> {
         let services: Vec<Service> =
-            self.services.iter().filter(|s| kinds.iter().any(|k| s.kind.eq_ignore_ascii_case(k))).cloned().collect();
+            self.services.iter().filter(|s| kinds.iter().any(|k| s.kind().eq_ignore_ascii_case(k))).cloned().collect();
         (!services.is_empty()).then(|| Device { services: services.into(), ..self.clone() })
     }
 
@@ -1094,8 +1286,8 @@ impl Device {
                 }
             }
             for svc in &device.services {
-                qs.ask(&svc.instance, rtype::SRV);
-                qs.ask(&svc.instance, rtype::TXT);
+                qs.ask(&svc.instance(), rtype::SRV);
+                qs.ask(&svc.instance(), rtype::TXT);
             }
         }
         qs.into_queries(limit)
@@ -1458,7 +1650,7 @@ fn query(questions: &[Question]) -> Message {
 /// [`MIN_REFLECT_TTL`]) or, if that is not known, `other_ttl`. Zero stays zero:
 /// that is a goodbye.
 pub fn service_ttl(svc: &Service, other_ttl: u32) -> u32 {
-    match (other_ttl, svc.ttl) {
+    match (other_ttl, svc.ttl()) {
         (0, _) => 0,
         (_, 0) => other_ttl,
         (_, ttl) => ttl.max(MIN_REFLECT_TTL),
@@ -1509,6 +1701,93 @@ fn ends_with_ci(name: &str, suffix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parts() -> ServiceParts {
+        ServiceParts {
+            instance: "Living Room\\. TV._http._tcp.local".into(),
+            kind: "_http._tcp.local".into(),
+            port: 8080,
+            target: Some("tv.local".into()),
+            txt: vec![b"a=b".to_vec(), vec![0xff, 0x00, 0x80], b"flag".to_vec()],
+            subtypes: vec!["_a._sub._http._tcp.local".into(), "_b._sub._http._tcp.local".into()],
+            ttl: 4500,
+        }
+    }
+
+    /// A service is made of what it is given and gives it back, with nothing
+    /// between but the block: no room to spare, whatever its parts.
+    #[test]
+    fn a_service_gives_back_what_it_was_made_of_in_a_block_with_no_room_to_spare() {
+        let service = Service::from(parts());
+        assert_eq!(service.parts(), parts());
+        assert_eq!(
+            (service.instance(), service.kind(), service.port(), service.target(), service.ttl()),
+            ("Living Room\\. TV._http._tcp.local", "_http._tcp.local", 8080, Some("tv.local"), 4500)
+        );
+        assert_eq!(service.subtypes().collect::<Vec<_>>(), ["_a._sub._http._tcp.local", "_b._sub._http._tcp.local"]);
+        // A TXT value may be any bytes, a NUL among them.
+        assert_eq!(service.txt().collect::<Vec<_>>(), [&b"a=b"[..], &[0xff, 0x00, 0x80], b"flag"]);
+        // The port and TTL, three names and the subtypes with their ends, and the TXT data.
+        let names = ["Living Room\\. TV._http._tcp.local", "_http._tcp.local", "tv.local"].map(str::len);
+        let size = 6 + names.iter().sum::<usize>() + 3 + (25 + 25) + 1 + (3 + 1 + 3 + 1 + 4 + 1);
+        assert_eq!(service.block.len(), size);
+    }
+
+    /// What is not known is empty, and none of it is told apart from what is
+    /// not there: no host, no subtypes, no TXT.
+    #[test]
+    fn a_service_with_little_known_of_it_says_so() {
+        for service in [Service::default(), ServiceParts { instance: "x._a._tcp.local".into(), ..Default::default() }.into()] {
+            assert_eq!((service.port(), service.ttl(), service.target()), (0, 0, None));
+            assert!(service.subtypes().next().is_none() && service.txt().next().is_none());
+            assert!(!service.is_resolved());
+        }
+        assert_eq!(Service::default().parts(), ServiceParts::default());
+        // Only a host and a port say where it is.
+        let mut service = Service::default();
+        service.edit(|p| p.port = 80);
+        assert!(!service.is_resolved());
+        service.edit(|p| p.target = Some("tv.local".into()));
+        assert!(service.is_resolved());
+    }
+
+    /// A name that has a NUL, which none that was checked has, is cut at it
+    /// and does not run into the next; and a string of TXT data is at most 255
+    /// bytes and not empty.
+    #[test]
+    fn a_name_with_a_nul_does_not_run_into_the_next_and_txt_is_what_a_string_can_be() {
+        let service: Service = ServiceParts {
+            instance: "a\0b._x._tcp.local".into(),
+            kind: "_x._tcp.local".into(),
+            subtypes: vec!["_s\0_sub._x._tcp.local".into(), "\0".into(), "_t._sub._x._tcp.local".into()],
+            txt: vec![vec![b'x'; 300], Vec::new(), b"k=v".to_vec()],
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(service.instance(), "a");
+        assert_eq!(service.kind(), "_x._tcp.local");
+        assert_eq!(service.subtypes().collect::<Vec<_>>(), ["_s", "_t._sub._x._tcp.local"]);
+        let txt: Vec<usize> = service.txt().map(<[u8]>::len).collect();
+        assert_eq!(txt, [255, 3]);
+    }
+
+    /// An edit that changes nothing leaves the block as it is, and one that
+    /// does makes it again with nothing to spare.
+    #[test]
+    fn editing_a_service_makes_the_block_again_only_if_something_is_not_as_it_was() {
+        let mut service = Service::from(parts());
+        let at = service.block.as_ptr();
+        assert!(!service.edit(|p| p.port = 8080));
+        assert!(!service.edit(|p| p.txt = vec![b"a=b".to_vec(), vec![0xff, 0x00, 0x80], b"flag".to_vec()]));
+        assert_eq!(service.block.as_ptr(), at, "the same block");
+
+        assert!(service.edit(|p| p.subtypes.retain(|s| s.starts_with("_a."))));
+        assert_eq!(service.subtypes().collect::<Vec<_>>(), ["_a._sub._http._tcp.local"]);
+        assert!(service.edit(|p| p.txt.clear()));
+        assert!(service.txt().next().is_none());
+        assert_eq!(service.parts().port, 8080, "the rest is as it was");
+        assert_eq!(Service::from(service.parts()), service);
+    }
     use crate::codec::Question;
 
     /// Its first routable IPv4 or IPv6 address, and link-local one.
@@ -1589,12 +1868,15 @@ mod tests {
             hostname: Some("tv.local".into()),
             services: instances
                 .iter()
-                .map(|i| Service {
-                    instance: format!("{i}._http._tcp.local"),
-                    kind: "_http._tcp.local".into(),
-                    port: 8080,
-                    txt: txt_of(vec![b"a=b".to_vec()]),
-                    ..Service::default()
+                .map(|i| {
+                    ServiceParts {
+                        instance: format!("{i}._http._tcp.local"),
+                        kind: "_http._tcp.local".into(),
+                        port: 8080,
+                        txt: vec![b"a=b".to_vec()],
+                        ..ServiceParts::default()
+                    }
+                    .into()
                 })
                 .collect(),
             ..Device::default()
@@ -1609,8 +1891,8 @@ mod tests {
         television.ttl = Some(300);
         let nas = Device { hostname: Some("nas.local".into()), ..tv("10.0.1.20", &["NAS"]) };
         let mut printer = Device { hostname: Some("printer.local".into()), ..tv("10.0.1.30", &["Printer"]) };
-        printer.services[0].kind = "_ipp._tcp.local".into();
-        printer.services[0].instance = "Printer._ipp._tcp.local".into();
+        printer.services[0].edit(|p| p.kind = "_ipp._tcp.local".into());
+        printer.services[0].edit(|p| p.instance = "Printer._ipp._tcp.local".into());
         vec![television, nas, printer]
     }
 
@@ -1657,8 +1939,8 @@ mod tests {
             .map(|i| {
                 let mut d = tv(&format!("10.0.1.{}", i + 1), &[&format!("Device {i}")]);
                 d.hostname = Some(format!("dev{i}.local"));
-                d.services[0].target = d.hostname.clone();
-                d.services[0].txt = txt_of(vec![format!("k={}", "v".repeat(txt)).into_bytes()]);
+                d.services[0].edit(|p| p.target = d.hostname.clone());
+                d.services[0].edit(|p| p.txt = vec![format!("k={}", "v".repeat(txt)).into_bytes()]);
                 d
             })
             .collect()
@@ -1748,7 +2030,7 @@ mod tests {
         // One device: its answer fits, but not all its additional records
         // (its TXT record is too big), and leaving those out is no truncation.
         let mut one = many(1, 0);
-        one[0].services[0].txt = txt_of(vec![format!("a={}", "x".repeat(240)).into_bytes(), format!("b={}", "x".repeat(240)).into_bytes()]);
+        one[0].services[0].edit(|p| p.txt = vec![format!("a={}", "x".repeat(240)).into_bytes(), format!("b={}", "x".repeat(240)).into_bytes()]);
         let whole = only(Device::query_response(&one, &browse, false, 1452).unwrap().0);
         let reply = only(Device::query_response(&one, &browse, true, 1452).unwrap().0);
         assert_eq!(reply.answers.len(), 1);
@@ -1762,8 +2044,8 @@ mod tests {
     fn long_questions_are_put_fewer_to_a_packet() {
         let mut devices = many(16, 1);
         for (i, d) in devices.iter_mut().enumerate() {
-            d.services[0].instance = format!("{}{i}._http._tcp.local", "n".repeat(60));
-            d.services[0].target = None;
+            d.services[0].edit(|p| p.instance = format!("{}{i}._http._tcp.local", "n".repeat(60)));
+            d.services[0].edit(|p| p.target = None);
         }
         let queries = Device::refresh_queries(&devices, 512);
         assert!(queries.len() > 2, "{}", queries.len());
@@ -1804,11 +2086,11 @@ mod tests {
     fn a_probe_asks_for_types_instances_subtypes_and_whatever_is_missing() {
         // Resolved and with a routable address: only its type is browsed.
         let mut resolved = tv("10.0.1.9", &["TV"]);
-        resolved.services[0].target = Some("tv.local".into());
+        resolved.services[0].edit(|p| p.target = Some("tv.local".into()));
         // Of the same type, with a subtype heard of, but not yet resolved.
         let mut unresolved = tv("10.0.1.10", &["Den"]);
         unresolved.hostname = None;
-        unresolved.services[0].subtypes = vec!["_scanner._sub._http._tcp.local".into()].into();
+        unresolved.services[0].edit(|p| p.subtypes = vec!["_scanner._sub._http._tcp.local".into()]);
         // Known by name, but only by a link-local address.
         let named = Device { hostname: Some("nas.local".into()), addresses: vec![ip("169.254.1.1").into()].into(), ..Device::default() };
         let types = BTreeSet::from(["_ipp._tcp.local".to_string()]);
@@ -1847,8 +2129,8 @@ mod tests {
         // Of the type, unresolved, known only by a link-local address.
         let mut plug = tv("169.254.1.5", &["Plug"]);
         plug.hostname = Some("plug.local".into());
-        plug.services[0].kind = "_shelly._tcp.local".into();
-        plug.services[0].instance = "Plug._shelly._tcp.local".into();
+        plug.services[0].edit(|p| p.kind = "_shelly._tcp.local".into());
+        plug.services[0].edit(|p| p.instance = "Plug._shelly._tcp.local".into());
         // Of another type, as unfinished: none of its business.
         let mut other = tv("169.254.1.6", &["TV"]);
         other.hostname = Some("other.local".into());
@@ -1873,7 +2155,7 @@ mod tests {
         assert_eq!(queries[0].answers, [ptr]);
 
         // Resolved and reachable, only the type is asked for.
-        plug.services[0].target = Some("plug.local".into());
+        plug.services[0].edit(|p| p.target = Some("plug.local".into()));
         plug.add_addrs(&[ip("10.0.1.5")]);
         assert_eq!(asked(&Device::type_queries(&[plug], &kinds, |_| Vec::new(), DEFAULT_MAX_PACKET)), [q("_Shelly._tcp.local", rtype::PTR)]);
     }
@@ -1883,10 +2165,10 @@ mod tests {
     #[test]
     fn a_device_narrowed_to_types_keeps_only_those_services() {
         let mut device = tv("10.0.1.9", &["TV", "Cast"]);
-        device.services[1].kind = "_googlecast._tcp.local".into();
+        device.services[1].edit(|p| p.kind = "_googlecast._tcp.local".into());
         let narrow = device.only_kinds(&["_GoogleCast._tcp.local".to_string()]).unwrap();
         assert_eq!(narrow.services.len(), 1);
-        assert_eq!(narrow.services[0].kind, "_googlecast._tcp.local");
+        assert_eq!(narrow.services[0].kind(), "_googlecast._tcp.local");
         assert_eq!((narrow.hostname, narrow.addresses), (device.hostname.clone(), device.addresses.clone()));
         assert!(device.only_kinds(&["_ipp._tcp.local".to_string()]).is_none());
     }
@@ -2092,9 +2374,9 @@ mod tests {
         let mut device = tv("10.0.1.9", &["TV", "Other"]);
         device.add_addrs(&[ip("fd00::9")]);
         device.reverse = vec![ip("10.0.1.9"), ip("fd00::9")].into();
-        device.services[0].subtypes = vec!["_printer._sub._http._tcp.local".into()].into();
+        device.services[0].edit(|p| p.subtypes = vec!["_printer._sub._http._tcp.local".into()]);
         device.nsec = Some(vec![rtype::A].into());
-        device.services[1].kind = "_Other._tcp.local".into();
+        device.services[1].edit(|p| p.kind = "_Other._tcp.local".into());
         for device in [device.clone(), Device { services: Box::default(), ..device.clone() }, Device { hostname: None, ..device }] {
             let (mut own, mut announced) = (BTreeSet::new(), BTreeSet::new());
             device.for_each_name(|name| lower(&mut own, name));
@@ -2275,7 +2557,7 @@ mod tests {
         let subtypes: Vec<Record> =
             (0..MAX_SUBTYPES + 5).map(|i| ptr(&format!("_s{i}._sub._http._tcp.local"), "S0._http._tcp.local")).collect();
         device.learn_records(subtypes.iter(), DEFAULT_MAX_SERVICES);
-        assert_eq!(device.service("S0._http._tcp.local").unwrap().subtypes.len(), MAX_SUBTYPES);
+        assert_eq!(device.service("S0._http._tcp.local").unwrap().subtypes().count(), MAX_SUBTYPES);
 
         let mappings: Vec<Record> = (0..MAX_REVERSE + 5).map(|i| reverse(&format!("10.0.2.{i}"), "tv.local")).collect();
         device.learn_records(mappings.iter(), DEFAULT_MAX_SERVICES);
@@ -2365,7 +2647,7 @@ mod tests {
         ]);
         assert_eq!(device.services.len(), 1, "{:?}", device.services);
         let svc = &device.services[0];
-        assert_eq!((svc.instance.as_str(), svc.kind.as_str(), svc.port), ("TV._http._tcp.local", "_HTTP._TCP.LOCAL", 80));
+        assert_eq!((svc.instance(), svc.kind(), svc.port()), ("TV._http._tcp.local", "_HTTP._TCP.LOCAL", 80));
 
         // A goodbye in yet another spelling still says goodbye to it.
         let bye = Record { ttl: 0, ..srv("Tv._Http._Tcp.Local", 80, "tv.local") };
@@ -2382,7 +2664,7 @@ mod tests {
         ]);
         assert_eq!(device.ttl, Some(120));
         // The SRV record's TTL counts, not the PTR's.
-        assert_eq!(device.services[0].ttl, 4500);
+        assert_eq!(device.services[0].ttl(), 4500);
     }
 
     /// A printer says it is an AirPrint one with a subtype PTR next to its
@@ -2401,23 +2683,23 @@ mod tests {
 
         let mut device = heard(printer(4500));
         assert_eq!(device.services.len(), 1);
-        assert_eq!(&*device.services[0].subtypes, ["_universal._sub._ipp._tcp.local"]);
-        assert_eq!(device.services[0].kind, "_ipp._tcp.local", "the type is not the subtype's");
+        assert_eq!(device.services[0].subtypes().collect::<Vec<_>>(), ["_universal._sub._ipp._tcp.local"]);
+        assert_eq!(device.services[0].kind(), "_ipp._tcp.local", "the type is not the subtype's");
 
         // Heard again, in another case and on its own: still one.
         hear(&mut device, vec![ptr("_UNIVERSAL._sub._ipp._tcp.local", "Office._ipp._tcp.local")]);
-        assert_eq!(device.services[0].subtypes.len(), 1);
+        assert_eq!(device.services[0].subtypes().count(), 1);
 
         hear(&mut device, printer(0));
-        assert!(device.services[0].subtypes.is_empty());
-        assert_eq!(device.services[0].port, 631);
+        assert!(device.services[0].subtypes().next().is_none());
+        assert_eq!(device.services[0].port(), 631);
     }
 
     #[test]
     fn subtypes_are_announced_answered_and_withdrawn() {
         let name = "_printer._sub._http._tcp.local";
         let mut printer = tv("10.0.1.9", &["Office"]);
-        printer.services[0].subtypes = vec![name.into()].into();
+        printer.services[0].edit(|p| p.subtypes = vec![name.into()]);
         let subtype = |records: &[Record]| records.iter().find(|r| r.name == name).cloned();
 
         let r = subtype(&printer.announcement(120, 4500)).expect("announced");
@@ -2432,7 +2714,7 @@ mod tests {
 
         // No longer of the subtype: that alone is withdrawn.
         let mut plain = printer.clone();
-        edit(&mut plain.services[0].subtypes).clear();
+        plain.services[0].edit(|p| p.subtypes.clear());
         let records = printer.replacement(&plain, 120, 4500);
         assert_eq!(subtype(&records).map(|r| r.ttl), Some(0));
         assert_eq!(records.iter().filter(|r| r.ttl == 0).count(), 1);
