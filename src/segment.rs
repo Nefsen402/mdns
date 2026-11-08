@@ -1900,7 +1900,7 @@ mod tests {
 
     use super::*;
     use crate::config::{DEFAULT_MAX_DEVICES, DEFAULT_MIN_LIFETIME};
-    use crate::device::{addr_of, Origin, META_QUERY};
+    use crate::device::{addr_of, edit, txt_of, Origin, META_QUERY};
     use crate::tracker::MAX_PER_SENDER;
     use std::collections::BTreeSet;
     use crate::codec::RData;
@@ -2054,14 +2054,14 @@ mod tests {
                     kind: "_http._tcp.local".into(),
                     port: 8080,
                     target: None,
-                    txt: vec![b"a=b".to_vec()],
+                    txt: txt_of(vec![b"a=b".to_vec()]),
                     ttl: 0,
                     ..Service::default()
                 })
                 .collect(),
             ttl: None,
             nsec: None,
-            reverse: Vec::new(),
+            reverse: Box::default(),
             ..Device::default()
         };
         device.add_addrs(&[ip(addr)]);
@@ -2207,7 +2207,7 @@ mod tests {
     #[test]
     fn a_device_probing_for_a_name_is_not_answered_with_a_copy() {
         let (seg, rx) = wired();
-        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.1.1").into()], ..Device::default() };
+        let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.1.1").into()].into(), ..Device::default() };
         seg.add_manual(Owner::Own, router).unwrap();
         seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
         while recv(&rx).is_some() {}
@@ -2250,7 +2250,7 @@ mod tests {
         let (seg, rx) = wired();
         let events = seg.subscribe();
         let mut copy = tv("10.0.2.9", &["TV"]);
-        copy.nsec = Some(vec![rtype::A]);
+        copy.nsec = Some(vec![rtype::A].into());
         seg.add_manual(Owner::Reflector(0), copy).unwrap();
         recv(&rx).unwrap();
         hear(&seg, "10.0.1.20", vec![
@@ -2539,7 +2539,7 @@ mod tests {
         let names: Vec<&str> = instances.iter().map(String::as_str).collect();
         let mut device = tv("10.0.2.9", &names);
         for svc in &mut device.services {
-            svc.txt = vec![format!("k={}", "v".repeat(60)).into_bytes()];
+            svc.txt = txt_of(vec![format!("k={}", "v".repeat(60)).into_bytes()]);
         }
         let expected = device.announcement(HOST_TTL, OTHER_TTL).len();
         seg.add_manual_ttl(Owner::Reflector(0), device, Duration::from_secs(HOST_TTL.into())).unwrap();
@@ -3504,7 +3504,7 @@ mod tests {
         let (seg, rx) = wired();
         let router = Device {
             hostname: Some("router.local".into()),
-            addresses: vec![ip("10.0.1.1").into()],
+            addresses: vec![ip("10.0.1.1").into()].into(),
             ..Device::default()
         };
         seg.add_manual(Owner::Own, router).unwrap();
@@ -3705,7 +3705,7 @@ mod tests {
         let (seg, rx) = wired_family(Family::V6);
         let router = Device {
             hostname: Some("router.local".into()),
-            addresses: vec![ip("fe80::1").into()],
+            addresses: vec![ip("fe80::1").into()].into(),
             ..Device::default()
         };
         seg.add_manual(Owner::Own, router).unwrap();
@@ -3733,7 +3733,7 @@ mod tests {
     fn a_device_with_no_addresses_is_announced_by_its_services() {
         let (seg, rx) = wired();
         let mut none = tv("10.0.1.9", &["TV"]);
-        none.addresses.clear();
+        edit(&mut none.addresses).clear();
         seg.add_manual(Owner::Own, none).unwrap();
         assert_eq!(seg.manual_devices().len(), 1);
         let m = recv(&rx).unwrap();
@@ -3787,13 +3787,13 @@ mod tests {
         let tv = find(&devices, "LGwebOSTV.local");
         let names: Vec<&str> = tv.services.iter().map(|s| s.instance.as_str()).collect();
         assert_eq!(names, ["OZAL TV._airplay._tcp.local"]);
-        assert_eq!(tv.services[0].txt, [b"model=TV"]);
+        assert_eq!(tv.services[0].txt, txt_of(vec![b"model=TV".to_vec()]));
         assert_eq!(v4(tv), None, "no address was announced, and the sender is not credited with one");
 
         let speaker = find(&devices, "OZAL-Speakers.local");
         let names: Vec<&str> = speaker.services.iter().map(|s| s.instance.as_str()).collect();
         assert_eq!(names, ["OZAL Speakers._airplay._tcp.local"]);
-        assert_eq!(speaker.services[0].txt, [b"model=RX"]);
+        assert_eq!(speaker.services[0].txt, txt_of(vec![b"model=RX".to_vec()]));
         assert_eq!(v4(speaker), Some(ip("10.0.2.73")));
 
         assert_eq!(rx.try_iter().filter(|e| matches!(e, Event::Added(d) if d.hostname.is_some())).count(), 2);
@@ -4961,7 +4961,7 @@ mod tests {
     fn a_copy_giving_way_leaves_the_nsec_of_the_device_here_alone() {
         let (seg, rx) = wired();
         let mut copy = tv("10.0.2.9", &[]);
-        copy.nsec = Some(vec![rtype::A]);
+        copy.nsec = Some(vec![rtype::A].into());
         seg.add_manual(Owner::Reflector(0), copy).unwrap();
         recv(&rx).unwrap();
 
@@ -4986,7 +4986,7 @@ mod tests {
         assert_eq!(s.instance, "Printer._http._tcp.local");
         assert_eq!(s.kind, "_http._tcp.local");
         assert_eq!((s.port, s.target.as_deref()), (631, Some("printer.local")));
-        assert_eq!(s.txt, [b"ty=hp"]);
+        assert_eq!(s.txt, txt_of(vec![b"ty=hp".to_vec()]));
 
         assert!(matches!(rx.try_recv(), Ok(Event::Added(_))));
         assert!(rx.try_recv().is_err());

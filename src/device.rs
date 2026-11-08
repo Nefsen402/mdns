@@ -6,6 +6,7 @@
 //! [`Device`] then takes in with [`Device::learn`]; a device is turned back
 //! into records with [`Device::announcement`] and [`Device::answers`].
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use hashbrown::{HashMap, HashSet};
@@ -85,10 +86,10 @@ pub struct Service {
     pub target: Option<String>,
     /// TXT strings, usually `key=value`, as they came: a value is any bytes,
     /// only often text.
-    pub txt: Vec<Vec<u8>>,
+    pub txt: Box<[Box<[u8]>]>,
     /// The subtypes it said it is of, by the name of their PTR record, such as
     /// `_universal._sub._ipp._tcp.local` (an AirPrint printer).
-    pub subtypes: Vec<String>,
+    pub subtypes: Box<[String]>,
     /// The TTL its records were last announced with, in seconds: that of the
     /// SRV record, or else of the PTR or TXT; 0 if not known.
     pub ttl: u32,
@@ -117,19 +118,61 @@ pub struct Device {
     /// link-local ones, which only mean something on the link it was heard
     /// on; IPv4 before IPv6. At most [`DEFAULT_MAX_ADDRS`] of a family, unless
     /// the segment keeps more. [`Device::addrs`] has them as plain IPs.
-    pub addresses: Vec<Address>,
+    pub addresses: Box<[Address]>,
     /// Those it learned of are in order of their instance names, ignoring
     /// case: names that differ only in case are one and the same.
-    pub services: Vec<Service>,
+    pub services: Box<[Service]>,
     /// The TTL its address records were last announced with, in seconds;
     /// `None` if it has not announced any (it was only heard from).
     pub ttl: Option<u32>,
     /// The record types it said its hostname has, by an NSEC record (such as
     /// A but no AAAA); `None` if it has not said.
-    pub nsec: Option<Vec<u16>>,
+    pub nsec: Option<Box<[u16]>>,
     /// The addresses it announced a reverse-mapping PTR for, naming its
     /// hostname (`9.1.0.10.in-addr.arpa PTR tv.local`).
-    pub reverse: Vec<IpAddr>,
+    pub reverse: Box<[IpAddr]>,
+}
+
+/// A list a device holds, to be made longer or shorter: it is a `Vec` while it
+/// is, and a boxed slice again when this is dropped, so that what it holds is
+/// all it has room for. A device keeps its lists as boxed slices, which have no
+/// room to spare, and this is the way to change how many they hold.
+pub struct Listed<'a, T> {
+    list: &'a mut Box<[T]>,
+    items: Vec<T>,
+}
+
+/// Change how many `list` holds: use the result as the `Vec` it is for the
+/// time it takes, as in `edit(&mut device.addresses).push(address)`.
+pub fn edit<T>(list: &mut Box<[T]>) -> Listed<'_, T> {
+    let items = core::mem::take(list).into_vec();
+    Listed { list, items }
+}
+
+impl<T> core::ops::Deref for Listed<'_, T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Vec<T> {
+        &self.items
+    }
+}
+
+impl<T> core::ops::DerefMut for Listed<'_, T> {
+    fn deref_mut(&mut self) -> &mut Vec<T> {
+        &mut self.items
+    }
+}
+
+impl<T> Drop for Listed<'_, T> {
+    fn drop(&mut self) {
+        *self.list = core::mem::take(&mut self.items).into_boxed_slice();
+    }
+}
+
+/// TXT strings, as a service holds them, for tests.
+#[cfg(test)]
+pub fn txt_of(strings: Vec<Vec<u8>>) -> Box<[Box<[u8]>]> {
+    strings.into_iter().map(Vec::into_boxed_slice).collect()
 }
 
 /// An address of a device, with what is known of it besides.
@@ -482,7 +525,7 @@ impl Device {
     /// its own link.
     pub fn without_link_local(&self) -> Device {
         let mut device = self.clone();
-        device.addresses.retain(|a| !is_link_local(&a.ip));
+        edit(&mut device.addresses).retain(|a| !is_link_local(&a.ip));
         device
     }
 
@@ -490,7 +533,7 @@ impl Device {
     /// table: only those it announced.
     pub fn without_neighbours(&self) -> Device {
         let mut device = self.clone();
-        device.addresses.retain(|a| a.origin == Origin::Announced);
+        edit(&mut device.addresses).retain(|a| a.origin == Origin::Announced);
         device
     }
 
@@ -502,7 +545,7 @@ impl Device {
             |v4: bool| self.addresses.iter().any(|a| a.origin == Origin::Announced && a.ip.is_ipv4() == v4 && is_link_local(&a.ip));
         let (v4, v6) = (announced_link_local(true), announced_link_local(false));
         let mut device = self.clone();
-        device.addresses.retain(|a| a.origin == Origin::Announced || if a.ip.is_ipv4() { v4 } else { v6 });
+        edit(&mut device.addresses).retain(|a| a.origin == Origin::Announced || if a.ip.is_ipv4() { v4 } else { v6 });
         device
     }
 
@@ -530,8 +573,8 @@ impl Device {
     /// phones are skipped).
     pub fn reflected(&self, neighbours: Neighbours, when: &ReflectedWhen) -> Option<Device> {
         let mut device = self.with_neighbours_as(neighbours);
-        device.addresses.retain(|a| !is_link_local(&a.ip));
-        device.services.retain(|s| s.is_resolved() && when.kinds.allows(&s.kind));
+        edit(&mut device.addresses).retain(|a| !is_link_local(&a.ip));
+        edit(&mut device.services).retain(|s| s.is_resolved() && when.kinds.allows(&s.kind));
         let fit = (!when.hostname || device.hostname.is_some())
             && (!when.address || device.routable().next().is_some())
             && (!when.service || !device.services.is_empty());
@@ -550,7 +593,7 @@ impl Device {
                         mine.origin = Origin::Announced;
                     }
                 }
-                None => device.addresses.push(*address),
+                None => edit(&mut device.addresses).push(*address),
             }
         }
         device.addresses.sort_by_key(|a| addr_order(&a.ip));
@@ -566,12 +609,12 @@ impl Device {
                 let mut types: Vec<u16> = mine.into_iter().chain(theirs.clone()).flatten().collect();
                 types.sort_unstable();
                 types.dedup();
-                Some(types)
+                Some(types.into_boxed_slice())
             }
         };
-        device.reverse.extend(other.reverse.iter().copied());
+        edit(&mut device.reverse).extend(other.reverse.iter().copied());
         device.reverse.sort_unstable();
-        device.reverse.dedup();
+        edit(&mut device.reverse).dedup();
         device
     }
 
@@ -588,7 +631,7 @@ impl Device {
 
     /// Forget its service called `instance`, ignoring case.
     pub fn forget_service(&mut self, instance: &str) {
-        self.services.retain(|s| !s.instance.eq_ignore_ascii_case(instance));
+        edit(&mut self.services).retain(|s| !s.instance.eq_ignore_ascii_case(instance));
     }
 
     /// Take in what `report` says about it, with the addresses that vouch for
@@ -610,7 +653,7 @@ impl Device {
     /// once it announces a routable address of a family, none of that family
     /// learned so is kept.
     pub fn take_addrs(&mut self, addrs: &[IpAddr], flushed: &[Family], gone: &[IpAddr], max_addrs: usize) {
-        self.addresses.retain(|a| {
+        edit(&mut self.addresses).retain(|a| {
             let flushed = a.origin == Origin::Announced && flushed.contains(&family_of(a.ip));
             !flushed && !gone.contains(&a.ip)
         });
@@ -625,7 +668,7 @@ impl Device {
             // it gives way to that, below.
             let announced = |a: &&Address| a.origin == Origin::Announced && a.ip.is_ipv4() == addr.is_ipv4();
             if self.addresses.iter().filter(announced).count() < max_addrs {
-                self.addresses.push(addr.into());
+                edit(&mut self.addresses).push(addr.into());
             }
         }
         self.drop_neighbours_of_announced_families();
@@ -633,7 +676,7 @@ impl Device {
         // family, which must still fit with it.
         for v4 in [true, false] {
             let mut room = max_addrs;
-            self.addresses.retain(|a| {
+            edit(&mut self.addresses).retain(|a| {
                 if a.ip.is_ipv4() != v4 {
                     return true;
                 }
@@ -653,13 +696,13 @@ impl Device {
     /// whether its addresses changed.
     pub fn take_neighbours(&mut self, learned: &[IpAddr], max_addrs: usize) -> bool {
         let before = self.addresses.clone();
-        self.addresses.retain(|a| a.origin != Origin::Neighbour || learned.contains(&a.ip));
+        edit(&mut self.addresses).retain(|a| a.origin != Origin::Neighbour || learned.contains(&a.ip));
         let mut learned: Vec<IpAddr> = learned.iter().copied().filter(|a| !is_link_local(a)).collect();
         sort_addrs(&mut learned);
         for ip in learned {
             let of_family = self.addresses.iter().filter(|a| a.ip.is_ipv4() == ip.is_ipv4()).count();
             if !self.has_addr(&ip) && of_family < max_addrs {
-                self.addresses.push(Address { ip, origin: Origin::Neighbour });
+                edit(&mut self.addresses).push(Address { ip, origin: Origin::Neighbour });
             }
         }
         self.drop_neighbours_of_announced_families();
@@ -674,7 +717,7 @@ impl Device {
             self.addresses.iter().any(|a| a.origin == Origin::Announced && a.ip.is_ipv4() == v4 && !is_link_local(&a.ip))
         };
         let (v4, v6) = (announced(true), announced(false));
-        self.addresses.retain(|a| a.origin != Origin::Neighbour || !(if a.ip.is_ipv4() { v4 } else { v6 }));
+        edit(&mut self.addresses).retain(|a| a.origin != Origin::Neighbour || !(if a.ip.is_ipv4() { v4 } else { v6 }));
     }
 
     /// Its link-local addresses, whose link-layer address finds the others in
@@ -698,9 +741,9 @@ impl Device {
                 RData::Ptr(host) if codec::reverse_addr(&rec.name).is_some() => {
                     let addr = codec::reverse_addr(&rec.name).expect("checked above");
                     if self.hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(host)) {
-                        self.reverse.retain(|a| *a != addr);
+                        edit(&mut self.reverse).retain(|a| *a != addr);
                         if rec.ttl != 0 && self.reverse.len() < MAX_REVERSE {
-                            self.reverse.push(addr);
+                            edit(&mut self.reverse).push(addr);
                         }
                     }
                 }
@@ -715,13 +758,13 @@ impl Device {
                         let same = |sub: &String| sub.eq_ignore_ascii_case(&rec.name);
                         if rec.ttl == 0 {
                             if let Some(svc) = self.services.iter_mut().find(|s| s.instance.eq_ignore_ascii_case(instance)) {
-                                svc.subtypes.retain(|sub| !same(sub));
+                                edit(&mut svc.subtypes).retain(|sub| !same(sub));
                             }
                         } else if let Some(svc) = self.service_mut(instance, max_services)
                             && !svc.subtypes.iter().any(same)
                             && svc.subtypes.len() < MAX_SUBTYPES
                         {
-                            svc.subtypes.push(rec.name.clone());
+                            edit(&mut svc.subtypes).push(rec.name.clone());
                         }
                         continue;
                     }
@@ -746,14 +789,14 @@ impl Device {
                 }
                 RData::Nsec { types, .. } => {
                     if self.hostname.as_deref().is_some_and(|host| host.eq_ignore_ascii_case(&rec.name)) {
-                        self.nsec = (rec.ttl != 0).then(|| types.clone());
+                        self.nsec = (rec.ttl != 0).then(|| Box::from(&types[..]));
                     }
                 }
                 RData::Txt(strings) => {
                     if rec.ttl != 0
                         && let Some(svc) = self.service_mut(&rec.name, max_services)
                     {
-                        svc.txt = strings.iter().filter(|s| !s.is_empty()).cloned().collect();
+                        svc.txt = strings.iter().filter(|s| !s.is_empty()).map(|s| Box::from(&s[..])).collect();
                         if svc.ttl == 0 {
                             svc.ttl = rec.ttl;
                         }
@@ -795,7 +838,7 @@ impl Device {
     fn insert_service(&mut self, svc: Service) -> usize {
         let key = svc.instance.to_ascii_lowercase();
         let at = self.services.partition_point(|s| s.instance.to_ascii_lowercase() < key);
-        self.services.insert(at, svc);
+        edit(&mut self.services).insert(at, svc);
         at
     }
 
@@ -803,7 +846,7 @@ impl Device {
     /// are taken.
     pub fn without(&self, taken: &dyn Fn(&str) -> bool) -> Device {
         let mut device = self.clone();
-        device.services.retain(|s| !taken(&s.instance));
+        edit(&mut device.services).retain(|s| !taken(&s.instance));
         device
     }
 
@@ -929,7 +972,7 @@ impl Device {
                 svc.instance.clone(),
                 true,
                 ttl,
-                RData::Txt(svc.txt.clone()),
+                RData::Txt(svc.txt.iter().map(|t| t.to_vec()).collect()),
             ),
         ];
         records.extend(subtypes);
@@ -1021,7 +1064,7 @@ impl Device {
     pub fn only_kinds(&self, kinds: &[String]) -> Option<Device> {
         let services: Vec<Service> =
             self.services.iter().filter(|s| kinds.iter().any(|k| s.kind.eq_ignore_ascii_case(k))).cloned().collect();
-        (!services.is_empty()).then(|| Device { services, ..self.clone() })
+        (!services.is_empty()).then(|| Device { services: services.into(), ..self.clone() })
     }
 
     /// Its records that answer `q`, with these TTLs, without the additional
@@ -1550,7 +1593,7 @@ mod tests {
                     instance: format!("{i}._http._tcp.local"),
                     kind: "_http._tcp.local".into(),
                     port: 8080,
-                    txt: vec![b"a=b".to_vec()],
+                    txt: txt_of(vec![b"a=b".to_vec()]),
                     ..Service::default()
                 })
                 .collect(),
@@ -1615,7 +1658,7 @@ mod tests {
                 let mut d = tv(&format!("10.0.1.{}", i + 1), &[&format!("Device {i}")]);
                 d.hostname = Some(format!("dev{i}.local"));
                 d.services[0].target = d.hostname.clone();
-                d.services[0].txt = vec![format!("k={}", "v".repeat(txt)).into_bytes()];
+                d.services[0].txt = txt_of(vec![format!("k={}", "v".repeat(txt)).into_bytes()]);
                 d
             })
             .collect()
@@ -1705,7 +1748,7 @@ mod tests {
         // One device: its answer fits, but not all its additional records
         // (its TXT record is too big), and leaving those out is no truncation.
         let mut one = many(1, 0);
-        one[0].services[0].txt = vec![format!("a={}", "x".repeat(240)).into_bytes(), format!("b={}", "x".repeat(240)).into_bytes()];
+        one[0].services[0].txt = txt_of(vec![format!("a={}", "x".repeat(240)).into_bytes(), format!("b={}", "x".repeat(240)).into_bytes()]);
         let whole = only(Device::query_response(&one, &browse, false, 1452).unwrap().0);
         let reply = only(Device::query_response(&one, &browse, true, 1452).unwrap().0);
         assert_eq!(reply.answers.len(), 1);
@@ -1765,9 +1808,9 @@ mod tests {
         // Of the same type, with a subtype heard of, but not yet resolved.
         let mut unresolved = tv("10.0.1.10", &["Den"]);
         unresolved.hostname = None;
-        unresolved.services[0].subtypes = vec!["_scanner._sub._http._tcp.local".into()];
+        unresolved.services[0].subtypes = vec!["_scanner._sub._http._tcp.local".into()].into();
         // Known by name, but only by a link-local address.
-        let named = Device { hostname: Some("nas.local".into()), addresses: vec![ip("169.254.1.1").into()], ..Device::default() };
+        let named = Device { hostname: Some("nas.local".into()), addresses: vec![ip("169.254.1.1").into()].into(), ..Device::default() };
         let types = BTreeSet::from(["_ipp._tcp.local".to_string()]);
 
         let questions = asked(&Device::probe_queries(&[resolved, unresolved, named], &types, DEFAULT_MAX_PACKET));
@@ -1867,7 +1910,7 @@ mod tests {
         let none = |_: &str| false;
         let mut old = tv("10.0.1.9", &["Kitchen", "Den"]);
         old.ttl = Some(300);
-        old.nsec = Some(vec![rtype::A]);
+        old.nsec = Some(vec![rtype::A].into());
         let goodbyes = |records: &[Record]| records.iter().filter(|r| r.ttl == 0).cloned().collect::<Vec<_>>();
 
         assert!(Device::transition(Some(&old), Some(&old), &none, false).is_empty(), "nothing changed");
@@ -1879,7 +1922,7 @@ mod tests {
 
         // Moved: the new address, and a goodbye for the old one that does not
         // flush the new.
-        let moved = Device { addresses: vec![ip("10.0.1.10").into()], ..old.clone() };
+        let moved = Device { addresses: vec![ip("10.0.1.10").into()].into(), ..old.clone() };
         let bye = goodbyes(&Device::transition(Some(&old), Some(&moved), &none, false));
         assert_eq!(bye.len(), 1);
         assert_eq!((&bye[0].data, bye[0].cache_flush), (&RData::A("10.0.1.9".parse().unwrap()), false));
@@ -1922,7 +1965,7 @@ mod tests {
     #[test]
     fn a_copys_nsec_names_its_ipv6_addresses_too() {
         let mut d = tv("fd00::9", &[]);
-        d.nsec = Some(vec![]);
+        d.nsec = Some(vec![].into());
         let types = |d: &Device| match d.nsec_record(120).map(|r| r.data) {
             Some(RData::Nsec { types, .. }) => types,
             other => panic!("{other:?}"),
@@ -2034,7 +2077,7 @@ mod tests {
         assert!(knows(&device, "TV._http._tcp.local", rtype::SRV));
         assert!(!knows(&device, "tv.local", rtype::AAAA), "it has not said");
         assert!(!knows(&device, "printer.local", rtype::A));
-        device.nsec = Some(vec![rtype::A]);
+        device.nsec = Some(vec![rtype::A].into());
         assert!(knows(&device, "tv.local", rtype::AAAA), "it said it has none");
     }
 
@@ -2048,11 +2091,11 @@ mod tests {
         };
         let mut device = tv("10.0.1.9", &["TV", "Other"]);
         device.add_addrs(&[ip("fd00::9")]);
-        device.reverse = vec![ip("10.0.1.9"), ip("fd00::9")];
-        device.services[0].subtypes = vec!["_printer._sub._http._tcp.local".into()];
-        device.nsec = Some(vec![rtype::A]);
+        device.reverse = vec![ip("10.0.1.9"), ip("fd00::9")].into();
+        device.services[0].subtypes = vec!["_printer._sub._http._tcp.local".into()].into();
+        device.nsec = Some(vec![rtype::A].into());
         device.services[1].kind = "_Other._tcp.local".into();
-        for device in [device.clone(), Device { services: vec![], ..device.clone() }, Device { hostname: None, ..device }] {
+        for device in [device.clone(), Device { services: Box::default(), ..device.clone() }, Device { hostname: None, ..device }] {
             let (mut own, mut announced) = (BTreeSet::new(), BTreeSet::new());
             device.for_each_name(|name| lower(&mut own, name));
             if device.hostname.is_some() {
@@ -2090,7 +2133,7 @@ mod tests {
     fn records_for_a_question_are_only_the_records_it_has() {
         let ask = |name: &str, qtype: u16| Question { name: name.into(), qtype, class: 1, unicast_response: false };
         let mut device = tv("10.0.1.9", &["TV"]);
-        device.nsec = Some(vec![rtype::A]);
+        device.nsec = Some(vec![rtype::A].into());
         let records = device.records_for(&ask("_http._tcp.local", rtype::PTR), 120, 4500);
         let kinds: Vec<u16> = records.iter().map(Record::rtype).collect();
         assert_eq!(kinds, [rtype::PTR]);
@@ -2224,7 +2267,7 @@ mod tests {
 
     #[test]
     fn a_device_holds_only_so_much() {
-        let mut device = Device { hostname: Some("tv.local".into()), addresses: vec![ip("10.0.1.7").into()], ..Device::default() };
+        let mut device = Device { hostname: Some("tv.local".into()), addresses: vec![ip("10.0.1.7").into()].into(), ..Device::default() };
         let services: Vec<Record> = (0..DEFAULT_MAX_SERVICES + 10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
         device.learn_records(services.iter(), DEFAULT_MAX_SERVICES);
         assert_eq!(device.services.len(), DEFAULT_MAX_SERVICES);
@@ -2358,7 +2401,7 @@ mod tests {
 
         let mut device = heard(printer(4500));
         assert_eq!(device.services.len(), 1);
-        assert_eq!(device.services[0].subtypes, ["_universal._sub._ipp._tcp.local"]);
+        assert_eq!(&*device.services[0].subtypes, ["_universal._sub._ipp._tcp.local"]);
         assert_eq!(device.services[0].kind, "_ipp._tcp.local", "the type is not the subtype's");
 
         // Heard again, in another case and on its own: still one.
@@ -2374,7 +2417,7 @@ mod tests {
     fn subtypes_are_announced_answered_and_withdrawn() {
         let name = "_printer._sub._http._tcp.local";
         let mut printer = tv("10.0.1.9", &["Office"]);
-        printer.services[0].subtypes = vec![name.into()];
+        printer.services[0].subtypes = vec![name.into()].into();
         let subtype = |records: &[Record]| records.iter().find(|r| r.name == name).cloned();
 
         let r = subtype(&printer.announcement(120, 4500)).expect("announced");
@@ -2389,7 +2432,7 @@ mod tests {
 
         // No longer of the subtype: that alone is withdrawn.
         let mut plain = printer.clone();
-        plain.services[0].subtypes.clear();
+        edit(&mut plain.services[0].subtypes).clear();
         let records = printer.replacement(&plain, 120, 4500);
         assert_eq!(subtype(&records).map(|r| r.ttl), Some(0));
         assert_eq!(records.iter().filter(|r| r.ttl == 0).count(), 1);
@@ -2408,11 +2451,11 @@ mod tests {
         ];
         assert_eq!(Report::all(&response(records.clone())).0.len(), 1);
         let mut device = heard(records);
-        assert_eq!(device.nsec, Some(vec![rtype::A]));
+        assert_eq!(device.nsec, Some(vec![rtype::A].into()));
 
         // On its own, it is still about the host it names.
         hear(&mut device, vec![nsec("TV.local", &[rtype::A, rtype::AAAA])]);
-        assert_eq!(device.nsec, Some(vec![rtype::A, rtype::AAAA]));
+        assert_eq!(device.nsec, Some(vec![rtype::A, rtype::AAAA].into()));
         hear(&mut device, vec![Record { ttl: 0, ..nsec("tv.local", &[rtype::A]) }]);
         assert_eq!(device.nsec, None);
     }
@@ -2420,7 +2463,7 @@ mod tests {
     #[test]
     fn a_reflected_device_denies_only_what_it_denied_itself() {
         let mut v4_only = tv("10.0.1.9", &["TV"]);
-        v4_only.nsec = Some(vec![rtype::A]);
+        v4_only.nsec = Some(vec![rtype::A].into());
         let nsec_of = |records: &[Record]| records.iter().find(|r| matches!(r.data, RData::Nsec { .. })).cloned();
         let r = nsec_of(&v4_only.announcement(120, 4500)).expect("announced");
         assert_eq!((r.name.as_str(), r.cache_flush, r.ttl), ("tv.local", true, 120));
@@ -2442,7 +2485,7 @@ mod tests {
 
         // What it announces is never denied, and NSEC itself is not listed.
         let mut said_less = v4_only.clone();
-        said_less.nsec = Some(vec![rtype::AAAA, rtype::NSEC, 300]);
+        said_less.nsec = Some(vec![rtype::AAAA, rtype::NSEC, 300].into());
         match said_less.nsec_record(120).map(|r| r.data) {
             Some(RData::Nsec { types, .. }) => assert_eq!(types, [rtype::A, rtype::AAAA]),
             other => panic!("{other:?}"),
@@ -2462,12 +2505,12 @@ mod tests {
         let records = vec![a_record("tv.local", "10.0.1.7"), reverse("10.0.1.7", "tv.local")];
         assert_eq!(Report::all(&response(records.clone())).0.len(), 1);
         let mut device = heard(records);
-        assert_eq!(device.reverse, [ip("10.0.1.7")]);
+        assert_eq!(&*device.reverse, [ip("10.0.1.7")]);
         assert!(device.services.is_empty());
 
         // On its own, as an answer to a reverse lookup: still the same.
         hear(&mut device, vec![reverse("10.0.1.7", "TV.local")]);
-        assert_eq!(device.reverse, [ip("10.0.1.7")]);
+        assert_eq!(&*device.reverse, [ip("10.0.1.7")]);
         hear(&mut device, vec![Record { ttl: 0, ..reverse("10.0.1.7", "tv.local") }]);
         assert!(device.reverse.is_empty());
     }
@@ -2490,14 +2533,14 @@ mod tests {
         let mut device = Device::default();
         device.learn(report, &report.addrs, DEFAULT_MAX_ADDRS, DEFAULT_MAX_SERVICES);
         assert_eq!(v4(&device), Some(ip("10.0.1.7")), "the proxy's address is not the host's");
-        assert_eq!((device.nsec, device.reverse), (Some(vec![rtype::A]), vec![ip("10.0.1.7")]));
+        assert_eq!((device.nsec, device.reverse), (Some(vec![rtype::A].into()), vec![ip("10.0.1.7")].into()));
     }
 
     #[test]
     fn reverse_mappings_are_announced_answered_and_withdrawn() {
         let name = "9.1.0.10.in-addr.arpa";
         let mut mapped = tv("10.0.1.9", &["TV"]);
-        mapped.reverse = vec![ip("10.0.1.9")];
+        mapped.reverse = vec![ip("10.0.1.9")].into();
         let of = |records: &[Record]| records.iter().find(|r| r.name == name).cloned();
 
         // Only for an address the device announced one for.
@@ -2511,7 +2554,7 @@ mod tests {
 
         // Moved: the old mapping is withdrawn along with the old address.
         let mut moved = tv("10.0.1.10", &["TV"]);
-        moved.reverse = vec![ip("10.0.1.10")];
+        moved.reverse = vec![ip("10.0.1.10")].into();
         let records = mapped.replacement(&moved, 120, 4500);
         assert_eq!(of(&records).map(|r| r.ttl), Some(0));
         assert!(records.iter().any(|r| r.name == "10.1.0.10.in-addr.arpa" && r.ttl > 0));

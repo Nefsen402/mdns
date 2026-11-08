@@ -88,6 +88,7 @@
 //! or TXT's), in seconds, `null` when not known. A reflected copy is announced
 //! with them, unless the configuration says otherwise.
 
+use alloc::boxed::Box;
 use hashbrown::HashMap;
 use core::time::Duration;
 
@@ -728,7 +729,7 @@ fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashMap
             if let Some(key) = &key {
                 shown.remove(key);
             }
-            let gone = narrow.unwrap_or_else(|| Device { services: Vec::new(), ..device.clone() });
+            let gone = narrow.unwrap_or_else(|| Device { services: Box::default(), ..device.clone() });
             Some(event_json("removed", segment, &notice.interface, &gone, Duration::ZERO))
         }
         _ => None,
@@ -986,6 +987,8 @@ fn error(message: &str) -> Value {
 mod tests {
     use std::rc::Rc;
 
+    use crate::device::edit;
+
     fn added(device: Device) -> Event {
         Event::Added(Rc::new(device))
     }
@@ -1177,7 +1180,8 @@ mod tests {
                 port: 22,
                 target: Some("pc.local".into()),
                 ..Default::default()
-            }],
+            }]
+            .into(),
             ..Device::default()
         };
         pc.add_addrs(&[ip("10.0.0.5")]);
@@ -1617,7 +1621,7 @@ mod tests {
             announce(&seg, "10.0.1.7", "tv.local", "TV");
             let mut d = seg.devices().remove(0);
             if !services {
-                d.services.clear();
+                edit(&mut d.services).clear();
             }
             d
         };
