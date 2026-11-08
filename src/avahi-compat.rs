@@ -39,7 +39,7 @@ use anyhow::Result;
 use crate::config::AdvertiseConfig;
 use crate::device::is_link_local;
 use crate::ipc::links_of;
-use crate::parser::{rtype, Question};
+use crate::codec::{rtype, Question};
 use crate::poll;
 use crate::runtime::Why;
 use crate::socket::{self, Family};
@@ -435,7 +435,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use super::*;
-    use crate::parser::{Header, Message, RData, Record};
+    use crate::codec::{Header, Message, RData, Record};
     use crate::reflector::Reflector;
     use crate::segment::Segment;
 

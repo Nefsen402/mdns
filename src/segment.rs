@@ -29,7 +29,7 @@ use crate::device::{
     DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
 };
 use crate::socket::{Family, Prefix, Sender, MDNS_PORT};
-use crate::parser::{Message, Question, Record};
+use crate::codec::{Message, Question, Record};
 
 use crate::prelude::*;
 
@@ -1903,7 +1903,7 @@ mod tests {
     use crate::device::{addr_of, Origin, META_QUERY};
     use crate::tracker::MAX_PER_SENDER;
     use std::collections::BTreeSet;
-    use crate::parser::RData;
+    use crate::codec::RData;
 
     /// `socket` as the segment takes a socket.
     fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
@@ -1923,7 +1923,7 @@ mod tests {
     }
 
     use crate::device::{record, Service, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
-    use crate::parser::{self, rtype, Header};
+    use crate::codec::{self, rtype, Header};
     use crate::socket::prefix;
     #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
     use crate::socket::open;
@@ -2215,7 +2215,7 @@ mod tests {
         let probe = |name: &str| {
             Message {
                 header: Header { id: 0, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 },
-                questions: vec![parser::Question { name: name.into(), qtype: rtype::ANY, class: 1, unicast_response: false }],
+                questions: vec![codec::Question { name: name.into(), qtype: rtype::ANY, class: 1, unicast_response: false }],
                 answers: vec![],
                 authorities: vec![a_record(name, "10.0.1.5")],
                 additionals: vec![],
@@ -3069,7 +3069,7 @@ mod tests {
     fn query(name: &str, qtype: u16, known: Vec<Record>) -> Vec<u8> {
         Message {
             header: Header { id: 0x4242, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 },
-            questions: vec![parser::Question { name: name.into(), qtype, class: 1, unicast_response: false }],
+            questions: vec![codec::Question { name: name.into(), qtype, class: 1, unicast_response: false }],
             answers: known,
             authorities: vec![],
             additionals: vec![],

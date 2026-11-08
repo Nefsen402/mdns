@@ -14,7 +14,7 @@ use core::net::IpAddr;
 use crate::config::{Neighbours, ReflectedWhen, DEFAULT_MAX_ADDRS};
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_SERVICES;
-use crate::parser::{self, rtype, Header, Message, Question, RData, Record};
+use crate::codec::{self, rtype, Header, Message, Question, RData, Record};
 use crate::socket::Family;
 
 use crate::prelude::*;
@@ -239,7 +239,7 @@ impl<'a> Report<'a> {
                 RData::Nsec { .. } if !is_instance(&rec.name) => {
                     report_index(&mut reports, &rec.name);
                 }
-                RData::Ptr(host) if parser::reverse_addr(&rec.name).is_some() => {
+                RData::Ptr(host) if codec::reverse_addr(&rec.name).is_some() => {
                     report_index(&mut reports, host);
                 }
                 _ => {}
@@ -260,7 +260,7 @@ impl<'a> Report<'a> {
                     continue;
                 }
                 // `9.1.0.10.in-addr.arpa PTR tv.local` is about the host it names.
-                RData::Ptr(host) if parser::reverse_addr(&rec.name).is_some() => {
+                RData::Ptr(host) if codec::reverse_addr(&rec.name).is_some() => {
                     let i = report_index(&mut reports, host);
                     reports[i].records.push(rec);
                     continue;
@@ -373,7 +373,7 @@ fn well_formed(rec: &Record) -> bool {
         RData::Nsec { .. } => is_hostname(&rec.name) || is_instance_name(&rec.name),
         RData::Srv { port, target, .. } => *port != 0 && is_instance_name(&rec.name) && is_hostname(target),
         RData::Txt(_) => is_instance_name(&rec.name),
-        RData::Ptr(target) if parser::reverse_addr(&rec.name).is_some() => is_hostname(target),
+        RData::Ptr(target) if codec::reverse_addr(&rec.name).is_some() => is_hostname(target),
         RData::Ptr(target) if rec.name.eq_ignore_ascii_case(META_QUERY) => is_type(target),
         // A browse answer: an instance of the type, or the subtype's type.
         RData::Ptr(target) => {
@@ -381,7 +381,7 @@ fn well_formed(rec: &Record) -> bool {
                 Some(kind) => kind,
                 None => return false,
             };
-            is_instance_name(target) && parser::split_instance(target).is_some_and(|(_, k)| k.eq_ignore_ascii_case(kind))
+            is_instance_name(target) && codec::split_instance(target).is_some_and(|(_, k)| k.eq_ignore_ascii_case(kind))
         }
         RData::Other { .. } => false,
     }
@@ -393,7 +393,7 @@ fn browsed_type(name: &str) -> Option<&str> {
     if is_type(name) {
         return Some(name);
     }
-    let (sub, rest) = parser::split_instance(name)?;
+    let (sub, rest) = codec::split_instance(name)?;
     let kind = rest.get(5..).filter(|_| starts_with_ci(rest, "_sub."))?;
     (proper(&unescape(sub)) && is_type(kind)).then_some(kind)
 }
@@ -426,7 +426,7 @@ pub fn is_type(name: &str) -> bool {
 /// Whether `name` is a service instance's: a [proper](proper) label (which
 /// may hold spaces and dots), of a [type](is_type).
 pub fn is_instance_name(name: &str) -> bool {
-    parser::split_instance(name).is_some_and(|(label, kind)| proper(&unescape(label)) && is_type(kind))
+    codec::split_instance(name).is_some_and(|(label, kind)| proper(&unescape(label)) && is_type(kind))
 }
 
 /// A label that can be in a name: not empty, at most 63 bytes, without
@@ -694,8 +694,8 @@ impl Device {
     pub fn learn_records<'a>(&mut self, records: impl Iterator<Item = &'a Record>, max_services: usize) {
         for rec in records {
             match &rec.data {
-                RData::Ptr(host) if parser::reverse_addr(&rec.name).is_some() => {
-                    let addr = parser::reverse_addr(&rec.name).expect("checked above");
+                RData::Ptr(host) if codec::reverse_addr(&rec.name).is_some() => {
+                    let addr = codec::reverse_addr(&rec.name).expect("checked above");
                     if self.hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(host)) {
                         self.reverse.retain(|a| *a != addr);
                         if rec.ttl != 0 && self.reverse.len() < MAX_REVERSE {
@@ -787,7 +787,7 @@ impl Device {
             None if self.services.len() >= max_services => return None,
             None => self.insert_service(Service {
                 instance: instance.to_string(),
-                kind: parser::split_instance(instance).map(|(_, kind)| kind.to_string()).unwrap_or_default(),
+                kind: codec::split_instance(instance).map(|(_, kind)| kind.to_string()).unwrap_or_default(),
                 ..Service::default()
             }),
         };
@@ -819,7 +819,7 @@ impl Device {
         let Some(host) = &self.hostname else { return };
         f(host);
         for addr in self.addrs().filter(|addr| self.reverse.contains(addr)) {
-            f(&parser::reverse_name(addr));
+            f(&codec::reverse_name(addr));
         }
         for svc in &self.services {
             f(&svc.kind);
@@ -899,7 +899,7 @@ impl Device {
         let Some(host) = &self.hostname else { return Vec::new() };
         self.addrs()
             .filter(|addr| self.reverse.contains(addr))
-            .map(|addr| record(parser::reverse_name(addr), true, ttl, RData::Ptr(host.clone())))
+            .map(|addr| record(codec::reverse_name(addr), true, ttl, RData::Ptr(host.clone())))
             .collect()
     }
 
@@ -1448,7 +1448,7 @@ pub fn record(name: String, cache_flush: bool, ttl: u32, data: RData) -> Record 
 /// Whether `name` is that of a service instance, such as
 /// `Office._ipp._tcp.local`, rather than of a host.
 fn is_instance(name: &str) -> bool {
-    parser::split_instance(name).is_some_and(|(_, kind)| is_service_type(kind))
+    codec::split_instance(name).is_some_and(|(_, kind)| is_service_type(kind))
 }
 
 pub fn is_service_type(name: &str) -> bool {
@@ -1469,7 +1469,7 @@ fn ends_with_ci(name: &str, suffix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::Question;
+    use crate::codec::Question;
 
     /// Its first routable IPv4 or IPv6 address, and link-local one.
     fn v4(d: &Device) -> Option<IpAddr> {
@@ -1504,7 +1504,7 @@ mod tests {
     }
 
     fn reverse(addr: &str, host: &str) -> Record {
-        record(parser::reverse_name(ip(addr)), true, 120, RData::Ptr(host.into()))
+        record(codec::reverse_name(ip(addr)), true, 120, RData::Ptr(host.into()))
     }
 
     fn response(records: Vec<Record>) -> Message {

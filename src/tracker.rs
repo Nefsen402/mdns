@@ -14,7 +14,7 @@ use crate::device::{addr_of, family_of, is_link_local, is_type, is_usable, Devic
 use alloc::rc::Rc;
 
 use crate::segment::Asked;
-use crate::parser::{Message, Question, RData, Record};
+use crate::codec::{Message, Question, RData, Record};
 use crate::prelude::*;
 use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
 use crate::socket::{Family, Prefix};
@@ -1039,7 +1039,7 @@ mod tests {
     use core::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
-    use crate::parser::Header;
+    use crate::codec::Header;
 
     fn record(name: &str, ttl: u32, data: RData) -> Record {
         Record { name: name.into(), class: 1, cache_flush: true, ttl, data }

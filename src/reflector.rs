@@ -488,7 +488,7 @@ mod tests {
         // SAFETY: a descriptor just given up by its owner.
         unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
     }
-    use crate::parser::{rtype, Header, Message, Question, RData, Record};
+    use crate::codec::{rtype, Header, Message, Question, RData, Record};
     use crate::socket::{prefix, Family};
 
     /// Its first routable IPv4 or IPv6 address, and link-local one.
