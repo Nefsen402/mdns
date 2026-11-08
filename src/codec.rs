@@ -1,6 +1,8 @@
-//! DNS wire-format parser (RFC 1035) with the mDNS (RFC 6762) twists: the top
-//! bit of a question's class is "unicast response wanted", and the top bit of
-//! a record's class is "cache flush".
+//! The DNS wire format (RFC 1035), decoded and encoded, with the mDNS (RFC 6762)
+//! twists: the top bit of a question's class is "unicast response wanted", and
+//! the top bit of a record's class is "cache flush". [`Message::parse`] takes a
+//! packet apart into a [`Message`], and [`Message::encode`] makes one from it:
+//! everything the daemon sends is made so.
 //!
 //! Names are returned as dot-joined strings without a trailing dot (the root
 //! is the empty string). A literal `.` or `\` inside a label is escaped with a
@@ -539,6 +541,12 @@ impl Reader<'_> {
                     }
                     strings.push(self.bytes(len)?.to_vec());
                 }
+                // A single empty string is how an empty record is written
+                // (RFC 6763 section 6.1), so it is what none is, as the
+                // encoder writes it.
+                if strings.len() == 1 && strings[0].is_empty() {
+                    strings.clear();
+                }
                 RData::Txt(strings)
             }
             rtype::NSEC => {
@@ -811,6 +819,131 @@ mod tests {
             ],
         };
         assert_eq!(Message::parse(&msg.encode().unwrap()).unwrap(), msg);
+    }
+
+    /// `bytes` parsed and serialized again says the same: it parses to the
+    /// same message, and serializes to the same bytes, which are not the same
+    /// as `bytes` where it had names compressed.
+    fn round_trip(what: &str, bytes: &[u8]) {
+        let message = Message::parse(bytes).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let out = message.encode().unwrap_or_else(|e| panic!("{what}: {e}"));
+        let again = Message::parse(&out).unwrap_or_else(|e| panic!("{what}: serialized, {e}"));
+        assert_eq!(again, message, "{what}: serialized, it says the same");
+        assert_eq!(again.encode().unwrap(), out, "{what}: and serializes the same");
+    }
+
+    /// A packet with something in every section and in the header.
+    fn every_section() -> Vec<u8> {
+        let mut p = header(0x8600 | 3, 1, 1); // a response, authoritative, truncated, rcode 3
+        p[8..10].copy_from_slice(&1u16.to_be_bytes());
+        p[10..12].copy_from_slice(&2u16.to_be_bytes());
+        p.extend(labels(&["_http", "_tcp", "local"]));
+        p.extend(rtype::PTR.to_be_bytes());
+        p.extend(0x8001u16.to_be_bytes());
+        let mut ptr_data = vec![2];
+        ptr_data.extend(b"tv");
+        ptr_data.extend(pointer(12));
+        rr(&mut p, &pointer(12), rtype::PTR, 1, 4500, &ptr_data);
+        let mut srv = vec![0, 1, 0, 2, 0x1f, 0x90];
+        srv.extend(labels(&["tv", "local"]));
+        rr(&mut p, &labels(&["tv", "_http", "_tcp", "local"]), rtype::SRV, 0x8001, 120, &srv);
+        rr(&mut p, &labels(&["tv", "local"]), rtype::A, 0x8001, 120, &[10, 0, 1, 7]);
+        rr(&mut p, &labels(&["tv", "local"]), rtype::AAAA, 0x8001, 120, &"fd00::7".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p
+    }
+
+    #[test]
+    fn a_packet_that_is_parsed_and_serialized_again_says_the_same() {
+        let mut query = header(0x0000, 1, 0);
+        query.extend(labels(&["_services", "_dns-sd", "_udp", "local"]));
+        query.extend(rtype::PTR.to_be_bytes());
+        query.extend(0x8001u16.to_be_bytes());
+
+        let mut address = header(0x8400, 0, 2);
+        rr(&mut address, &labels(&["host", "local"]), rtype::AAAA, 1, 120, &"fe80::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        let mut nsec = labels(&["host", "local"]);
+        nsec.extend([0, 4, 0x40, 0x00, 0x00, 0x08, 1, 1, 0x80]); // A and AAAA, and a type of block 1
+        rr(&mut address, &labels(&["host", "local"]), rtype::NSEC, 1, 120, &nsec);
+
+        let mut raw = header(0x8400, 0, 1);
+        rr(&mut raw, &labels(&["x", "local"]), 13, 1, 10, b"\x01\x02");
+
+        let mut dotted = header(0x8400, 0, 2);
+        rr(&mut dotted, &labels(&["TV. Room", "_x", "local"]), rtype::TXT, 1, 10, b"");
+        rr(&mut dotted, &labels(&["back\\slash", "local"]), rtype::TXT, 1, 10, b"\x03a=b");
+
+        let mut goodbye = header(0x8400, 0, 1);
+        rr(&mut goodbye, &labels(&["tv", "local"]), rtype::A, 0x8001, 0, &[10, 0, 1, 7]);
+
+        for (what, bytes) in [
+            ("an announcement with compressed names", announcement()),
+            ("a query of the unicast kind", query),
+            ("addresses and the types a name has", address),
+            ("a record of a type it does not know", raw),
+            ("names with a dot and a backslash in a label", dotted),
+            ("a goodbye", goodbye),
+            ("every section, and the header", every_section()),
+        ] {
+            round_trip(what, &bytes);
+        }
+    }
+
+    /// What the header and the sections say is what comes out, not just that it
+    /// parses again: the unicast and cache-flush bits, the TTL, the sections
+    /// of a record, and what the header says.
+    #[test]
+    fn what_a_packet_says_is_what_is_serialized() {
+        let message = Message::parse(&every_section()).unwrap();
+        let again = Message::parse(&message.encode().unwrap()).unwrap();
+        assert_eq!(
+            (again.header.id, again.header.response, again.header.authoritative, again.header.truncated, again.header.rcode),
+            (0x1234, true, true, true, 3)
+        );
+        assert_eq!((again.questions.len(), again.answers.len(), again.authorities.len(), again.additionals.len()), (1, 1, 1, 2));
+        assert!(again.questions[0].unicast_response);
+        assert_eq!((again.answers[0].name.as_str(), again.authorities[0].name.as_str()), ("_http._tcp.local", "tv._http._tcp.local"));
+        assert!(again.additionals.iter().all(|r| r.cache_flush && r.ttl == 120));
+    }
+
+    /// An empty TXT record is none, whether it is written as no data or as the
+    /// single empty string that DNS-SD writes it as, and is written the latter
+    /// way.
+    #[test]
+    fn an_empty_txt_record_is_one_however_it_is_written() {
+        for rdata in [&b""[..], b"\x00"] {
+            let mut p = header(0x8400, 0, 1);
+            rr(&mut p, &labels(&["tv", "_x", "local"]), rtype::TXT, 1, 10, rdata);
+            let message = Message::parse(&p).unwrap();
+            assert_eq!(message.answers[0].data, RData::Txt(vec![]));
+            let out = message.encode().unwrap();
+            assert_eq!(&out[out.len() - 3..], [0, 1, 0], "one empty string, of length 1");
+            round_trip("an empty TXT record", &p);
+        }
+    }
+
+    /// Whatever the parser makes of a packet, however mangled, can be
+    /// serialized, and comes back the same.
+    #[test]
+    fn what_the_parser_makes_of_a_mangled_packet_can_be_serialized_again() {
+        let mut parsed = 0;
+        for good in [announcement(), every_section()] {
+            let mut candidates = vec![good.clone()];
+            for i in 0..good.len() {
+                candidates.push(good[..i].to_vec());
+                for b in [0x00, 0x01, 0x3f, 0x41, 0x7f, 0xc0, 0xff] {
+                    let mut bad = good.clone();
+                    bad[i] = b;
+                    candidates.push(bad);
+                }
+            }
+            for (n, bytes) in candidates.iter().enumerate() {
+                if Message::parse(bytes).is_ok() {
+                    parsed += 1;
+                    round_trip(&format!("mangled packet {n}"), bytes);
+                }
+            }
+        }
+        assert!(parsed > 100, "{parsed} of them parsed: enough to mean something");
     }
 
     #[test]

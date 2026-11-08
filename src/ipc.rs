@@ -1021,7 +1021,7 @@ mod tests {
         // SAFETY: a descriptor just given up by its owner.
         unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
     }
-    use crate::parser::{Header, Message, RData, Record};
+    use crate::codec::{Header, Message, RData, Record};
     use crate::reflector::{deliver_made, Reflector};
 
     fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Segment>) {

@@ -13,11 +13,11 @@ mod runtime;
 mod args;
 #[path = "avahi-compat.rs"]
 mod avahi_compat;
+mod codec;
 mod config;
 mod device;
 mod ipc;
 mod netlink;
-mod parser;
 mod poll;
 mod reflector;
 mod segment;
