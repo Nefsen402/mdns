@@ -1380,6 +1380,35 @@ interfaces=br0,wifi
         assert!(error_of(&format!("[Devices]\nReflectTTL=5min\n{EXAMPLE}")).contains("unknown setting"));
     }
 
+    /// What a name or a service may be in the configuration is what the codec
+    /// can write: a label of 63 bytes and a name of 253, and a service type of
+    /// 15 characters after the underscore. A byte more is refused when it is
+    /// read, not when it is announced.
+    #[test]
+    fn what_the_configuration_takes_as_a_name_is_what_can_be_written() {
+        let advertise = |host: &str, service: &str| {
+            Config::parse(&format!("[Advertise]\nHostname={host}\nServices={service}:22\n{EXAMPLE}")).map(|c| c.advertise[0].clone())
+        };
+        let label = |n: usize| "a".repeat(n);
+        // Four labels and `.local`: 63 + 63 + 63 + 55 + 3 dots + 6 = 253.
+        let longest = format!("{}.{}.{}.{}.local", label(63), label(63), label(63), label(55));
+        assert_eq!(longest.len(), 253);
+        let kind = format!("_{}._tcp", label(15));
+        let advertised = advertise(&longest, &kind).unwrap();
+        assert_eq!((advertised.name.len(), advertised.services[0].0.len()), (253, kind.len()));
+
+        let too_long = format!("{}.{}.{}.{}.local", label(63), label(63), label(63), label(56));
+        for (host, service, why) in [
+            (too_long.as_str(), kind.as_str(), "a name of 254"),
+            (format!("{}.local", label(64)).as_str(), "_ssh._tcp", "a label of 64"),
+            ("pc", format!("_{}._tcp", label(16)).as_str(), "a service type of 16 after the underscore"),
+            ("p\0c", "_ssh._tcp", "a NUL in a name"),
+            ("pc", "_s\0h._tcp", "a NUL in a type"),
+        ] {
+            assert!(advertise(host, service).is_err(), "{why}");
+        }
+    }
+
     /// The man page must document every key and a config that really parses.
     #[test]
     fn man_page_documents_every_key_and_its_example_parses() {

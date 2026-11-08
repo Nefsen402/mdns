@@ -80,8 +80,7 @@ pub const MIN_REFLECT_TTL: u32 = 10;
 /// the block again if what it is made of is not as it was.
 ///
 /// The block is its port and TTL, then its names, each ended by a NUL (which
-/// no name can hold, as it is not one of the characters a name may have: see
-/// `proper`): the instance, the type, the host it is on (empty if it is not
+/// no name can hold: see `proper`, and [`ServiceParts::encode`]): the instance, the type, the host it is on (empty if it is not
 /// known), and the subtypes, which an empty name ends; and then its TXT data,
 /// as it is on the wire, each string after its length, to the end of the
 /// block.
@@ -114,29 +113,41 @@ pub struct ServiceParts {
 /// The port and the TTL, which come first in a block.
 const SERVICE_HEADER: usize = 6;
 
-/// A name as a block holds it: up to a NUL, which only a name that was not
-/// checked has.
-fn name_of(name: &str) -> &str {
-    name.split('\0').next().unwrap_or_default()
-}
-
 impl ServiceParts {
     /// The block they make.
+    ///
+    /// # Panics
+    ///
+    /// If a name has a NUL, which the block ends a name with, or a string of
+    /// TXT data is over 255 bytes, which is as long as the wire says one is.
+    /// Neither is from the network, which is checked first (`proper`, and
+    /// a string's length is a byte), nor from the configuration, which does
+    /// not take them (`local_name`, `parse_service`): it is a mistake to make
+    /// one.
     fn encode(&self) -> Vec<u8> {
-        let target = self.target.as_deref().map_or("", name_of);
-        let subtypes = || self.subtypes.iter().map(|s| name_of(s)).filter(|s| !s.is_empty());
-        // A string of TXT data is at most 255 bytes, and not empty: it would not be said.
-        let txt = || self.txt.iter().map(|s| &s[..s.len().min(255)]).filter(|s| !s.is_empty());
+        let name = |s: &str| {
+            assert!(!s.contains('\0'), "a name has no NUL in it: {s:?}");
+            s.len() + 1
+        };
+        let target = self.target.as_deref().unwrap_or("");
+        // A subtype and a string of TXT data that is empty would not be said.
+        let subtypes = || self.subtypes.iter().map(String::as_str).filter(|s| !s.is_empty());
+        let txt = || {
+            self.txt.iter().map(Vec::as_slice).filter(|s| !s.is_empty()).inspect(|s| {
+                assert!(s.len() <= 255, "a string of TXT data is at most 255 bytes, not {}", s.len());
+            })
+        };
         let size = SERVICE_HEADER
-            + [name_of(&self.instance), name_of(&self.kind), target].iter().map(|n| n.len() + 1).sum::<usize>()
-            + subtypes().map(|s| s.len() + 1).sum::<usize>()
+            + [&self.instance, &self.kind].into_iter().map(|n| name(n)).sum::<usize>()
+            + name(target)
+            + subtypes().map(name).sum::<usize>()
             + 1
             + txt().map(|s| s.len() + 1).sum::<usize>();
         let mut out = Vec::with_capacity(size);
         out.extend(self.port.to_le_bytes());
         out.extend(self.ttl.to_le_bytes());
-        for name in [name_of(&self.instance), name_of(&self.kind), target].into_iter().chain(subtypes()) {
-            out.extend(name.as_bytes());
+        for n in [self.instance.as_str(), self.kind.as_str(), target].into_iter().chain(subtypes()) {
+            out.extend(n.as_bytes());
             out.push(0);
         }
         out.push(0);
@@ -1751,24 +1762,38 @@ mod tests {
         assert!(service.is_resolved());
     }
 
-    /// A name that has a NUL, which none that was checked has, is cut at it
-    /// and does not run into the next; and a string of TXT data is at most 255
-    /// bytes and not empty.
+    /// A string of TXT data is as long as the wire says it can be, and one
+    /// that is empty, as a subtype is, is not said.
     #[test]
-    fn a_name_with_a_nul_does_not_run_into_the_next_and_txt_is_what_a_string_can_be() {
+    fn txt_is_what_a_string_can_be_and_what_is_empty_is_not_said() {
         let service: Service = ServiceParts {
-            instance: "a\0b._x._tcp.local".into(),
+            instance: "a._x._tcp.local".into(),
             kind: "_x._tcp.local".into(),
-            subtypes: vec!["_s\0_sub._x._tcp.local".into(), "\0".into(), "_t._sub._x._tcp.local".into()],
-            txt: vec![vec![b'x'; 300], Vec::new(), b"k=v".to_vec()],
+            subtypes: vec!["_s._sub._x._tcp.local".into(), String::new()],
+            txt: vec![vec![b'x'; 255], Vec::new(), b"k=v".to_vec()],
             ..Default::default()
         }
         .into();
-        assert_eq!(service.instance(), "a");
-        assert_eq!(service.kind(), "_x._tcp.local");
-        assert_eq!(service.subtypes().collect::<Vec<_>>(), ["_s", "_t._sub._x._tcp.local"]);
-        let txt: Vec<usize> = service.txt().map(<[u8]>::len).collect();
-        assert_eq!(txt, [255, 3]);
+        assert_eq!(service.subtypes().collect::<Vec<_>>(), ["_s._sub._x._tcp.local"]);
+        assert_eq!(service.txt().map(<[u8]>::len).collect::<Vec<_>>(), [255, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a name has no NUL")]
+    fn a_name_with_a_nul_in_it_is_a_mistake() {
+        let _ = Service::from(ServiceParts { instance: "a\0b._x._tcp.local".into(), ..Default::default() });
+    }
+
+    #[test]
+    #[should_panic(expected = "a name has no NUL")]
+    fn a_subtype_with_a_nul_in_it_is_a_mistake() {
+        let _ = Service::from(ServiceParts { subtypes: vec!["_s\0_sub._x._tcp.local".into()], ..Default::default() });
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 255 bytes, not 256")]
+    fn a_string_of_txt_data_over_255_bytes_is_a_mistake() {
+        let _ = Service::from(ServiceParts { txt: vec![vec![b'x'; 256]], ..Default::default() });
     }
 
     /// An edit that changes nothing leaves the block as it is, and one that

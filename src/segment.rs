@@ -4284,6 +4284,25 @@ mod tests {
         hear(seg, "10.0.1.5", vec![a_record("tv.local", "10.0.1.5"), srv("TV._http._tcp.local", 80, "tv.local")]);
     }
 
+    /// The longest name and service the configuration takes can be announced:
+    /// what it takes is what the codec can write.
+    #[test]
+    fn the_longest_name_and_services_the_configuration_takes_are_announced() {
+        let label = |n: usize| "a".repeat(n);
+        let host = format!("{}.{}.{}.{}.local", label(63), label(63), label(63), label(55));
+        let services: String = (0..6).map(|i| format!("_{}{i}._tcp:{}", label(14), 1000 + i)).collect::<Vec<_>>().join(",");
+        let config = crate::config::Config::parse(&format!(
+            "[Advertise]\nHostname={host}\nServices={services}\n[Segment]\nName=s\nInterfaces=a"
+        ))
+        .unwrap();
+        let (seg, rx) = wired();
+        seg.advertise(&config.advertise[0], &[ip("10.0.0.5")]);
+        assert_eq!(seg.manual_devices().len(), 1);
+        let announced = recv(&rx).expect("announced");
+        assert!(announced.answers.iter().any(|r| r.name == host), "{announced:?}");
+        assert!(announced.encode().is_ok());
+    }
+
     /// `tv.local` saying goodbye to its address.
     fn tv_leaves(seg: &Segment) {
         hear(seg, "10.0.1.5", vec![record("tv.local".into(), true, 0, RData::A(ip("10.0.1.5").to_string().parse().unwrap()))]);
