@@ -88,7 +88,8 @@ def srv(owner, port, target, ttl=120):
 
 
 def txt(owner, *strings, ttl=4500):
-    data = b"".join(bytes([len(s)]) + s.encode() for s in strings) or b"\0"
+    strings = [s if isinstance(s, bytes) else s.encode() for s in strings]
+    data = b"".join(bytes([len(s)]) + s for s in strings) or b"\0"
     return rr(owner, TXT, ttl, data, True)
 
 
