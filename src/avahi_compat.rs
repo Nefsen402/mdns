@@ -429,5 +429,5 @@ fn ask_for(groups: &[Group], name: &str, family: Option<Family>) {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/avahi-compat.rs"]
+#[path = "../tests/unit/avahi_compat.rs"]
 mod tests;
