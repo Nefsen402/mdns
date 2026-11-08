@@ -122,8 +122,7 @@ class Reflecting(Case):
 
         def told():
             """How many times the other network was told of the device."""
-            hb.flush()
-            return sum(1 for h in hb.heard if h.src == lb.router_addr and h.message.has("tv.local"))
+            return len(hb.matching(lambda h: h.src == lb.router_addr and h.message.has("tv.local")))
 
         tv.multicast(chatter)
         self.assertTrue(hb.wait(alive("tv.local", A, "10.9.1.50")), self.logs(d))
@@ -184,8 +183,7 @@ class Topologies(Case):
 
     def told(self, hearer, link, host, **kind):
         """How many times `link`'s router told what `hearer` is on of `host`."""
-        hearer.flush()
-        return sum(1 for h in hearer.heard if h.src == link.router_addr and h.message.response and h.message.has(f"{host}.local", **kind))
+        return len(hearer.matching(lambda h: h.src == link.router_addr and h.message.response and h.message.has(f"{host}.local", **kind)))
 
     def test_a_triangle_of_trusted_segments_tells_each_network_of_a_device_as_two_do_and_no_more(self):
         la, lb, lc = self.three_links()
@@ -237,8 +235,7 @@ class Topologies(Case):
             "[Segment]\nName=ac\nInterfaces=ra,rc\nForwardQuestions=always\n"))
         question = ("_ipp._tcp.local", PTR)
         def asked(link, hearer):
-            hearer.flush()
-            return sum(1 for h in hearer.heard if h.src == link.router_addr and h.message.asks(*question) and not h.message.response)
+            return len(hearer.matching(lambda h: h.src == link.router_addr and h.message.asks(*question) and not h.message.response))
 
         self.assertTrue(hb.wait(asks(*PROBE)), self.logs(d))
         d.settle()
@@ -1082,7 +1079,7 @@ class Timers(Case):
         got = dev.hearer.seen(asks("dev.local", A), asked) or dev.hearer.wait(asks("dev.local", A), 5, since=asked)
         self.assertTrue(got, "asked three quarters of the minute in\n" + self.logs(d))
         d.advance(10)
-        self.assertEqual(len([h for h in dev.hearer.heard[asked:] if asks("dev.local", A)(h)]), 1, "once")
+        self.assertEqual(len(dev.hearer.matching(asks("dev.local", A), asked)), 1, "once")
         d.advance(5)
         self.assertFalse(d.host("s", "dev.local"))
 
