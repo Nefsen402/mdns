@@ -11,7 +11,6 @@ mod runtime;
 // Shared with mdnsctl, whose options take values; the daemon's take none.
 #[allow(dead_code)]
 mod args;
-#[path = "avahi-compat.rs"]
 mod avahi_compat;
 mod codec;
 mod config;
