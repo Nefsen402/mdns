@@ -25,7 +25,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::config::AdvertiseConfig;
 use crate::runtime::Why;
 use crate::device::{
-    family_of, is_link_local, is_type, responses, service_ttl, Device, Service,
+    family_of, is_link_local, is_type, responses, service_ttl, Device, ServiceParts,
     DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
 };
 use crate::socket::{Family, Prefix, Sender, MDNS_PORT};
@@ -1342,12 +1342,15 @@ impl Segment {
         let label = name.split('.').next().unwrap_or(name);
         device.services = services
             .iter()
-            .map(|(kind, port)| Service {
-                instance: format!("{label}.{kind}.local"),
-                kind: format!("{kind}.local"),
-                port: *port,
-                target: Some(name.clone()),
-                ..Service::default()
+            .map(|(kind, port)| {
+                ServiceParts {
+                    instance: format!("{label}.{kind}.local"),
+                    kind: format!("{kind}.local"),
+                    port: *port,
+                    target: Some(name.clone()),
+                    ..ServiceParts::default()
+                }
+                .into()
             })
             .collect();
         match self.add_manual_ttl(Owner::Own, device, *ttl) {
@@ -1900,7 +1903,7 @@ mod tests {
 
     use super::*;
     use crate::config::{DEFAULT_MAX_DEVICES, DEFAULT_MIN_LIFETIME};
-    use crate::device::{addr_of, edit, txt_of, Origin, META_QUERY};
+    use crate::device::{addr_of, edit, Origin, META_QUERY};
     use crate::tracker::MAX_PER_SENDER;
     use std::collections::BTreeSet;
     use crate::codec::RData;
@@ -1922,7 +1925,7 @@ mod tests {
         seg
     }
 
-    use crate::device::{record, Service, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
+    use crate::device::{record, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
     use crate::codec::{self, rtype, Header};
     use crate::socket::prefix;
     #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
@@ -2049,14 +2052,17 @@ mod tests {
             hostname: Some("tv.local".into()),
             services: instances
                 .iter()
-                .map(|i| Service {
-                    instance: format!("{i}._http._tcp.local"),
-                    kind: "_http._tcp.local".into(),
-                    port: 8080,
-                    target: None,
-                    txt: txt_of(vec![b"a=b".to_vec()]),
-                    ttl: 0,
-                    ..Service::default()
+                .map(|i| {
+                    ServiceParts {
+                        instance: format!("{i}._http._tcp.local"),
+                        kind: "_http._tcp.local".into(),
+                        port: 8080,
+                        target: None,
+                        txt: vec![b"a=b".to_vec()],
+                        ttl: 0,
+                        ..ServiceParts::default()
+                    }
+                    .into()
                 })
                 .collect(),
             ttl: None,
@@ -2416,7 +2422,7 @@ mod tests {
         let (socket, dest) = broken();
         seg.attach(Family::V4, fd(socket), dest);
         assert!(seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV", "Cast"])).is_err());
-        let shown: Vec<String> = seg.manual_devices()[0].services.iter().map(|s| s.instance.clone()).collect();
+        let shown: Vec<String> = seg.manual_devices()[0].services.iter().map(|s| s.instance().to_string()).collect();
         assert_eq!(shown, ["TV._http._tcp.local"], "still what was announced");
         // And it is what is recorded: offering it again changes nothing.
         assert!(!seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap());
@@ -2539,7 +2545,7 @@ mod tests {
         let names: Vec<&str> = instances.iter().map(String::as_str).collect();
         let mut device = tv("10.0.2.9", &names);
         for svc in &mut device.services {
-            svc.txt = txt_of(vec![format!("k={}", "v".repeat(60)).into_bytes()]);
+            svc.edit(|p| p.txt = vec![format!("k={}", "v".repeat(60)).into_bytes()]);
         }
         let expected = device.announcement(HOST_TTL, OTHER_TTL).len();
         seg.add_manual_ttl(Owner::Reflector(0), device, Duration::from_secs(HOST_TTL.into())).unwrap();
@@ -2708,7 +2714,7 @@ mod tests {
         let devices = seg.devices();
         let device = |host: &str| devices.iter().find(|d| d.hostname.as_deref() == Some(host)).unwrap_or_else(|| panic!("{host}: {devices:?}"));
         assert_eq!(device("speakers.local").addrs().collect::<Vec<_>>(), Vec::<IpAddr>::new(), "no address of the router's");
-        assert!(device("speakers.local").services.iter().all(|s| s.kind == "_raop._tcp.local"), "{:?}", device("speakers.local").services);
+        assert!(device("speakers.local").services.iter().all(|s| s.kind() == "_raop._tcp.local"), "{:?}", device("speakers.local").services);
         assert_eq!(device("router.local").addrs().collect::<Vec<_>>(), [ip("10.0.0.1")]);
         assert!(device("router.local").service("router._ssh._tcp.local").is_some_and(|s| s.is_resolved()));
 
@@ -2731,7 +2737,7 @@ mod tests {
             ptr("_ssh._tcp.local", "router._ssh._tcp.local"),
         ]);
         let speakers = |seg: &Segment| seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("speakers.local")).unwrap();
-        assert!(speakers(&seg).services.iter().all(|s| s.kind == "_raop._tcp.local"), "{:?}", speakers(&seg).services);
+        assert!(speakers(&seg).services.iter().all(|s| s.kind() == "_raop._tcp.local"), "{:?}", speakers(&seg).services);
         // Held where it was heard from, by address, until it says whose it is.
         let by_address = seg.devices().into_iter().find(|d| d.hostname.is_none() && d.service("router._ssh._tcp.local").is_some());
         assert!(by_address.is_some(), "{:?}", seg.devices());
@@ -2741,7 +2747,7 @@ mod tests {
         let devices = seg.devices();
         let router = devices.iter().find(|d| d.hostname.as_deref() == Some("router.local")).unwrap();
         assert!(router.service("router._ssh._tcp.local").is_some_and(|s| s.is_resolved()));
-        assert!(speakers(&seg).services.iter().all(|s| s.kind == "_raop._tcp.local"));
+        assert!(speakers(&seg).services.iter().all(|s| s.kind() == "_raop._tcp.local"));
     }
 
     #[test]
@@ -3629,7 +3635,7 @@ mod tests {
         assert_eq!(devices[0].hostname.as_deref(), Some("speaker.local"));
         assert_eq!(v4(&devices[0]), Some(ip("10.0.2.73")));
         assert_eq!(devices[0].services.len(), 1, "the service learned before the name is kept");
-        assert_eq!((devices[0].services[0].port, devices[0].services[0].target.as_deref()), (7000, Some("speaker.local")));
+        assert_eq!((devices[0].services[0].port(), devices[0].services[0].target().as_deref()), (7000, Some("speaker.local")));
 
         let kinds: Vec<&str> = rx
             .try_iter()
@@ -3785,15 +3791,15 @@ mod tests {
         assert_eq!(devices.len(), 2, "the sender is not made a device of its own: {devices:?}");
 
         let tv = find(&devices, "LGwebOSTV.local");
-        let names: Vec<&str> = tv.services.iter().map(|s| s.instance.as_str()).collect();
+        let names: Vec<&str> = tv.services.iter().map(|s| s.instance()).collect();
         assert_eq!(names, ["OZAL TV._airplay._tcp.local"]);
-        assert_eq!(tv.services[0].txt, txt_of(vec![b"model=TV".to_vec()]));
+        assert_eq!(tv.services[0].txt().collect::<Vec<_>>(), vec![b"model=TV".to_vec()]);
         assert_eq!(v4(tv), None, "no address was announced, and the sender is not credited with one");
 
         let speaker = find(&devices, "OZAL-Speakers.local");
-        let names: Vec<&str> = speaker.services.iter().map(|s| s.instance.as_str()).collect();
+        let names: Vec<&str> = speaker.services.iter().map(|s| s.instance()).collect();
         assert_eq!(names, ["OZAL Speakers._airplay._tcp.local"]);
-        assert_eq!(speaker.services[0].txt, txt_of(vec![b"model=RX".to_vec()]));
+        assert_eq!(speaker.services[0].txt().collect::<Vec<_>>(), vec![b"model=RX".to_vec()]);
         assert_eq!(v4(speaker), Some(ip("10.0.2.73")));
 
         assert_eq!(rx.try_iter().filter(|e| matches!(e, Event::Added(d) if d.hostname.is_some())).count(), 2);
@@ -4621,7 +4627,7 @@ mod tests {
                 added += 1;
                 let mut device = tv("10.4.0.1", &["X"]);
                 device.hostname = Some(format!("x{added}.local"));
-                device.services[0].instance = format!("X{added}._http._tcp.local");
+                device.services[0].edit(|p| p.instance = format!("X{added}._http._tcp.local"));
                 seg.add_manual(Owner::Reflector(0), device).unwrap();
             });
 
@@ -4741,7 +4747,7 @@ mod tests {
     fn tv_with_ttls(addr: Option<u32>, svc: u32) -> Device {
         let mut device = tv("10.0.1.1", &["TV"]);
         device.ttl = addr;
-        device.services[0].ttl = svc;
+        device.services[0].edit(|p| p.ttl = svc);
         device
     }
 
@@ -4983,10 +4989,10 @@ mod tests {
         assert_eq!(d.hostname.as_deref(), Some("printer.local"));
         assert_eq!(d.services.len(), 1);
         let s = &d.services[0];
-        assert_eq!(s.instance, "Printer._http._tcp.local");
-        assert_eq!(s.kind, "_http._tcp.local");
-        assert_eq!((s.port, s.target.as_deref()), (631, Some("printer.local")));
-        assert_eq!(s.txt, txt_of(vec![b"ty=hp".to_vec()]));
+        assert_eq!(s.instance(), "Printer._http._tcp.local");
+        assert_eq!(s.kind(), "_http._tcp.local");
+        assert_eq!((s.port(), s.target().as_deref()), (631, Some("printer.local")));
+        assert_eq!(s.txt().collect::<Vec<_>>(), vec![b"ty=hp".to_vec()]);
 
         assert!(matches!(rx.try_recv(), Ok(Event::Added(_))));
         assert!(rx.try_recv().is_err());

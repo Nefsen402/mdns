@@ -807,7 +807,7 @@ mod tests {
             let mut seen: Vec<(String, Vec<String>)> = b
                 .manual_devices()
                 .into_iter()
-                .map(|d| (d.hostname.clone().unwrap(), d.services.iter().map(|s| s.kind.clone()).collect()))
+                .map(|d| (d.hostname.clone().unwrap(), d.services.iter().map(|s| s.kind().to_string()).collect()))
                 .collect();
             seen.sort();
             seen
@@ -978,7 +978,7 @@ mod tests {
         assert_eq!(announced_ttls(&brx), (vec![300], vec![600, 600, 600]));
         // What the device said is on record, too.
         assert_eq!(a.devices()[0].ttl, Some(300));
-        assert_eq!(a.devices()[0].services[0].ttl, 600);
+        assert_eq!(a.devices()[0].services[0].ttl(), 600);
     }
 
     #[test]
@@ -1182,7 +1182,7 @@ mod tests {
 
         announce(&a, "10.0.1.5", "tv.local", &["TV"]);
         wait_for(|| b.manual_devices().len() == 1);
-        let names: Vec<String> = b.manual_devices()[0].services.iter().map(|s| s.instance.clone()).collect();
+        let names: Vec<String> = b.manual_devices()[0].services.iter().map(|s| s.instance().to_string()).collect();
         assert_eq!(names, ["TV._http._tcp.local"]);
     }
 

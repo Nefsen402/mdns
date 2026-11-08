@@ -943,14 +943,14 @@ fn device_json(interface: &str, d: &Device) -> Value {
         .iter()
         .map(|s| {
             json!({
-                "instance": s.instance,
-                "type": s.kind,
-                "port": s.port,
-                "target": s.target,
+                "instance": s.instance(),
+                "type": s.kind(),
+                "port": s.port(),
+                "target": s.target(),
                 // Text where it is: a value that is not is shown as the nearest.
-                "txt": s.txt.iter().map(|t| String::from_utf8_lossy(t)).collect::<Vec<_>>(),
-                "subtypes": s.subtypes,
-                "ttl": (s.ttl != 0).then_some(s.ttl),
+                "txt": s.txt().map(|t| String::from_utf8_lossy(t)).collect::<Vec<_>>(),
+                "subtypes": s.subtypes().collect::<Vec<_>>(),
+                "ttl": (s.ttl() != 0).then_some(s.ttl()),
             })
         })
         .collect();
@@ -1174,13 +1174,14 @@ mod tests {
     fn advertise_self(seg: &Segment) {
         let mut pc = Device {
             hostname: Some("pc.local".into()),
-            services: vec![crate::device::Service {
+            services: vec![crate::device::ServiceParts {
                 instance: "pc._ssh._tcp.local".into(),
                 kind: "_ssh._tcp.local".into(),
                 port: 22,
                 target: Some("pc.local".into()),
                 ..Default::default()
-            }]
+            }
+            .into()]
             .into(),
             ..Device::default()
         };
@@ -1630,7 +1631,7 @@ mod tests {
 
         let moved = || {
             let mut d = tv(true);
-            d.services[0].port = 8080;
+            d.services[0].edit(|p| p.port = 8080);
             d
         };
 
