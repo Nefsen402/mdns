@@ -31,8 +31,9 @@ and LLVM_PROFDATA). Report from a checkout of the source that was built, at the
 same path: the source is read from where it was when it was built. In a GitHub
 Actions job, the summary is also written to the job's summary.
 
-The test code in each file counts, as covered: read the figures as a little
-flattering.
+The unit tests are in tests/unit, and are left out of the report: what is
+counted is the daemon's own code. (What little is only for them, such as a
+module's `check`, is in the module, and counts.)
 """
 import argparse
 import glob
@@ -43,7 +44,9 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-IGNORE = r"/\.cargo/|/rustc/|/registry/|/usr/src/|/rustlib/"
+# What is not the daemon: what the compiler brings, and the unit tests, which are
+# files of their own, in tests/unit, for the report to leave out.
+IGNORE = r"/\.cargo/|/rustc/|/registry/|/usr/src/|/rustlib/|/tests/unit/"
 
 
 def run(cmd, env=None, check=True, **kw):
@@ -229,7 +232,7 @@ def markdown(summary, baseline):
             f"| `{path}` | {pct(s['lines']['percent'])}{delta(s['lines']['percent'], before)} "
             f"| {s['lines']['covered']}/{s['lines']['count']} | {pct(s['functions']['percent'])} | {pct(s['regions']['percent'])} |"
         )
-    lines += ["", "<sub>Test code in each file counts as covered, so the figures are a little flattering.</sub>", ""]
+    lines += ["", "<sub>The unit tests, in tests/unit, are not counted: this is the daemon's own code.</sub>", ""]
     return "\n".join(lines)
 
 
