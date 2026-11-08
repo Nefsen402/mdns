@@ -1,5 +1,6 @@
 """The scenarios. See e2e.py for how to run them."""
 import os
+import signal
 import subprocess
 import unittest
 
@@ -419,6 +420,29 @@ class ServiceTypes(Case):
         self.assertTrue(hb.none(lambda h: h.message.has("box.local")))
 
 
+class IPv6(Case):
+    """What is said over IPv6, as the devices of the other scenarios, which speak
+    IPv4 whatever addresses they have, do not."""
+
+    # FreeBSD's sockets are not yet tried with a device that speaks it.
+    @unittest.skipIf(FREEBSD, "not yet tried with a device that speaks IPv6")
+    def test_a_device_that_announces_over_ipv6_is_heard_and_reflected(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        la.add_router_addr("fd00:9::1/64")
+        lb = self.lab.link("rb", "10.9.2.1/24", "10.9.2.2/24")
+        hb = lb.hearer()
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,rb\n", ipv6=True))
+        tv = la.device6("fd00:9::50")
+        tv.multicast(response(aaaa("tv.local", "fd00:9::50"), srv("TV._http._tcp.local", 80, "tv.local"),
+                              ptr("_http._tcp.local", "TV._http._tcp.local")))
+        self.assertTrue(hb.wait(alive("tv.local", AAAA, "fd00:9::50")), "reflected\n" + self.logs(d))
+        self.assertTrue(hb.wait(alive("TV._http._tcp.local", SRV, "80 tv.local")), self.logs(d))
+        d.settle()
+        listed = d.host("s", "tv.local")
+        self.assertEqual([x["addresses"] for x in listed], [["fd00:9::50"]], listed)
+        self.assertEqual(listed[0]["interface"], "ra")
+
+
 class Vlans(Case):
     """Interfaces that are VLANs of one link, as a router has them: each a
     network of its own, over the same wire."""
@@ -521,6 +545,25 @@ class Bridges(Case):
 
 
 class Interfaces(Case):
+    @follows_changes
+    @unittest.skipIf(FREEBSD, "the flood is made with iproute2")
+    def test_what_the_kernel_had_no_room_to_say_is_found_by_looking_again(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=r?\n"))
+        self.assertTrue(d.wait_log(r"ra: here \(index \d+\), listening", 5), self.logs(d))
+        # While it is not reading, more happens than its socket has room for, and
+        # after that an interface comes, which the kernel has no room to tell it of.
+        os.kill(d.proc.pid, signal.SIGSTOP)
+        try:
+            flood = "".join(
+                f"neigh replace 10.{n >> 16 & 255}.{n >> 8 & 255}.{n % 253 + 1} lladdr 02:00:00:00:{n >> 8 & 255:02x}:{n & 255:02x} dev ra nud permanent\n"
+                for n in range(20000))
+            subprocess.run([*self.lab.net.router_argv(), "ip", "-batch", "-"], input=flood, text=True, check=True, timeout=60)
+            self.lab.link("rb", "10.9.2.1/24", "10.9.2.2/24")
+        finally:
+            os.kill(d.proc.pid, signal.SIGCONT)
+        self.assertTrue(d.wait_log(r"rb: here \(index \d+\), listening", 10), "found by looking again\n" + self.logs(d))
+
     @follows_changes
     def test_an_interface_that_is_not_there_yet_is_waited_for_and_followed_as_it_comes_and_goes(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
