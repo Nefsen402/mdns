@@ -164,7 +164,7 @@ impl Reflector {
         // reflecting is idempotent.
         for member in inner.snapshot() {
             for device in member.segment.devices() {
-                inner.relay(&member.segment, None, Some(&device), None);
+                inner.relay(&member.segment, None, Some(&Rc::new(device)), None);
             }
         }
 
@@ -201,7 +201,7 @@ impl Reflector {
         let new = self.inner.snapshot().pop().map(|m| m.segment);
         for member in self.inner.snapshot() {
             for device in member.segment.devices() {
-                self.inner.relay(&member.segment, None, Some(&device), new.as_ref().filter(|n| !n.is(&member.segment)));
+                self.inner.relay(&member.segment, None, Some(&Rc::new(device)), new.as_ref().filter(|n| !n.is(&member.segment)));
             }
         }
         Ok(())
@@ -421,15 +421,15 @@ impl Inner {
 
     /// Show what a device of `from` was and is on the other segments, those
     /// that are announced anything, or only on `only`: as it is to be shown
-    /// there ([`Device::reflected`]), or withdrawn if it is not to be, or was
+    /// there ([`Device::reflectable`]), or withdrawn if it is not to be, or was
     /// called another name. Each segment keeps what it is shown by where it
     /// comes from, so the others' devices are not looked at.
     ///
     /// Failures are logged and kept, so that [`Inner::reconcile`] tries again.
-    fn relay(&self, from: &Segment, before: Option<&Device>, after: Option<&Device>, only: Option<&Segment>) {
-        let host = after.and_then(Device::key);
+    fn relay(&self, from: &Segment, before: Option<&Device>, after: Option<&Rc<Device>>, only: Option<&Segment>) {
+        let host = after.and_then(|device| device.key());
         let old = before.and_then(Device::key).filter(|old| host.as_ref() != Some(old));
-        let shown = after.filter(|device| device.reflectable(&self.advertise, &self.when)).map(|device| Rc::new(device.clone()));
+        let shown = after.filter(|device| device.reflectable(&self.advertise, &self.when));
         let origin = from.interface();
         let mut book = self.book();
         for member in self.snapshot() {
@@ -441,7 +441,7 @@ impl Inner {
                 self.attempt(&mut book, target, origin, old, None);
             }
             if let Some(host) = &host {
-                self.attempt(&mut book, target, origin, host, shown.clone());
+                self.attempt(&mut book, target, origin, host, shown.cloned());
             }
         }
     }
