@@ -186,8 +186,8 @@ fn manual_list_is_separate() {
     assert!(seg.devices().is_empty());
     assert!(rx.try_recv().is_err());
     assert_eq!(seg.manual_devices().len(), 1);
-    assert!(seg.remove_manual(&device).unwrap());
-    assert!(!seg.remove_manual(&device).unwrap());
+    assert!(seg.remove_manual(&seg.own(), &device).unwrap());
+    assert!(!seg.remove_manual(&seg.own(), &device).unwrap());
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn add_announces_and_remove_says_goodbye() {
     assert!(!seg.add_manual(OWN, &device).unwrap());
     assert!(recv(&rx).is_none());
 
-    seg.remove_manual(&device).unwrap();
+    seg.remove_manual(&seg.own(), &device).unwrap();
     let bye = recv(&rx).expect("goodbye");
     assert_eq!(bye.answers.len(), m.answers.len());
     assert!(bye.answers.iter().all(|r| r.ttl == 0));
@@ -269,14 +269,14 @@ fn a_hostname_two_owners_want_goes_to_the_lower_and_passes_to_the_next() {
     assert!(recv(&rx).is_none());
 
     // When the winner goes, the next one is announced in its place.
-    assert!(seg.remove_manual(&low).unwrap());
+    assert!(seg.remove_manual(&seg.own(), &low).unwrap());
     let m = recv(&rx).unwrap();
     assert!(has(&m, a("10.0.1.10"), true) && has(&m, a("10.0.2.9"), false) && has(&m, b_ptr(), true));
     assert_eq!(seg.manual_devices(), [tv("10.0.1.10", &["A", "B"])]);
 
     // What is not there removes nothing; the last one says goodbye.
-    assert!(!seg.remove_manual(&low).unwrap());
-    assert!(seg.remove_manual(&high).unwrap());
+    assert!(!seg.remove_manual(&seg.own(), &low).unwrap());
+    assert!(seg.remove_manual(&seg.own(), &high).unwrap());
     assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
     assert!(seg.manual_devices().is_empty());
 }
@@ -550,11 +550,11 @@ fn a_device_that_cannot_be_withdrawn_is_kept() {
 
     let (socket, dest) = broken();
     seg.attach(Family::V4, fd(socket), dest);
-    assert!(seg.remove_manual(&device).is_err());
+    assert!(seg.remove_manual(&seg.own(), &device).is_err());
     assert_eq!(seg.manual_devices().len(), 1, "kept");
 
     repair(&seg, &rx);
-    assert!(seg.remove_manual(&device).unwrap());
+    assert!(seg.remove_manual(&seg.own(), &device).unwrap());
     let goodbye = recv(&rx).unwrap();
     assert!(!goodbye.answers.is_empty() && goodbye.answers.iter().all(|r| r.ttl == 0));
     assert!(seg.manual_devices().is_empty());
@@ -1644,7 +1644,7 @@ fn a_device_without_services_can_be_advertised() {
     // ...is re-announced, and says goodbye when removed.
     seg.reannounce(Instant::now() + reannounce_after(HOST_TTL) + Duration::from_secs(1)).unwrap();
     assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL));
-    seg.remove_manual(&router).unwrap();
+    seg.remove_manual(&seg.own(), &router).unwrap();
     assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
 }
 
@@ -2490,12 +2490,12 @@ fn a_reflected_device_is_withdrawn_with_goodbyes_when_the_reflector_says() {
     let tv = shown(&a, "tv.local");
     tv_leaves(&a);
     assert_eq!(b.manual_devices().len(), 1, "still shown: nobody has said");
-    assert!(b.unreflect(&reflector(0), &tv).unwrap());
+    assert!(b.remove_manual(&reflector(0), &tv).unwrap());
     assert!(b.manual_devices().is_empty());
     let bye = recv(&rx).expect("goodbyes");
     assert!(bye.answers.iter().all(|r| r.ttl == 0), "{bye:?}");
     assert!(b.state.borrow().hosts.is_empty());
-    assert!(!b.unreflect(&reflector(0), &tv).unwrap(), "nothing left");
+    assert!(!b.remove_manual(&reflector(0), &tv).unwrap(), "nothing left");
 }
 
 /// Several reflectors may show a device of the same segment, each as it is
@@ -2514,11 +2514,39 @@ fn what_two_reflectors_show_of_a_device_of_one_segment_is_announced_together() {
         assert_eq!(shown[0].services.len(), 2, "{shown:?}");
         assert_eq!(shown[0].addrs().count(), 1);
 
-        b.unreflect(&reflector(0), first).unwrap();
+        b.remove_manual(&reflector(0), first).unwrap();
         assert_eq!(b.manual_devices()[0].services.len(), 1, "the other's is left");
-        b.unreflect(&reflector(1), second).unwrap();
+        b.remove_manual(&reflector(1), second).unwrap();
         assert!(b.manual_devices().is_empty());
     }
+}
+
+/// A segment taken down withdraws what is announced on it, copies and its own
+/// alike, with goodbyes, and says that its devices are gone, so that whoever
+/// shows copies of them elsewhere withdraws them.
+#[test]
+fn a_segment_taken_down_withdraws_what_it_announced_and_says_its_devices_are_gone() {
+    let (a, _arx) = wired();
+    let (b, rx) = wired();
+    tv_on(&a);
+    reflect_of(&b, &a, "tv.local").unwrap();
+    let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.2.1").into()].into(), ..Device::default() };
+    b.add_manual(OWN, &Shared::new(router)).unwrap();
+    assert_eq!(b.manual_devices().len(), 2);
+    while recv(&rx).is_some() {}
+    a.take_events();
+
+    a.destroy().unwrap();
+    let events = a.take_events();
+    assert!(matches!(&events[..], [Event::Removed(d)] if d.borrow().hostname.as_deref() == Some("tv.local")), "{events:?}");
+    assert!(a.devices().is_empty());
+
+    b.destroy().unwrap();
+    let said: Vec<Record> = std::iter::from_fn(|| recv(&rx)).flat_map(|m| m.answers).collect();
+    let bye = |name: &str| said.iter().any(|r| r.name == name && matches!(r.data, RData::A(_)) && r.ttl == 0);
+    assert!(bye("tv.local") && bye("router.local"), "{said:?}");
+    assert!(b.manual_devices().is_empty());
+    assert!(b.state.borrow().hosts.is_empty());
 }
 
 /// A device is the same one when it is renamed: it is withdrawn under the name
@@ -2539,7 +2567,7 @@ fn a_device_that_is_renamed_is_withdrawn_under_its_old_name_and_shown_under_the_
     assert_eq!(b.manual_devices()[0].hostname.as_deref(), Some("lounge.local"));
     b.state.borrow().hosts.check();
 
-    assert!(b.unreflect(&how, &device).unwrap(), "found by the device, under its new name");
+    assert!(b.remove_manual(&how, &device).unwrap(), "found by the device, under its new name");
     assert!(b.manual_devices().is_empty());
     assert!(b.state.borrow().hosts.is_empty());
 }
@@ -2557,14 +2585,14 @@ fn of_one_name_from_two_segments_the_lowest_is_announced_and_the_next_takes_over
     assert_eq!(shown.len(), 1);
     assert!(shown[0].addrs().eq([ip("10.0.1.1")]), "{shown:?}");
 
-    b.unreflect(&reflector(0), &low).unwrap();
+    b.remove_manual(&reflector(0), &low).unwrap();
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.2.2")]), "the other takes over");
 
     b.reflect(1, &low, &reflector(0), None).unwrap();
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.1.1")]), "back, and first");
     b.withdraw_all(&reflector(0)).unwrap();
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.2.2")]));
-    b.unreflect(&reflector(1), &high).unwrap();
+    b.remove_manual(&reflector(1), &high).unwrap();
     assert!(b.manual_devices().is_empty());
 }
 
@@ -3260,7 +3288,7 @@ fn live_announce() {
         let device = Shared::new(tv(&addr.to_string(), &["LiveTV"]));
         seg.add_manual(OWN, &device).unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        seg.remove_manual(&device).unwrap();
+        seg.remove_manual(&seg.own(), &device).unwrap();
     }
 }
 

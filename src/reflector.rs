@@ -451,7 +451,7 @@ impl Inner {
         let result = if show {
             target.reflect(priority, device, &self.advertise, self.reflect_ttl).map(drop)
         } else {
-            target.unreflect(&self.advertise, device).map(drop)
+            target.remove_manual(&self.advertise, device).map(drop)
         };
         let failed = result.is_err();
         if let Err(e) = result {

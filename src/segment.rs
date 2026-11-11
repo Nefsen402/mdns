@@ -1272,7 +1272,7 @@ impl Segment {
     /// `host_ttl` for its address records, if given, or else its own. The
     /// device is held where it is heard, and so is shown as it is now:
     /// whoever shows it says again when it has changed, and withdraws it with
-    /// [`unreflect`](Segment::unreflect) when it has gone. A device of the
+    /// [`remove_manual`](Segment::remove_manual) when it has gone. A device of the
     /// same name from the same segment that more than one shows (each with its
     /// own `how`) is announced as what they show of it together; from another
     /// segment, the lowest priority's is, and the other takes over when it
@@ -1289,18 +1289,18 @@ impl Segment {
         self.state.borrow_mut().put(manual, Instant::now())
     }
 
-    /// Forget `device`, which was made for this segment. If that is what is
-    /// announced, the next one's device takes its place, or, if there is none,
-    /// goodbyes are sent for it. Returns false if there was no such device. If
-    /// sending fails it is kept.
-    pub fn remove_manual(&self, device: &Shared) -> Result<bool> {
-        let own = Rc::clone(&self.state.borrow().own);
-        self.unreflect(&own, device)
+    /// How what is made for this segment ([`add_manual`](Segment::add_manual))
+    /// is shown, for [`remove_manual`](Segment::remove_manual).
+    pub fn own(&self) -> Rc<Advertise> {
+        Rc::clone(&self.state.borrow().own)
     }
 
-    /// Forget the copy of `device` that was to be shown as `how` says, as
-    /// [`remove_manual`](Segment::remove_manual) forgets one made for it.
-    pub fn unreflect(&self, how: &Rc<Advertise>, device: &Shared) -> Result<bool> {
+    /// Forget `device`, to be shown as `how` says: made for this segment (see
+    /// [`own`](Segment::own)) or reflected. If that is what is announced, the
+    /// next one's device takes its place, or, if there is none, goodbyes are
+    /// sent for it. Returns false if there was no such device. If sending
+    /// fails it is kept.
+    pub fn remove_manual(&self, how: &Rc<Advertise>, device: &Shared) -> Result<bool> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         let Some((host, manual)) = state.hosts.take((device.addr(), Rc::as_ptr(how) as usize)) else {
@@ -1313,7 +1313,21 @@ impl Segment {
     /// for what is then no longer announced. Every one is tried; the first
     /// error is returned.
     pub fn withdraw_all(&self, how: &Rc<Advertise>) -> Result<()> {
-        let taken = |m: &Manual| Rc::ptr_eq(&m.how, how);
+        self.withdraw_where(|m| Rc::ptr_eq(&m.how, how))
+    }
+
+    /// Take the segment down: everything announced on it is withdrawn, with
+    /// goodbyes, and every device found on it is forgotten, which is said by
+    /// an [event](Segment::take_events) of each going, for whoever shows
+    /// copies of them elsewhere to withdraw them. Once every segment is down
+    /// nothing is announced of any. Every one is tried; the first error is
+    /// returned.
+    pub fn destroy(&self) -> Result<()> {
+        self.forget_discovered();
+        self.withdraw_where(|_| true)
+    }
+
+    fn withdraw_where(&self, taken: impl Fn(&Manual) -> bool) -> Result<()> {
         let hosts: Vec<String> = {
             let state = self.state.borrow();
             state.hosts.iter().filter(|h| h.manuals.iter().any(&taken)).map(|h| h.host.to_string()).collect()
@@ -1322,7 +1336,7 @@ impl Segment {
         for host in hosts {
             let mut guard = self.state.borrow_mut();
             let state = &mut *guard;
-            let manuals = state.hosts.take_where(&host, taken);
+            let manuals = state.hosts.take_where(&host, &taken);
             if let Err(e) = state.settled(&host, manuals) {
                 first_err.get_or_insert(e);
             }
@@ -1387,7 +1401,7 @@ impl Segment {
         let existing = self.own_device(name);
         if addrs.is_empty() {
             eprintln!("{}: no address to advertise {name} with", self.interface);
-            if let Some(Err(e)) = existing.map(|existing| self.remove_manual(&existing)) {
+            if let Some(Err(e)) = existing.map(|existing| self.remove_manual(&self.own(), &existing)) {
                 eprintln!("{}: withdrawing {name} failed: {e:#}", self.interface);
             }
             return;

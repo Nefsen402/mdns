@@ -189,24 +189,22 @@ fn daemon(args: Vec<String>) -> Result<()> {
     let signal = event_loop(&signals, netlink, &mut ifaces, &mut server, &mut avahi)?;
     eprintln!("received {signal}: withdrawing reflected devices");
     // The loop has stopped, and the upkeep with it, while the goodbyes go
-    // out: the watches are told, and dropping the reflectors withdraws all
-    // they announced.
+    // out: the watches are told. Each segment is taken down, which withdraws
+    // what is announced on it and says that its devices are gone, for the
+    // reflectors to withdraw their copies of them elsewhere. Once all are
+    // down nothing is announced.
     server.shut_down();
     drop(server);
     drop(avahi);
     let links: Vec<Segment> = ifaces.live.iter().map(|i| i.segment.clone()).collect();
-    drop(ifaces);
-    drop(segments);
-    // With the reflectors gone, what is left in the manual lists is the
-    // advertised name: say goodbye to it too.
     for link in &links {
-        for (device, _) in link.own_devices() {
-            if let Err(e) = link.remove_manual(&device) {
-                let host = device.borrow().hostname.clone().unwrap_or_default();
-                eprintln!("{}: withdrawing {host} failed: {e:#}", link.interface());
-            }
+        if let Err(e) = link.destroy() {
+            eprintln!("{}: withdrawing what was announced failed: {e:#}", link.interface());
         }
     }
+    reflector::deliver(&segments.iter().map(|g| &g.reflector).collect::<Vec<_>>());
+    drop(ifaces);
+    drop(segments);
     let _ = rustix::fs::unlink(config.socket.as_str());
     Ok(())
 }
