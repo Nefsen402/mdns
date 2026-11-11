@@ -30,9 +30,9 @@ fn segment(name: &str, families: &[Family]) -> Segment {
 
 use crate::device::{record, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
 use crate::codec::{self, rtype, Header};
-use crate::socket::prefix;
+use crate::interface::prefix;
 #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
-use crate::socket::open;
+use crate::interface::open;
 
 /// Its first routable IPv4 or IPv6 address, and link-local one.
 fn v4(d: &Device) -> Option<IpAddr> {

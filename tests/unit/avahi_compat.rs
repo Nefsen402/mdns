@@ -55,7 +55,7 @@ fn fd(socket: impl std::os::fd::IntoRawFd) -> OwnedFd {
 fn group_on_lo() -> (Vec<Group>, Segment, UdpSocket) {
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-    let seg = Segment::new(socket::LOOPBACK, &[Family::V4, Family::V6]);
+    let seg = Segment::new(interface::LOOPBACK, &[Family::V4, Family::V6]);
     seg.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
     let reflector = Reflector::new(vec![seg.clone()]).unwrap();
     (vec![Group { name: "lan".into(), reflector }], seg, rx)
@@ -134,7 +134,7 @@ fn a_name_that_is_known_is_answered_at_once_and_the_connection_closed() {
     let (groups, seg, _rx) = group_on_lo();
     hear(&seg, "10.0.0.7", "tv.local", &["10.0.0.7", "fe80::7", "fd00::7"]);
     let (mut h, path) = Harness::new("known", groups);
-    let index = socket::ifindex(socket::LOOPBACK).unwrap();
+    let index = interface::ifindex(interface::LOOPBACK).unwrap();
     assert_eq!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 tv.local\n"), format!("+ {index} 0 tv.local 10.0.0.7\n"));
     assert_eq!(h.ask(&path, "RESOLVE-HOSTNAME-IPV6 TV.local\n"), format!("+ {index} 1 tv.local fd00::7\n"));
     assert_eq!(h.ask(&path, "RESOLVE-ADDRESS fe80::7\n"), format!("+ {index} 1 tv.local\n"));
@@ -175,7 +175,7 @@ fn a_name_that_is_not_known_is_asked_for_and_answered_once_it_is_heard() {
         }
         assert!(Instant::now() < deadline);
     }
-    assert_eq!(line, format!("+ {} 0 sleepy.local 10.0.0.8\n", socket::ifindex(socket::LOOPBACK).unwrap()));
+    assert_eq!(line, format!("+ {} 0 sleepy.local 10.0.0.8\n", interface::ifindex(interface::LOOPBACK).unwrap()));
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn v4_only(_: &str, _: &[Family]) -> Vec<IpAddr> {
 fn a_name_this_host_advertises_is_answered_at_its_own_addresses() {
     let (groups, _seg, _rx) = group_on_lo();
     let (mut h, path) = Harness::advertising("own", groups, &[advertise("Pc.local", &[])], dual_stack);
-    let index = socket::ifindex(socket::LOOPBACK).unwrap();
+    let index = interface::ifindex(interface::LOOPBACK).unwrap();
     // Without asking the network: it is not waited for.
     let started = Instant::now();
     assert_eq!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 pc.local\n"), format!("+ {index} 0 pc.local 10.0.0.1\n"));
@@ -242,7 +242,7 @@ fn a_name_this_host_advertises_is_answered_at_its_own_addresses() {
 #[test]
 fn a_name_is_only_answered_for_on_the_interfaces_it_is_advertised_on() {
     let (groups, _seg, _rx) = group_on_lo();
-    let (mut h, path) = Harness::advertising("where", groups, &[advertise("pc.local", &[socket::LOOPBACK]), advertise("away.local", &["eth9"])], dual_stack);
+    let (mut h, path) = Harness::advertising("where", groups, &[advertise("pc.local", &[interface::LOOPBACK]), advertise("away.local", &["eth9"])], dual_stack);
     assert!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 pc.local\n").starts_with("+ "));
     // Of an interface the segment does not have, nothing: it is asked for, and not found.
     assert_eq!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 away.local\n"), "-15 Timeout reached\n");

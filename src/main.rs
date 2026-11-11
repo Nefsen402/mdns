@@ -21,7 +21,7 @@ mod poll;
 mod reflector;
 mod segment;
 mod signal;
-mod socket;
+mod interface;
 mod table;
 mod time;
 mod tracker;
@@ -40,7 +40,7 @@ use config::{AdvertiseConfig, Config, Forward, Interface, Listen, Neighbours};
 use netlink::{Event, Netlink};
 use reflector::Reflector;
 use segment::Segment;
-use socket::{Family, Hub};
+use interface::{Family, Hub};
 
 /// What every module takes from alloc, as std's prelude would give it.
 mod prelude {
@@ -160,7 +160,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // with a socket for each family and one list of devices for both: mDNS
     // records do not belong to the transport they come over. One that is not
     // there yet is waited for.
-    let hub = Rc::new(socket::Hub::new(&families, &unicast).context("opening the sockets")?);
+    let hub = Rc::new(interface::Hub::new(&families, &unicast).context("opening the sockets")?);
     let interfaces = config.interfaces();
     let mut ifaces = Ifaces { config: &config, hub, groups: &segments, live: Vec::new(), seen: HashSet::new(), skipped: HashSet::new() };
     for interface in &interfaces {
@@ -180,7 +180,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
     }
     // Those already there that a pattern names, which netlink says of too, but
     // not on a system that has none.
-    for name in socket::interfaces().unwrap_or_default() {
+    for name in interface::interfaces().unwrap_or_default() {
         if is_pattern_match(&config, &name) {
             ifaces.add(&name)?;
         }
@@ -342,12 +342,12 @@ impl Ifaces<'_> {
         if !self.wants(name) || self.live.iter().any(|i| i.name == name) {
             return Ok(Opened::Absent);
         }
-        let Ok(index) = socket::ifindex(name) else {
+        let Ok(index) = interface::ifindex(name) else {
             return Ok(Opened::Absent);
         };
         // A pattern is for the networks there are: what a loopback interface hears
         // is what this host sends itself. One that is named is wanted.
-        if is_pattern_match(self.config, name) && socket::is_loopback(name) {
+        if is_pattern_match(self.config, name) && interface::is_loopback(name) {
             if self.skipped.insert(name.to_string()) {
                 eprintln!("{name}: a loopback interface, which a pattern does not take; name it to listen on it");
             }
@@ -361,10 +361,10 @@ impl Ifaces<'_> {
             return Ok(Opened::Absent);
         }
         let mut iface = Iface::new(&interface, index, self);
-        iface.take_mtu(socket::mtu(name).ok());
+        iface.take_mtu(interface::mtu(name).ok());
         // Of the families it has no address to join the group over, only what is
         // waited for waits: IPv6 is listened to when IPv4 cannot be yet.
-        iface.missing = iface.families.iter().copied().filter(|&f| !socket::joinable(name, f)).collect();
+        iface.missing = iface.families.iter().copied().filter(|&f| !interface::joinable(name, f)).collect();
         if !iface.missing.is_empty() {
             eprintln!("{name}: no IPv4 address yet: IPv4 is listened to when it has one");
         }
@@ -440,7 +440,7 @@ impl Ifaces<'_> {
             }
             Event::Addresses { name, index } => match self.live.iter().position(|i| i.index == *index) {
                 // One that was waiting for an address to listen over a family by, and has one now.
-                Some(at) if self.live[at].missing.iter().any(|&f| socket::joinable(name, f)) => {
+                Some(at) if self.live[at].missing.iter().any(|&f| interface::joinable(name, f)) => {
                     self.remove(at);
                     self.add(name)?;
                 }
@@ -506,7 +506,7 @@ impl Iface {
         let mut sockets = Vec::new();
         let _ = ifaces;
         for &family in &self.families {
-            let sock = socket::open(&self.name, family, self.unicast.contains(&family))
+            let sock = interface::open(&self.name, family, self.unicast.contains(&family))
                 .with_context(|| format!("opening {family:?} socket on {}", self.name))?;
             sockets.push(sock);
         }
@@ -551,7 +551,7 @@ impl Iface {
     /// The interface's addresses are new: tell its segment the networks it is
     /// on, and announce the advertised name with them.
     fn addresses_changed(&self) {
-        match socket::prefixes(&self.name) {
+        match interface::prefixes(&self.name) {
             Ok(prefixes) => self.segment.set_prefixes(prefixes),
             Err(e) => eprintln!("{}: {e:#}", self.name),
         }
@@ -561,7 +561,7 @@ impl Iface {
         if self.advertise.is_empty() {
             return;
         }
-        let addrs = socket::addresses(&self.name, &self.families).unwrap_or_default();
+        let addrs = interface::addresses(&self.name, &self.families).unwrap_or_default();
         for block in &self.advertise {
             self.segment.advertise(block, &addrs);
         }
@@ -586,7 +586,7 @@ impl Iface {
     /// interface's: the event loop found it readable.
     fn receive(&self, fd: RawFd) {
         if let Some(sock) = self.sockets.iter().find(|s| s.as_raw_fd() == fd) {
-            socket::drain(sock, &self.name, |from, to, datagram| self.segment.hear(from, to, datagram));
+            interface::drain(sock, &self.name, |from, to, datagram| self.segment.hear(from, to, datagram));
         }
     }
 }

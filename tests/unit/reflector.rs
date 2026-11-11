@@ -12,7 +12,7 @@ fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
     unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
 }
 use crate::codec::{rtype, Header, Message, Question, RData, Record};
-use crate::socket::{prefix, Family};
+use crate::interface::{prefix, Family};
 
 /// Its first routable IPv4 or IPv6 address, and link-local one.
 fn v4(d: &Device) -> Option<IpAddr> {

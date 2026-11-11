@@ -778,5 +778,5 @@ fn set_int(fd: impl AsFd, level: libc::c_int, name: libc::c_int, value: libc::c_
 pub(crate) const LOOPBACK: &str = if cfg!(target_os = "linux") { "lo" } else { "lo0" };
 
 #[cfg(test)]
-#[path = "../tests/unit/socket.rs"]
+#[path = "../tests/unit/interface.rs"]
 mod tests;

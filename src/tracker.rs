@@ -16,7 +16,7 @@ use crate::segment::Asked;
 use crate::codec::{Message, Question, RData, Record};
 use crate::prelude::*;
 use crate::config::{Advertise, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
-use crate::socket::{Family, Prefix};
+use crate::interface::{Family, Prefix};
 use crate::table::{hash_addr, hash_name, Id, Multi, Table};
 use crate::time::Instant;
 

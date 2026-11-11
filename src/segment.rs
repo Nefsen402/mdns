@@ -4,7 +4,7 @@
 //! devices heard on it, with their addresses and services, the ones put there
 //! by hand or reflected from elsewhere, and what is wanted announced under their names. It
 //! answers for them, announces, probes and refreshes them, and forgets them
-//! as they expire, sending through the [`socket`](crate::socket)s attached to
+//! as they expire, sending through the [`socket`](crate::interface)s attached to
 //! it.
 
 use core::fmt;
@@ -30,7 +30,7 @@ use crate::device::{
     family_of, is_link_local, is_type, responses, service_ttl, Advertised, Device, ServiceParts, Shared,
     DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
 };
-use crate::socket::{Family, Prefix, Sender, MDNS_PORT};
+use crate::interface::{Family, Prefix, Sender, MDNS_PORT};
 use crate::codec::{Message, Question, Record};
 
 use crate::prelude::*;

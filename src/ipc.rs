@@ -106,7 +106,7 @@ use crate::device::{is_type, Device, Origin};
 use crate::runtime::Why;
 use crate::poll;
 use crate::segment::{Event, Probed, Segment};
-use crate::socket::Family;
+use crate::interface::Family;
 use crate::Group;
 
 use crate::prelude::*;

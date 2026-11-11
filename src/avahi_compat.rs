@@ -42,7 +42,7 @@ use crate::ipc::links_of;
 use crate::codec::{rtype, Question};
 use crate::poll;
 use crate::runtime::Why;
-use crate::socket::{self, Family};
+use crate::interface::{self, Family};
 use crate::Group;
 
 use crate::prelude::*;
@@ -84,7 +84,7 @@ pub struct Server {
 type Addresses = fn(&str, &[Family]) -> Vec<IpAddr>;
 
 fn system_addresses(interface: &str, families: &[Family]) -> Vec<IpAddr> {
-    socket::addresses(interface, families).unwrap_or_default()
+    interface::addresses(interface, families).unwrap_or_default()
 }
 
 struct Client {
@@ -340,13 +340,13 @@ fn answer(groups: &[Group], host: &Host, request: &Request) -> (Option<String>, 
     match request {
         Request::Host { name, family } => {
             let (found, advertised) = hosts(groups, host, name);
-            let line = choose(&found, *family).map(|f| format!("+ {} {} {name} {}", socket::ifindex(&f.interface).unwrap_or(0), protocol(f.ip), f.ip));
+            let line = choose(&found, *family).map(|f| format!("+ {} {} {name} {}", interface::ifindex(&f.interface).unwrap_or(0), protocol(f.ip), f.ip));
             (line, advertised || !found.is_empty())
         }
         // What is known is told, and nothing waits for the rest.
         Request::Address(addr) => {
             let line = match name_of(groups, host, *addr) {
-                Some((interface, name)) => format!("+ {} {} {name}", socket::ifindex(&interface).unwrap_or(0), protocol(*addr)),
+                Some((interface, name)) => format!("+ {} {} {name}", interface::ifindex(&interface).unwrap_or(0), protocol(*addr)),
                 None => "-30 Not found".to_string(),
             };
             (Some(line), true)
