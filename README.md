@@ -82,9 +82,13 @@ What the model does not hold does not cross:
 
 - Records other than A, AAAA, PTR, SRV, TXT and NSEC are not passed on, nor
   are the priority and weight of SRV records.
-- A device is reflected once it has a hostname, a routable address and a
-  service with its host and port. Until it has said all that, nothing of it
-  is shown elsewhere.
+- By default a device is reflected once it has a hostname, a routable address
+  and a service whose host and port are known, and until it has all that nothing
+  of it is shown elsewhere. Only its services that are known so, and of the
+  types `ReflectedServices=` lets through, go with it. `ReflectedWhen=` can
+  leave out the address or the service, so that a device is found by its name
+  alone, or by its services alone; the hostname is always needed, as it is what
+  a device is announced by (see `mdnsd.conf(5)`).
 - Only mDNS is handled: SSDP/UPnP and LLMNR discovery are not.
 
 ## Reflecting between networks
