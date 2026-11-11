@@ -5,7 +5,7 @@ of the devices on each network it is told to watch, makes chosen ones visible on
 other networks, lets scripts ask it what is there, and announces the host's own
 name and services.
 
-It has three uses, which are the same daemon with a different configuration,
+It has four uses, which are the same daemon with a different configuration,
 and **any combination of them runs at once**, from one config file, on the same
 interfaces or on different ones: a router that reflects between two networks,
 tracks a third and advertises itself on the first is one daemon (see
@@ -15,6 +15,10 @@ tracks a third and advertises itself on the first is one daemon (see
   networks (VLANs, a guest or IoT Wi-Fi): your phone on the LAN finds the
   speakers on the media VLAN, with per-pair control over which networks may see
   each other, and in which direction.
+- **[A bridge over a tunnel](#reflecting-over-a-tunnel)** that carries only
+  unicast, such as WireGuard: a daemon at each end, each told where the other
+  is, so that the devices of one site are found from the other, in one
+  direction or both, though no multicast crosses the tunnel.
 - **[A device tracker for scripts](#tracking-devices-for-scripts)**: the
   daemon watches a network all the time, so a short-lived script can ask it what
   is there in one call, smart plugs that only answer when asked included, or
@@ -139,14 +143,17 @@ media_stuff: 3 devices
 The rules for what is reflected, and when, are in `mdnsd(8)`. Don't run another
 reflector (Avahi's `enable-reflector`) over the same interfaces.
 
-### Over a tunnel
+## Reflecting over a tunnel
 
-A tunnel that cannot carry multicast, such as WireGuard, can still carry mDNS
-between two daemons, one at each end, if each says where the other is:
+mDNS is multicast, and a tunnel such as WireGuard carries no multicast: it
+sends a packet only to a peer whose `AllowedIPs` has the destination, which the
+mDNS group is not. Run a daemon at each end and tell each where the other is,
+and they carry mDNS over the tunnel as unicast, to each other alone. For a
+home network (`br0`) and a remote site, joined by a WireGuard tunnel (`wg0`),
+home on `10.8.0.1` and the remote site on `10.8.0.2`:
 
-```
-# /etc/mdnsd.conf, at home. The tunnel's devices are reflected into br0, and
-# nothing of br0 is announced down it.
+```ini
+# /etc/mdnsd.conf, at home
 [Interface]
 Name=wg0
 Peer=10.8.0.2
@@ -157,10 +164,39 @@ Interfaces=br0,wg0
 Untrusted=wg0
 ```
 
-At the other end, `Peer=10.8.0.1` on its `wg0`, with `Untrusted=` left out if
-each side is to see the other's devices. What goes over the tunnel is the mDNS
-a link would carry, sent to the peer alone, over the families its address is of;
-`PeerPort=` moves it from the mDNS port, and `Peer=` takes several hosts.
+```ini
+# /etc/mdnsd.conf, at the remote site
+[Interface]
+Name=wg0
+Peer=10.8.0.1
+
+[Segment]
+Name=home
+Interfaces=lan,wg0
+```
+
+The remote site's devices are announced to home through the tunnel, and home
+reflects them into `br0`: the speakers there are found from the LAN here. At
+home `wg0` is untrusted, so nothing of `br0` is announced down the tunnel; the
+remote site is told nothing of home. Leave `Untrusted=` out on both sides and
+each sees the other's devices, as two networks of a router do.
+
+- **What goes over the tunnel** is the mDNS a link would carry: announcements,
+  questions and answers, sent to the peer alone, from and to port 5353 (`PeerPort=`
+  moves it), over the family the peer's address is of. Only what a peer sends
+  is heard: no other host on the tunnel is, whatever it sends.
+- **Several peers** are `Peer=10.8.0.2, 10.8.0.3`: each is sent to and heard.
+  The peers of one interface are one network to the daemon, so a device heard
+  from one is not announced to another.
+- **WireGuard** needs each peer's tunnel address in `AllowedIPs` of the other
+  end (it is, for the tunnel to work at all), and the firewall must let UDP at
+  port 5353 through between the two addresses. As elsewhere, mDNS only makes
+  devices discoverable: connections to them have to be allowed, and routed
+  over the tunnel, as well.
+- It is for a tunnel with an address at each end, or any link where multicast
+  does not reach: `Peer=` is of one interface, whatever it is.
+- Linux only, for now: the BSDs share one socket between all interfaces, which
+  cannot say who an interface's peers are.
 
 ## Tracking devices for scripts
 
