@@ -82,8 +82,6 @@ What the model does not hold does not cross:
 
 - Records other than A, AAAA, PTR, SRV, TXT and NSEC are not passed on, nor
   are the priority and weight of SRV records.
-- TXT values are kept as text: one that is not valid UTF-8 is not passed on
-  byte for byte.
 - A device is reflected once it has a hostname, a routable address and a
   service with its host and port. Until it has said all that, nothing of it
   is shown elsewhere.
