@@ -116,7 +116,7 @@ fn reflecting_one_more_device_costs() {
             announce(&a, &format!("10.1.{}.{}", i / 250, i % 250 + 1), &format!("h{i}.local"), &[&format!("S{i}")]);
             deliver_made();
         }
-        assert_eq!(b.manual_devices().len(), n);
+        assert_eq!(b.reflected_devices().len(), n);
         let runs = 20;
         let start = std::time::Instant::now();
         for i in 0..runs {
@@ -193,9 +193,9 @@ fn reflects_to_other_segments_only() {
     let _r = Reflector::new(vec![a.clone(), b.clone(), c.clone()]).unwrap();
 
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
-    wait_for(|| b.manual_devices().len() == 1 && c.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1 && c.reflected_devices().len() == 1);
 
-    assert!(a.manual_devices().is_empty());
+    assert!(a.reflected_devices().is_empty());
     assert!(b.devices().is_empty(), "reflected copies are not discovered");
     let sent = drain(&brx);
     assert_eq!(sent.len(), 1);
@@ -210,7 +210,7 @@ fn reflects_devices_already_discovered() {
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
 
     let _r = Reflector::new(vec![a, b.clone()]).unwrap();
-    assert_eq!(b.manual_devices().len(), 1);
+    assert_eq!(b.reflected_devices().len(), 1);
     assert_eq!(drain(&brx).len(), 1);
 }
 
@@ -220,11 +220,11 @@ fn removal_withdraws_with_goodbye() {
     let (b, brx) = wired("b");
     let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
-    wait_for(|| b.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1);
     drain(&brx);
 
     a.expire(Instant::now() + Duration::from_secs(36000));
-    wait_for(|| b.manual_devices().is_empty());
+    wait_for(|| b.reflected_devices().is_empty());
     let bye = drain(&brx);
     assert_eq!(bye.len(), 1);
     assert!(bye[0].answers.iter().all(|r| r.ttl == 0));
@@ -236,10 +236,10 @@ fn updates_follow_the_source() {
     let (b, _brx) = wired("b");
     let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
-    wait_for(|| b.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1);
 
     announce(&a, "10.0.1.5", "tv.local", &["TV", "Cast"]);
-    wait_for(|| b.manual_devices()[0].services.len() == 2);
+    wait_for(|| b.reflected_devices()[0].services.len() == 2);
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn skips_devices_that_cannot_be_announced() {
     a.observe(ip("10.0.1.5")); // no hostname, no services
     announce(&a, "10.0.1.6", "bare.local", &[]); // hostname only
     deliver_made();
-    assert!(b.manual_devices().is_empty());
+    assert!(b.reflected_devices().is_empty());
     assert!(drain(&brx).is_empty());
 }
 
@@ -270,7 +270,7 @@ fn a_device_without_services_is_reflected_only_if_asked_to() {
 
         announce(&a, "10.0.1.6", "bare.local", &[]);
         deliver_made();
-        let reflected = b.manual_devices();
+        let reflected = b.reflected_devices();
         assert_eq!(reflected.len(), usize::from(!service));
         if !service {
             assert_eq!(reflected[0].hostname.as_deref(), Some("bare.local"));
@@ -324,7 +324,7 @@ fn only_the_services_of_the_types_asked_for_are_reflected() {
         announce_kinds(&a, "10.0.1.8", "shell.local", &[("Box", "_ssh._tcp")]);
         deliver_made();
         let mut seen: Vec<(String, Vec<String>)> = b
-            .manual_devices()
+            .reflected_devices()
             .into_iter()
             .map(|d| (d.hostname.clone().unwrap(), d.services.iter().map(|s| s.kind().to_string()).collect()))
             .collect();
@@ -358,7 +358,7 @@ fn a_device_without_a_routable_address_is_reflected_only_if_asked_to() {
         announce6(&a, "fe80::6", "mute.local", &["fe80::6"], "Mute");
         wait_for(|| !a.devices().is_empty());
         deliver_made();
-        let reflected = b.manual_devices();
+        let reflected = b.reflected_devices();
         assert_eq!(reflected.len(), usize::from(!address), "{reflected:?}");
         if !address {
             assert_eq!(reflected[0].addrs().count(), 0);
@@ -373,11 +373,11 @@ fn drop_withdraws_everything() {
     let (b, brx) = wired("b");
     let r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
-    wait_for(|| b.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1);
     drain(&brx);
 
     drop(r);
-    assert!(b.manual_devices().is_empty());
+    assert!(b.reflected_devices().is_empty());
     let bye = drain(&brx);
     assert_eq!(bye.len(), 1);
     assert!(bye[0].answers.iter().all(|r| r.ttl == 0));
@@ -393,20 +393,20 @@ fn hostname_clash_goes_to_lowest_segment_then_fails_over() {
     announce(&b, "10.0.2.5", "tv.local", &["TV"]);
     announce(&a, "10.0.1.5", "TV.local", &["TV"]);
     wait_for(|| {
-        let d = c.manual_devices();
+        let d = c.reflected_devices();
         d.len() == 1 && v4(&d[0]) == Some(ip("10.0.1.5"))
     });
 
     a.expire(Instant::now() + Duration::from_secs(36000));
     wait_for(|| {
-        let d = c.manual_devices();
+        let d = c.reflected_devices();
         d.len() == 1 && v4(&d[0]) == Some(ip("10.0.2.5"))
     });
 }
 
 /// What each segment announces, by hostname.
 fn announced_on(seg: &Segment) -> Vec<String> {
-    let mut names: Vec<String> = seg.manual_devices().into_iter().filter_map(|d| d.hostname).collect();
+    let mut names: Vec<String> = seg.reflected_devices().into_iter().filter_map(|d| d.hostname).collect();
     names.sort();
     names
 }
@@ -492,7 +492,7 @@ fn reflected_devices_are_announced_with_the_ttls_they_announced_themselves_with(
     let _r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
 
     announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
-    wait_for(|| b.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1);
     assert_eq!(announced_ttls(&brx), (vec![300], vec![600, 600, 600]));
     // What the device said is on record, too.
     assert_eq!(a.devices()[0].ttl, Some(300));
@@ -507,7 +507,7 @@ fn a_configured_reflect_ttl_wins_for_the_address_and_leaves_the_services_alone()
     let _r = Reflector::with_options(vec![a.clone(), b.clone()], &[], Forward::default(), Advertise::default(), ReflectedWhen::default(), ttl).unwrap();
 
     announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
-    wait_for(|| b.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1);
     assert_eq!(announced_ttls(&brx), (vec![900], vec![600, 600, 600]));
 }
 
@@ -523,10 +523,10 @@ fn segments_sharing_an_interface_each_reflect_with_their_own_ttl() {
     let _wifi = Reflector::new(vec![br0.clone(), wifi.clone()]).unwrap();
 
     announce_ttl(&media, "10.0.2.5", "tv.local", &["TV"], 300, 600);
-    wait_for(|| br0.manual_devices().len() == 1);
+    wait_for(|| br0.reflected_devices().len() == 1);
     assert_eq!(announced_ttls(&brx).0, vec![900]);
     announce_ttl(&wifi, "10.0.3.5", "plug.local", &["Plug"], 300, 600);
-    wait_for(|| br0.manual_devices().len() == 2);
+    wait_for(|| br0.reflected_devices().len() == 2);
     assert_eq!(announced_ttls(&brx).0, vec![300]);
 }
 
@@ -544,10 +544,10 @@ fn a_device_with_two_hostnames_on_one_address_has_both_reflected() {
     wait_for(|| a.devices().len() == 2);
     deliver_made();
 
-    let mut names: Vec<_> = b.manual_devices().iter().map(|d| d.hostname.clone().unwrap()).collect();
+    let mut names: Vec<_> = b.reflected_devices().iter().map(|d| d.hostname.clone().unwrap()).collect();
     names.sort();
     assert_eq!(names, ["tv-nsas-1.local", "tv.local"]);
-    assert!(b.manual_devices().iter().all(|d| v4(d) == Some(ip("10.0.1.5"))));
+    assert!(b.reflected_devices().iter().all(|d| v4(d) == Some(ip("10.0.1.5"))));
 }
 
 /// The configured topology: a<->b and b<->c, but never a<->c, even
@@ -562,24 +562,24 @@ fn overlapping_reflectors_do_not_leak_through_the_shared_segment() {
 
     announce(&a, "10.0.1.5", "tv-a.local", &["A"]);
     announce(&c, "10.0.3.5", "tv-c.local", &["C"]);
-    wait_for(|| b.manual_devices().len() == 2);
+    wait_for(|| b.reflected_devices().len() == 2);
     deliver_made();
 
     // b learned both, but a and c each only learned about b's side.
-    assert_eq!(a.manual_devices().len(), 0);
-    assert_eq!(c.manual_devices().len(), 0);
+    assert_eq!(a.reflected_devices().len(), 0);
+    assert_eq!(c.reflected_devices().len(), 0);
 
     announce(&b, "10.0.2.5", "tv-b.local", &["B"]);
-    wait_for(|| a.manual_devices().len() == 1 && c.manual_devices().len() == 1);
-    assert_eq!(v4(&a.manual_devices()[0]), Some(ip("10.0.2.5")));
-    assert_eq!(v4(&c.manual_devices()[0]), Some(ip("10.0.2.5")));
+    wait_for(|| a.reflected_devices().len() == 1 && c.reflected_devices().len() == 1);
+    assert_eq!(v4(&a.reflected_devices()[0]), Some(ip("10.0.2.5")));
+    assert_eq!(v4(&c.reflected_devices()[0]), Some(ip("10.0.2.5")));
 
     // Dropping one reflector withdraws only what it announced.
     drop(r_ab);
-    assert!(a.manual_devices().is_empty());
-    let on_b: Vec<_> = b.manual_devices().iter().map(|d| v4(d).unwrap()).collect();
+    assert!(a.reflected_devices().is_empty());
+    let on_b: Vec<_> = b.reflected_devices().iter().map(|d| v4(d).unwrap()).collect();
     assert_eq!(on_b, [ip("10.0.3.5")]);
-    assert_eq!(c.manual_devices().len(), 1);
+    assert_eq!(c.reflected_devices().len(), 1);
 }
 
 /// Two segments that share br0, with a `tv.local` on each of the others.
@@ -592,7 +592,7 @@ fn segments_sharing_an_interface_keep_both_and_the_first_segment_wins() {
     let (wifi, _wifi_rx) = wired("wifi");
     let _first = Reflector::new(vec![br0.clone(), media.clone()]).unwrap();
     let _second = Reflector::new(vec![br0.clone(), wifi.clone()]).unwrap();
-    let on_br0 = || br0.manual_devices().iter().map(v4).collect::<Vec<_>>();
+    let on_br0 = || br0.reflected_devices().iter().map(v4).collect::<Vec<_>>();
     let gone = || Instant::now() + Duration::from_secs(3600);
 
     // Media's wins, and is not displaced by the one heard after it.
@@ -627,7 +627,7 @@ fn a_device_here_keeps_its_name_and_the_copy_gives_way() {
     let (br0, br0_rx) = wired("br0");
     let (media, _media_rx) = wired("media");
     let _r = Reflector::new(vec![br0.clone(), media.clone()]).unwrap();
-    let on_br0 = || br0.manual_devices().iter().map(v4).collect::<Vec<_>>();
+    let on_br0 = || br0.reflected_devices().iter().map(v4).collect::<Vec<_>>();
     let tv_records = |msgs: Vec<Message>| -> Vec<Record> {
         msgs.into_iter().flat_map(|m| m.answers).filter(|r| r.name.eq_ignore_ascii_case("tv.local")).collect()
     };
@@ -636,7 +636,7 @@ fn a_device_here_keeps_its_name_and_the_copy_gives_way() {
     announce(&media, "10.0.2.5", "TV.local", &["Living Room"]);
     wait_for(|| br0.devices().len() == 1 && media.devices().len() == 1);
     deliver_made();
-    assert!(on_br0().is_empty() && media.manual_devices().is_empty());
+    assert!(on_br0().is_empty() && media.reflected_devices().is_empty());
     assert!(tv_records(drain(&br0_rx)).is_empty(), "nothing about tv.local was sent onto br0");
 
     // The one on br0 goes: media's is shown in its place.
@@ -660,19 +660,19 @@ fn a_device_named_like_the_advertised_name_leaves_it_alone() {
     let (br0, br0_rx) = wired("br0");
     let (media, _media_rx) = wired("media");
     let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.0.1").into()].into(), ..Device::default() };
-    br0.add_manual_ttl(OWN, &Shared::new(router.clone()), Duration::from_secs(120)).unwrap();
+    br0.add_reflected_ttl(OWN, &Shared::new(router.clone()), Duration::from_secs(120)).unwrap();
     let _r = Reflector::new(vec![br0.clone(), media.clone()]).unwrap();
     drain(&br0_rx);
 
     announce(&media, "10.0.2.5", "Router.local", &["Admin"]);
     wait_for(|| media.devices().len() == 1);
     deliver_made();
-    assert_eq!(br0.manual_devices(), std::slice::from_ref(&router));
+    assert_eq!(br0.reflected_devices(), std::slice::from_ref(&router));
 
     media.expire(Instant::now() + Duration::from_secs(3600));
     wait_for(|| media.devices().is_empty());
     deliver_made();
-    assert_eq!(br0.manual_devices(), [router]);
+    assert_eq!(br0.reflected_devices(), [router]);
     assert!(drain(&br0_rx).is_empty(), "nothing about it was sent, or withdrawn");
 }
 
@@ -696,11 +696,11 @@ fn only_services_known_where_they_are_are_reflected() {
     a.handle(SocketAddr::new(ip("10.0.1.5"), 5353), &msg.encode().unwrap()).unwrap();
     wait_for(|| a.devices().iter().any(|d| !d.services.is_empty()));
     deliver_made();
-    assert!(b.manual_devices().is_empty(), "nothing resolved to reflect");
+    assert!(b.reflected_devices().is_empty(), "nothing resolved to reflect");
 
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
-    wait_for(|| b.manual_devices().len() == 1);
-    let names: Vec<String> = b.manual_devices()[0].services.iter().map(|s| s.instance().to_string()).collect();
+    wait_for(|| b.reflected_devices().len() == 1);
+    let names: Vec<String> = b.reflected_devices()[0].services.iter().map(|s| s.instance().to_string()).collect();
     assert_eq!(names, ["TV._http._tcp.local"]);
 }
 
@@ -748,7 +748,7 @@ fn a_question_nothing_answers_is_asked_where_the_answer_could_come_from() {
 
     // The printer on media answers the daemon, and br0 is told of it.
     announce(&media, "10.0.2.7", "printer.local", &["Printer"]);
-    wait_for(|| br0.manual_devices().len() == 1);
+    wait_for(|| br0.reflected_devices().len() == 1);
     let told: Vec<Record> = drain(&br0_rx).into_iter().flat_map(|m| m.answers).collect();
     assert!(told.iter().any(|r| r.data == RData::A("10.0.2.7".parse().unwrap())), "{told:?}");
 
@@ -776,7 +776,7 @@ fn a_browse_a_copy_answers_is_asked_elsewhere_as_configured() {
         let (media, media_rx) = wired("media");
         let _r = Reflector::with_options(vec![br0.clone(), media.clone()], &[], forward, Advertise::default(), ReflectedWhen::default(), None).unwrap();
         announce(&media, "10.0.2.7", "tv.local", &["TV"]);
-        wait_for(|| br0.manual_devices().len() == 1);
+        wait_for(|| br0.reflected_devices().len() == 1);
         drain(&media_rx);
 
         ask_type(&br0, "10.0.0.50", "_http._tcp.local", rtype::PTR);
@@ -815,15 +815,15 @@ fn failed_sends_are_retried_until_they_go_through() {
 
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
     deliver_made();
-    assert!(b.manual_devices().is_empty(), "it could not be announced");
+    assert!(b.reflected_devices().is_empty(), "it could not be announced");
     let retry = r.next_retry().expect("to be tried again");
     assert!(retry > Instant::now() + RETRY - Duration::from_secs(1));
     retry_made(retry);
-    assert!(b.manual_devices().is_empty(), "still not");
+    assert!(b.reflected_devices().is_empty(), "still not");
     repair();
     assert!(r.next_retry().is_some_and(|at| at > retry), "put off");
     retry_made(r.next_retry().unwrap());
-    assert_eq!(b.manual_devices().len(), 1);
+    assert_eq!(b.reflected_devices().len(), 1);
     assert_eq!(r.next_retry(), None, "nothing left to try");
     let told: Vec<Record> = drain(&b_rx).into_iter().flat_map(|m| m.answers).collect();
     assert!(told.iter().any(|r| r.data == RData::A("10.0.1.5".parse().unwrap()) && r.ttl > 0), "{told:?}");
@@ -833,10 +833,10 @@ fn failed_sends_are_retried_until_they_go_through() {
     b.attach(Family::V4, fd(socket), dest);
     a.expire(Instant::now() + Duration::from_secs(100_000));
     deliver_made();
-    assert_eq!(b.manual_devices().len(), 1, "kept: its goodbye did not go out");
+    assert_eq!(b.reflected_devices().len(), 1, "kept: its goodbye did not go out");
     repair();
     retry_made(r.next_retry().unwrap());
-    assert!(b.manual_devices().is_empty());
+    assert!(b.reflected_devices().is_empty());
     let told: Vec<Record> = drain(&b_rx).into_iter().flat_map(|m| m.answers).collect();
     assert!(told.iter().any(|r| r.data == RData::A("10.0.1.5".parse().unwrap()) && r.ttl == 0), "{told:?}");
 }
@@ -850,21 +850,21 @@ fn a_copy_whose_goodbye_failed_is_withdrawn_when_its_segment_goes() {
     let r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
     deliver_made();
-    assert_eq!(b.manual_devices().len(), 1);
+    assert_eq!(b.reflected_devices().len(), 1);
 
     let (socket, dest) = (UdpSocket::bind("127.0.0.1:0").unwrap(), "[::1]:5353".parse::<SocketAddr>().unwrap());
     b.attach(Family::V4, fd(socket), dest);
     a.forget_discovered();
     deliver_made();
-    assert_eq!(b.manual_devices().len(), 1, "kept: its goodbye did not go out");
+    assert_eq!(b.reflected_devices().len(), 1, "kept: its goodbye did not go out");
 
     // The device is not a's any more, only a copy of it is left, and a goes.
     r.remove("a");
-    assert_eq!(b.manual_devices().len(), 1, "still: b cannot send");
+    assert_eq!(b.reflected_devices().len(), 1, "still: b cannot send");
     let retry = r.next_retry().expect("to be tried again");
     b.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), b_rx.local_addr().unwrap());
     retry_made(retry);
-    assert!(b.manual_devices().is_empty());
+    assert!(b.reflected_devices().is_empty());
     assert_eq!(r.next_retry(), None);
 }
 
@@ -893,12 +893,12 @@ fn a_device_known_only_by_link_local_is_reflected_with_its_neighbour_addresses()
     };
     a.handle(SocketAddr::new(ip("fe80::9"), 5353), &msg.encode().unwrap()).unwrap();
     deliver_made();
-    assert!(b.manual_devices().is_empty(), "nowhere to reach it at");
+    assert!(b.reflected_devices().is_empty(), "nowhere to reach it at");
 
     a.neighbour(ip("fd00::9"), Some(mac));
-    wait_for(|| b.manual_devices().first().is_some_and(|d| d.addrs().eq([ip("fd00::9")])));
+    wait_for(|| b.reflected_devices().first().is_some_and(|d| d.addrs().eq([ip("fd00::9")])));
     a.neighbour(ip("fd00::9"), None);
-    wait_for(|| b.manual_devices().is_empty());
+    wait_for(|| b.reflected_devices().is_empty());
 }
 
 /// What a segment reflects of the addresses from the neighbour table:
@@ -940,7 +940,7 @@ fn a_segment_chooses_which_neighbour_addresses_to_reflect() {
         };
         heard("10.0.1.9", "printer.local", RData::A("10.0.1.9".parse().unwrap()));
         heard("fe80::8", "tv.local", RData::Aaaa("fe80::8".parse().unwrap()));
-        let copy = |host: &str| b.manual_devices().into_iter().find(|d| d.hostname.as_deref() == Some(host));
+        let copy = |host: &str| b.reflected_devices().into_iter().find(|d| d.hostname.as_deref() == Some(host));
         wait_for(|| copy("printer.local").is_some_and(|d| d.addrs().eq(printer.iter().copied())));
         match &tv {
             Some(addrs) => wait_for(|| copy("tv.local").is_some_and(|d| d.addrs().eq(addrs.iter().copied()))),
@@ -978,9 +978,9 @@ fn a_copy_carries_both_families_but_no_link_local_address() {
         additionals: vec![],
     };
     a.handle(SocketAddr::new(ip("10.0.1.5"), 5353), &msg.encode().unwrap()).unwrap();
-    wait_for(|| b.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1);
 
-    let there = b.manual_devices().remove(0);
+    let there = b.reflected_devices().remove(0);
     assert_eq!(there.addrs().collect::<Vec<_>>(), [ip("10.0.1.5"), ip("fd00::5")]);
     let sent: Vec<RData> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.name == "tv.local").map(|r| r.data).collect();
     assert_eq!(sent, [RData::A("10.0.1.5".parse().unwrap()), RData::Aaaa("fd00::5".parse().unwrap())]);
@@ -1006,8 +1006,8 @@ fn a_copy_carries_a_global_and_a_ula_address() {
         additionals: vec![],
     };
     a.handle(SocketAddr::new(ip("fe80::5"), 5353), &msg.encode().unwrap()).unwrap();
-    wait_for(|| b.manual_devices().len() == 1);
-    assert_eq!(b.manual_devices()[0].addrs().collect::<Vec<_>>(), [ip("2001:db8::5"), ip("fd00::5")]);
+    wait_for(|| b.reflected_devices().len() == 1);
+    assert_eq!(b.reflected_devices()[0].addrs().collect::<Vec<_>>(), [ip("2001:db8::5"), ip("fd00::5")]);
     let sent: Vec<RData> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.name == "tv.local").map(|r| r.data).collect();
     assert_eq!(sent, [RData::Aaaa("2001:db8::5".parse().unwrap()), RData::Aaaa("fd00::5".parse().unwrap())]);
 }
@@ -1031,11 +1031,11 @@ fn a_copy_drops_an_address_that_ran_out() {
         additionals: vec![],
     };
     a.handle(SocketAddr::new(ip("10.0.1.5"), 5353), &msg.encode().unwrap()).unwrap();
-    wait_for(|| b.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1);
     drain(&brx);
 
     a.expire(Instant::now() + Duration::from_secs(400));
-    wait_for(|| b.manual_devices().first().is_some_and(|d| d.addrs().eq([ip("fd00::5")])));
+    wait_for(|| b.reflected_devices().first().is_some_and(|d| d.addrs().eq([ip("fd00::5")])));
     let bye: Vec<Record> = drain(&brx).into_iter().flat_map(|m| m.answers).filter(|r| r.ttl == 0).collect();
     assert_eq!(bye.len(), 1, "{bye:?}");
     assert_eq!(bye[0].data, RData::A("10.0.1.5".parse().unwrap()));
@@ -1051,13 +1051,13 @@ fn link_local_addresses_never_leave_their_link() {
 
     // It sends from its link-local address and announces that and a ULA.
     announce6(&a, "fe80::5", "tv.local", &["fd00:0:1::5", "fe80::5"], "TV");
-    wait_for(|| b.manual_devices().len() == 1);
+    wait_for(|| b.reflected_devices().len() == 1);
 
     // Where it lives, both addresses are known...
     let home = &a.devices()[0];
     assert_eq!((v6(home), ll6(home)), (Some(ip("fd00:0:1::5")), Some(ip("fe80::5"))));
     // ...but the other network is told only the routable one.
-    let there = &b.manual_devices()[0];
+    let there = &b.reflected_devices()[0];
     assert_eq!((v6(there), ll6(there)), (Some(ip("fd00:0:1::5")), None));
     let on_the_wire: Vec<Ipv6Addr> = drain(&brx)
         .iter()
@@ -1080,7 +1080,7 @@ fn a_device_known_only_by_a_link_local_address_is_not_reflected() {
     wait_for(|| !a.devices().is_empty());
     deliver_made();
     assert_eq!(v4(&a.devices()[0]), None);
-    assert!(b.manual_devices().is_empty());
+    assert!(b.reflected_devices().is_empty());
     assert!(drain(&brx).is_empty());
 }
 
@@ -1090,7 +1090,7 @@ fn single_segment_reflects_nothing() {
     let _r = Reflector::new(vec![a.clone()]).unwrap();
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
     deliver_made();
-    assert!(a.manual_devices().is_empty());
+    assert!(a.reflected_devices().is_empty());
     assert!(drain(&arx).is_empty());
 }
 

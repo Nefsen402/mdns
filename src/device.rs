@@ -893,7 +893,7 @@ impl Device {
         device
     }
 
-    /// What identifies it in the manual list and to the reflector: its
+    /// What identifies it among the reflected devices and to the reflector: its
     /// hostname, case-insensitively.
     pub fn key(&self) -> Option<String> {
         self.hostname.as_ref().map(|h| h.to_ascii_lowercase())

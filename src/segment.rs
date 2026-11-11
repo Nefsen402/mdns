@@ -2,7 +2,7 @@
 //!
 //! A [`Segment`] keeps a model of the link rather than its packets: the
 //! devices heard on it, with their addresses and services, the ones put there
-//! by hand or reflected from elsewhere, and the manuals that want their names. It
+//! by hand or reflected from elsewhere, and what is wanted announced under their names. It
 //! answers for them, announces, probes and refreshes them, and forgets them
 //! as they expire, sending through the [`socket`](crate::socket)s attached to
 //! it.
@@ -160,16 +160,16 @@ impl Sent {
 /// segment, which has that segment's priority, above this.
 pub const OWN: u32 = 0;
 
-/// What a manual is told apart by: where its device and its [`Advertise`] are.
-type ManualKey = (usize, usize);
+/// What a [`Reflected`] is told apart by: where its device and its [`Advertise`] are.
+type ReflectedKey = (usize, usize);
 
-/// A wish to have a device announced here: the device itself, held where it is
-/// heard and so as it is now, and how much of it to show. It is told apart by
+/// A device reflected here, which is a wish to have it announced: the device
+/// itself, held where it is heard and so as it is now, and how much of it to show. It is told apart by
 /// the device, which is the same device however it changes, and by how it is
 /// to be shown, which is a reflector's own (another may show the same device
 /// otherwise); the reflector says when to look at it again.
 #[derive(Clone)]
-struct Manual {
+struct Reflected {
     /// Which wins where the same hostname is wanted announced by more than
     /// one: the lowest. What is made for the segment comes first of all, with
     /// [`OWN`]; a copy of a device of another segment has that segment's
@@ -183,15 +183,15 @@ struct Manual {
     host_ttl: Option<u32>,
 }
 
-impl Manual {
+impl Reflected {
     /// What it is, for finding it again: where its device and its way of
     /// being shown are, which is unique while it holds them.
-    fn key(&self) -> ManualKey {
+    fn key(&self) -> ReflectedKey {
         (self.device.addr(), Rc::as_ptr(&self.how) as usize)
     }
 
-    /// Where it sorts: the first of a hostname's manuals wins.
-    fn order(&self) -> (u32, ManualKey) {
+    /// Where it sorts: the first of those reflected under a hostname wins.
+    fn order(&self) -> (u32, ReflectedKey) {
         (self.priority, self.key())
     }
 
@@ -243,10 +243,10 @@ static NEXT_PRIORITY: AtomicU32 = AtomicU32::new(1);
 struct Host {
     /// The hostname, in lowercase: what it is told apart by.
     host: Box<str>,
-    /// Everyone who wants this hostname announced, the winner first; empty
+    /// What is reflected under this hostname, the winner first; empty
     /// only while what was shown is still to be withdrawn. See
     /// [`State::wanted`] for what is.
-    manuals: Vec<Manual>,
+    reflected: Vec<Reflected>,
     /// What is announced: what the winner was, less what devices on this
     /// segment have themselves (see [`State::wanted`]). `None` while a device
     /// here has the hostname.
@@ -272,7 +272,7 @@ impl Host {
     fn new(host: &str, now: Instant) -> Host {
         Host {
             host: host.to_ascii_lowercase().into(),
-            manuals: Vec::new(),
+            reflected: Vec::new(),
             shown: None,
             announced: now,
             repeat: false,
@@ -361,31 +361,31 @@ pub struct UpkeepInfo {
 // not shown is gone, as it has nothing to be found by.
 
 impl Host {
-    /// Put `manual` where it sorts, in place of the one of its key, which is
+    /// Put `reflected` where it sorts, in place of the one of its key, which is
     /// returned. A few at most, so a list with room for just
     /// those.
-    fn put(&mut self, manual: Manual) -> Option<Manual> {
-        let replaced = self.take(manual.key());
-        let at = self.manuals.binary_search_by_key(&manual.order(), Manual::order).unwrap_or_else(|at| at);
-        self.manuals.reserve_exact(1);
-        self.manuals.insert(at, manual);
+    fn put(&mut self, reflected: Reflected) -> Option<Reflected> {
+        let replaced = self.take(reflected.key());
+        let at = self.reflected.binary_search_by_key(&reflected.order(), Reflected::order).unwrap_or_else(|at| at);
+        self.reflected.reserve_exact(1);
+        self.reflected.insert(at, reflected);
         replaced
     }
 
-    fn take(&mut self, key: ManualKey) -> Option<Manual> {
-        let at = self.manuals.iter().position(|m| m.key() == key)?;
-        let manual = self.manuals.remove(at);
-        if self.manuals.is_empty() {
-            self.manuals = Vec::new();
+    fn take(&mut self, key: ReflectedKey) -> Option<Reflected> {
+        let at = self.reflected.iter().position(|m| m.key() == key)?;
+        let reflected = self.reflected.remove(at);
+        if self.reflected.is_empty() {
+            self.reflected = Vec::new();
         } else {
-            self.manuals.shrink_to_fit();
+            self.reflected.shrink_to_fit();
         }
-        Some(manual)
+        Some(reflected)
     }
 
     /// Whether nothing of it is wanted or shown.
     fn gone(&self) -> bool {
-        self.manuals.is_empty() && self.shown.is_none()
+        self.reflected.is_empty() && self.shown.is_none()
     }
 }
 
@@ -411,8 +411,8 @@ struct Hosts {
     /// Whether devices that have not changed are announced again, which is
     /// what when they are due goes by.
     unchanged: bool,
-    /// The host each manual is under, by its key.
-    by_manual: HashMap<ManualKey, Id>,
+    /// The host each reflected device is under, by its key.
+    by_reflected: HashMap<ReflectedKey, Id>,
     hasher: DefaultHashBuilder,
 }
 
@@ -444,8 +444,8 @@ impl Hosts {
             shown.for_each_name(|name| names.push(hash_name(hasher, name)));
         }
         // What is wanted, by everyone who wants it.
-        for manual in &host.manuals {
-            manual.device.borrow().for_each_name(&manual.how, |name| names.push(hash_name(hasher, name)));
+        for reflected in &host.reflected {
+            reflected.device.borrow().for_each_name(&reflected.how, |name| names.push(hash_name(hasher, name)));
         }
         names.sort_unstable();
         names.dedup();
@@ -500,44 +500,44 @@ impl Hosts {
         self.table.remove(id)
     }
 
-    /// Put `manual` among those wanted announced as `host` (lowercase), in
+    /// Put `reflected` among those wanted announced as `host` (lowercase), in
     /// place of one of the same key under the same name. Returns
     /// that one. A device that was under another name is not taken from there:
     /// [`take`](Hosts::take) it first.
-    fn put(&mut self, host: &str, manual: Manual, now: Instant) -> Option<Manual> {
-        let key = manual.key();
+    fn put(&mut self, host: &str, reflected: Reflected, now: Instant) -> Option<Reflected> {
+        let key = reflected.key();
         let replaced = match self.find(host) {
-            Some(_) => self.edit(host, |h| h.put(manual)).flatten(),
+            Some(_) => self.edit(host, |h| h.put(reflected)).flatten(),
             None => {
                 let mut h = Host::new(host, now);
-                h.put(manual);
+                h.put(reflected);
                 self.insert(h);
                 None
             }
         };
         let id = self.find(host).expect("it was just put");
-        self.by_manual.insert(key, id);
+        self.by_reflected.insert(key, id);
         replaced
     }
 
-    /// Where the manual of `key` is: the hostname it was put under.
-    fn locate(&self, key: ManualKey) -> Option<String> {
-        self.by_manual.get(&key).map(|&id| self.table.get(id).host.to_string())
+    /// Where the device reflected with `key` is: the hostname it was put under.
+    fn locate(&self, key: ReflectedKey) -> Option<String> {
+        self.by_reflected.get(&key).map(|&id| self.table.get(id).host.to_string())
     }
 
-    /// Take the manual of `key` back from the host it is under. The host
+    /// Take back the device reflected with `key` from the host it is under. The host
     /// goes if nothing of it is shown.
-    fn take(&mut self, key: ManualKey) -> Option<(String, Manual)> {
+    fn take(&mut self, key: ReflectedKey) -> Option<(String, Reflected)> {
         let host = self.locate(key)?;
-        self.by_manual.remove(&key);
-        let manual = self.edit(&host, |h| h.take(key)).flatten()?;
-        Some((host, manual))
+        self.by_reflected.remove(&key);
+        let reflected = self.edit(&host, |h| h.take(key)).flatten()?;
+        Some((host, reflected))
     }
 
-    /// Take back the manuals of `host` that `taken` says.
-    fn take_where(&mut self, host: &str, taken: impl Fn(&Manual) -> bool) -> Vec<Manual> {
-        let keys: Vec<ManualKey> = self.get(host).map(|h| h.manuals.iter().filter(|m| taken(m)).map(Manual::key).collect()).unwrap_or_default();
-        keys.into_iter().filter_map(|key| self.take(key)).map(|(_, manual)| manual).collect()
+    /// Take back the devices reflected under `host` that `taken` says.
+    fn take_where(&mut self, host: &str, taken: impl Fn(&Reflected) -> bool) -> Vec<Reflected> {
+        let keys: Vec<ReflectedKey> = self.get(host).map(|h| h.reflected.iter().filter(|m| taken(m)).map(Reflected::key).collect()).unwrap_or_default();
+        keys.into_iter().filter_map(|key| self.take(key)).map(|(_, reflected)| reflected).collect()
     }
 
     /// The devices that have, or that someone wants to have, records under
@@ -545,7 +545,7 @@ impl Hosts {
     fn with_claimed_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Host> + 'a {
         let hash = hash_name(&self.hasher, name);
         self.by_name.under(hash).map(|id| self.table.get(id)).filter(move |host| {
-            host.manuals.iter().any(|m| m.device.borrow().has_name(&m.how, name))
+            host.reflected.iter().any(|m| m.device.borrow().has_name(&m.how, name))
                 || host.shown.as_ref().is_some_and(|shown| shown.has_name(name))
         })
     }
@@ -631,7 +631,7 @@ impl Hosts {
             // segment that changed since.
             let now = self.held_now(entry);
             assert_eq!(held.due, now.due, "it is held as due as it is: {host}");
-            if entry.manuals.iter().all(|m| m.priority == 0) {
+            if entry.reflected.iter().all(|m| m.priority == 0) {
                 assert_eq!(held.names, now.names, "its names are held as they are: {host}");
             }
         }
@@ -816,20 +816,20 @@ impl State {
         self.tracker.discovered.with_name(instance).any(|e| e.device.borrow().service(instance).is_some())
     }
 
-    /// What should be announced as `key`: the winning manual, less the
+    /// What should be announced as `key`: the winning device, less the
     /// services whose instance names devices here have, or nothing if a device
     /// here has the hostname. Announced on top of a device here, a copy would
     /// be a conflict, and the device would rename itself. The advertised name
     /// is ours, and announced whatever is here.
     fn wanted(&self, key: &str, host: &Host) -> Option<(Shown, u32)> {
-        let first = host.manuals.first()?;
+        let first = host.reflected.first()?;
         // What other segments' devices of the name there are: the lowest
         // segment's is announced, as everyone who reflects it shows it, and
         // those who show the same segment's device show it together. One made
         // for it is shown alone.
-        let group: Vec<&Manual> = match first.priority {
+        let group: Vec<&Reflected> = match first.priority {
             OWN => vec![first],
-            priority => host.manuals.iter().take_while(|m| m.priority == priority).collect(),
+            priority => host.reflected.iter().take_while(|m| m.priority == priority).collect(),
         };
         let host_ttl = group.iter().map(|m| m.host_ttl()).max()?;
         let shown = match group[..] {
@@ -865,12 +865,12 @@ impl State {
         Some((Shown { device: without.unwrap_or(shown.device), how: shown.how }, host_ttl))
     }
 
-    /// Put `manual` among what is wanted announced, and settle what is
+    /// Put `reflected` among what is wanted announced, and settle what is
     /// announced. Returns whether anything was sent. If sending fails nothing
     /// is recorded.
-    fn put(&mut self, manual: Manual, now: Instant) -> Result<bool> {
-        let key = manual.key();
-        let Some(host) = manual.host() else {
+    fn put(&mut self, reflected: Reflected, now: Instant) -> Result<bool> {
+        let key = reflected.key();
+        let Some(host) = reflected.host() else {
             bail!("a reflected device needs a hostname to announce");
         };
         // A device that was renamed is taken from under the name it had, and
@@ -880,7 +880,7 @@ impl State {
             let (old, taken) = self.hosts.take(key).expect("it was found");
             self.settled(&old, vec![taken])?;
         }
-        let replaced = self.hosts.put(&host, manual, now);
+        let replaced = self.hosts.put(&host, reflected, now);
         match self.settle(&host, now) {
             Ok(sent) => Ok(sent || renamed),
             Err(e) => {
@@ -894,16 +894,16 @@ impl State {
         }
     }
 
-    /// Settle what is announced as `host` after `manuals` were taken from it,
+    /// Settle what is announced as `host` after `taken` were taken from it,
     /// and put them back if sending fails. Returns whether there were any.
-    fn settled(&mut self, host: &str, manuals: Vec<Manual>) -> Result<bool> {
-        if manuals.is_empty() {
+    fn settled(&mut self, host: &str, taken: Vec<Reflected>) -> Result<bool> {
+        if taken.is_empty() {
             return Ok(false);
         }
         let now = Instant::now();
         if let Err(e) = self.settle(host, now) {
-            for manual in manuals {
-                self.hosts.put(host, manual, now);
+            for reflected in taken {
+                self.hosts.put(host, reflected, now);
             }
             return Err(e);
         }
@@ -984,7 +984,7 @@ impl State {
         for key in keys {
             let Some(m) = self.hosts.get(&key) else { continue };
             let Some(device) = &m.shown else { continue };
-            if probing && m.manuals.first().map(|m| m.priority) != Some(OWN) {
+            if probing && m.reflected.first().map(|m| m.priority) != Some(OWN) {
                 continue;
             }
             if !legacy && !probing && now.saturating_duration_since(m.last_sent.over(family)) < MIN_MULTICAST_GAP {
@@ -1240,7 +1240,7 @@ impl Segment {
     /// not say), and those of its services with theirs.
     ///
     /// It is the caller's to say again when it has changed, with another
-    /// call, and to withdraw with [`remove_manual`](Segment::remove_manual).
+    /// call, and to withdraw with [`remove_reflected`](Segment::remove_reflected).
     ///
     /// If another wants the same hostname announced, the lower priority
     /// wins: an outranked device is only remembered, and announced once the
@@ -1253,16 +1253,16 @@ impl Segment {
     ///
     /// Returns whether anything was sent: not if it is as it was announced.
     /// If sending fails nothing is recorded.
-    pub fn add_manual(&self, priority: u32, device: &Shared) -> Result<bool> {
+    pub fn add_reflected(&self, priority: u32, device: &Shared) -> Result<bool> {
         let ttl = device.borrow().ttl.map(|t| t.max(MIN_REFLECT_TTL)).unwrap_or(HOST_TTL);
-        self.add_manual_ttl(priority, device, Duration::from_secs(ttl.into()))
+        self.add_reflected_ttl(priority, device, Duration::from_secs(ttl.into()))
     }
 
-    /// Like [`add_manual`](Segment::add_manual), with the address records
+    /// Like [`add_reflected`](Segment::add_reflected), with the address records
     /// announced for `host_ttl` (whole seconds, at least one) whatever the
     /// device says, and, if the segment re-announces, re-announced at 80% of
     /// it.
-    pub fn add_manual_ttl(&self, priority: u32, device: &Shared, host_ttl: Duration) -> Result<bool> {
+    pub fn add_reflected_ttl(&self, priority: u32, device: &Shared, host_ttl: Duration) -> Result<bool> {
         let own = Rc::clone(&self.state.borrow().own);
         self.reflect(priority, device, &own, Some(host_ttl))
     }
@@ -1272,7 +1272,7 @@ impl Segment {
     /// `host_ttl` for its address records, if given, or else its own. The
     /// device is held where it is heard, and so is shown as it is now:
     /// whoever shows it says again when it has changed, and withdraws it with
-    /// [`remove_manual`](Segment::remove_manual) when it has gone. A device of the
+    /// [`remove_reflected`](Segment::remove_reflected) when it has gone. A device of the
     /// same name from the same segment that more than one shows (each with its
     /// own `how`) is announced as what they show of it together; from another
     /// segment, the lowest priority's is, and the other takes over when it
@@ -1282,15 +1282,15 @@ impl Segment {
         if host_ttl == Some(0) {
             bail!("a TTL of zero would withdraw the device");
         }
-        let manual = Manual { priority, device: device.clone(), how: Rc::clone(how), host_ttl };
-        if manual.host().is_none() {
+        let reflected = Reflected { priority, device: device.clone(), how: Rc::clone(how), host_ttl };
+        if reflected.host().is_none() {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
         }
-        self.state.borrow_mut().put(manual, Instant::now())
+        self.state.borrow_mut().put(reflected, Instant::now())
     }
 
-    /// How what is made for this segment ([`add_manual`](Segment::add_manual))
-    /// is shown, for [`remove_manual`](Segment::remove_manual).
+    /// How what is made for this segment ([`add_reflected`](Segment::add_reflected))
+    /// is shown, for [`remove_reflected`](Segment::remove_reflected).
     pub fn own(&self) -> Rc<Advertise> {
         Rc::clone(&self.state.borrow().own)
     }
@@ -1300,13 +1300,13 @@ impl Segment {
     /// next one's device takes its place, or, if there is none, goodbyes are
     /// sent for it. Returns false if there was no such device. If sending
     /// fails it is kept.
-    pub fn remove_manual(&self, how: &Rc<Advertise>, device: &Shared) -> Result<bool> {
+    pub fn remove_reflected(&self, how: &Rc<Advertise>, device: &Shared) -> Result<bool> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let Some((host, manual)) = state.hosts.take((device.addr(), Rc::as_ptr(how) as usize)) else {
+        let Some((host, reflected)) = state.hosts.take((device.addr(), Rc::as_ptr(how) as usize)) else {
             return Ok(false);
         };
-        state.settled(&host, vec![manual])
+        state.settled(&host, vec![reflected])
     }
 
     /// Forget everything that was to be shown as `how` says, with goodbyes
@@ -1327,17 +1327,17 @@ impl Segment {
         self.withdraw_where(|_| true)
     }
 
-    fn withdraw_where(&self, taken: impl Fn(&Manual) -> bool) -> Result<()> {
+    fn withdraw_where(&self, taken: impl Fn(&Reflected) -> bool) -> Result<()> {
         let hosts: Vec<String> = {
             let state = self.state.borrow();
-            state.hosts.iter().filter(|h| h.manuals.iter().any(&taken)).map(|h| h.host.to_string()).collect()
+            state.hosts.iter().filter(|h| h.reflected.iter().any(&taken)).map(|h| h.host.to_string()).collect()
         };
         let mut first_err = None;
         for host in hosts {
             let mut guard = self.state.borrow_mut();
             let state = &mut *guard;
-            let manuals = state.hosts.take_where(&host, &taken);
-            if let Err(e) = state.settled(&host, manuals) {
+            let reflected = state.hosts.take_where(&host, &taken);
+            if let Err(e) = state.settled(&host, reflected) {
                 first_err.get_or_insert(e);
             }
         }
@@ -1401,7 +1401,7 @@ impl Segment {
         let existing = self.own_device(name);
         if addrs.is_empty() {
             eprintln!("{}: no address to advertise {name} with", self.interface);
-            if let Some(Err(e)) = existing.map(|existing| self.remove_manual(&self.own(), &existing)) {
+            if let Some(Err(e)) = existing.map(|existing| self.remove_reflected(&self.own(), &existing)) {
                 eprintln!("{}: withdrawing {name} failed: {e:#}", self.interface);
             }
             return;
@@ -1425,7 +1425,7 @@ impl Segment {
             .collect();
         let shared = existing.unwrap_or_default();
         let was = core::mem::replace(&mut *shared.borrow_mut(), device);
-        match self.add_manual_ttl(OWN, &shared, *ttl) {
+        match self.add_reflected_ttl(OWN, &shared, *ttl) {
             Ok(true) => {
                 let shown: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
                 eprintln!("{}: advertising {name} as {} (TTL {}s)", self.interface, shown.join(", "), ttl.as_secs());
@@ -1443,7 +1443,7 @@ impl Segment {
     fn own_device(&self, name: &str) -> Option<Shared> {
         let state = self.state.borrow();
         let host = state.hosts.get(&name.to_ascii_lowercase())?;
-        host.manuals.iter().find(|m| m.priority == OWN).map(|m| m.device.clone())
+        host.reflected.iter().find(|m| m.priority == OWN).map(|m| m.device.clone())
     }
 
     /// Forget every device discovered here, as when the interface is gone:
@@ -1464,14 +1464,14 @@ impl Segment {
         state
             .hosts
             .iter()
-            .filter_map(|h| h.manuals.iter().find(|m| m.priority == OWN))
+            .filter_map(|h| h.reflected.iter().find(|m| m.priority == OWN))
             .map(|m| (m.device.clone(), Duration::from_secs(u64::from(m.host_ttl()))))
             .collect()
     }
 
     /// The devices announced on this segment: for each hostname, what is
     /// shown of the one that won.
-    pub fn manual_devices(&self) -> Vec<Device> {
+    pub fn reflected_devices(&self) -> Vec<Device> {
         let state = self.state.borrow_mut();
         state.hosts.iter().filter_map(|m| m.shown.as_ref().map(Shown::made)).collect()
     }

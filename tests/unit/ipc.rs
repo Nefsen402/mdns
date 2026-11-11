@@ -176,7 +176,7 @@ fn reflected_copies_are_not_listed() {
     let (g, segs) = group("media", Family::V4, &["a", "b"]);
     announce(&segs[0], "10.0.1.5", "tv.local", "TV");
     deliver_made();
-    assert!(!segs[1].manual_devices().is_empty(), "precondition: reflected onto b");
+    assert!(!segs[1].reflected_devices().is_empty(), "precondition: reflected onto b");
     let out = handle(&[g], &Watches::default(), "devices media");
     assert_eq!(out.matches("\"addresses\"").count(), 1, "{out}");
 }
@@ -197,7 +197,7 @@ fn advertise_self(seg: &Segment) {
         ..Device::default()
     };
     pc.add_addrs(&[ip("10.0.0.5")]);
-    seg.add_manual_ttl(crate::segment::OWN, &crate::device::Shared::new(pc), Duration::from_secs(120)).unwrap();
+    seg.add_reflected_ttl(crate::segment::OWN, &crate::device::Shared::new(pc), Duration::from_secs(120)).unwrap();
 }
 
 /// Nothing is heard of this host, so it is listed as it advertises itself,
