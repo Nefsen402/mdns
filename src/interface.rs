@@ -33,6 +33,7 @@ use rustix::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
 use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
 
+use crate::config::Interface;
 use crate::runtime::{errno, Why};
 
 
@@ -44,6 +45,41 @@ pub const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 pub enum Family {
     V4,
     V6,
+}
+
+/// The families `interface` is used over: those of its peers, if it has any,
+/// and else those it listens over.
+pub fn families(interface: &Interface) -> Vec<Family> {
+    if interface.peers.is_empty() {
+        [(interface.ipv4, Family::V4), (interface.ipv6, Family::V6)]
+            .into_iter()
+            .filter_map(|(listen, family)| listen.enabled().then_some(family))
+            .collect()
+    } else {
+        [(true, Family::V4), (false, Family::V6)]
+            .into_iter()
+            .filter_map(|(v4, family)| interface.peers.iter().any(|peer| peer.is_ipv4() == v4).then_some(family))
+            .collect()
+    }
+}
+
+/// The families of `interface` of which what is sent to the daemon itself is
+/// heard too: none with peers, which are heard alone.
+pub fn unicast(interface: &Interface) -> Vec<Family> {
+    if !interface.peers.is_empty() {
+        return Vec::new();
+    }
+    [(interface.ipv4, Family::V4), (interface.ipv6, Family::V6)]
+        .into_iter()
+        .filter_map(|(listen, family)| listen.unicast().then_some(family))
+        .collect()
+}
+
+/// The families of `interface` that it cannot be listened to over yet, as it
+/// has no address to join the group by: they are joined when it has one. A
+/// peer's is not a group to join, and needs no address of the interface's.
+pub fn missing(interface: &Interface) -> Vec<Family> {
+    families(interface).into_iter().filter(|&family| interface.peers.is_empty() && !joinable(&interface.name, family)).collect()
 }
 
 /// What an interface hears and says with, and all that a segment knows of how
@@ -356,15 +392,20 @@ pub(crate) fn looped(interface: &str, family: Family) -> (OwnedFd, Link) {
 
 #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
 impl Link {
-    /// The link of `interface` over `families`, with a socket of its own for
-    /// each, pinned to it, which also hears what is sent to the daemon itself
-    /// for those of `unicast`. It keeps the source port at 5353, and sends to
-    /// the group (scoped to the interface for IPv6).
-    pub fn open(interface: &str, families: &[Family], unicast: &[Family]) -> Result<Link> {
+    /// The link of `interface`, with a socket of its own for each family it is
+    /// used over, pinned to it, which also hears what is sent to the daemon
+    /// itself for those it says so of. It keeps the source port at 5353, and
+    /// sends to the group (scoped to the interface for IPv6), or, if it has
+    /// peers, to them alone.
+    pub fn open(interface: &Interface) -> Result<Link> {
+        if !interface.peers.is_empty() {
+            return Link::open_peers(&interface.name, &interface.peers, interface.peer_port);
+        }
+        let (name, unicast) = (&interface.name, unicast(interface));
         let mut link = Link::default();
-        for &family in families {
-            let (index, socket) = pinned::socket(interface, family, unicast.contains(&family))
-                .with_context(|| format!("opening {family:?} socket on {interface}"))?;
+        for family in families(interface) {
+            let (index, socket) = pinned::socket(name, family, unicast.contains(&family))
+                .with_context(|| format!("opening {family:?} socket on {name}"))?;
             // Never waited on: the loop reads it when it is readable, and a
             // send that cannot go out at once fails, and is tried again.
             rustix::io::ioctl_fionbio(&socket, true).map_err(Why)?;
@@ -378,7 +419,7 @@ impl Link {
     /// The link of `interface` that talks to `peers` alone, at `port`, with a
     /// socket of its own for each family they are of, pinned to it. It keeps
     /// the source port at `port`, which the peers hear it from.
-    pub fn open_peers(interface: &str, peers: &[IpAddr], port: u16) -> Result<Link> {
+    fn open_peers(interface: &str, peers: &[IpAddr], port: u16) -> Result<Link> {
         let mut link = Link { peers: peers.to_vec(), ..Link::default() };
         for family in [Family::V4, Family::V6] {
             let of_family: Vec<IpAddr> = peers.iter().copied().filter(|&peer| family_of(peer) == family).collect();
@@ -828,12 +869,17 @@ mod portable {
             Ok((Sender { fd, out: Some((index, v4)) }, group_of(family, index)))
         }
 
-        /// The link of `interface`, joined to the group over `families`, for
-        /// those of `unicast` asking hosts directly too.
-        pub fn link(&self, interface: &str, families: &[Family], unicast: &[Family]) -> Result<Link> {
+        /// The link of `interface`, joined to the group over the families it is
+        /// used over and can be now, asking hosts directly over those it hears
+        /// what is sent to the daemon itself of.
+        pub fn link(&self, interface: &Interface) -> Result<Link> {
+            if !interface.peers.is_empty() {
+                bail!("{}: Peer= needs a socket of the interface's own, which this system cannot make", interface.name);
+            }
+            let (name, unicast, missing) = (&interface.name, unicast(interface), missing(interface));
             let mut link = Link::default();
-            for &family in families {
-                let (sender, dest) = self.join(interface, family).with_context(|| format!("joining the group over {family:?} on {interface}"))?;
+            for family in families(interface).into_iter().filter(|family| !missing.contains(family)) {
+                let (sender, dest) = self.join(name, family).with_context(|| format!("joining the group over {family:?} on {name}"))?;
                 link.add(family, sender, alloc::vec![dest], unicast.contains(&family));
             }
             Ok(link)
