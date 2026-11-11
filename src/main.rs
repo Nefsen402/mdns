@@ -29,7 +29,7 @@ mod tracker;
 use alloc::rc::Rc;
 use core::ffi::c_int;
 
-use rustix::fd::{AsRawFd, OwnedFd, RawFd};
+use rustix::fd::RawFd;
 
 use hashbrown::HashSet;
 use time::Instant;
@@ -40,7 +40,7 @@ use config::{AdvertiseConfig, Config, Forward, Interface, Listen, Neighbours};
 use netlink::{Event, Netlink};
 use reflector::Reflector;
 use segment::Segment;
-use interface::{Family, Hub};
+use interface::{Family, Hub, Link};
 
 /// What every module takes from alloc, as std's prelude would give it.
 mod prelude {
@@ -321,11 +321,11 @@ struct Iface {
     missing: Vec<Family>,
     /// Its MTU, once known: what a packet sent on it may hold follows it.
     mtu: Option<u32>,
-    /// The sockets it hears on, one per family, for the event loop to read
-    /// when they are readable. None where one socket per family is shared by
-    /// every interface: it is the hub's, which joins the group on this
+    /// What it hears and says with, which the event loop reads when it is
+    /// readable. Where one socket per family is shared by every interface it
+    /// has none to read: it is the hub's, which joins the group on this
     /// interface for as long as it is there.
-    sockets: Vec<OwnedFd>,
+    link: Rc<Link>,
 }
 
 impl Ifaces<'_> {
@@ -467,10 +467,9 @@ impl Iface {
     fn new(interface: &Interface, index: u32, ifaces: &Ifaces) -> Iface {
         let families = families_of(interface, Listen::enabled);
         let unicast = families_of(interface, Listen::unicast);
-        let segment = Segment::new(&interface.name, &families);
+        let segment = Segment::new(&interface.name);
         segment.set_min_lifetime(interface.min_lifetime);
         segment.set_max_addrs(interface.max_addrs);
-        segment.set_direct(&unicast);
         segment.set_max_devices(interface.max_devices);
         segment.set_max_services(interface.max_services);
         segment.set_reannounce(interface.reannounce);
@@ -496,46 +495,33 @@ impl Iface {
             unicast,
             missing: Vec::new(),
             mtu: None,
-            sockets: Vec::new(),
+            link: Rc::default(),
         }
     }
 
     /// A socket of its own for each family, pinned to the interface.
     #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
     fn open_sockets(&mut self, ifaces: &Ifaces) -> Result<()> {
-        let mut sockets = Vec::new();
         let _ = ifaces;
-        for &family in &self.families {
-            let sock = interface::open(&self.name, family, self.unicast.contains(&family))
-                .with_context(|| format!("opening {family:?} socket on {}", self.name))?;
-            sockets.push(sock);
-        }
-        let mut receivers = Vec::new();
-        for sock in sockets {
-            // Never waited on: the loop reads it when it is readable, and a
-            // send that cannot go out at once fails, and is tried again.
-            rustix::io::ioctl_fionbio(&sock.socket, true).map_err(runtime::Why)?;
-            let (tx, dest) = sock.sender()?;
-            self.segment.attach(sock.family, tx, dest);
-            eprintln!("listening on {} ({:?})", self.name, sock.family);
-            receivers.push(sock.socket);
-        }
-        self.sockets = receivers;
+        self.use_link(Link::open(&self.name, &self.families, &self.unicast)?);
         Ok(())
     }
 
     /// The shared sockets, joined to the group on this interface.
     #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
     fn open_sockets(&mut self, ifaces: &Ifaces) -> Result<()> {
-        for &family in self.families.iter().filter(|f| !self.missing.contains(f)) {
-            let (tx, dest) = ifaces
-                .hub
-                .join(&self.name, family)
-                .with_context(|| format!("joining the group over {family:?} on {}", self.name))?;
-            self.segment.attach(family, tx, dest);
+        let joined: Vec<Family> = self.families.iter().copied().filter(|f| !self.missing.contains(f)).collect();
+        self.use_link(ifaces.hub.link(&self.name, &joined, &self.unicast)?);
+        Ok(())
+    }
+
+    /// Say and hear with `link`, from now on.
+    fn use_link(&mut self, link: Link) {
+        for family in link.families() {
             eprintln!("listening on {} ({:?})", self.name, family);
         }
-        Ok(())
+        self.link = Rc::new(link);
+        self.segment.attach(Rc::clone(&self.link));
     }
 
     /// Let go of the sockets: the shared ones leave the group on this interface.
@@ -579,15 +565,13 @@ impl Iface {
 
     /// The descriptors of its sockets, for the event loop to wait on.
     fn fds(&self) -> impl Iterator<Item = RawFd> + '_ {
-        self.sockets.iter().map(|s| s.as_raw_fd())
+        self.link.fds()
     }
 
     /// Handle everything the socket `fd` has heard, if it is one of this
     /// interface's: the event loop found it readable.
     fn receive(&self, fd: RawFd) {
-        if let Some(sock) = self.sockets.iter().find(|s| s.as_raw_fd() == fd) {
-            interface::drain(sock, &self.name, |from, to, datagram| self.segment.hear(from, to, datagram));
-        }
+        self.link.drain(fd, &self.name, |from, to, datagram| self.segment.hear(from, to, datagram));
     }
 }
 

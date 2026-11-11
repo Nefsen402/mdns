@@ -3,6 +3,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::net::UnixStream;
 
 use super::*;
+use crate::interface::Link;
 use crate::codec::{Header, Message, RData, Record};
 use crate::reflector::Reflector;
 use crate::segment::Segment;
@@ -55,8 +56,8 @@ fn fd(socket: impl std::os::fd::IntoRawFd) -> OwnedFd {
 fn group_on_lo() -> (Vec<Group>, Segment, UdpSocket) {
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-    let seg = Segment::new(interface::LOOPBACK, &[Family::V4, Family::V6]);
-    seg.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
+    let seg = Segment::new(interface::LOOPBACK);
+    seg.attach(Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap()));
     let reflector = Reflector::new(vec![seg.clone()]).unwrap();
     (vec![Group { name: "lan".into(), reflector }], seg, rx)
 }

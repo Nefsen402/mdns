@@ -11,7 +11,7 @@ use core::fmt;
 use alloc::collections::{BTreeSet, VecDeque};
 
 use hashbrown::{DefaultHashBuilder, HashMap};
-use core::net::{IpAddr, SocketAddr, SocketAddrV6};
+use core::net::{IpAddr, SocketAddr};
 
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -22,15 +22,14 @@ use core::time::Duration;
 
 use crate::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 
 use crate::config::{Advertise, AdvertiseConfig};
-use crate::runtime::Why;
 use crate::device::{
     family_of, is_link_local, is_type, responses, service_ttl, Advertised, Device, ServiceParts, Shared,
     DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
 };
-use crate::interface::{Family, Prefix, Sender, MDNS_PORT};
+use crate::interface::{Family, Link, Prefix, MDNS_PORT};
 use crate::codec::{Message, Question, Record};
 
 use crate::prelude::*;
@@ -116,44 +115,6 @@ impl fmt::Display for Labelled<'_> {
         write!(f, "{} {}", self.0, self.1)
     }
 }
-
-/// A way to send over one family: a socket, and the group to send to.
-struct Outbound {
-    family: Family,
-    socket: Sender,
-    dest: SocketAddr,
-}
-
-/// When a device's records were last multicast, over each family: the rate
-/// limit is per group, and each family has its own.
-#[derive(Clone, Copy)]
-struct Sent {
-    v4: Instant,
-    v6: Instant,
-}
-
-impl Sent {
-    /// Over both, at `now`: what announcing does.
-    fn both(now: Instant) -> Sent {
-        Sent { v4: now, v6: now }
-    }
-
-    fn over(&self, family: Family) -> Instant {
-        match family {
-            Family::V4 => self.v4,
-            Family::V6 => self.v6,
-        }
-    }
-
-    fn set(&mut self, family: Family, now: Instant) {
-        match family {
-            Family::V4 => self.v4 = now,
-            Family::V6 => self.v6 = now,
-        }
-    }
-}
-
-
 
 /// The priority of what is made for a segment, such as the daemon's own name
 /// (`[Advertise]`): it comes first of all, ahead of any device of another
@@ -255,9 +216,8 @@ struct Host {
     /// Whether that was what changed, still to be announced a second time
     /// ([`ANNOUNCE_REPEAT`]).
     repeat: bool,
-    /// When any of its records was last multicast, over each family; drives
-    /// the rate limit.
-    last_sent: Sent,
+    /// When any of its records was last multicast; drives the rate limit.
+    last_sent: Instant,
     /// Not before this, after sending failed.
     retry: Option<Instant>,
     /// The TTL it is announced with, of the records that are not its address.
@@ -274,7 +234,7 @@ impl Host {
             shown: None,
             announced: now,
             repeat: false,
-            last_sent: Sent::both(now),
+            last_sent: now,
             retry: None,
             other_ttl: OTHER_TTL,
             held: Held::default(),
@@ -683,15 +643,13 @@ struct State {
     /// How often to probe on its own, if at all, and when next.
     probe_interval: Option<Duration>,
     next_routine: Option<Instant>,
-    /// How to send, over each family the segment has a socket of.
-    outbound: Vec<Outbound>,
+    /// What it hears and says with: all that it knows of how it is reached.
+    /// Until it has one it says nothing and hears nothing.
+    link: Rc<Link>,
     /// Whether what is announced here is announced again before its TTL runs
     /// out though it has not changed. It need not be: whoever still wants it
     /// asks again (RFC 6762 section 5.2), and is answered.
     reannounce: bool,
-    /// The families a device is asked directly over, to refresh it: those that
-    /// hear what is sent to the daemon.
-    direct: Vec<Family>,
     /// The most a packet sent here may hold: what the interface's MTU leaves.
     max_packet: usize,
     upkeep: Upkeep,
@@ -722,7 +680,7 @@ impl State {
     /// and put the events out.
     fn report(&mut self, mut touched: Touched, now: Instant) {
         for (ll, device) in core::mem::take(&mut touched.nudges) {
-            nudge(&self.outbound, ll, &Device::refresh_queries(core::slice::from_ref(&device), self.max_packet));
+            nudge(&self.link, ll, &Device::refresh_queries(core::slice::from_ref(&device), self.max_packet));
         }
         let names = touched.names(&self.tracker.discovered);
         let events = touched.events(&self.tracker.discovered);
@@ -762,7 +720,7 @@ impl State {
     /// Have the devices go by how long before they run out they are asked to
     /// answer again, when that, or whether there is a way to ask, changed.
     fn sync_refresh(&mut self) {
-        let before = self.upkeep.before.filter(|_| !self.outbound.is_empty());
+        let before = self.upkeep.before.filter(|_| !self.link.is_empty());
         self.tracker.discovered.set_refresh(before);
     }
 
@@ -782,7 +740,7 @@ impl State {
             for (addr, &at) in e.addr_expires.iter().filter(|&(_, at)| *at < e.expires) {
                 f("expire", &Labelled(who, addr), at);
             }
-            if let Some(at) = before.filter(|_| !self.outbound.is_empty()).and_then(|before| e.refresh_due(before)) {
+            if let Some(at) = before.filter(|_| !self.link.is_empty()).and_then(|before| e.refresh_due(before)) {
                 f("refresh", who, at);
             }
         }
@@ -936,7 +894,7 @@ impl State {
         drop((old_device, new_device));
         let sent = !records.is_empty();
         if sent {
-            send(&self.outbound, self.max_packet, &records)?;
+            send(&self.link, self.max_packet, &records)?;
         }
 
         // Gone, if nobody wants it and nothing of it is shown.
@@ -944,7 +902,7 @@ impl State {
             if sent {
                 m.announced = now;
                 m.repeat = true;
-                m.last_sent = Sent::both(now);
+                m.last_sent = now;
                 m.retry = None;
             }
             m.shown = want;
@@ -979,7 +937,7 @@ impl State {
     /// take them for a conflict, and once it announces, the copy gives way.
     /// The daemon's own name answers a probe however recently it went out:
     /// that answer defends it, which section 6 exempts from the wait.
-    fn answering(&self, query: &Message, now: Instant, legacy: bool, probing: bool, family: Family) -> Vec<(String, Reflected)> {
+    fn answering(&self, query: &Message, now: Instant, legacy: bool, probing: bool) -> Vec<(String, Reflected)> {
         // Only those with records under a name asked for can answer.
         let mut keys: Vec<String> = query.questions.iter().flat_map(|q| self.hosts.hosts_showing(&q.name)).collect();
         keys.sort_unstable();
@@ -991,7 +949,7 @@ impl State {
             if probing && m.reflected.first().map(|m| m.priority) != Some(OWN) {
                 continue;
             }
-            if !legacy && !probing && now.saturating_duration_since(m.last_sent.over(family)) < MIN_MULTICAST_GAP {
+            if !legacy && !probing && now.saturating_duration_since(m.last_sent) < MIN_MULTICAST_GAP {
                 continue;
             }
             out.push((key, device.clone()));
@@ -1024,19 +982,16 @@ impl State {
 #[derive(Clone)]
 pub struct Segment {
     interface: Rc<str>,
-    families: Rc<[Family]>,
     state: Rc<RefCell<State>>,
 }
 
 impl Segment {
-    /// A segment for `interface`, over `families`, each to be given a socket
-    /// with [`attach`](Segment::attach).
-    pub fn new(interface: &str, families: &[Family]) -> Segment {
+    /// A segment for `interface`, to be given a link with
+    /// [`attach`](Segment::attach).
+    pub fn new(interface: &str) -> Segment {
         Segment {
             interface: interface.into(),
-            families: families.into(),
             state: Rc::new(RefCell::new(State {
-                direct: vec![Family::V4, Family::V6],
                 max_packet: DEFAULT_MAX_PACKET,
                 own: Rc::new(Advertise::ALL),
                 // Those made first win, unless told otherwise.
@@ -1053,14 +1008,6 @@ impl Segment {
     /// Applies to what is heard from now on.
     pub fn set_min_lifetime(&self, min_lifetime: Duration) {
         self.state.borrow_mut().tracker.min_lifetime = min_lifetime;
-    }
-
-    /// The families a device is asked directly over, to refresh it, rather than
-    /// on the group: those the daemon hears what is sent to it over, which is
-    /// where the answer comes if the device sends it to the daemon. The
-    /// default is both.
-    pub fn set_direct(&self, families: &[Family]) {
-        self.state.borrow_mut().direct = families.to_vec();
     }
 
     /// How many addresses of a family a discovered device is kept with, at
@@ -1157,18 +1104,16 @@ impl Segment {
         &self.interface
     }
 
-    /// The families it serves.
-    pub fn families(&self) -> &[Family] {
-        &self.families
+    /// The families it is used over: those of its link.
+    pub fn families(&self) -> Vec<Family> {
+        self.state.borrow().link.families()
     }
 
-    /// Give the segment a way to send over `family`: `socket`, to the group
-    /// at `dest`. Replaces an earlier one of the family. Without any (as in
-    /// unit tests), hosts changes are recorded but nothing goes on the wire.
-    pub fn attach(&self, family: Family, socket: impl Into<Sender>, dest: SocketAddr) {
+    /// Give the segment its link, replacing an earlier one. Without any (as in
+    /// unit tests), what is reflected is recorded but nothing goes on the wire.
+    pub fn attach(&self, link: impl Into<Rc<Link>>) {
         let mut state = self.state.borrow_mut();
-        state.outbound.retain(|o| o.family != family);
-        state.outbound.push(Outbound { family, socket: socket.into(), dest });
+        state.link = link.into();
         state.sync_refresh();
     }
 
@@ -1352,7 +1297,7 @@ impl Segment {
     /// announced here is kept, to announce again once it is back.
     pub fn detach_all(&self) {
         let mut state = self.state.borrow_mut();
-        state.outbound.clear();
+        state.link = Rc::default();
         state.sync_refresh();
     }
 
@@ -1362,18 +1307,18 @@ impl Segment {
     pub fn announce_all(&self) -> Result<()> {
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
-        let State { hosts, outbound, max_packet, .. } = &mut *guard;
+        let State { hosts, link, max_packet, .. } = &mut *guard;
         let mut first_err = None;
         for key in hosts.hosts_all() {
             let Some(m) = hosts.get(&key) else { continue };
             let Some(device) = &m.shown else { continue };
             let records = device.device.borrow().announcement(&device.how, device.host_ttl(), m.other_ttl);
-            match send(outbound, *max_packet, &records) {
+            match send(link, *max_packet, &records) {
                 Ok(()) => {
                     hosts.edit(&key, |m| {
                         m.announced = now;
                         m.repeat = true;
-                        m.last_sent = Sent::both(now);
+                        m.last_sent = now;
                         m.retry = None;
                     });
                 }
@@ -1499,7 +1444,7 @@ impl Segment {
                 };
                 let announced = match &m.shown {
                     Some(device) => {
-                        send(&state.outbound, state.max_packet, &device.device.borrow().announcement(&device.how, device.host_ttl(), m.other_ttl))?;
+                        send(&state.link, state.max_packet, &device.device.borrow().announcement(&device.how, device.host_ttl(), m.other_ttl))?;
                         true
                     }
                     None => false,
@@ -1508,7 +1453,7 @@ impl Segment {
                     if announced {
                         m.announced = now;
                         m.repeat = false;
-                        m.last_sent = Sent::both(now);
+                        m.last_sent = now;
                     }
                     m.retry = None;
                 });
@@ -1551,7 +1496,7 @@ impl Segment {
             state.notify(Event::Question(asked));
         }
         let probing = !query.authorities.is_empty();
-        let answering = state.answering(query, now, legacy, probing, family);
+        let answering = state.answering(query, now, legacy, probing);
         let keys: Vec<&String> = answering.iter().map(|(key, ..)| key).collect();
         let borrowed: Vec<_> = answering.iter().map(|(_, shown)| shown.device.borrow()).collect();
         let devices: Vec<Advertised> = answering
@@ -1563,12 +1508,12 @@ impl Segment {
             return Ok(());
         };
         for msg in &msgs {
-            transmit(&state.outbound, family, msg, legacy.then_some(from))?;
+            transmit(&state.link, family, msg, legacy.then_some(from))?;
         }
 
         if !legacy {
             for i in answered {
-                state.hosts.edit(keys[i], |m| m.last_sent.set(family, now));
+                state.hosts.edit(keys[i], |m| m.last_sent = now);
             }
         }
         Ok(())
@@ -1589,7 +1534,7 @@ impl Segment {
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        if state.outbound.is_empty() {
+        if state.link.is_empty() {
             return Ok(0);
         }
         state.forwarded.retain(|_, at| now.saturating_duration_since(*at) < FORWARD_GAP);
@@ -1602,7 +1547,7 @@ impl Segment {
             }
         }
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
-        ask(&state.outbound, &Device::forward_queries(fresh, known, state.max_packet))
+        ask(&state.link, &Device::forward_queries(fresh, known, state.max_packet))
     }
 
     // Fed by the receive loops and the timer.
@@ -1730,7 +1675,7 @@ impl Segment {
         state.probes_started += 1;
         let probing = Probing { kinds, why, id: state.probes_started, asked, round: 0, next: Instant::now(), sent: 0 };
         let id = probing.id;
-        if state.outbound.is_empty() {
+        if state.link.is_empty() {
             drop(state);
             self.finish(probing, Ok(0));
         } else {
@@ -1805,18 +1750,18 @@ impl Segment {
     /// when the segment has no sender attached.
     fn probe_round(&self) -> Result<usize> {
         let state = self.state.borrow_mut();
-        if state.outbound.is_empty() {
+        if state.link.is_empty() {
             return Ok(0);
         }
 
         let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
-        ask(&state.outbound, &Device::probe_queries(&devices, &state.tracker.types, state.max_packet))
+        ask(&state.link, &Device::probe_queries(&devices, &state.tracker.types, state.max_packet))
     }
 
     fn query_types_round(&self, kinds: &[String]) -> Result<usize> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        if state.outbound.is_empty() {
+        if state.link.is_empty() {
             return Ok(0);
         }
         for kind in kinds.iter().filter(|k| is_type(k)) {
@@ -1827,7 +1772,7 @@ impl Segment {
         let now = Instant::now();
         let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
-        ask(&state.outbound, &Device::type_queries(&devices, kinds, known, state.max_packet))
+        ask(&state.link, &Device::type_queries(&devices, kinds, known, state.max_packet))
     }
 
     /// Ask the devices that are about to expire to answer again, so that a
@@ -1847,8 +1792,8 @@ impl Segment {
     /// many questions were sent.
     pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
         let mut guard = self.state.borrow_mut();
-        let State { tracker: Tracker { discovered, .. }, outbound, max_packet, direct, .. } = &mut *guard;
-        if outbound.is_empty() {
+        let State { tracker: Tracker { discovered, .. }, link, max_packet, .. } = &mut *guard;
+        if link.is_empty() {
             return Ok(0);
         }
         let gap = refresh_gap(before);
@@ -1872,14 +1817,14 @@ impl Segment {
             let retry = entry.refreshed.is_some_and(|t| entry.soonest().checked_sub(entry.lead(before)).is_none_or(|from| t >= from));
             let device = entry.device.snapshot();
             discovered.edit(id, |entry| entry.refreshed = Some(now));
-            let direct = direct_address(&device, direct).filter(|_| !retry);
+            let direct = direct_address(&device, link).filter(|_| !retry);
             let queries = Device::refresh_queries(core::slice::from_ref(&device), *max_packet);
             match direct {
-                Some(addr) if ask_at(outbound, addr, &queries) => asked += queries.iter().map(|q| q.questions.len()).sum::<usize>(),
+                Some(addr) if ask_at(link, addr, &queries) => asked += queries.iter().map(|q| q.questions.len()).sum::<usize>(),
                 _ => asking.push(device),
             }
         }
-        Ok(asked + ask(outbound, &Device::refresh_queries(&asking, *max_packet))?)
+        Ok(asked + ask(link, &Device::refresh_queries(&asking, *max_packet))?)
     }
 
     /// Drop devices whose lifetime has run out as of `now`.
@@ -1907,84 +1852,60 @@ pub fn set_checking(on: bool) {
 }
 
 /// Ask `queries` of the device at `addr`, by unicast to its port 5353 (RFC
-/// 6762 section 5.5), over the socket of its family. Whether all were sent.
-/// To a link-local address, the kernel has to look up its link-layer address,
-/// which is what [`nudge`] is for.
-fn ask_at(outbound: &[Outbound], addr: IpAddr, queries: &[Message]) -> bool {
-    let Some(out) = outbound.iter().find(|o| o.family == family_of(addr)) else { return false };
-    let dest = match (addr, out.dest) {
-        (IpAddr::V6(addr), SocketAddr::V6(group)) => SocketAddr::V6(SocketAddrV6::new(addr, MDNS_PORT, 0, group.scope_id())),
-        (addr, _) => SocketAddr::new(addr, MDNS_PORT),
-    };
-    queries.iter().all(|query| query.encode().is_ok_and(|bytes| send_to(&out.socket, &bytes, dest).is_ok()))
+/// 6762 section 5.5), over its family. Whether all were sent. To a link-local
+/// address, the kernel has to look up its link-layer address, which is what
+/// [`nudge`] is for.
+fn ask_at(link: &Link, addr: IpAddr, queries: &[Message]) -> bool {
+    queries.iter().all(|query| query.encode().is_ok_and(|bytes| link.ask(addr, &bytes)))
 }
 
 /// Ask `queries` of the device at link-local address `ll`, for the kernel to
 /// look up its link-layer address. Failing to send is no matter: the next
 /// time will do.
-fn nudge(outbound: &[Outbound], ll: IpAddr, queries: &[Message]) {
-    ask_at(outbound, ll, queries);
+fn nudge(link: &Link, ll: IpAddr, queries: &[Message]) {
+    ask_at(link, ll, queries);
 }
 
-/// Where to ask `device` directly, over one of `families`: a routable
-/// address, IPv4 first, else a link-local one.
-fn direct_address(device: &Device, families: &[Family]) -> Option<IpAddr> {
-    let allowed = |a: &IpAddr| families.contains(&family_of(*a));
+/// Where to ask `device` directly: a routable address the link hears the
+/// answer at, IPv4 first, else a link-local one.
+fn direct_address(device: &Device, link: &Link) -> Option<IpAddr> {
+    let allowed = |a: &IpAddr| link.reaches(*a);
     let routable = || device.routable().filter(allowed);
     routable().find(IpAddr::is_ipv4).or_else(|| routable().next()).or_else(|| device.link_local().find(allowed))
 }
 
-/// Multicast `queries`, over every family. Returns how many questions they
-/// asked.
-fn ask(outbound: &[Outbound], queries: &[Message]) -> Result<usize> {
+/// Multicast `queries`, to everyone on the link. Returns how many questions
+/// they asked.
+fn ask(link: &Link, queries: &[Message]) -> Result<usize> {
     for q in queries {
-        multicast(outbound, q)?;
+        multicast(link, q)?;
     }
     Ok(queries.iter().map(|q| q.questions.len()).sum())
 }
 
-/// Announce `records`, over every family, in as many packets as it takes to
-/// keep each within `limit`. Every packet is tried; the first error is
+/// Announce `records`, to everyone on the link, in as many packets as it takes
+/// to keep each within `limit`. Every packet is tried; the first error is
 /// returned.
-fn send(outbound: &[Outbound], limit: usize, records: &[Record]) -> Result<()> {
+fn send(link: &Link, limit: usize, records: &[Record]) -> Result<()> {
     let mut first_err = None;
     for msg in responses(records, &[], limit) {
-        if let Err(e) = multicast(outbound, &msg) {
+        if let Err(e) = multicast(link, &msg) {
             first_err.get_or_insert(e);
         }
     }
     first_err.map_or(Ok(()), Err)
 }
 
-/// Send `msg` to the group of every family. Every family is tried; the
-/// first error is returned. A no-op when the segment has no sender attached.
-fn multicast(outbound: &[Outbound], msg: &Message) -> Result<()> {
-    let bytes = msg.encode()?;
-    let mut first_err = None;
-    for out in outbound {
-        if let Err(e) = send_to(&out.socket, &bytes, out.dest) {
-            first_err.get_or_insert(anyhow!(e).context(format!("sending to {}", out.dest)));
-        }
-    }
-    first_err.map_or(Ok(()), Err)
+/// Send `msg` to everyone on the link. A no-op when the segment has no link
+/// attached.
+fn multicast(link: &Link, msg: &Message) -> Result<()> {
+    link.send(&msg.encode()?)
 }
 
-/// Send `msg` over `family`: to its group, or to `dest` alone for a unicast
-/// reply. Over another family's socket if there is none of `family` (a
-/// segment is given one of each it serves, but tests may give it fewer). A
-/// no-op when the segment has no sender attached.
-fn transmit(outbound: &[Outbound], family: Family, msg: &Message, dest: Option<SocketAddr>) -> Result<()> {
-    let Some(out) = outbound.iter().find(|o| o.family == family).or(outbound.first()) else {
-        return Ok(());
-    };
-    let dest = dest.unwrap_or(out.dest);
-    send_to(&out.socket, &msg.encode()?, dest).with_context(|| format!("sending to {dest}"))?;
-    Ok(())
-}
-
-/// Send the datagram `bytes` to `dest` on `socket`.
-fn send_to(socket: &Sender, bytes: &[u8], dest: SocketAddr) -> Result<(), Why> {
-    socket.send_to(bytes, dest).map_err(Why)
+/// Answer over `family`: to everyone on the link, or to `dest` alone for a
+/// unicast reply.
+fn transmit(link: &Link, family: Family, msg: &Message, dest: Option<SocketAddr>) -> Result<()> {
+    link.reply(family, dest, &msg.encode()?)
 }
 
 #[cfg(test)]

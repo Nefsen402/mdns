@@ -12,7 +12,7 @@ fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
     unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
 }
 use crate::codec::{rtype, Header, Message, Question, RData, Record};
-use crate::interface::{prefix, Family};
+use crate::interface::{prefix, Family, Link};
 
 /// Its first routable IPv4 or IPv6 address, and link-local one.
 fn v4(d: &Device) -> Option<IpAddr> {
@@ -30,8 +30,8 @@ fn wired(name: &str) -> (Segment, UdpSocket) {
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let seg = Segment::new(name, &[Family::V4]);
-    seg.attach(Family::V4, fd(tx), rx.local_addr().unwrap());
+    let seg = Segment::new(name);
+    seg.attach(Link::to(Family::V4, fd(tx), rx.local_addr().unwrap()));
     (seg, rx)
 }
 
@@ -39,8 +39,8 @@ fn wired(name: &str) -> (Segment, UdpSocket) {
 fn wired_v6(name: &str) -> (Segment, UdpSocket) {
     let (_, rx) = wired(name);
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let seg = Segment::new(name, &[Family::V6]);
-    seg.attach(Family::V6, fd(tx), rx.local_addr().unwrap());
+    let seg = Segment::new(name);
+    seg.attach(Link::to(Family::V6, fd(tx), rx.local_addr().unwrap()));
     (seg, rx)
 }
 
@@ -808,9 +808,9 @@ fn failed_sends_are_retried_until_they_go_through() {
     let (a, _a_rx) = wired("a");
     let (b, b_rx) = wired("b");
     let broken = || (UdpSocket::bind("127.0.0.1:0").unwrap(), "[::1]:5353".parse::<SocketAddr>().unwrap());
-    let repair = || b.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), b_rx.local_addr().unwrap());
+    let repair = || b.attach(Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), b_rx.local_addr().unwrap()));
     let (socket, dest) = broken();
-    b.attach(Family::V4, fd(socket), dest);
+    b.attach(Link::to(Family::V4, fd(socket), dest));
     let r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
 
     announce(&a, "10.0.1.5", "tv.local", &["TV"]);
@@ -830,7 +830,7 @@ fn failed_sends_are_retried_until_they_go_through() {
 
     // Gone from a while b cannot send: the copy stays until its goodbye goes out.
     let (socket, dest) = broken();
-    b.attach(Family::V4, fd(socket), dest);
+    b.attach(Link::to(Family::V4, fd(socket), dest));
     a.expire(Instant::now() + Duration::from_secs(100_000));
     deliver_made();
     assert_eq!(b.reflected_devices().len(), 1, "kept: its goodbye did not go out");
@@ -853,7 +853,7 @@ fn a_copy_whose_goodbye_failed_is_withdrawn_when_its_segment_goes() {
     assert_eq!(b.reflected_devices().len(), 1);
 
     let (socket, dest) = (UdpSocket::bind("127.0.0.1:0").unwrap(), "[::1]:5353".parse::<SocketAddr>().unwrap());
-    b.attach(Family::V4, fd(socket), dest);
+    b.attach(Link::to(Family::V4, fd(socket), dest));
     a.forget_discovered();
     deliver_made();
     assert_eq!(b.reflected_devices().len(), 1, "kept: its goodbye did not go out");
@@ -862,7 +862,7 @@ fn a_copy_whose_goodbye_failed_is_withdrawn_when_its_segment_goes() {
     r.remove("a");
     assert_eq!(b.reflected_devices().len(), 1, "still: b cannot send");
     let retry = r.next_retry().expect("to be tried again");
-    b.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), b_rx.local_addr().unwrap());
+    b.attach(Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), b_rx.local_addr().unwrap()));
     retry_made(retry);
     assert!(b.reflected_devices().is_empty());
     assert_eq!(r.next_retry(), None);

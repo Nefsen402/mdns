@@ -39,21 +39,122 @@ pub enum Family {
     V6,
 }
 
-#[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
-pub struct MdnsSocket {
-    pub index: u32,
-    pub family: Family,
-    pub socket: OwnedFd,
+/// What an interface hears and says with, and all that a segment knows of how
+/// it is reached: it listens over every family it is used over, and what it
+/// says goes to everyone on the link, which is each family's group.
+#[derive(Default)]
+pub struct Link {
+    /// What it hears with, a socket for each family, for the event loop to
+    /// read when they are readable. None where one socket for each family is
+    /// shared by every interface, which is the hub's.
+    listeners: Vec<OwnedFd>,
+    outs: Vec<Out>,
 }
 
-#[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
-impl MdnsSocket {
-    /// A second handle on this socket for sending, plus the group address
-    /// (scoped to this interface for IPv6) to send to. It keeps the source
-    /// port at 5353 and the socket's interface binding.
-    pub fn sender(&self) -> Result<(Sender, SocketAddr)> {
-        Ok((Sender::from(rustix::io::fcntl_dupfd_cloexec(&self.socket, 0).map_err(Why)?), group_of(self.family, self.index)))
+/// A way to send over one family, to everyone on the link over it.
+struct Out {
+    family: Family,
+    sender: Sender,
+    /// Where everyone on the link is over this family: its group.
+    to: Vec<SocketAddr>,
+    /// Whether a host on the link may be asked directly, at its own address,
+    /// and its answer is heard.
+    direct: bool,
+}
+
+impl Link {
+    /// A link that sends over `family` with `sender` to `to`, which asks hosts
+    /// directly too: for what is not an interface's own, a test's.
+    pub fn to(family: Family, sender: impl Into<Sender>, to: SocketAddr) -> Link {
+        Link::default().and(family, sender, to)
     }
+
+    /// This, and over `family` too.
+    pub fn and(mut self, family: Family, sender: impl Into<Sender>, to: SocketAddr) -> Link {
+        self.add(family, sender.into(), alloc::vec![to], true);
+        self
+    }
+
+    /// Say over `family` with `sender` to `to`, and ask hosts directly if
+    /// `direct`, replacing what there was over the family.
+    pub(crate) fn add(&mut self, family: Family, sender: Sender, to: Vec<SocketAddr>, direct: bool) {
+        self.outs.retain(|out| out.family != family);
+        self.outs.push(Out { family, sender, to, direct });
+    }
+
+    /// Whether it is used over no family: it says nothing, and hears nothing.
+    pub fn is_empty(&self) -> bool {
+        self.outs.is_empty()
+    }
+
+    /// The families it is used over.
+    pub fn families(&self) -> Vec<Family> {
+        self.outs.iter().map(|out| out.family).collect()
+    }
+
+    /// The descriptors it hears with, for the event loop to wait on.
+    pub fn fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        self.listeners.iter().map(|fd| fd.as_raw_fd())
+    }
+
+    /// Everything the socket `fd` has heard, if it is one of its: from whom,
+    /// to what address if that is known, and what.
+    pub fn drain(&self, fd: RawFd, interface: &str, heard: impl FnMut(SocketAddr, Option<IpAddr>, &[u8])) {
+        if let Some(listener) = self.listeners.iter().find(|l| l.as_raw_fd() == fd) {
+            drain(listener, interface, heard);
+        }
+    }
+
+    /// Say `bytes` to everyone on the link, over every family. Every one is
+    /// tried; the first error is returned. A no-op if it is used over none.
+    pub fn send(&self, bytes: &[u8]) -> Result<()> {
+        let mut first_err = None;
+        for out in &self.outs {
+            for &dest in &out.to {
+                if let Err(e) = out.sender.send_to(bytes, dest) {
+                    first_err.get_or_insert(anyhow::Error::new(Why(e)).context(format!("sending to {dest}")));
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// Answer a host over its `family`: to everyone on the link over it, or,
+    /// if it is a legacy resolver, to `to` alone. Over another family if it is
+    /// not used over that one. A no-op if it is used over none.
+    pub fn reply(&self, family: Family, to: Option<SocketAddr>, bytes: &[u8]) -> Result<()> {
+        let Some(out) = self.outs.iter().find(|out| out.family == family).or(self.outs.first()) else {
+            return Ok(());
+        };
+        let dests = to.map(|to| alloc::vec![to]).unwrap_or_else(|| out.to.clone());
+        for dest in dests {
+            out.sender.send_to(bytes, dest).map_err(Why).with_context(|| format!("sending to {dest}"))?;
+        }
+        Ok(())
+    }
+
+    /// Say `bytes` to the host at `addr` alone, at its mDNS port (RFC 6762
+    /// section 5.5), over its family. Whether it was sent. To a link-local
+    /// address the kernel has to look up the link-layer address first.
+    pub fn ask(&self, addr: IpAddr, bytes: &[u8]) -> bool {
+        let Some(out) = self.outs.iter().find(|out| out.family == family_of(addr)) else { return false };
+        let dest = match (addr, out.to.first()) {
+            (IpAddr::V6(addr), Some(SocketAddr::V6(group))) => SocketAddr::V6(SocketAddrV6::new(addr, MDNS_PORT, 0, group.scope_id())),
+            (addr, _) => SocketAddr::new(addr, MDNS_PORT),
+        };
+        out.sender.send_to(bytes, dest).is_ok()
+    }
+
+    /// Whether the host at `addr` is to be asked directly: it is over a family
+    /// that hears what is sent to the daemon itself.
+    pub fn reaches(&self, addr: IpAddr) -> bool {
+        self.outs.iter().any(|out| out.family == family_of(addr) && out.direct)
+    }
+}
+
+/// The family of `addr`.
+fn family_of(addr: IpAddr) -> Family {
+    if addr.is_ipv4() { Family::V4 } else { Family::V6 }
 }
 
 /// What a segment sends with: a socket, and, where one socket is shared by
@@ -121,7 +222,7 @@ mod pinned {
     /// A socket pinned to `interface` over `family`: bound to the group, or, if
     /// `unicast`, to the wildcard address, which hears what is sent to the
     /// daemon itself too.
-    pub fn open(interface: &str, family: Family, unicast: bool) -> Result<MdnsSocket> {
+    pub fn socket(interface: &str, family: Family, unicast: bool) -> Result<(u32, OwnedFd)> {
         let index = ifindex(interface)?;
         let socket = udp(family)?;
         let fd = &socket;
@@ -167,11 +268,7 @@ mod pinned {
             }
         }
 
-        Ok(MdnsSocket {
-            index,
-            family,
-            socket,
-        })
+        Ok((index, socket))
     }
 
     /// Pin `fd` to `interface`: it hears and sends nothing elsewhere.
@@ -189,8 +286,41 @@ mod pinned {
     }
 }
 
+/// For a manual test on a real interface: the socket of `interface` over
+/// `family` that hears what a host on this one sends to the group, and the
+/// link that sends from a second handle on it.
+#[cfg(all(test, target_os = "linux", not(feature = "portable-sockets")))]
+pub(crate) fn looped(interface: &str, family: Family) -> (OwnedFd, Link) {
+    let (index, socket) = pinned::socket(interface, family, false).unwrap();
+    match family {
+        Family::V4 => sockopt::set_ip_multicast_loop(&socket, true).unwrap(),
+        Family::V6 => sockopt::set_ipv6_multicast_loop(&socket, true).unwrap(),
+    }
+    let sender = Sender::from(rustix::io::fcntl_dupfd_cloexec(&socket, 0).unwrap());
+    (socket, Link::to(family, sender, group_of(family, index)))
+}
+
 #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
-pub use pinned::open;
+impl Link {
+    /// The link of `interface` over `families`, with a socket of its own for
+    /// each, pinned to it, which also hears what is sent to the daemon itself
+    /// for those of `unicast`. It keeps the source port at 5353, and sends to
+    /// the group (scoped to the interface for IPv6).
+    pub fn open(interface: &str, families: &[Family], unicast: &[Family]) -> Result<Link> {
+        let mut link = Link::default();
+        for &family in families {
+            let (index, socket) = pinned::socket(interface, family, unicast.contains(&family))
+                .with_context(|| format!("opening {family:?} socket on {interface}"))?;
+            // Never waited on: the loop reads it when it is readable, and a
+            // send that cannot go out at once fails, and is tried again.
+            rustix::io::ioctl_fionbio(&socket, true).map_err(Why)?;
+            let sender = Sender::from(rustix::io::fcntl_dupfd_cloexec(&socket, 0).map_err(Why)?);
+            link.add(family, sender, alloc::vec![group_of(family, index)], unicast.contains(&family));
+            link.listeners.push(socket);
+        }
+        Ok(link)
+    }
+}
 
 /// Whether the group can be joined on `interface` over `family` now: a socket
 /// of the interface's own is joined by its index, and needs nothing of it.
@@ -614,6 +744,17 @@ mod portable {
             };
             let fd = rustix::io::fcntl_dupfd_cloexec(socket, 0).map_err(Why)?;
             Ok((Sender { fd, out: Some((index, v4)) }, group_of(family, index)))
+        }
+
+        /// The link of `interface`, joined to the group over `families`, for
+        /// those of `unicast` asking hosts directly too.
+        pub fn link(&self, interface: &str, families: &[Family], unicast: &[Family]) -> Result<Link> {
+            let mut link = Link::default();
+            for &family in families {
+                let (sender, dest) = self.join(interface, family).with_context(|| format!("joining the group over {family:?} on {interface}"))?;
+                link.add(family, sender, alloc::vec![dest], unicast.contains(&family));
+            }
+            Ok(link)
         }
 
         /// Leave the group on `interface`, as it is gone: what is not joined

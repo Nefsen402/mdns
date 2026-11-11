@@ -22,12 +22,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::interface::Link;
 use crate::device::EditService;
 
 /// A segment that keeps a device at least five minutes, which is what these
 /// tests of what is listed assume; the default keeps one for its TTL.
-fn segment(name: &str, families: &[Family]) -> Segment {
-    let seg = Segment::new(name, families);
+fn segment(name: &str) -> Segment {
+    let seg = Segment::new(name);
     seg.set_min_lifetime(Duration::from_secs(300));
     seg
 }
@@ -40,8 +41,16 @@ fn fd(socket: impl std::os::fd::IntoRawFd) -> rustix::fd::OwnedFd {
 use crate::codec::{Header, Message, RData, Record};
 use crate::reflector::{deliver_made, Reflector};
 
+/// A segment that is used over `family`, to somewhere nobody listens.
+fn linked(name: &str, family: Family) -> Segment {
+    let seg = segment(name);
+    let socket = fd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    seg.attach(Link::to(family, socket, "127.0.0.1:9".parse().unwrap()));
+    seg
+}
+
 fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Segment>) {
-    let segs: Vec<Segment> = interfaces.iter().map(|i| segment(i, &[family])).collect();
+    let segs: Vec<Segment> = interfaces.iter().map(|i| linked(i, family)).collect();
     let reflector = Reflector::new(segs.clone()).unwrap();
     (Group { name: name.into(), reflector }, segs)
 }
@@ -134,7 +143,7 @@ fn lists_segments_merging_families() {
 
 #[test]
 fn segments_say_which_interfaces_are_untrusted() {
-    let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| segment(i, &[Family::V4])).collect();
+    let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| linked(i, Family::V4)).collect();
     let reflector = Reflector::with_untrusted(segs, &["wifi".to_string()]).unwrap();
     let groups = [Group { name: "IoT to br0".into(), reflector }];
     assert_eq!(
@@ -239,9 +248,9 @@ fn a_watch_for_a_type_the_host_offers_shows_it_present_and_for_another_does_not(
 #[test]
 fn probes_each_interface_once_even_when_segments_share_it() {
     let (a, b, c) = (
-        segment("a", &[Family::V4]),
-        segment("b", &[Family::V4]),
-        segment("c", &[Family::V4]),
+        segment("a"),
+        segment("b"),
+        segment("c"),
     );
     let groups = [
         Group { name: "x".into(), reflector: Reflector::new(vec![a.clone(), b.clone()]).unwrap() },
@@ -264,8 +273,8 @@ fn probes_each_interface_once_even_when_segments_share_it() {
 
 #[test]
 fn probe_reports_what_was_sent_per_interface() {
-    let (g, _segs) = group("media", Family::V4, &["a"]);
-    // No sender is attached in tests, so nothing is sent.
+    // No link is attached to it, so nothing is sent.
+    let g = Group { name: "media".into(), reflector: Reflector::new(vec![segment("a")]).unwrap() };
     assert_eq!(
         handle(&[g], &Watches::default(), "probe media"),
         r#"{"ok":true,"probed":[{"interface":"a","queries":0,"error":null}]}"#
@@ -539,8 +548,8 @@ fn watch_streams_changes_until_the_daemon_stops() {
 fn wired(interface: &str) -> (Segment, std::net::UdpSocket) {
     let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-    let seg = segment(interface, &[Family::V4]);
-    seg.attach(Family::V4, fd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
+    let seg = segment(interface);
+    seg.attach(Link::to(Family::V4, fd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap()));
     (seg, rx)
 }
 
@@ -630,7 +639,7 @@ fn a_watch_for_a_type_narrows_what_it_shows() {
     let kinds = ["_http._tcp.local".to_string()];
     let mut shown = HashMap::new();
     let tv = |services: bool| {
-        let seg = segment("wifi", &[Family::V4]);
+        let seg = segment("wifi");
         announce(&seg, "10.0.1.7", "tv.local", "TV");
         let mut d = seg.devices().remove(0);
         if !services {
@@ -719,7 +728,7 @@ fn watchers_lists_the_open_watches_and_who_holds_them() {
 /// updated or removed. Questions are not changes, and are not shown.
 #[test]
 fn a_watch_line_says_what_happened() {
-    let seg = segment("wifi", &[Family::V4]);
+    let seg = segment("wifi");
     announce(&seg, "10.0.1.7", "tv.local", "TV");
     let tv = seg.devices().remove(0);
     let line = |event| notice_json("IoT", &Notice { interface: "wifi".into(), event, ttl: Duration::from_secs(120) });

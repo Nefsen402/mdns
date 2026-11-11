@@ -22,17 +22,15 @@ const FLOOR: Duration = Duration::from_secs(300);
 /// A segment that keeps a device at least five minutes, as most of these
 /// tests are of timings that go by a lifetime that long; the default keeps
 /// a device for exactly its TTL.
-fn segment(name: &str, families: &[Family]) -> Segment {
-    let seg = Segment::new(name, families);
+fn segment(name: &str) -> Segment {
+    let seg = Segment::new(name);
     seg.set_min_lifetime(FLOOR);
     seg
 }
 
 use crate::device::{record, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
 use crate::codec::{self, rtype, Header};
-use crate::interface::prefix;
-#[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
-use crate::interface::open;
+use crate::interface::{prefix, Link};
 
 /// Its first routable IPv4 or IPv6 address, and link-local one.
 fn v4(d: &Device) -> Option<IpAddr> {
@@ -113,7 +111,7 @@ fn unnamed(addr: &str) -> Device {
 
 #[test]
 fn observe_adds_once_and_notifies() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let rx = seg.subscribe();
     seg.observe(ip("10.0.1.5"));
     seg.observe(ip("10.0.1.5"));
@@ -124,7 +122,7 @@ fn observe_adds_once_and_notifies() {
 
 #[test]
 fn expire_removes_and_notifies() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.observe(ip("10.0.1.5"));
     let rx = seg.subscribe();
     seg.expire(Instant::now());
@@ -139,8 +137,8 @@ fn wired() -> (Segment, UdpSocket) {
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let seg = segment("test", &[Family::V4]);
-    seg.attach(Family::V4, fd(tx), rx.local_addr().unwrap());
+    let seg = segment("test");
+    seg.attach(Link::to(Family::V4, fd(tx), rx.local_addr().unwrap()));
     (seg, rx)
 }
 
@@ -179,7 +177,7 @@ fn tv(addr: &str, instances: &[&str]) -> Device {
 
 #[test]
 fn reflected_list_is_separate() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let rx = seg.subscribe();
     let device = Shared::new(tv("10.0.1.9", &["TV"]));
     assert!(seg.add_reflected(OWN, &device).unwrap());
@@ -431,7 +429,7 @@ fn a_question_from_elsewhere_is_asked_once_a_second_without_the_askers_wishes() 
     while recv(&rx).is_some() {}
 
     // Without a sender, nothing.
-    assert_eq!(segment("quiet", &[Family::V4]).query_question(&questions).unwrap(), 0);
+    assert_eq!(segment("quiet").query_question(&questions).unwrap(), 0);
 }
 
 /// A question asked on another's behalf carries what is known here of
@@ -493,7 +491,7 @@ fn types_asked_for_by_name_are_asked_with_what_is_known_and_remembered() {
     assert!(probed.iter().any(|n| n == "_hue._tcp.local"), "{probed:?}");
 
     // Without a sender, nothing.
-    assert_eq!(run_probe(&segment("quiet", &[Family::V4]), Some(&kinds)).0, Ok(0));
+    assert_eq!(run_probe(&segment("quiet"), Some(&kinds)).0, Ok(0));
 }
 
 /// A way to send over IPv4 that always fails: its group is an IPv6
@@ -504,7 +502,7 @@ fn broken() -> (UdpSocket, SocketAddr) {
 
 /// Give `seg` a working way to send again, to `rx`.
 fn repair(seg: &Segment, rx: &UdpSocket) {
-    seg.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
+    seg.attach(Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap()));
 }
 
 fn retry_of(seg: &Segment, host: &str) -> Option<Instant> {
@@ -518,7 +516,7 @@ fn retry_of(seg: &Segment, host: &str) -> Option<Instant> {
 fn a_device_that_cannot_be_announced_is_not_recorded() {
     let (seg, rx) = wired();
     let (socket, dest) = broken();
-    seg.attach(Family::V4, fd(socket), dest);
+    seg.attach(Link::to(Family::V4, fd(socket), dest));
     let device = Shared::new(tv("10.0.2.9", &["TV"]));
     let err = seg.add_reflected(FIRST, &device).unwrap_err();
     assert!(format!("{err:#}").contains("sending to [::1]:5353"), "{err:#}");
@@ -530,7 +528,7 @@ fn a_device_that_cannot_be_announced_is_not_recorded() {
     recv(&rx).unwrap();
 
     let (socket, dest) = broken();
-    seg.attach(Family::V4, fd(socket), dest);
+    seg.attach(Link::to(Family::V4, fd(socket), dest));
     *device.borrow_mut() = tv("10.0.2.9", &["TV", "Cast"]);
     assert!(seg.add_reflected(FIRST, &device).is_err());
     let shown: Vec<String> = seg.reflected_devices()[0].services.iter().map(|s| s.instance().to_string()).collect();
@@ -550,7 +548,7 @@ fn a_device_that_cannot_be_withdrawn_is_kept() {
     recv(&rx).unwrap();
 
     let (socket, dest) = broken();
-    seg.attach(Family::V4, fd(socket), dest);
+    seg.attach(Link::to(Family::V4, fd(socket), dest));
     assert!(seg.remove_reflected(&seg.own(), &device).is_err());
     assert_eq!(seg.reflected_devices().len(), 1, "kept");
 
@@ -571,7 +569,7 @@ fn an_announcement_that_fails_is_tried_again() {
     recv(&rx).unwrap();
 
     let (socket, dest) = broken();
-    seg.attach(Family::V4, fd(socket), dest);
+    seg.attach(Link::to(Family::V4, fd(socket), dest));
     let before = Instant::now();
     assert!(seg.announce_all().is_err());
     let retry = retry_of(&seg, "tv.local").expect("to be tried again");
@@ -602,7 +600,7 @@ fn a_copy_that_cannot_give_way_is_withdrawn_once_it_can() {
     recv(&rx).unwrap();
 
     let (socket, dest) = broken();
-    seg.attach(Family::V4, fd(socket), dest);
+    seg.attach(Link::to(Family::V4, fd(socket), dest));
     hear(&seg, "10.0.1.50", vec![a_record("tv.local", "10.0.1.50"), srv("Den._http._tcp.local", 80, "tv.local")]);
     let retry = retry_of(&seg, "tv.local").expect("to be tried again");
     assert_eq!(seg.reflected_devices().len(), 1, "still shown: the goodbye did not go out");
@@ -622,10 +620,9 @@ fn every_family_is_tried_when_one_fails() {
     // The one that fails comes first, so the other is only tried if
     // sending goes on past a failure.
     let (_, rx) = wired();
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     let (socket, dest) = broken();
-    seg.attach(Family::V4, fd(socket), dest);
-    seg.attach(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
+    seg.attach(Link::to(Family::V4, fd(socket), dest).and(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap()));
     let err = seg.add_reflected(FIRST, &Shared::new(tv("10.0.2.9", &["TV"]))).unwrap_err();
     assert!(format!("{err:#}").contains("[::1]:5353"), "{err:#}");
     let sent = recv(&rx).expect("sent over the other family all the same");
@@ -637,7 +634,7 @@ fn every_family_is_tried_when_one_fails() {
 /// allows.
 #[test]
 fn the_mtu_sets_what_a_packet_may_hold() {
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     assert_eq!(seg.state.borrow_mut().max_packet, DEFAULT_MAX_PACKET, "a standard frame until told");
     assert_eq!(seg.set_mtu(1500), 1452);
     assert_eq!(seg.set_mtu(1492), 1444, "PPPoE");
@@ -733,7 +730,7 @@ fn everything_sent_keeps_within_the_mtu() {
 /// address to credit it with, nor one to know a device by.
 #[test]
 fn a_packet_from_an_unusable_address_vouches_for_none() {
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     hear(&seg, "0.0.0.0", vec![aaaa("tv.local", "fe80::9"), srv("TV._http._tcp.local", 80, "tv.local")]);
     let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).expect("still heard of");
     assert_eq!(tv.addrs().collect::<Vec<_>>(), [ip("fe80::9")]);
@@ -752,7 +749,7 @@ const MAC: [u8; 6] = [0x04, 0x09, 0x86, 0x43, 0xe3, 0xf6];
 /// whichever comes first, and loses them with their entries.
 #[test]
 fn a_device_is_given_the_addresses_the_neighbour_table_has_for_it() {
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     let events = seg.subscribe();
     let learned = |seg: &Segment| -> Vec<IpAddr> {
         let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
@@ -796,7 +793,7 @@ fn a_device_is_given_the_addresses_the_neighbour_table_has_for_it() {
 /// segment to say.
 #[test]
 fn a_device_is_found_in_the_neighbour_table_by_any_address_it_announced() {
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     seg.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
     seg.neighbour(ip("10.0.1.9"), Some(MAC.to_vec()));
     seg.neighbour(ip("fd00::9"), Some(MAC.to_vec()));
@@ -815,7 +812,7 @@ fn a_device_is_found_in_the_neighbour_table_by_any_address_it_announced() {
 /// own, in the same packet, the device's.
 #[test]
 fn a_device_known_at_the_address_is_not_taken_for_the_sender_of_a_packet_about_another() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     // The router, heard of by what it announces.
     hear(&seg, "10.0.0.1", vec![a_record("router.local", "10.0.0.1"), ptr("_ssh._tcp.local", "router._ssh._tcp.local"), srv("router._ssh._tcp.local", 22, "router.local")]);
     // Then, from it, the browse answer: one device's services, and a service of its own, no addresses.
@@ -843,7 +840,7 @@ fn a_device_known_at_the_address_is_not_taken_for_the_sender_of_a_packet_about_a
 /// added to a device by a guess.
 #[test]
 fn a_service_without_a_host_is_not_given_to_a_device_whose_address_was_guessed() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     hear(&seg, "10.0.0.1", vec![
         ptr("_raop._tcp.local", "Speakers._raop._tcp.local"),
         srv("Speakers._raop._tcp.local", 7000, "speakers.local"),
@@ -865,7 +862,7 @@ fn a_service_without_a_host_is_not_given_to_a_device_whose_address_was_guessed()
 
 #[test]
 fn only_neighbour_addresses_on_the_interfaces_networks_are_learned() {
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     let learned = |seg: &Segment| -> Vec<IpAddr> {
         let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         d.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip).collect()
@@ -891,7 +888,7 @@ fn only_neighbour_addresses_on_the_interfaces_networks_are_learned() {
 /// daemon itself, only of a host on the interface's networks or link-local.
 #[test]
 fn what_is_sent_to_the_daemon_is_only_heard_of_a_host_on_the_interface() {
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     seg.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
     let group = Some(ip("224.0.0.251"));
     let group6 = Some(ip("ff02::fb"));
@@ -922,8 +919,8 @@ fn what_is_sent_to_the_daemon_is_only_heard_of_a_host_on_the_interface() {
 #[test]
 fn a_device_unknown_to_the_neighbour_table_is_nudged_once() {
     let rx = UdpSocket::bind("[::1]:0").unwrap();
-    let seg = segment("test", &[Family::V6]);
-    seg.attach(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap());
+    let seg = segment("test");
+    seg.attach(Link::to(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap()));
     let nudged = |seg: &Segment| {
         let state = seg.state.borrow();
         state.tracker.discovered.get(host_id(&state, "speakers.local")).nudged
@@ -934,8 +931,8 @@ fn a_device_unknown_to_the_neighbour_table_is_nudged_once() {
     assert_eq!(nudged(&seg), Some(first), "not again so soon");
 
     // One with a routable IPv6 address is not.
-    let seg = segment("test", &[Family::V6]);
-    seg.attach(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap());
+    let seg = segment("test");
+    seg.attach(Link::to(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap()));
     hear(&seg, "fe80::9", vec![aaaa("speakers.local", "fe80::9"), aaaa("speakers.local", "fd00::9")]);
     assert_eq!(nudged(&seg), None);
 }
@@ -947,7 +944,7 @@ fn a_device_unknown_to_the_neighbour_table_is_nudged_once() {
 /// of a family than it is set to.
 #[test]
 fn a_segment_keeps_as_many_addresses_as_it_is_set_to() {
-    let seg = segment("test", &[Family::V6]);
+    let seg = segment("test");
     seg.set_max_addrs(2);
     let many: Vec<Record> = (1..=5).map(|i| aaaa("tv.local", &format!("2001:db8::{i}"))).collect();
     hear(&seg, "fe80::5", many);
@@ -960,7 +957,7 @@ fn a_segment_keeps_as_many_addresses_as_it_is_set_to() {
 /// device, with services that live longer, stays.
 #[test]
 fn an_address_not_heard_of_again_runs_out_on_its_own() {
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     let events = seg.subscribe();
     let t0 = Instant::now();
     hear(&seg, "10.0.1.7", vec![
@@ -1004,7 +1001,7 @@ fn a_device_is_asked_again_before_its_address_runs_out() {
 
 #[test]
 fn one_sender_may_describe_only_so_many_hosts() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     for i in 0..MAX_PER_SENDER + 10 {
         hear(&seg, "10.0.1.1", vec![a_record(&format!("h{i}.local"), &format!("10.0.2.{}", i % 250 + 1))]);
     }
@@ -1021,7 +1018,7 @@ fn one_sender_may_describe_only_so_many_hosts() {
 
 #[test]
 fn a_segment_remembers_only_so_many_devices() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     for i in 0..DEFAULT_MAX_DEVICES + 20 {
         seg.observe(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i as u32 + 1)));
     }
@@ -1030,7 +1027,7 @@ fn a_segment_remembers_only_so_many_devices() {
 
 #[test]
 fn the_number_of_services_a_device_is_kept_with_can_be_set() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.set_max_services(3);
     let services: Vec<Record> = (0..10).map(|i| srv(&format!("S{i}._http._tcp.local"), 80, "tv.local")).collect();
     hear(&seg, "10.0.1.7", [vec![a_record("tv.local", "10.0.1.7")], services.clone()].concat());
@@ -1044,7 +1041,7 @@ fn the_number_of_services_a_device_is_kept_with_can_be_set() {
 
 #[test]
 fn the_number_of_devices_a_segment_remembers_can_be_set() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.set_max_devices(10);
     let host = |i: usize| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i as u32 + 1));
     for i in 0..30 {
@@ -1067,7 +1064,7 @@ fn the_number_of_devices_a_segment_remembers_can_be_set() {
 /// announced none at all.
 #[test]
 fn a_host_with_only_unusable_addresses_is_not_given_the_senders() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     hear(&seg, "10.0.1.7", vec![a_record("tv.local", "0.0.0.0"), srv("TV._http._tcp.local", 80, "tv.local")]);
     let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
     assert_eq!((v4(&tv), ll4(&tv)), (None, None));
@@ -1081,13 +1078,13 @@ fn a_host_with_only_unusable_addresses_is_not_given_the_senders() {
 /// family it sent over or any: a host has the addresses it announced.
 #[test]
 fn the_sender_is_not_credited_with_an_address_it_did_not_announce() {
-    let seg = segment("test", &[Family::V6]);
+    let seg = segment("test");
     hear(&seg, "fe80::7", vec![a_record("tv.local", "10.0.1.7"), srv("TV._http._tcp.local", 80, "tv.local")]);
     let tv = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
     assert_eq!(v4(&tv), Some(ip("10.0.1.7")));
     assert_eq!(ll6(&tv), None, "not the sender's, over IPv6");
 
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     hear(&seg, "10.0.1.8", vec![a_record("nas.local", "0.0.0.0"), aaaa("nas.local", "fd00::8")]);
     let nas = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
     assert_eq!((v4(&nas), v6(&nas)), (None, Some(ip("fd00::8"))));
@@ -1098,7 +1095,7 @@ fn the_sender_is_not_credited_with_an_address_it_did_not_announce() {
 /// up the one. Saying goodbye with nothing in its place, it is.
 #[test]
 fn giving_up_a_temporary_address_is_not_leaving() {
-    let seg = segment("test", &[Family::V6]);
+    let seg = segment("test");
     hear(&seg, "2001:db8::5", vec![
         aaaa("tv.local", "2001:db8::5"),
         aaaa("tv.local", "fd00::5"),
@@ -1129,7 +1126,7 @@ fn goodbyes_over_both_families_leave_in_either_order() {
         ]
     };
     for (first, second) in [("10.0.2.160", "fe80::160"), ("fe80::160", "10.0.2.160")] {
-        let seg = segment("test", &[Family::V4, Family::V6]);
+        let seg = segment("test");
         hear(&seg, "10.0.2.160", records(120));
         hear(&seg, first, records(0));
         assert!(
@@ -1166,7 +1163,7 @@ fn an_interface_that_goes_and_comes_back() {
 
     // Back: a new socket, and everything announced again.
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-    seg.attach(Family::V4, fd(tx), rx.local_addr().unwrap());
+    seg.attach(Link::to(Family::V4, fd(tx), rx.local_addr().unwrap()));
     seg.announce_all().unwrap();
     let m = recv(&rx).expect("announced again");
     assert!(m.answers.iter().any(|r| r.name == "tv.local" && r.ttl > 0));
@@ -1261,8 +1258,7 @@ fn age(seg: &Segment, secs: u64) {
     for host in state.hosts.hosts_all() {
         state.hosts.edit(&host, |m| {
             m.announced -= Duration::from_secs(secs);
-            m.last_sent.v4 -= Duration::from_secs(secs);
-            m.last_sent.v6 -= Duration::from_secs(secs);
+            m.last_sent -= Duration::from_secs(secs);
         });
     }
 }
@@ -1602,7 +1598,7 @@ fn a_name_that_is_not_valid_utf8_is_never_learned_or_asked_about() {
 
 #[test]
 fn probe_without_a_sender_does_nothing() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let id = seg.probe();
     assert_eq!(seg.probed(id), Some(Ok(0)), "done at once");
     assert_eq!(seg.probed(id), None, "taken");
@@ -1610,7 +1606,7 @@ fn probe_without_a_sender_does_nothing() {
 
 #[test]
 fn learned_types_are_capped() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let ptrs = (0..MAX_TYPES + 50)
         .map(|i| record(META_QUERY.into(), false, 4500, RData::Ptr(format!("_t{i}._tcp.local"))))
         .collect();
@@ -1653,9 +1649,11 @@ fn a_device_without_services_can_be_advertised() {
 fn wired_both() -> (Segment, UdpSocket, UdpSocket) {
     let (_, rx4) = wired();
     let (_, rx6) = wired_family(Family::V6);
-    let seg = segment("test", &[Family::V4, Family::V6]);
-    seg.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx4.local_addr().unwrap());
-    seg.attach(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx6.local_addr().unwrap());
+    let seg = segment("test");
+    seg.attach(
+        Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx4.local_addr().unwrap())
+            .and(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx6.local_addr().unwrap()),
+    );
     (seg, rx4, rx6)
 }
 
@@ -1663,7 +1661,7 @@ fn wired_both() -> (Segment, UdpSocket, UdpSocket) {
 /// addresses of both.
 #[test]
 fn a_segment_over_both_families_keeps_one_list() {
-    let seg = segment("test", &[Family::V4, Family::V6]);
+    let seg = segment("test");
     hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), srv("TV._http._tcp.local", 80, "tv.local")]);
     hear(&seg, "fe80::7", vec![aaaa("tv.local", "fd00::7")]);
     let named: Vec<Device> = seg.devices().into_iter().filter(|d| d.hostname.is_some()).collect();
@@ -1688,12 +1686,17 @@ fn announcements_go_out_over_both_families_and_replies_over_the_askers() {
     assert!(recv(&rx6).is_none(), "and over IPv4 only");
     assert!(m.additionals.iter().any(|r| r.data == RData::Aaaa("fd00::9".parse().unwrap())), "{:?}", m.additionals);
 
-    // Just answered over IPv4, it may still answer over IPv6.
+    // Just answered, it is not answered again within the second, over either
+    // family: the limit is the interface's.
+    seg.handle(sa("fe80::50"), &query("tv.local", rtype::AAAA, vec![])).unwrap();
+    assert!(recv(&rx6).is_none() && recv(&rx4).is_none(), "not again yet");
+    seg.handle(sa("10.0.1.51"), &query("tv.local", rtype::A, vec![])).unwrap();
+    assert!(recv(&rx4).is_none());
+
+    // A second on, over the family it was asked over.
+    age(&seg, 2);
     seg.handle(sa("fe80::50"), &query("tv.local", rtype::AAAA, vec![])).unwrap();
     assert!(recv(&rx6).is_some(), "answered over IPv6");
-    assert!(recv(&rx4).is_none());
-    // But not over IPv4 again just yet.
-    seg.handle(sa("10.0.1.51"), &query("tv.local", rtype::A, vec![])).unwrap();
     assert!(recv(&rx4).is_none());
 }
 
@@ -1710,8 +1713,8 @@ fn a_probe_goes_out_over_both_families() {
 fn wired_family(family: Family) -> (Segment, UdpSocket) {
     let (_, rx) = wired();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let seg = segment("test", &[family]);
-    seg.attach(family, fd(tx), rx.local_addr().unwrap());
+    let seg = segment("test");
+    seg.attach(Link::to(family, fd(tx), rx.local_addr().unwrap()));
     (seg, rx)
 }
 
@@ -1733,7 +1736,7 @@ fn ptr(kind: &str, instance: &str) -> Record {
 
 #[test]
 fn a_device_first_heard_by_address_becomes_the_named_device() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let rx = seg.subscribe();
 
     // A browse answer: an instance, but not yet who or where it is.
@@ -1770,7 +1773,7 @@ fn a_device_first_heard_by_address_becomes_the_named_device() {
 /// is not mistaken for any of them.
 #[test]
 fn a_reflector_announcing_other_devices_is_not_mistaken_for_them() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     hear(&seg, "10.0.0.1", vec![
         a_record("speaker.local", "10.0.2.73"),
         ptr("_airplay._tcp.local", "Speaker._airplay._tcp.local"),
@@ -1790,7 +1793,7 @@ fn a_reflector_announcing_other_devices_is_not_mistaken_for_them() {
 
 #[test]
 fn packets_that_do_not_name_their_sender_belong_to_the_device_it_is() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
     assert_eq!(seg.devices().len(), 1);
 
@@ -1805,7 +1808,7 @@ fn packets_that_do_not_name_their_sender_belong_to_the_device_it_is() {
 #[test]
 fn goodbye_and_expiry_also_forget_the_addresses() {
     for goodbye in [true, false] {
-        let seg = segment("test", &[Family::V4]);
+        let seg = segment("test");
         seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
         if goodbye {
             seg.handle(sa("10.0.1.7"), &announcement(0)).unwrap();
@@ -1893,7 +1896,7 @@ fn find<'a>(devices: &'a [Device], host: &str) -> &'a Device {
 /// names, not to whichever host the packet happened to mention first.
 #[test]
 fn a_packet_describing_two_devices_attributes_each_record_to_its_own_device() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let rx = seg.subscribe();
     hear(&seg, "10.0.0.1", vec![
         ptr("_airplay._tcp.local", "OZAL TV._airplay._tcp.local"),
@@ -1925,7 +1928,7 @@ fn a_packet_describing_two_devices_attributes_each_record_to_its_own_device() {
 
 #[test]
 fn the_only_host_a_packet_describes_is_not_given_the_senders_address_when_it_announces_none() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     hear(&seg, "10.0.1.9", vec![srv("Dev._http._tcp.local", 80, "dev.local")]);
     let devices = seg.devices();
     assert_eq!(devices.len(), 1);
@@ -1936,7 +1939,7 @@ fn the_only_host_a_packet_describes_is_not_given_the_senders_address_when_it_ann
 /// later packet resolves them to their hosts they are not kept twice.
 #[test]
 fn resolved_instances_leave_the_unresolved_copy_behind() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     hear(&seg, "10.0.0.1", vec![
         ptr("_x._tcp.local", "A._x._tcp.local"),
         ptr("_x._tcp.local", "B._x._tcp.local"),
@@ -1961,7 +1964,7 @@ fn resolved_instances_leave_the_unresolved_copy_behind() {
 /// the list of devices that may hold one follows them coming and going.
 #[test]
 fn an_unresolved_copy_on_another_device_is_found_and_the_list_of_them_is_kept_clean() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     hear(&seg, "10.0.0.1", vec![ptr("_x._tcp.local", "A._x._tcp.local")]);
     hear(&seg, "10.0.0.5", vec![ptr("_x._tcp.local", "C._x._tcp.local")]);
     assert_eq!(seg.state.borrow().tracker.discovered.with_unresolved().count(), 2);
@@ -1989,7 +1992,7 @@ fn an_unresolved_copy_on_another_device_is_found_and_the_list_of_them_is_kept_cl
 /// at them, and the ones that do not run out are left alone.
 #[test]
 fn devices_that_run_out_together_are_dropped_and_the_others_kept() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.set_max_devices(500);
     for i in 0..200 {
         let (host, from) = (format!("h{i}.local"), format!("10.1.0.{}", i + 1));
@@ -2095,16 +2098,21 @@ fn a_refresh_is_asked_at_a_routable_address_of_the_device_before_a_link_local() 
         d.add_addrs(&addrs.iter().map(|a| ip(a)).collect::<Vec<_>>());
         d
     };
-    let both = [Family::V4, Family::V6];
+    let to = "127.0.0.1:9".parse().unwrap();
+    let link = |families: &[Family]| {
+        let socket = || fd(UdpSocket::bind("127.0.0.1:0").unwrap());
+        families.iter().fold(Link::default(), |link, &family| link.and(family, socket(), to))
+    };
+    let both = link(&[Family::V4, Family::V6]);
     assert_eq!(direct_address(&device(&["fe80::1", "fd00::2", "10.0.1.3"]), &both), Some(ip("10.0.1.3")));
     assert_eq!(direct_address(&device(&["fe80::1", "fd00::2"]), &both), Some(ip("fd00::2")));
     assert_eq!(direct_address(&device(&["fe80::1"]), &both), Some(ip("fe80::1")));
     assert_eq!(direct_address(&device(&[]), &both), None);
     // Only over a family that hears what is sent to the daemon.
-    assert_eq!(direct_address(&device(&["fe80::1", "fd00::2", "10.0.1.3"]), &[Family::V6]), Some(ip("fd00::2")));
-    assert_eq!(direct_address(&device(&["fe80::1", "10.0.1.3"]), &[Family::V4]), Some(ip("10.0.1.3")));
-    assert_eq!(direct_address(&device(&["fe80::1", "fd00::2"]), &[Family::V4]), None);
-    assert_eq!(direct_address(&device(&["10.0.1.3"]), &[]), None);
+    assert_eq!(direct_address(&device(&["fe80::1", "fd00::2", "10.0.1.3"]), &link(&[Family::V6])), Some(ip("fd00::2")));
+    assert_eq!(direct_address(&device(&["fe80::1", "10.0.1.3"]), &link(&[Family::V4])), Some(ip("10.0.1.3")));
+    assert_eq!(direct_address(&device(&["fe80::1", "fd00::2"]), &link(&[Family::V4])), None);
+    assert_eq!(direct_address(&device(&["10.0.1.3"]), &link(&[])), None);
 }
 
 /// Where the device cannot be sent to, the question goes to the group.
@@ -2161,7 +2169,7 @@ fn refresh_asks_an_ipv6_device_for_its_aaaa_record() {
 
 #[test]
 fn refresh_without_a_sender_does_nothing_and_remembers_nothing() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
     assert_eq!(seg.refresh(Instant::now() + Duration::from_secs(250), Duration::from_secs(60)).unwrap(), 0);
     // Once there is a sender it still asks, because the earlier call asked nobody.
@@ -2300,7 +2308,7 @@ fn refresh_does_not_ask_a_device_whose_time_has_already_run_out() {
 /// runs out first makes room.
 #[test]
 fn a_new_address_takes_the_place_of_the_stalest_at_the_limit() {
-    let seg = segment("test", &[Family::V6]);
+    let seg = segment("test");
     seg.set_max_addrs(2);
     let aaaa = |a: &str| record("phone.local".into(), false, 120, RData::Aaaa(a.parse().unwrap()));
     for a in ["2001:db8::1", "2001:db8::2", "2001:db8::3"] {
@@ -2314,7 +2322,7 @@ fn a_new_address_takes_the_place_of_the_stalest_at_the_limit() {
 /// The addresses a packet repeats are not the ones to make room.
 #[test]
 fn making_room_leaves_the_addresses_a_packet_repeats() {
-    let seg = segment("test", &[Family::V6]);
+    let seg = segment("test");
     seg.set_max_addrs(2);
     let aaaa = |a: &str| record("phone.local".into(), false, 120, RData::Aaaa(a.parse().unwrap()));
     hear(&seg, "2001:db8::1", vec![aaaa("2001:db8::1")]);
@@ -2344,27 +2352,27 @@ fn alive_after(seg: &Segment, secs: u64) -> bool {
 #[test]
 fn the_minimum_lifetime_is_a_floor_under_a_devices_ttl_and_can_be_changed() {
     // Default: the 5 minute floor holds a 10 second TTL up to 300 s.
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     hear_a_device_with_ttl(&seg, 10);
     assert!(alive_after(&seg, 290));
     assert!(!alive_after(&seg, 301));
 
     // A shorter floor lets that device go sooner...
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.set_min_lifetime(Duration::from_secs(60));
     hear_a_device_with_ttl(&seg, 10);
     assert!(alive_after(&seg, 50));
     assert!(!alive_after(&seg, 61));
 
     // ...a longer one keeps it longer...
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.set_min_lifetime(Duration::from_secs(900));
     hear_a_device_with_ttl(&seg, 10);
     assert!(alive_after(&seg, 890));
     assert!(!alive_after(&seg, 901));
 
     // ...and zero means no floor: it lives for exactly its TTL.
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.set_min_lifetime(Duration::ZERO);
     hear_a_device_with_ttl(&seg, 10);
     assert!(alive_after(&seg, 8));
@@ -2373,7 +2381,7 @@ fn the_minimum_lifetime_is_a_floor_under_a_devices_ttl_and_can_be_changed() {
 
 #[test]
 fn a_ttl_longer_than_the_floor_still_wins() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.set_min_lifetime(Duration::from_secs(60));
     hear_a_device_with_ttl(&seg, 4500);
     assert!(alive_after(&seg, 4490));
@@ -3018,7 +3026,7 @@ fn a_given_address_ttl_wins_for_the_address_only() {
 
 #[test]
 fn a_device_known_only_by_address_has_announced_no_ttls() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.observe(ip("10.0.1.99"));
     let bare = seg.devices().remove(0);
     assert_eq!((bare.ttl, bare.services.len()), (None, 0));
@@ -3026,7 +3034,7 @@ fn a_device_known_only_by_address_has_announced_no_ttls() {
 
 #[test]
 fn a_segment_that_cannot_send_has_nothing_to_refresh() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
     seg.set_refresh_before(Some(Duration::from_secs(60)));
     // Only the expiry: refresh would return at once without asking, and
@@ -3119,19 +3127,19 @@ fn lifetime_left_is_what_the_daemon_will_keep_a_device() {
 
 #[test]
 fn events_wait_to_be_taken() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.observe(ip("10.0.1.5"));
     seg.observe(ip("10.0.1.6"));
     assert_eq!(seg.take_events().len(), 2);
     assert!(seg.take_events().is_empty(), "taken");
-    assert!(seg.is(&seg.clone()) && !seg.is(&segment("test", &[Family::V4])));
+    assert!(seg.is(&seg.clone()) && !seg.is(&segment("test")));
 }
 
 /// Service types learned from the enumeration are one per type, whatever
 /// their case.
 #[test]
 fn service_types_are_learned_once_whatever_their_case() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let meta = |kind: &str| ptr("_services._dns-sd._udp.local", kind);
     hear(&seg, "10.0.1.7", vec![meta("_http._tcp.local"), meta("_HTTP._tcp.LOCAL")]);
     assert_eq!(seg.state.borrow_mut().tracker.types.len(), 1);
@@ -3183,7 +3191,7 @@ fn a_copy_giving_way_leaves_the_nsec_of_the_device_here_alone() {
 
 #[test]
 fn ingest_fills_in_hostname_and_services() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let rx = seg.subscribe();
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
 
@@ -3208,7 +3216,7 @@ fn ingest_fills_in_hostname_and_services() {
 
 #[test]
 fn later_packet_updates_and_ttl0_removes_service() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.observe(ip("10.0.1.7"));
     let rx = seg.subscribe();
 
@@ -3230,7 +3238,7 @@ fn later_packet_updates_and_ttl0_removes_service() {
 
 #[test]
 fn address_goodbye_removes_device() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
     let rx = seg.subscribe();
     seg.handle(sa("10.0.1.7"), &announcement(0)).unwrap();
@@ -3240,7 +3248,7 @@ fn address_goodbye_removes_device() {
 
 #[test]
 fn long_ttl_extends_lifetime() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.handle(sa("10.0.1.7"), &announcement(4500)).unwrap();
     seg.expire(Instant::now() + FLOOR + Duration::from_secs(1));
     assert_eq!(seg.devices().len(), 1);
@@ -3250,14 +3258,14 @@ fn long_ttl_extends_lifetime() {
 
 #[test]
 fn garbage_still_counts_as_alive() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     seg.handle(sa("10.0.1.5"), b"\xff\xff not dns").unwrap();
     assert_eq!(seg.devices().len(), 1);
 }
 
 #[test]
 fn query_records_are_ignored() {
-    let seg = segment("test", &[Family::V4]);
+    let seg = segment("test");
     let mut p = announcement(120);
     p[2] = 0x00; // clear QR: a query carrying known answers
     seg.handle(sa("10.0.1.8"), &p).unwrap();
@@ -3273,15 +3281,10 @@ fn query_records_are_ignored() {
 fn live_announce() {
     let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
     for family in [Family::V4, Family::V6] {
-        let sock = open(&iface, family, false).unwrap();
         // Let a listener on this same host hear it.
-        match family {
-            Family::V4 => rustix::net::sockopt::set_ip_multicast_loop(&sock.socket, true).unwrap(),
-            Family::V6 => rustix::net::sockopt::set_ipv6_multicast_loop(&sock.socket, true).unwrap(),
-        }
-        let seg = segment(&iface, &[family]);
-        let (tx, dest) = sock.sender().unwrap();
-        seg.attach(family, tx, dest);
+        let (_socket, link) = crate::interface::looped(&iface, family);
+        let seg = segment(&iface);
+        seg.attach(link);
         let addr = match family {
             Family::V4 => ip("10.9.9.9"),
             Family::V6 => ip("fd00::9"),
@@ -3300,16 +3303,14 @@ fn live_announce() {
 #[ignore]
 fn live_respond() {
     let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
-    let sock = open(&iface, Family::V4, false).unwrap();
-    rustix::net::sockopt::set_ip_multicast_loop(&sock.socket, true).unwrap();
-    let seg = segment(&iface, &[Family::V4]);
-    let (tx, dest) = sock.sender().unwrap();
-    seg.attach(Family::V4, tx, dest);
+    let (socket, link) = crate::interface::looped(&iface, Family::V4);
+    let seg = segment(&iface);
+    seg.attach(link);
     seg.add_reflected(OWN, &Shared::new(tv("10.9.9.9", &["LiveTV"]))).unwrap();
     age(&seg, 2);
 
     // SAFETY: a descriptor given up by its owner.
-    let udp: UdpSocket = unsafe { std::os::fd::FromRawFd::from_raw_fd(rustix::fd::IntoRawFd::into_raw_fd(sock.socket)) };
+    let udp: UdpSocket = unsafe { std::os::fd::FromRawFd::from_raw_fd(rustix::fd::IntoRawFd::into_raw_fd(socket)) };
     udp.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
     let end = Instant::now() + Duration::from_secs(4);
     let mut buf = [0u8; 9000];

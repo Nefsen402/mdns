@@ -193,3 +193,46 @@ fn a_socket_is_not_pinned_to_an_interface_that_is_not_there() {
     assert_eq!(hub.fds().count(), 0);
     hub.receive(3, |_, _, _, _| panic!("nothing to give"));
 }
+
+/// What a link says goes to everyone on it over every family, an answer goes
+/// to the asker's side alone, a legacy resolver is answered by itself, and a
+/// host is asked directly over its own family.
+#[test]
+fn a_link_says_to_everyone_answers_the_askers_side_and_asks_hosts_directly() {
+    use std::net::UdpSocket;
+    let (group4, group6) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+    for socket in [&group4, &group6] {
+        socket.set_read_timeout(Some(core::time::Duration::from_millis(100))).unwrap();
+    }
+    let sender = || -> OwnedFd {
+        // SAFETY: a descriptor just given up by its owner.
+        unsafe { rustix::fd::FromRawFd::from_raw_fd(std::os::fd::IntoRawFd::into_raw_fd(UdpSocket::bind("127.0.0.1:0").unwrap())) }
+    };
+    // Both go to a local socket, as the groups do in tests: the family is only what they are told.
+    let link = Link::to(Family::V4, sender(), group4.local_addr().unwrap()).and(Family::V6, sender(), group6.local_addr().unwrap());
+    assert_eq!(link.families().len(), 2);
+    let heard = |socket: &UdpSocket| {
+        let mut buf = [0u8; 16];
+        socket.recv(&mut buf).ok().map(|n| buf[..n].to_vec())
+    };
+
+    link.send(b"all").unwrap();
+    assert_eq!((heard(&group4), heard(&group6)), (Some(b"all".to_vec()), Some(b"all".to_vec())));
+
+    link.reply(Family::V6, None, b"six").unwrap();
+    assert_eq!((heard(&group4), heard(&group6)), (None, Some(b"six".to_vec())), "to the asker's side");
+    let alone = UdpSocket::bind("127.0.0.1:0").unwrap();
+    alone.set_read_timeout(Some(core::time::Duration::from_millis(100))).unwrap();
+    link.reply(Family::V4, Some(alone.local_addr().unwrap()), b"alone").unwrap();
+    assert_eq!((heard(&group4), heard(&alone)), (None, Some(b"alone".to_vec())), "a legacy resolver by itself");
+
+    assert!(link.reaches(ip("10.0.1.3")) && link.reaches(ip("fd00::3")));
+    assert!(!Link::default().reaches(ip("10.0.1.3")));
+    assert!(link.ask(ip("127.0.0.1"), b"direct"), "sent to its port, which nothing listens on");
+    assert!(!Link::to(Family::V4, sender(), group4.local_addr().unwrap()).ask(ip("fd00::3"), b"x"), "no way to its family");
+
+    // A link used over nothing says nothing, and is not an error.
+    assert!(Link::default().is_empty());
+    Link::default().send(b"nobody").unwrap();
+    Link::default().reply(Family::V4, None, b"nobody").unwrap();
+}
