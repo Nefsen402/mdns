@@ -41,7 +41,7 @@ use crate::reflector::{deliver_made, Reflector};
 
 fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Segment>) {
     let segs: Vec<Segment> = interfaces.iter().map(|i| segment(i, &[family])).collect();
-    let reflector = Reflector::new(0, segs.clone()).unwrap();
+    let reflector = Reflector::new(segs.clone()).unwrap();
     (Group { name: name.into(), reflector }, segs)
 }
 
@@ -134,7 +134,7 @@ fn lists_segments_merging_families() {
 #[test]
 fn segments_say_which_interfaces_are_untrusted() {
     let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| segment(i, &[Family::V4])).collect();
-    let reflector = Reflector::with_untrusted(0, segs, &["wifi".to_string()]).unwrap();
+    let reflector = Reflector::with_untrusted(segs, &["wifi".to_string()]).unwrap();
     let groups = [Group { name: "IoT to br0".into(), reflector }];
     assert_eq!(
         handle(&groups, &Watches::default(), "segments"),
@@ -197,7 +197,7 @@ fn advertise_self(seg: &Segment) {
         ..Device::default()
     };
     pc.add_addrs(&[ip("10.0.0.5")]);
-    seg.add_manual_ttl(crate::segment::Owner::Own, pc, Duration::from_secs(120)).unwrap();
+    seg.add_manual_ttl(crate::segment::OWN, pc, Duration::from_secs(120)).unwrap();
 }
 
 /// Nothing is heard of this host, so it is listed as it advertises itself,
@@ -225,7 +225,7 @@ fn the_host_is_listed_as_it_advertises_itself() {
 fn a_watch_for_a_type_the_host_offers_shows_it_present_and_for_another_does_not() {
     let (seg, _rx) = wired("a");
     advertise_self(&seg);
-    let groups = vec![Group { name: "lan".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }];
+    let groups = vec![Group { name: "lan".into(), reflector: Reflector::new(vec![seg.clone()]).unwrap() }];
     let present = |arg: &str| follow(&groups, arg).ok().unwrap().present;
     let lines = present("--query=_ssh._tcp lan");
     assert_eq!(lines.len(), 1, "{lines:?}");
@@ -243,8 +243,8 @@ fn probes_each_interface_once_even_when_segments_share_it() {
         segment("c", &[Family::V4]),
     );
     let groups = [
-        Group { name: "x".into(), reflector: Reflector::new(0, vec![a.clone(), b.clone()]).unwrap() },
-        Group { name: "y".into(), reflector: Reflector::new(1, vec![a, c]).unwrap() },
+        Group { name: "x".into(), reflector: Reflector::new(vec![a.clone(), b.clone()]).unwrap() },
+        Group { name: "y".into(), reflector: Reflector::new(vec![a, c]).unwrap() },
     ];
     let interfaces = |request: &str| -> Vec<String> {
         let reply: Value = serde_json::from_str(&handle(&groups, &Watches::default(), request)).unwrap();
@@ -441,7 +441,7 @@ fn serves_requests_over_the_socket() {
 fn probe_is_answered_once_done_while_the_rest_goes_on() {
     let (seg, _rx) = wired("wifi");
     let path = temp_socket("probe");
-    let mut h = Harness::new(&path, vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }]);
+    let mut h = Harness::new(&path, vec![Group { name: "IoT".into(), reflector: Reflector::new(vec![seg.clone()]).unwrap() }]);
 
     let (mut stream, mut reader) = connect(&path);
     writeln!(stream, "probe IoT").unwrap();
@@ -579,7 +579,7 @@ fn query_options_take_service_types_and_how_often_to_ask() {
 #[test]
 fn devices_lists_what_is_known_and_asks_nothing() {
     let (a, a_rx) = wired("a");
-    let groups = [Group { name: "IoT".into(), reflector: Reflector::new(0, vec![a.clone()]).unwrap() }];
+    let groups = [Group { name: "IoT".into(), reflector: Reflector::new(vec![a.clone()]).unwrap() }];
     announce(&a, "10.0.1.7", "tv.local", "TV");
     let ask = |request: &str| handle(&groups, &Watches::default(), request);
     let reply: Value = serde_json::from_str(&ask("devices IoT")).unwrap();
@@ -593,7 +593,7 @@ fn devices_lists_what_is_known_and_asks_nothing() {
 #[test]
 fn watch_with_a_query_shows_what_is_there_asks_and_asks_again() {
     let (seg, rx) = wired("wifi");
-    let groups = vec![Group { name: "IoT".into(), reflector: Reflector::new(0, vec![seg.clone()]).unwrap() }];
+    let groups = vec![Group { name: "IoT".into(), reflector: Reflector::new(vec![seg.clone()]).unwrap() }];
     announce(&seg, "10.0.1.7", "tv.local", "TV");
     let path = temp_socket("watch-query");
     let mut h = Harness::new(&path, groups);

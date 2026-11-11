@@ -180,19 +180,19 @@ fn tv(addr: &str, instances: &[&str]) -> Device {
 fn manual_list_is_separate() {
     let seg = segment("test", &[Family::V4]);
     let rx = seg.subscribe();
-    assert!(seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap());
-    assert!(!seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap());
+    assert!(seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap());
+    assert!(!seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap());
     assert!(seg.devices().is_empty());
     assert!(rx.try_recv().is_err());
     assert_eq!(seg.manual_devices().len(), 1);
-    assert!(seg.remove_manual(Owner::Own, "TV.local").unwrap(), "by hostname, ignoring case");
-    assert!(!seg.remove_manual(Owner::Own, "tv.local").unwrap());
+    assert!(seg.remove_manual(OWN, "TV.local").unwrap(), "by hostname, ignoring case");
+    assert!(!seg.remove_manual(OWN, "tv.local").unwrap());
 }
 
 #[test]
 fn add_announces_and_remove_says_goodbye() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
 
     let m = recv(&rx).expect("announcement");
     assert!(m.header.response && m.header.authoritative);
@@ -217,10 +217,10 @@ fn add_announces_and_remove_says_goodbye() {
     assert!(m.answers.iter().any(|r| r.data == RData::Txt(vec![b"a=b".to_vec()])));
 
     // Identical re-add is a no-op on the wire.
-    assert!(!seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap());
+    assert!(!seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap());
     assert!(recv(&rx).is_none());
 
-    seg.remove_manual(Owner::Own, "tv.local").unwrap();
+    seg.remove_manual(OWN, "tv.local").unwrap();
     let bye = recv(&rx).expect("goodbye");
     assert_eq!(bye.answers.len(), m.answers.len());
     assert!(bye.answers.iter().all(|r| r.ttl == 0));
@@ -230,10 +230,10 @@ fn add_announces_and_remove_says_goodbye() {
 #[test]
 fn replacing_sends_goodbye_for_dropped_services() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["A", "B"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["A", "B"])).unwrap();
     recv(&rx).unwrap();
 
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["A"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["A"])).unwrap();
     let m = recv(&rx).unwrap();
     let gone: Vec<_> = m.answers.iter().filter(|r| r.ttl == 0).collect();
     assert_eq!(gone.len(), 3); // PTR, SRV, TXT of "B"
@@ -244,7 +244,7 @@ fn replacing_sends_goodbye_for_dropped_services() {
 #[test]
 fn a_hostname_two_owners_want_goes_to_the_lower_and_passes_to_the_next() {
     let (seg, rx) = wired();
-    let (first, second) = (Owner::Reflector(0), Owner::Reflector(1));
+    let (first, second) = (FIRST, SECOND);
     let has = |m: &Message, data: RData, live: bool| m.answers.iter().any(|r| r.data == data && (r.ttl > 0) == live);
     let a = |s: &str| RData::A(s.parse().unwrap());
     let b_ptr = || RData::Ptr("B._http._tcp.local".into());
@@ -292,7 +292,7 @@ fn a_service_named_like_one_here_is_left_out_of_the_copy() {
     };
     hear(&seg, "10.0.1.20", kitchen());
 
-    seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["Kitchen", "Den"])).unwrap();
+    seg.add_manual(FIRST, tv("10.0.2.9", &["Kitchen", "Den"])).unwrap();
     assert!(!mentions_kitchen(&recv(&rx).unwrap()));
     assert_eq!(seg.manual_devices(), [tv("10.0.2.9", &["Den"])]);
 
@@ -316,8 +316,8 @@ fn a_service_named_like_one_here_is_left_out_of_the_copy() {
 fn a_device_probing_for_a_name_is_not_answered_with_a_copy() {
     let (seg, rx) = wired();
     let router = Device { hostname: Some("router.local".into()), addresses: vec![ip("10.0.1.1").into()].into(), ..Device::default() };
-    seg.add_manual(Owner::Own, router).unwrap();
-    seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, router).unwrap();
+    seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap();
     while recv(&rx).is_some() {}
     age(&seg, 2);
     let probe = |name: &str| {
@@ -359,7 +359,7 @@ fn a_question_is_passed_on_marked_with_whether_it_is_answered_here() {
     let events = seg.subscribe();
     let mut copy = tv("10.0.2.9", &["TV"]);
     copy.nsec = Some(vec![rtype::A].into());
-    seg.add_manual(Owner::Reflector(0), copy).unwrap();
+    seg.add_manual(FIRST, copy).unwrap();
     recv(&rx).unwrap();
     hear(&seg, "10.0.1.20", vec![
         a_record("nas.local", "10.0.1.20"),
@@ -512,22 +512,22 @@ fn a_device_that_cannot_be_announced_is_not_recorded() {
     let (seg, rx) = wired();
     let (socket, dest) = broken();
     seg.attach(Family::V4, fd(socket), dest);
-    let err = seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap_err();
+    let err = seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap_err();
     assert!(format!("{err:#}").contains("sending to [::1]:5353"), "{err:#}");
     assert!(seg.manual_devices().is_empty());
     assert!(seg.state.borrow_mut().hosts.is_empty(), "nothing left behind");
 
     repair(&seg, &rx);
-    assert!(seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap());
+    assert!(seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap());
     recv(&rx).unwrap();
 
     let (socket, dest) = broken();
     seg.attach(Family::V4, fd(socket), dest);
-    assert!(seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV", "Cast"])).is_err());
+    assert!(seg.add_manual(FIRST, tv("10.0.2.9", &["TV", "Cast"])).is_err());
     let shown: Vec<String> = seg.manual_devices()[0].services.iter().map(|s| s.instance().to_string()).collect();
     assert_eq!(shown, ["TV._http._tcp.local"], "still what was announced");
     // And it is what is recorded: offering it again changes nothing.
-    assert!(!seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap());
+    assert!(!seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap());
 }
 
 /// A device whose goodbye cannot be sent is kept, so that withdrawing it
@@ -535,16 +535,16 @@ fn a_device_that_cannot_be_announced_is_not_recorded() {
 #[test]
 fn a_device_that_cannot_be_withdrawn_is_kept() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+    seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
 
     let (socket, dest) = broken();
     seg.attach(Family::V4, fd(socket), dest);
-    assert!(seg.remove_manual(Owner::Reflector(0), "tv.local").is_err());
+    assert!(seg.remove_manual(FIRST, "tv.local").is_err());
     assert_eq!(seg.manual_devices().len(), 1, "kept");
 
     repair(&seg, &rx);
-    assert!(seg.remove_manual(Owner::Reflector(0), "tv.local").unwrap());
+    assert!(seg.remove_manual(FIRST, "tv.local").unwrap());
     let goodbye = recv(&rx).unwrap();
     assert!(!goodbye.answers.is_empty() && goodbye.answers.iter().all(|r| r.ttl == 0));
     assert!(seg.manual_devices().is_empty());
@@ -556,7 +556,7 @@ fn a_device_that_cannot_be_withdrawn_is_kept() {
 #[test]
 fn an_announcement_that_fails_is_tried_again() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+    seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
 
     let (socket, dest) = broken();
@@ -587,7 +587,7 @@ fn an_announcement_that_fails_is_tried_again() {
 #[test]
 fn a_copy_that_cannot_give_way_is_withdrawn_once_it_can() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+    seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
 
     let (socket, dest) = broken();
@@ -615,7 +615,7 @@ fn every_family_is_tried_when_one_fails() {
     let (socket, dest) = broken();
     seg.attach(Family::V4, fd(socket), dest);
     seg.attach(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
-    let err = seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap_err();
+    let err = seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap_err();
     assert!(format!("{err:#}").contains("[::1]:5353"), "{err:#}");
     let sent = recv(&rx).expect("sent over the other family all the same");
     assert!(sent.answers.iter().any(|r| r.data == RData::A("10.0.2.9".parse().unwrap())));
@@ -650,7 +650,7 @@ fn an_announcement_too_big_for_the_mtu_goes_in_packets_that_fit() {
         svc.edit(|p| p.txt = vec![format!("k={}", "v".repeat(60)).into_bytes()]);
     }
     let expected = device.announcement(&Advertise::ALL, HOST_TTL, OTHER_TTL).len();
-    seg.add_manual_ttl(Owner::Reflector(0), device, Duration::from_secs(HOST_TTL.into())).unwrap();
+    seg.add_manual_ttl(FIRST, device, Duration::from_secs(HOST_TTL.into())).unwrap();
 
     let mut buf = [0u8; 9000];
     let mut records = 0;
@@ -696,7 +696,7 @@ fn everything_sent_keeps_within_the_mtu() {
     for i in 0..20 {
         let mut copy = tv(&format!("10.0.2.{}", i + 1), &[&format!("A copied service with a long name {i}")]);
         copy.hostname = Some(format!("a-copy-with-a-rather-long-name-{i}.local"));
-        seg.add_manual(Owner::Reflector(0), copy).unwrap();
+        seg.add_manual(FIRST, copy).unwrap();
     }
     packets();
     age(&seg, 2);
@@ -1139,7 +1139,7 @@ fn an_interface_that_goes_and_comes_back() {
     let (seg, rx) = wired();
     let events = seg.subscribe();
     hear(&seg, "10.0.1.7", vec![a_record("nas.local", "10.0.1.7"), srv("NAS._smb._tcp.local", 445, "nas.local")]);
-    seg.add_manual(Owner::Reflector(0), tv("10.0.2.9", &["TV"])).unwrap();
+    seg.add_manual(FIRST, tv("10.0.2.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
     repeat(&seg, &rx);
     events.try_iter().count();
@@ -1168,7 +1168,7 @@ fn add_rejects_unannounceable_devices() {
     let (seg, rx) = wired();
     let mut nameless = tv("10.0.1.9", &["TV"]);
     nameless.hostname = None;
-    assert!(seg.add_manual(Owner::Own, nameless).is_err());
+    assert!(seg.add_manual(OWN, nameless).is_err());
     assert!(seg.manual_devices().is_empty());
     assert!(recv(&rx).is_none());
 }
@@ -1259,7 +1259,7 @@ fn age(seg: &Segment, secs: u64) {
 #[test]
 fn answers_ptr_query_with_additionals() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
     age(&seg, 2);
 
@@ -1279,7 +1279,7 @@ fn answers_ptr_query_with_additionals() {
 #[test]
 fn matches_names_case_insensitively_and_any_type() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
     age(&seg, 2);
 
@@ -1296,7 +1296,7 @@ fn matches_names_case_insensitively_and_any_type() {
 #[test]
 fn multicast_replies_are_rate_limited() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
 
     // Just announced: a query within the second gets nothing.
@@ -1314,7 +1314,7 @@ fn multicast_replies_are_rate_limited() {
 #[test]
 fn known_answers_suppress_replies() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
     age(&seg, 2);
 
@@ -1332,7 +1332,7 @@ fn known_answers_suppress_replies() {
 #[test]
 fn legacy_resolvers_get_unicast_replies() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
 
     // Rate limit does not apply to unicast replies.
@@ -1352,7 +1352,7 @@ fn legacy_resolvers_get_unicast_replies() {
 #[test]
 fn ignores_responses_and_odd_queries() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
     age(&seg, 2);
 
@@ -1368,7 +1368,7 @@ fn ignores_responses_and_odd_queries() {
 #[test]
 fn what_is_announced_anew_is_announced_again_a_second_later_and_then_left_alone() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     let first = recv(&rx).unwrap();
     seg.reannounce(Instant::now()).unwrap();
     assert!(recv(&rx).is_none(), "not within the second");
@@ -1384,7 +1384,7 @@ fn what_is_announced_anew_is_announced_again_a_second_later_and_then_left_alone(
     assert!(seg.pending().iter().all(|p| p.what != "re-announce"));
 
     // A change is, twice again.
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV", "Other TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV", "Other TV"])).unwrap();
     assert!(recv(&rx).is_some());
     repeat(&seg, &rx);
     seg.reannounce(Instant::now() + Duration::from_secs(100_000)).unwrap();
@@ -1395,7 +1395,7 @@ fn what_is_announced_anew_is_announced_again_a_second_later_and_then_left_alone(
 fn a_segment_that_reannounces_keeps_unchanged_devices_up_at_80_percent_of_their_ttl() {
     let (seg, rx) = wired();
     seg.set_reannounce(true);
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     let first = recv(&rx).unwrap();
     repeat(&seg, &rx);
 
@@ -1615,7 +1615,7 @@ fn a_device_without_services_can_be_advertised() {
         addresses: vec![ip("10.0.1.1").into()].into(),
         ..Device::default()
     };
-    seg.add_manual(Owner::Own, router).unwrap();
+    seg.add_manual(OWN, router).unwrap();
 
     let m = recv(&rx).expect("announcement");
     assert_eq!(m.answers.len(), 1, "just the address record: {:?}", m.answers);
@@ -1631,7 +1631,7 @@ fn a_device_without_services_can_be_advertised() {
     // ...is re-announced, and says goodbye when removed.
     seg.reannounce(Instant::now() + reannounce_after(HOST_TTL) + Duration::from_secs(1)).unwrap();
     assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL));
-    seg.remove_manual(Owner::Own, "router.local").unwrap();
+    seg.remove_manual(OWN, "router.local").unwrap();
     assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
 }
 
@@ -1665,7 +1665,7 @@ fn announcements_go_out_over_both_families_and_replies_over_the_askers() {
     let (seg, rx4, rx6) = wired_both();
     let mut both = tv("10.0.1.9", &["TV"]);
     both.add_addrs(&[ip("fd00::9")]);
-    seg.add_manual(Owner::Own, both).unwrap();
+    seg.add_manual(OWN, both).unwrap();
     assert!(recv(&rx4).is_some() && recv(&rx6).is_some(), "announced over both");
 
     age(&seg, 2);
@@ -1816,7 +1816,7 @@ fn a_link_local_only_device_can_be_advertised_on_its_own_link() {
         addresses: vec![ip("fe80::1").into()].into(),
         ..Device::default()
     };
-    seg.add_manual(Owner::Own, router).unwrap();
+    seg.add_manual(OWN, router).unwrap();
     let m = recv(&rx).unwrap();
     assert_eq!(m.answers.len(), 1);
     assert_eq!(m.answers[0].data, RData::Aaaa("fe80::1".parse().unwrap()));
@@ -1825,10 +1825,10 @@ fn a_link_local_only_device_can_be_advertised_on_its_own_link() {
 #[test]
 fn replacing_a_device_withdraws_the_addresses_it_no_longer_has() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv("10.0.1.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.9", &["TV"])).unwrap();
     recv(&rx).unwrap();
 
-    seg.add_manual(Owner::Own, tv("10.0.1.10", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.1.10", &["TV"])).unwrap();
     let m = recv(&rx).unwrap();
     let ttl_of = |a: &str| m.answers.iter().find(|r| r.data == RData::A(a.parse().unwrap())).map(|r| r.ttl);
     assert_eq!((ttl_of("10.0.1.9"), ttl_of("10.0.1.10")), (Some(0), Some(HOST_TTL)));
@@ -1842,7 +1842,7 @@ fn a_device_with_no_addresses_is_announced_by_its_services() {
     let (seg, rx) = wired();
     let mut none = tv("10.0.1.9", &["TV"]);
     edit(&mut none.addresses).clear();
-    seg.add_manual(Owner::Own, none).unwrap();
+    seg.add_manual(OWN, none).unwrap();
     assert_eq!(seg.manual_devices().len(), 1);
     let m = recv(&rx).unwrap();
     assert!(m.answers.iter().all(|r| addr_of(&r.data).is_none()));
@@ -1856,7 +1856,7 @@ fn a_device_is_announced_with_the_addresses_of_both_families() {
     let (seg, rx) = wired();
     let mut both = tv("10.0.1.9", &["TV"]);
     both.add_addrs(&[ip("fd00::9"), ip("fe80::9")]);
-    seg.add_manual(Owner::Own, both).unwrap();
+    seg.add_manual(OWN, both).unwrap();
     let addrs: Vec<RData> = recv(&rx).unwrap().answers.into_iter().filter(|r| r.name == "tv.local").map(|r| r.data).collect();
     for want in [RData::A("10.0.1.9".parse().unwrap()), RData::Aaaa("fd00::9".parse().unwrap()), RData::Aaaa("fe80::9".parse().unwrap())] {
         assert!(addrs.contains(&want), "{want:?} in {addrs:?}");
@@ -2410,6 +2410,20 @@ fn tv_leaves(seg: &Segment) {
     hear(seg, "10.0.1.5", vec![record("tv.local".into(), true, 0, RData::A(ip("10.0.1.5").to_string().parse().unwrap()))]);
 }
 
+/// Priorities of what is made for a segment, that rank behind the devices of
+/// the segments there are.
+const FIRST: u32 = 1_000_000;
+const SECOND: u32 = FIRST + 1;
+
+/// The way the `n`th reflector of the test shows a device, which is the same
+/// every time: it is what tells one reflector's wish from another's.
+fn reflector(n: usize) -> Rc<Advertise> {
+    thread_local! {
+        static HOWS: [Rc<Advertise>; 2] = [Rc::new(Advertise::ALL), Rc::new(Advertise::ALL)];
+    }
+    HOWS.with(|hows| Rc::clone(&hows[n]))
+}
+
 /// The device of `seg` called `host`, as a reflector is given it.
 fn shown(seg: &Segment, host: &str) -> Shared {
     let named = |d: &Shared| d.borrow().hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(host));
@@ -2419,7 +2433,7 @@ fn shown(seg: &Segment, host: &str) -> Shared {
 /// `target` is shown the device of `origin` called `host` as it is now, by
 /// the first reflector.
 fn reflect_of(target: &Segment, origin: &Segment, host: &str) -> Result<bool> {
-    target.reflect(Owner::Reflector(0), origin.priority(), &shown(origin, host), Rc::new(Advertise::ALL), None)
+    target.reflect(origin.priority(), &shown(origin, host), &reflector(0), None)
 }
 
 #[test]
@@ -2461,12 +2475,12 @@ fn a_reflected_device_is_withdrawn_with_goodbyes_when_the_reflector_says() {
     let tv = shown(&a, "tv.local");
     tv_leaves(&a);
     assert_eq!(b.manual_devices().len(), 1, "still shown: nobody has said");
-    assert!(b.unreflect(Owner::Reflector(0), &tv).unwrap());
+    assert!(b.unreflect(&reflector(0), &tv).unwrap());
     assert!(b.manual_devices().is_empty());
     let bye = recv(&rx).expect("goodbyes");
     assert!(bye.answers.iter().all(|r| r.ttl == 0), "{bye:?}");
     assert!(b.state.borrow().hosts.is_empty());
-    assert!(!b.unreflect(Owner::Reflector(0), &tv).unwrap(), "nothing left");
+    assert!(!b.unreflect(&reflector(0), &tv).unwrap(), "nothing left");
 }
 
 /// Several reflectors may show a device of the same segment, each as it is
@@ -2478,16 +2492,16 @@ fn what_two_reflectors_show_of_a_device_of_one_segment_is_announced_together() {
     let two = Shared::new(tv("10.0.1.1", &["Two"]));
     for (first, second) in [(&one, &two), (&two, &one)] {
         let (b, _rx) = wired();
-        b.reflect(Owner::Reflector(0), 1, first, Rc::new(Advertise::ALL), None).unwrap();
-        b.reflect(Owner::Reflector(1), 1, second, Rc::new(Advertise::ALL), None).unwrap();
+        b.reflect(1, first, &reflector(0), None).unwrap();
+        b.reflect(1, second, &reflector(1), None).unwrap();
         let shown = b.manual_devices();
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].services.len(), 2, "{shown:?}");
         assert_eq!(shown[0].addrs().count(), 1);
 
-        b.unreflect(Owner::Reflector(0), first).unwrap();
+        b.unreflect(&reflector(0), first).unwrap();
         assert_eq!(b.manual_devices()[0].services.len(), 1, "the other's is left");
-        b.unreflect(Owner::Reflector(1), second).unwrap();
+        b.unreflect(&reflector(1), second).unwrap();
         assert!(b.manual_devices().is_empty());
     }
 }
@@ -2498,19 +2512,19 @@ fn what_two_reflectors_show_of_a_device_of_one_segment_is_announced_together() {
 fn a_device_that_is_renamed_is_withdrawn_under_its_old_name_and_shown_under_the_new() {
     let (b, rx) = wired();
     let device = Shared::new(tv("10.0.1.1", &["TV"]));
-    let (owner, how) = (Owner::Reflector(0), Rc::new(Advertise::ALL));
-    b.reflect(owner, 1, &device, Rc::clone(&how), None).unwrap();
+    let how = reflector(0);
+    b.reflect(1, &device, &how, None).unwrap();
     recv(&rx).unwrap();
 
     device.borrow_mut().hostname = Some("lounge.local".into());
-    b.reflect(owner, 1, &device, how, None).unwrap();
+    b.reflect(1, &device, &how, None).unwrap();
     let said: Vec<Record> = std::iter::from_fn(|| recv(&rx)).flat_map(|m| m.answers).collect();
     let a = |name: &str, live: bool| said.iter().any(|r| r.name == name && matches!(r.data, RData::A(_)) && (r.ttl > 0) == live);
     assert!(a("tv.local", false) && a("lounge.local", true), "{said:?}");
     assert_eq!(b.manual_devices()[0].hostname.as_deref(), Some("lounge.local"));
     b.state.borrow().hosts.check();
 
-    assert!(b.unreflect(owner, &device).unwrap(), "found by the device, under its new name");
+    assert!(b.unreflect(&how, &device).unwrap(), "found by the device, under its new name");
     assert!(b.manual_devices().is_empty());
     assert!(b.state.borrow().hosts.is_empty());
 }
@@ -2522,19 +2536,19 @@ fn of_one_name_from_two_segments_the_lowest_is_announced_and_the_next_takes_over
     let (b, _rx) = wired();
     let (low, high) = (Shared::new(tv("10.0.1.1", &["Low"])), Shared::new(tv("10.0.2.2", &["High"])));
     // Shown in the order that is not the segments'.
-    b.reflect(Owner::Reflector(1), 2, &high, Rc::new(Advertise::ALL), None).unwrap();
-    b.reflect(Owner::Reflector(0), 1, &low, Rc::new(Advertise::ALL), None).unwrap();
+    b.reflect(2, &high, &reflector(1), None).unwrap();
+    b.reflect(1, &low, &reflector(0), None).unwrap();
     let shown = b.manual_devices();
     assert_eq!(shown.len(), 1);
     assert!(shown[0].addrs().eq([ip("10.0.1.1")]), "{shown:?}");
 
-    b.unreflect(Owner::Reflector(0), &low).unwrap();
+    b.unreflect(&reflector(0), &low).unwrap();
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.2.2")]), "the other takes over");
 
-    b.reflect(Owner::Reflector(0), 1, &low, Rc::new(Advertise::ALL), None).unwrap();
-    b.drop_origin(Owner::Reflector(0), 1).unwrap();
+    b.reflect(1, &low, &reflector(0), None).unwrap();
+    b.drop_origin(&reflector(0), 1).unwrap();
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.2.2")]));
-    b.drop_origin(Owner::Reflector(1), 2).unwrap();
+    b.drop_origin(&reflector(1), 2).unwrap();
     assert!(b.manual_devices().is_empty());
 }
 
@@ -2547,10 +2561,10 @@ fn what_an_owner_wanted_is_withdrawn_all_at_once_and_the_others_kept() {
     for host in ["tv.local", "nas.local"] {
         reflect_of(&b, &a, host).unwrap();
     }
-    b.add_manual(Owner::Reflector(1), tv("10.0.9.9", &["Other"])).unwrap();
+    b.add_manual(SECOND, tv("10.0.9.9", &["Other"])).unwrap();
     assert_eq!(b.manual_devices().len(), 2, "tv.local has two who want it, the first one's is announced");
 
-    b.withdraw_all(Owner::Reflector(0)).unwrap();
+    b.withdraw_all(&reflector(0)).unwrap();
     let left = b.manual_devices();
     assert_eq!(left.len(), 1, "{left:?}");
     assert_eq!(left[0].hostname.as_deref(), Some("tv.local"), "the other owner's is announced instead");
@@ -2567,11 +2581,11 @@ fn a_device_without_a_hostname_or_a_ttl_of_zero_is_not_reflected() {
     let bare = a.state.borrow().tracker.discovered.find_nameless(&ip("10.0.1.5"));
     assert!(bare.is_none(), "heard from the address of a named device");
     let named = shown(&a, "tv.local");
-    let err = b.reflect(Owner::Reflector(0), a.priority(), &named, Rc::new(Advertise::ALL), Some(Duration::ZERO)).unwrap_err();
+    let err = b.reflect(a.priority(), &named, &reflector(0), Some(Duration::ZERO)).unwrap_err();
     assert!(format!("{err}").contains("zero"));
     assert!(b.manual_devices().is_empty());
     // The TTL it is given is the one its address is announced with.
-    b.reflect(Owner::Reflector(0), a.priority(), &named, Rc::new(Advertise::ALL), Some(Duration::from_secs(900))).unwrap();
+    b.reflect(a.priority(), &named, &reflector(0), Some(Duration::from_secs(900))).unwrap();
     assert_eq!(b.state.borrow().hosts["tv.local"].host_ttl, 900);
 }
 
@@ -2773,7 +2787,7 @@ fn scale_of_what_a_full_segment_costs_to_reflect_with() {
             let mut device = tv("10.4.0.1", &["X"]);
             device.hostname = Some(format!("x{added}.local"));
             device.services[0].edit(|p| p.instance = format!("X{added}._http._tcp.local"));
-            seg.add_manual(Owner::Reflector(0), device).unwrap();
+            seg.add_manual(FIRST, device).unwrap();
         });
 
         // The upkeep when nothing is due.
@@ -2817,7 +2831,7 @@ fn the_next_deadline_is_the_earliest_of_expiry_refresh_and_reannounce() {
     assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)));
 
     // A reflected device is due for re-announcement, and a failed one not before its retry.
-    seg.add_manual(Owner::Own, tv("10.0.9.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.9.9", &["TV"])).unwrap();
     let announced = seg.state.borrow_mut().hosts["tv.local"].announced;
     assert_eq!(next_due(&seg), Some(expires - Duration::from_secs(45)).min(Some(announced + ANNOUNCE_REPEAT)));
     seg.state.borrow_mut().hosts.edit("tv.local", |m| m.retry = Some(announced + Duration::from_secs(500)));
@@ -2832,7 +2846,7 @@ fn pending_lists_everything_the_upkeep_waits_for_soonest_first() {
 
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
     seg.observe(ip("10.0.1.99")); // heard, but never named
-    seg.add_manual(Owner::Own, tv("10.0.9.9", &["TV"])).unwrap();
+    seg.add_manual(OWN, tv("10.0.9.9", &["TV"])).unwrap();
 
     let expires = expiry_of(&seg, "printer.local");
     let pending = seg.pending();
@@ -2845,7 +2859,7 @@ fn pending_lists_everything_the_upkeep_waits_for_soonest_first() {
     // A name is shown as it is announced, not as it is filed, lowercase.
     let mut mixed = tv("10.0.9.10", &[]);
     mixed.hostname = Some("Living-Room-TV.local".into());
-    seg.add_manual(Owner::Reflector(0), mixed).unwrap();
+    seg.add_manual(FIRST, mixed).unwrap();
     assert!(seg.pending().iter().any(|p| p.what == "re-announce" && p.who == "Living-Room-TV.local"), "{:?}", seg.pending());
     assert!(pending.windows(2).all(|w| w[0].at <= w[1].at), "soonest first");
     // The upkeep is due at the first of them.
@@ -2861,7 +2875,7 @@ fn pending_lists_everything_the_upkeep_waits_for_soonest_first() {
 fn a_name_can_be_announced_with_its_own_ttl_and_is_kept_up_at_80_percent_of_it() {
     let (seg, rx) = wired();
     seg.set_reannounce(true);
-    seg.add_manual_ttl(Owner::Own, tv("10.0.1.1", &[]), Duration::from_secs(1000)).unwrap();
+    seg.add_manual_ttl(OWN, tv("10.0.1.1", &[]), Duration::from_secs(1000)).unwrap();
     let first = recv(&rx).unwrap();
     assert!(first.answers.iter().all(|r| r.ttl == 1000));
     assert!(repeat(&seg, &rx).answers.iter().all(|r| r.ttl == 1000));
@@ -2882,9 +2896,9 @@ fn a_name_can_be_announced_with_its_own_ttl_and_is_kept_up_at_80_percent_of_it()
 
     // The usual way is unchanged, and a TTL of zero (a goodbye) is refused.
     let (usual, rx) = wired();
-    usual.add_manual(Owner::Own, tv("10.0.1.1", &[])).unwrap();
+    usual.add_manual(OWN, tv("10.0.1.1", &[])).unwrap();
     assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == HOST_TTL || r.ttl == OTHER_TTL));
-    assert!(usual.add_manual_ttl(Owner::Own, tv("10.0.1.2", &[]), Duration::from_millis(900)).is_err());
+    assert!(usual.add_manual_ttl(OWN, tv("10.0.1.2", &[]), Duration::from_millis(900)).is_err());
 }
 
 /// `tv.local` as it announced itself: an address with `addr` seconds, and a
@@ -2910,7 +2924,7 @@ fn announced_ttls(rx: &UdpSocket) -> Vec<(bool, u32)> {
 #[test]
 fn a_device_is_announced_with_the_ttls_it_announced_itself_with() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 600)).unwrap();
+    seg.add_manual(OWN, tv_with_ttls(Some(300), 600)).unwrap();
     let ttls = announced_ttls(&rx);
     assert!(ttls.contains(&(true, 300)), "{ttls:?}");
     assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
@@ -2924,7 +2938,7 @@ fn a_device_is_announced_with_the_ttls_it_announced_itself_with() {
 #[test]
 fn a_short_service_ttl_brings_the_reannouncement_forward() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv_with_ttls(Some(300), 50)).unwrap();
+    seg.add_manual(OWN, tv_with_ttls(Some(300), 50)).unwrap();
     assert!(announced_ttls(&rx).contains(&(false, 50)));
     repeat(&seg, &rx);
     let announced = seg.state.borrow_mut().hosts["tv.local"].announced;
@@ -2934,12 +2948,12 @@ fn a_short_service_ttl_brings_the_reannouncement_forward() {
 #[test]
 fn what_a_device_did_not_say_gets_the_usual_ttl_and_tiny_ones_are_raised() {
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv_with_ttls(None, 0)).unwrap();
+    seg.add_manual(OWN, tv_with_ttls(None, 0)).unwrap();
     let ttls = announced_ttls(&rx);
     assert!(ttls.contains(&(true, HOST_TTL)) && ttls.contains(&(false, OTHER_TTL)), "{ttls:?}");
 
     let (seg, rx) = wired();
-    seg.add_manual(Owner::Own, tv_with_ttls(Some(2), 3)).unwrap();
+    seg.add_manual(OWN, tv_with_ttls(Some(2), 3)).unwrap();
     let ttls = announced_ttls(&rx);
     assert!(ttls.iter().all(|(_, ttl)| *ttl == MIN_REFLECT_TTL), "{ttls:?}");
 }
@@ -2947,7 +2961,7 @@ fn what_a_device_did_not_say_gets_the_usual_ttl_and_tiny_ones_are_raised() {
 #[test]
 fn a_given_address_ttl_wins_for_the_address_only() {
     let (seg, rx) = wired();
-    seg.add_manual_ttl(Owner::Own, tv_with_ttls(Some(300), 600), Duration::from_secs(900)).unwrap();
+    seg.add_manual_ttl(OWN, tv_with_ttls(Some(300), 600), Duration::from_secs(900)).unwrap();
     let ttls = announced_ttls(&rx);
     assert!(ttls.contains(&(true, 900)), "{ttls:?}");
     assert!(ttls.iter().filter(|(is_addr, _)| !is_addr).all(|(_, ttl)| *ttl == 600), "{ttls:?}");
@@ -3113,7 +3127,7 @@ fn a_copy_giving_way_leaves_the_nsec_of_the_device_here_alone() {
     let (seg, rx) = wired();
     let mut copy = tv("10.0.2.9", &[]);
     copy.nsec = Some(vec![rtype::A].into());
-    seg.add_manual(Owner::Reflector(0), copy).unwrap();
+    seg.add_manual(FIRST, copy).unwrap();
     recv(&rx).unwrap();
 
     hear(&seg, "10.0.1.5", vec![a_record("tv.local", "10.0.1.5"), nsec("tv.local", &[rtype::A])]);
@@ -3227,9 +3241,9 @@ fn live_announce() {
             Family::V4 => ip("10.9.9.9"),
             Family::V6 => ip("fd00::9"),
         };
-        seg.add_manual(Owner::Own, tv(&addr.to_string(), &["LiveTV"])).unwrap();
+        seg.add_manual(OWN, tv(&addr.to_string(), &["LiveTV"])).unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        seg.remove_manual(Owner::Own, "tv.local").unwrap();
+        seg.remove_manual(OWN, "tv.local").unwrap();
     }
 }
 
@@ -3245,7 +3259,7 @@ fn live_respond() {
     let seg = segment(&iface, &[Family::V4]);
     let (tx, dest) = sock.sender().unwrap();
     seg.attach(Family::V4, tx, dest);
-    seg.add_manual(Owner::Own, tv("10.9.9.9", &["LiveTV"])).unwrap();
+    seg.add_manual(OWN, tv("10.9.9.9", &["LiveTV"])).unwrap();
     age(&seg, 2);
 
     // SAFETY: a descriptor given up by its owner.

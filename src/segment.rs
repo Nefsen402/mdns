@@ -155,30 +155,26 @@ impl Sent {
 
 
 
-/// Who wants a device announced on a segment. Several may want the same
-/// hostname announced there: reflectors that share the interface, which show
-/// it together if it is of the same segment, and a reflected device named like
-/// the advertised one, which loses to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Owner {
-    /// The daemon's own name (`[Advertise]`), which always wins.
-    Own,
-    /// A reflector, by where its segment is in the config.
-    Reflector(u32),
-}
+/// The priority of what is made for a segment, such as the daemon's own name
+/// (`[Advertise]`): it comes first of all, ahead of any device of another
+/// segment, which has that segment's priority, above this.
+pub const OWN: u32 = 0;
 
-/// One owner's wish to have a device announced here: the device itself, held
-/// where it is heard and so as it is now, and how much of it to show. It is
-/// told apart by its owner and the device, which is the same device however it
-/// changes; the reflector says when to look at it again.
+/// What a manual is told apart by: where its device and its [`Advertise`] are.
+type ManualKey = (usize, usize);
+
+/// A wish to have a device announced here: the device itself, held where it is
+/// heard and so as it is now, and how much of it to show. It is told apart by
+/// the device, which is the same device however it changes, and by how it is
+/// to be shown, which is a reflector's own (another may show the same device
+/// otherwise); the reflector says when to look at it again.
 #[derive(Clone)]
 struct Manual {
-    owner: Owner,
     /// Which wins where the same hostname is wanted announced by more than
-    /// one: the lowest. A device made for it comes first of all, with 0; a
-    /// copy of one of another segment has that segment's priority, which is
-    /// above 0. Copies of the same segment's device (the same priority) are
-    /// shown together.
+    /// one: the lowest. What is made for the segment comes first of all, with
+    /// [`OWN`]; a copy of a device of another segment has that segment's
+    /// priority, which is above. Copies of the same segment's device (the same
+    /// priority) are shown together.
     priority: u32,
     device: Shared,
     /// The addresses and services to show of it.
@@ -188,14 +184,15 @@ struct Manual {
 }
 
 impl Manual {
-    /// Who and what it is, for finding it again.
-    fn key(&self) -> (Owner, usize) {
-        (self.owner, self.device.addr())
+    /// What it is, for finding it again: where its device and its way of
+    /// being shown are, which is unique while it holds them.
+    fn key(&self) -> ManualKey {
+        (self.device.addr(), Rc::as_ptr(&self.how) as usize)
     }
 
     /// Where it sorts: the first of a hostname's manuals wins.
-    fn order(&self) -> (u32, Owner, usize) {
-        (self.priority, self.owner, self.device.addr())
+    fn order(&self) -> (u32, ManualKey) {
+        (self.priority, self.key())
     }
 
     /// The TTL its address records are announced with.
@@ -364,8 +361,8 @@ pub struct UpkeepInfo {
 // not shown is gone, as it has nothing to be found by.
 
 impl Host {
-    /// Put `manual` where it sorts, in place of the one of its owner and
-    /// device, which is returned. A few at most, so a list with room for just
+    /// Put `manual` where it sorts, in place of the one of its key, which is
+    /// returned. A few at most, so a list with room for just
     /// those.
     fn put(&mut self, manual: Manual) -> Option<Manual> {
         let replaced = self.take(manual.key());
@@ -375,7 +372,7 @@ impl Host {
         replaced
     }
 
-    fn take(&mut self, key: (Owner, usize)) -> Option<Manual> {
+    fn take(&mut self, key: ManualKey) -> Option<Manual> {
         let at = self.manuals.iter().position(|m| m.key() == key)?;
         let manual = self.manuals.remove(at);
         if self.manuals.is_empty() {
@@ -414,9 +411,8 @@ struct Hosts {
     /// Whether devices that have not changed are announced again, which is
     /// what when they are due goes by.
     unchanged: bool,
-    /// The host each manual is under, by its owner and where its device is,
-    /// which is not the same as long as the device is held.
-    by_manual: HashMap<(Owner, usize), Id>,
+    /// The host each manual is under, by its key.
+    by_manual: HashMap<ManualKey, Id>,
     hasher: DefaultHashBuilder,
 }
 
@@ -505,7 +501,7 @@ impl Hosts {
     }
 
     /// Put `manual` among those wanted announced as `host` (lowercase), in
-    /// place of one of the same owner and device under the same name. Returns
+    /// place of one of the same key under the same name. Returns
     /// that one. A device that was under another name is not taken from there:
     /// [`take`](Hosts::take) it first.
     fn put(&mut self, host: &str, manual: Manual, now: Instant) -> Option<Manual> {
@@ -525,13 +521,13 @@ impl Hosts {
     }
 
     /// Where the manual of `key` is: the hostname it was put under.
-    fn locate(&self, key: (Owner, usize)) -> Option<String> {
+    fn locate(&self, key: ManualKey) -> Option<String> {
         self.by_manual.get(&key).map(|&id| self.table.get(id).host.to_string())
     }
 
     /// Take the manual of `key` back from the host it is under. The host
     /// goes if nothing of it is shown.
-    fn take(&mut self, key: (Owner, usize)) -> Option<(String, Manual)> {
+    fn take(&mut self, key: ManualKey) -> Option<(String, Manual)> {
         let host = self.locate(key)?;
         self.by_manual.remove(&key);
         let manual = self.edit(&host, |h| h.take(key)).flatten()?;
@@ -540,7 +536,7 @@ impl Hosts {
 
     /// Take back the manuals of `host` that `taken` says.
     fn take_where(&mut self, host: &str, taken: impl Fn(&Manual) -> bool) -> Vec<Manual> {
-        let keys: Vec<(Owner, usize)> = self.get(host).map(|h| h.manuals.iter().filter(|m| taken(m)).map(Manual::key).collect()).unwrap_or_default();
+        let keys: Vec<ManualKey> = self.get(host).map(|h| h.manuals.iter().filter(|m| taken(m)).map(Manual::key).collect()).unwrap_or_default();
         keys.into_iter().filter_map(|key| self.take(key)).map(|(_, manual)| manual).collect()
     }
 
@@ -830,7 +826,7 @@ impl State {
         // those who show the same segment's device show it together. One made
         // for it is shown alone.
         let group: Vec<&Manual> = match first.priority {
-            0 => vec![first],
+            OWN => vec![first],
             priority => host.manuals.iter().take_while(|m| m.priority == priority).collect(),
         };
         let host_ttl = group.iter().map(|m| m.host_ttl()).max()?;
@@ -853,7 +849,7 @@ impl State {
             }
             [] => return None,
         };
-        if first.owner == Owner::Own {
+        if first.priority == OWN {
             return Some((shown, host_ttl));
         }
         if self.tracker.discovered.contains_host(key) {
@@ -982,7 +978,7 @@ impl State {
         for key in keys {
             let Some(m) = self.hosts.get(&key) else { continue };
             let Some(device) = &m.shown else { continue };
-            if probing && m.manuals.first().map(|m| m.owner) != Some(Owner::Own) {
+            if probing && m.manuals.first().map(|m| m.priority) != Some(OWN) {
                 continue;
             }
             if !legacy && !probing && now.saturating_duration_since(m.last_sent.over(family)) < MIN_MULTICAST_GAP {
@@ -1229,8 +1225,8 @@ impl Segment {
 
     // 3. Reflected devices, invisible to 1 and 2.
 
-    /// Announce `device` on this segment for `owner` and remember it, under
-    /// its hostname. It needs a hostname and at least one address, all of
+    /// Announce `device` on this segment, made for it, with `priority` (such
+    /// as [`OWN`]), and remember it, under its hostname. It needs a hostname and at least one address, all of
     /// this segment's family, and announces exactly the addresses it has: a
     /// reflected device should arrive with only its routable one, since a
     /// link-local address is no use on another link. Its address records are
@@ -1238,8 +1234,8 @@ impl Segment {
     /// and two minutes if it did not say), and those of its services with
     /// theirs.
     ///
-    /// If another owner wants the same hostname announced, the lower
-    /// [`Owner`] wins: an outranked device is only remembered, and announced
+    /// If another wants the same hostname announced, the lower priority
+    /// wins: an outranked device is only remembered, and announced
     /// once the ones ahead of it are removed. Replacing what is announced
     /// also sends goodbyes for services and addresses that are no longer
     /// there. A device on this segment comes first of all: while one has the
@@ -1247,18 +1243,18 @@ impl Segment {
     /// services whose instance names one has are left out (the advertised
     /// name is announced regardless).
     ///
-    /// Returns false (and sends nothing) if `owner` already has an identical
-    /// device here. If sending fails nothing is recorded.
-    pub fn add_manual(&self, owner: Owner, device: Device) -> Result<bool> {
+    /// Returns false (and sends nothing) if one of that priority is here
+    /// already, identical. If sending fails nothing is recorded.
+    pub fn add_manual(&self, priority: u32, device: Device) -> Result<bool> {
         let ttl = device.ttl.map(|t| t.max(MIN_REFLECT_TTL)).unwrap_or(HOST_TTL);
-        self.add_manual_ttl(owner, device, Duration::from_secs(ttl.into()))
+        self.add_manual_ttl(priority, device, Duration::from_secs(ttl.into()))
     }
 
     /// Like [`add_manual`](Segment::add_manual), with the address records
     /// announced for `host_ttl` (whole seconds, at least one) whatever the
     /// device says, and, if the segment re-announces, re-announced at 80% of
     /// it.
-    pub fn add_manual_ttl(&self, owner: Owner, device: Device, host_ttl: Duration) -> Result<bool> {
+    pub fn add_manual_ttl(&self, priority: u32, device: Device, host_ttl: Duration) -> Result<bool> {
         let host_ttl = u32::try_from(host_ttl.as_secs()).unwrap_or(u32::MAX);
         if host_ttl == 0 {
             bail!("a TTL of zero would withdraw the device");
@@ -1268,8 +1264,8 @@ impl Segment {
         };
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        // One made for the owner under a name is one: it is changed in place.
-        let ours = |m: &Manual| m.owner == owner && m.priority == 0;
+        // One made under a name with a priority is one: it is changed in place.
+        let ours = |m: &Manual| m.priority == priority;
         let existing = state.hosts.get(&host).and_then(|h| h.manuals.iter().find(|m| ours(m)).cloned());
         if existing.as_ref().is_some_and(|e| e.host_ttl == Some(host_ttl) && *e.device.borrow() == device) {
             return Ok(false);
@@ -1280,7 +1276,7 @@ impl Segment {
                 *existing.device.borrow_mut() = device;
                 Manual { host_ttl: Some(host_ttl), ..existing.clone() }
             }
-            None => Manual { owner, priority: 0, device: Shared::new(device), how: Rc::new(Advertise::ALL), host_ttl: Some(host_ttl) },
+            None => Manual { priority, device: Shared::new(device), how: Rc::new(Advertise::ALL), host_ttl: Some(host_ttl) },
         };
         let device = manual.device.clone();
         if let Err(e) = state.put(manual, Instant::now()) {
@@ -1295,20 +1291,21 @@ impl Segment {
     }
 
     /// Announce `device`, one of another segment, whose `priority` is that
-    /// segment's, and is to be shown here as `how` says, for `owner`, with the
-    /// TTL `host_ttl` for its address records, if given, or else its own. The
+    /// segment's, and is to be shown here as `how` says, with the TTL
+    /// `host_ttl` for its address records, if given, or else its own. The
     /// device is held where it is heard, and so is shown as it is now:
     /// whoever shows it says again when it has changed, and withdraws it with
     /// [`unreflect`](Segment::unreflect) when it has gone. A device of the
-    /// same name from the same segment that more than one owner shows is
-    /// announced as what they show of it together; from another segment, the
-    /// lowest priority's is, and the other takes over when it goes.
-    pub fn reflect(&self, owner: Owner, priority: u32, device: &Shared, how: Rc<Advertise>, host_ttl: Option<Duration>) -> Result<bool> {
+    /// same name from the same segment that more than one shows (each with its
+    /// own `how`) is announced as what they show of it together; from another
+    /// segment, the lowest priority's is, and the other takes over when it
+    /// goes.
+    pub fn reflect(&self, priority: u32, device: &Shared, how: &Rc<Advertise>, host_ttl: Option<Duration>) -> Result<bool> {
         let host_ttl = host_ttl.map(|ttl| u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX));
         if host_ttl == Some(0) {
             bail!("a TTL of zero would withdraw the device");
         }
-        let manual = Manual { owner, priority, device: device.clone(), how, host_ttl };
+        let manual = Manual { priority, device: device.clone(), how: Rc::clone(how), host_ttl };
         if manual.host().is_none() {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
         }
@@ -1318,41 +1315,41 @@ impl Segment {
         Ok(true)
     }
 
-    /// Forget what `owner` wanted announced as `hostname`. If that is what is
-    /// announced, the next owner's device takes its place, or, if there is
-    /// none, goodbyes are sent for it. Returns false if `owner` had no such
-    /// device. If sending fails it is kept.
-    pub fn remove_manual(&self, owner: Owner, hostname: &str) -> Result<bool> {
+    /// Forget what was made for this segment with `priority` to be announced
+    /// as `hostname`. If that is what is announced, the next one's device
+    /// takes its place, or, if there is none, goodbyes are sent for it.
+    /// Returns false if there was no such device. If sending fails it is kept.
+    pub fn remove_manual(&self, priority: u32, hostname: &str) -> Result<bool> {
         let host = hostname.to_ascii_lowercase();
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let taken = state.hosts.take_where(&host, |m| m.owner == owner && m.priority == 0);
+        let taken = state.hosts.take_where(&host, |m| m.priority == priority);
         state.settled(&host, taken)
     }
 
-    /// Forget the copy of `device` that `owner` wanted announced, as
+    /// Forget the copy of `device` that was to be shown as `how` says, as
     /// [`remove_manual`](Segment::remove_manual) forgets one made for it.
-    pub fn unreflect(&self, owner: Owner, device: &Shared) -> Result<bool> {
+    pub fn unreflect(&self, how: &Rc<Advertise>, device: &Shared) -> Result<bool> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        let Some((host, manual)) = state.hosts.take((owner, device.addr())) else {
+        let Some((host, manual)) = state.hosts.take((device.addr(), Rc::as_ptr(how) as usize)) else {
             return Ok(false);
         };
         state.settled(&host, vec![manual])
     }
 
-    /// Forget every device of the segment of `priority` that `owner` wanted
-    /// announced, as it is gone. Every one is tried; the first error is
+    /// Forget every device of the segment of `priority` that was to be shown
+    /// as `how` says, as it is gone. Every one is tried; the first error is
     /// returned.
-    pub fn drop_origin(&self, owner: Owner, priority: u32) -> Result<()> {
-        self.withdraw_where(|m| m.owner == owner && m.priority == priority)
+    pub fn drop_origin(&self, how: &Rc<Advertise>, priority: u32) -> Result<()> {
+        self.withdraw_where(|m| Rc::ptr_eq(&m.how, how) && m.priority == priority)
     }
 
-    /// Forget everything `owner` wanted announced, with goodbyes for what is
-    /// then no longer announced. Every one is tried; the first error is
-    /// returned.
-    pub fn withdraw_all(&self, owner: Owner) -> Result<()> {
-        self.withdraw_where(|m| m.owner == owner)
+    /// Forget everything that was to be shown as `how` says, with goodbyes
+    /// for what is then no longer announced. Every one is tried; the first
+    /// error is returned.
+    pub fn withdraw_all(&self, how: &Rc<Advertise>) -> Result<()> {
+        self.withdraw_where(|m| Rc::ptr_eq(&m.how, how))
     }
 
     fn withdraw_where(&self, taken: impl Fn(&Manual) -> bool) -> Result<()> {
@@ -1427,7 +1424,7 @@ impl Segment {
         let AdvertiseConfig { name, ttl, services, .. } = advertise;
         if addrs.is_empty() {
             eprintln!("{}: no address to advertise {name} with", self.interface);
-            if let Err(e) = self.remove_manual(Owner::Own, name) {
+            if let Err(e) = self.remove_manual(OWN, name) {
                 eprintln!("{}: withdrawing {name} failed: {e:#}", self.interface);
             }
             return;
@@ -1449,7 +1446,7 @@ impl Segment {
                 .into()
             })
             .collect();
-        match self.add_manual_ttl(Owner::Own, device, *ttl) {
+        match self.add_manual_ttl(OWN, device, *ttl) {
             Ok(true) => {
                 let shown: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
                 eprintln!("{}: advertising {name} as {} (TTL {}s)", self.interface, shown.join(", "), ttl.as_secs());
@@ -1477,7 +1474,7 @@ impl Segment {
         state
             .hosts
             .iter()
-            .filter_map(|h| h.manuals.iter().find(|m| m.owner == Owner::Own && m.priority == 0))
+            .filter_map(|h| h.manuals.iter().find(|m| m.priority == OWN))
             .map(|m| (m.device.snapshot(), Duration::from_secs(u64::from(m.host_ttl()))))
             .collect()
     }

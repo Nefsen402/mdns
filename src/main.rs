@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use config::{AdvertiseConfig, Config, Forward, Interface, Neighbours};
 use netlink::{Event, Netlink};
 use reflector::Reflector;
-use segment::{Owner, Segment};
+use segment::{Segment, OWN};
 use socket::{Family, Hub};
 
 /// What every module takes from alloc, as std's prelude would give it.
@@ -108,11 +108,12 @@ fn daemon(args: Vec<String>) -> Result<()> {
 
     // One reflector per configured segment, over the interfaces that are
     // there, which come and go. Where segments share an interface and both
-    // want a hostname announced there, the one listed first wins.
+    // want a hostname announced there, they show it together if it is of the
+    // same interface, and otherwise the lowest interface's device wins.
     let mut segments = Vec::new();
-    for (rank, seg) in (0..).zip(&config.segments) {
+    for seg in &config.segments {
         let reflector =
-            Reflector::with_options(rank, Vec::new(), &seg.untrusted, seg.forward, seg.advertise.clone(), seg.reflected_when.clone(), seg.reflect_ttl)
+            Reflector::with_options(Vec::new(), &seg.untrusted, seg.forward, seg.advertise.clone(), seg.reflected_when.clone(), seg.reflect_ttl)
             .with_context(|| format!("starting segment {:?}", seg.name))?;
         eprintln!("segment {:?}: {}", seg.name, seg.interfaces.join(", "));
         if !seg.untrusted.is_empty() {
@@ -200,7 +201,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // advertised name: say goodbye to it too.
     for link in &links {
         for host in link.manual_devices().into_iter().filter_map(|d| d.hostname) {
-            if let Err(e) = link.remove_manual(Owner::Own, &host) {
+            if let Err(e) = link.remove_manual(OWN, &host) {
                 eprintln!("{}: withdrawing {host} failed: {e:#}", link.interface());
             }
         }

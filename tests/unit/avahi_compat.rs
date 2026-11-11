@@ -57,7 +57,7 @@ fn group_on_lo() -> (Vec<Group>, Segment, UdpSocket) {
     rx.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
     let seg = Segment::new(socket::LOOPBACK, &[Family::V4, Family::V6]);
     seg.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap());
-    let reflector = Reflector::new(0, vec![seg.clone()]).unwrap();
+    let reflector = Reflector::new(vec![seg.clone()]).unwrap();
     (vec![Group { name: "lan".into(), reflector }], seg, rx)
 }
 

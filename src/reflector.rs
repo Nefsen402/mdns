@@ -24,7 +24,7 @@ use anyhow::{bail, Result};
 
 use crate::config::{glob, Advertise, Forward, ReflectedWhen};
 use crate::device::Shared;
-use crate::segment::{Asked, Event, Owner, Segment};
+use crate::segment::{Asked, Event, Segment};
 
 use crate::prelude::*;
 
@@ -51,9 +51,6 @@ pub struct Reflector {
 }
 
 struct Inner {
-    /// Whose the devices it announces are, on segments it shares with other
-    /// reflectors.
-    owner: Owner,
     /// The segments it spans, and whether each is untrusted: it is not
     /// announced anything. They come and go with their interfaces.
     members: RefCell<Vec<Member>>,
@@ -104,12 +101,11 @@ impl Reflector {
     /// [`remove`](Reflector::remove) say what comes and goes. Devices already
     /// discovered are reflected before this returns.
     ///
-    /// `rank` settles clashes with other reflectors that share an interface:
-    /// if both want a hostname announced there, the lower rank's device is,
-    /// and the other's takes over when it goes. The daemon ranks reflectors
-    /// by the order of their segments in the config.
-    pub fn new(rank: u32, segments: Vec<Segment>) -> Result<Reflector> {
-        Self::with_untrusted(rank, segments, &[])
+    /// Where reflectors share an interface and more than one wants a hostname
+    /// announced there, the device of the segment with the lowest priority is
+    /// (see [`Segment::priority`]), and the next takes over when it goes.
+    pub fn new(segments: Vec<Segment>) -> Result<Reflector> {
+        Self::with_untrusted(segments, &[])
     }
 
     /// Like [`new`](Reflector::new), but the segments on the interfaces named
@@ -117,8 +113,8 @@ impl Reflector {
     /// announced to the others, but they do not learn about the devices of the
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
-    pub fn with_untrusted(rank: u32, segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
-        Self::with_options(rank, segments, untrusted, Forward::default(), Advertise::default(), ReflectedWhen::default(), None)
+    pub fn with_untrusted(segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
+        Self::with_options(segments, untrusted, Forward::default(), Advertise::default(), ReflectedWhen::default(), None)
     }
 
     /// Like [`with_untrusted`](Reflector::with_untrusted), putting the
@@ -127,7 +123,6 @@ impl Reflector {
     /// devices that have what `when` asks for, and announcing what it reflects with the address TTL
     /// `reflect_ttl`, if given, in place of each device's own.
     pub fn with_options(
-        rank: u32,
         segments: Vec<Segment>,
         untrusted: &[String],
         forward: Forward,
@@ -148,7 +143,6 @@ impl Reflector {
             .collect();
 
         let inner = Rc::new(Inner {
-            owner: Owner::Reflector(rank),
             members: RefCell::new(members),
             untrusted,
             forward,
@@ -217,12 +211,12 @@ impl Reflector {
             let Some(at) = members.iter().position(|m| m.segment.interface() == interface) else { return };
             members.remove(at).segment
         };
-        if let Err(e) = removed.withdraw_all(self.inner.owner) {
+        if let Err(e) = removed.withdraw_all(&self.inner.advertise) {
             eprintln!("{interface}: withdrawing what was reflected failed: {e:#}");
         }
         let priority = removed.priority();
         for member in self.inner.snapshot() {
-            if let Err(e) = member.segment.drop_origin(self.inner.owner, priority) {
+            if let Err(e) = member.segment.drop_origin(&self.inner.advertise, priority) {
                 eprintln!("{}: withdrawing what was reflected of {interface} failed: {e:#}", member.segment.interface());
             }
         }
@@ -339,7 +333,7 @@ impl Drop for Reflector {
     fn drop(&mut self) {
         // Nothing is wanted any more: what it announced is withdrawn.
         for seg in self.segments() {
-            if let Err(e) = seg.withdraw_all(self.inner.owner) {
+            if let Err(e) = seg.withdraw_all(&self.inner.advertise) {
                 eprintln!("{}: withdrawing what was reflected failed: {e:#}", seg.interface());
             }
         }
@@ -451,9 +445,9 @@ impl Inner {
     fn attempt(&self, book: &mut Book, target: &Segment, priority: u32, device: &Shared, show: bool) {
         book.failed.retain(|f| !(f.target.is(target) && f.device.is(device)));
         let result = if show {
-            target.reflect(self.owner, priority, device, Rc::clone(&self.advertise), self.reflect_ttl).map(drop)
+            target.reflect(priority, device, &self.advertise, self.reflect_ttl).map(drop)
         } else {
-            target.unreflect(self.owner, device).map(drop)
+            target.unreflect(&self.advertise, device).map(drop)
         };
         let failed = result.is_err();
         if let Err(e) = result {
