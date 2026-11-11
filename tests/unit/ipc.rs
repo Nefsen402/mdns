@@ -197,7 +197,7 @@ fn advertise_self(seg: &Segment) {
         ..Device::default()
     };
     pc.add_addrs(&[ip("10.0.0.5")]);
-    seg.add_manual_ttl(crate::segment::OWN, pc, Duration::from_secs(120)).unwrap();
+    seg.add_manual_ttl(crate::segment::OWN, &crate::device::Shared::new(pc), Duration::from_secs(120)).unwrap();
 }
 
 /// Nothing is heard of this host, so it is listed as it advertises itself,

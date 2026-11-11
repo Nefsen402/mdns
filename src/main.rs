@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use config::{AdvertiseConfig, Config, Forward, Interface, Neighbours};
 use netlink::{Event, Netlink};
 use reflector::Reflector;
-use segment::{Segment, OWN};
+use segment::Segment;
 use socket::{Family, Hub};
 
 /// What every module takes from alloc, as std's prelude would give it.
@@ -200,8 +200,9 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // With the reflectors gone, what is left in the manual lists is the
     // advertised name: say goodbye to it too.
     for link in &links {
-        for host in link.manual_devices().into_iter().filter_map(|d| d.hostname) {
-            if let Err(e) = link.remove_manual(OWN, &host) {
+        for (device, _) in link.own_devices() {
+            if let Err(e) = link.remove_manual(&device) {
+                let host = device.borrow().hostname.clone().unwrap_or_default();
                 eprintln!("{}: withdrawing {host} failed: {e:#}", link.interface());
             }
         }

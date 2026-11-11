@@ -682,7 +682,7 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
                 present.push(event_json("present", name, seg.interface(), &device, ttl));
             }
             // Nothing is heard of this host: it is here as it advertises itself.
-            for (device, ttl) in seg.own_devices().iter().filter_map(|(d, ttl)| Some((d.only_kinds(&query.kinds)?, *ttl))) {
+            for (device, ttl) in seg.own_devices().iter().filter_map(|(d, ttl)| Some((d.borrow().only_kinds(&query.kinds)?, *ttl))) {
                 let mut line = event_json("present", name, seg.interface(), &device, ttl);
                 line["device"]["own"] = Value::Bool(true);
                 present.push(line);
@@ -828,7 +828,7 @@ fn devices(groups: &[Group], name: &str) -> Value {
             found.sort_by_key(|d| (d.key(), d.addrs().collect::<Vec<_>>()));
             list.extend(found.iter().map(|d| device_json(seg.interface(), d)));
             // This host, as it advertises itself, is among them.
-            list.extend(seg.own_devices().iter().map(|(d, ttl)| own_json(seg.interface(), d, *ttl)));
+            list.extend(seg.own_devices().iter().map(|(d, ttl)| own_json(seg.interface(), &d.borrow(), *ttl)));
         }
     }
     json!({ "ok": true, "name": name, "devices": list })
