@@ -8,6 +8,8 @@
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+use alloc::rc::Rc;
+use core::cell::{Ref, RefCell, RefMut};
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use hashbrown::{HashMap, HashSet};
@@ -330,18 +332,88 @@ pub struct Device {
     pub reverse: Box<[IpAddr]>,
 }
 
-/// A device as it is shown: with the addresses and services `how` says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A device as it is shown: with the addresses and services `how` says, and
+/// the TTL its address records are announced with.
+#[derive(Clone, Copy, Debug)]
 pub struct Advertised<'a> {
     pub device: &'a Device,
     pub how: &'a Advertise,
+    pub host_ttl: u32,
 }
 
 impl<'a> From<&'a Device> for Advertised<'a> {
-    /// As it was heard, with everything it has.
+    /// As it was heard, with everything it has and its own TTL.
     fn from(device: &'a Device) -> Advertised<'a> {
         static ALL: Advertise = Advertise::ALL;
-        Advertised { device, how: &ALL }
+        Advertised { device, how: &ALL, host_ttl: device.ttl.unwrap_or(HOST_TTL) }
+    }
+}
+
+impl PartialEq for Advertised<'_> {
+    /// Shown the same: the TTL that counts is the one it is shown with, not
+    /// the device's own.
+    fn eq(&self, other: &Advertised<'_>) -> bool {
+        self.how == other.how && self.host_ttl == other.host_ttl && self.device.same_but_ttl(other.device)
+    }
+}
+
+impl Eq for Advertised<'_> {}
+
+/// A device held once, however many segments show it: it is changed where it
+/// is heard, and those that show it see the change without being told. They
+/// are told of what changed (an [`Event`](crate::tracker::Event)) when it is
+/// time to do something about it. Two are the same device if they are the same
+/// allocation ([`Shared::is`]), whatever they hold.
+#[derive(Clone, Default)]
+pub struct Shared(Rc<RefCell<Device>>);
+
+impl Shared {
+    pub fn new(device: Device) -> Shared {
+        Shared(Rc::new(RefCell::new(device)))
+    }
+
+    pub fn borrow(&self) -> Ref<'_, Device> {
+        self.0.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, Device> {
+        self.0.borrow_mut()
+    }
+
+    /// Whether `other` is this very device, not just one that holds the same.
+    pub fn is(&self, other: &Shared) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Where it is, to tell devices apart by without holding them: valid for
+    /// as long as it is held.
+    pub fn addr(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
+    /// What it holds now, for what is to be kept as it is.
+    pub fn snapshot(&self) -> Device {
+        self.0.borrow().clone()
+    }
+}
+
+impl PartialEq for Shared {
+    fn eq(&self, other: &Shared) -> bool {
+        *self.0.borrow() == *other.0.borrow()
+    }
+}
+
+impl Eq for Shared {}
+
+impl core::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.borrow().fmt(f)
+    }
+}
+
+impl From<Device> for Shared {
+    fn from(device: Device) -> Shared {
+        Shared::new(device)
     }
 }
 
@@ -702,6 +774,15 @@ fn unescape(label: &str) -> String {
 }
 
 impl Device {
+    /// Whether it is the same as `other` but for its TTL.
+    pub fn same_but_ttl(&self, other: &Device) -> bool {
+        self.hostname == other.hostname
+            && self.addresses == other.addresses
+            && self.services == other.services
+            && self.nsec == other.nsec
+            && self.reverse == other.reverse
+    }
+
     /// Its addresses, the routable ones first, IPv4 before IPv6.
     pub fn addrs(&self) -> impl Iterator<Item = IpAddr> + '_ {
         self.addresses.iter().map(|a| a.ip)
@@ -1119,7 +1200,7 @@ impl Device {
     /// announcing `new` under the same hostname: all of `new`, and goodbyes
     /// for the services and addresses of this one that `new` does not have.
     pub fn replacement(&self, how: &Advertise, new: Advertised, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
-        let Advertised { device: new, how: new_how } = new;
+        let Advertised { device: new, how: new_how, .. } = new;
         let mut records = new.announcement(new_how, host_ttl, other_ttl);
         let kept: HashMap<String, &Service> =
             new.advertised_services(new_how).map(|s| (s.instance().to_ascii_lowercase(), s)).collect();
@@ -1326,12 +1407,11 @@ impl Device {
     /// just what theirs does. And no goodbye carries the cache-flush bit,
     /// which would flush their records of the name too.
     pub fn transition(old: Option<Advertised>, new: Option<Advertised>, local: &dyn Fn(&str) -> bool, host_here: bool) -> Vec<Record> {
-        let ttl = |d: &Advertised| d.device.ttl.unwrap_or(HOST_TTL);
         let mut records = match (old, new) {
             (Some(old), Some(new)) if old == new => Vec::new(),
             (None, None) => Vec::new(),
-            (None, Some(new)) => new.device.announcement(new.how, ttl(&new), OTHER_TTL),
-            (Some(old), Some(new)) => old.device.without(local).replacement(old.how, new, ttl(&new), OTHER_TTL),
+            (None, Some(new)) => new.device.announcement(new.how, new.host_ttl, OTHER_TTL),
+            (Some(old), Some(new)) => old.device.without(local).replacement(old.how, new, new.host_ttl, OTHER_TTL),
             (Some(old), None) => old.device.without(local).announcement(old.how, 0, 0),
         };
         for r in records.iter_mut().filter(|r| r.ttl == 0) {
@@ -1365,8 +1445,8 @@ impl Device {
         let mut answers: Vec<Record> = Vec::new();
         let mut additionals: Vec<Record> = Vec::new();
         let mut answered = Vec::new();
-        for (i, Advertised { device, how }) in devices.iter().enumerate() {
-            let (a, x) = device.answers(how, query, device.ttl.unwrap_or(HOST_TTL), OTHER_TTL);
+        for (i, Advertised { device, how, host_ttl }) in devices.iter().enumerate() {
+            let (a, x) = device.answers(how, query, *host_ttl, OTHER_TTL);
             if a.is_empty() {
                 continue;
             }

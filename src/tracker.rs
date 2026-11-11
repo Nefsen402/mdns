@@ -10,8 +10,7 @@ use alloc::collections::BTreeSet;
 
 use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
 
-use crate::device::{addr_of, edit, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
-use alloc::rc::Rc;
+use crate::device::{addr_of, edit, Shared, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
 
 use crate::segment::Asked;
 use crate::codec::{Message, Question, RData, Record};
@@ -93,29 +92,33 @@ impl Tracker {
         for &id in ids {
             let Some(entry) = self.discovered.try_get(id) else { continue };
             // Its link-layer address, by any address it announced.
-            let announced = entry.device.addresses.iter().filter(|a| a.origin == Origin::Announced);
-            let mut macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
-            macs.sort_unstable();
-            macs.dedup();
-            let on_link = |ip: &IpAddr| self.prefixes.iter().any(|p| p.contains(ip));
-            let learned: Vec<IpAddr> = macs
-                .iter()
-                .flat_map(|mac| self.neighbours.with_mac(mac))
-                .filter(|ip| !is_link_local(ip) && on_link(ip))
-                .collect();
+            let (learned, nudge) = {
+                let device = entry.device.borrow();
+                let announced = device.addresses.iter().filter(|a| a.origin == Origin::Announced);
+                let mut macs: Vec<&Vec<u8>> = announced.filter_map(|a| self.neighbours.get(&a.ip)).collect();
+                macs.sort_unstable();
+                macs.dedup();
+                let on_link = |ip: &IpAddr| self.prefixes.iter().any(|p| p.contains(ip));
+                let learned: Vec<IpAddr> = macs
+                    .iter()
+                    .flat_map(|mac| self.neighbours.with_mac(mac))
+                    .filter(|ip| !is_link_local(ip) && on_link(ip))
+                    .collect();
 
-            let unresolved = entry.device.link_local().find(|ll| ll.is_ipv6() && !self.neighbours.contains_key(ll));
-            let has_v6 = entry.device.routable().any(|a| a.is_ipv6());
-            let due = entry.nudged.is_none_or(|t| now.saturating_duration_since(t) >= NUDGE_GAP);
-            if let Some(ll) = unresolved.filter(|_| !has_v6 && due) {
-                touched.nudges.push((ll, entry.device.clone()));
+                let unresolved = device.link_local().find(|ll| ll.is_ipv6() && !self.neighbours.contains_key(ll));
+                let has_v6 = device.routable().any(|a| a.is_ipv6());
+                let due = entry.nudged.is_none_or(|t| now.saturating_duration_since(t) >= NUDGE_GAP);
+                (learned, unresolved.filter(|_| !has_v6 && due).map(|ll| (ll, device.clone())))
+            };
+            if let Some(nudge) = nudge {
+                touched.nudges.push(nudge);
                 self.discovered.get_mut(id).nudged = Some(now);
             }
 
-            let mut device = self.discovered.get(id).device.clone();
+            let mut device = self.discovered.get(id).device.snapshot();
             if device.take_neighbours(&learned, self.max_addrs) {
                 touched.note(&self.discovered, id);
-                self.discovered.get_mut(id).device = device;
+                *self.discovered.get(id).device.borrow_mut() = device;
             }
         }
     }
@@ -138,7 +141,7 @@ impl Tracker {
             return Touched::default();
         }
         self.prefixes = prefixes;
-        let ids: Vec<Id> = self.discovered.ids().filter(|&id| !self.discovered.get(id).device.addresses.is_empty()).collect();
+        let ids: Vec<Id> = self.discovered.ids().filter(|&id| !self.discovered.get(id).device.borrow().addresses.is_empty()).collect();
         self.relearn(&ids, now)
     }
 
@@ -309,7 +312,7 @@ impl Tracker {
             let ttl = Duration::from_secs(report.longest_ttl().into());
             entry.expires = entry.expires.max(now + ttl.max(floor));
             entry.make_room(&addrs, &report.flushed, &report.gone, max_addrs);
-            entry.device.learn(report, &addrs, max_addrs, max_services);
+            entry.device.borrow_mut().learn(report, &addrs, max_addrs, max_services);
             entry.renew_addrs(&addrs, &report.ttls, now, floor);
             if entry.soonest() != was {
                 entry.began = now;
@@ -353,13 +356,13 @@ impl Tracker {
             entry.expires = entry.expires.max(now + ttl.max(floor));
             if usable {
                 entry.make_room(&[src], &[], &[], max_addrs);
-                entry.device.take_addrs(&[src], &[], &[], max_addrs);
+                entry.device.borrow_mut().take_addrs(&[src], &[], &[], max_addrs);
                 entry.renew_addrs(&[src], &HashMap::new(), now, floor);
             }
             if entry.soonest() != was {
                 entry.began = now;
             }
-            entry.device.learn_records(rest.iter().copied(), max_services);
+            entry.device.borrow_mut().learn_records(rest.iter().copied(), max_services);
         }
 
         // An instance that has now been resolved to its host no longer needs
@@ -369,12 +372,12 @@ impl Tracker {
             let others: Vec<Id> = self
                 .discovered
                 .with_unresolved()
-                .filter(|&(id, e)| id != owner && e.device.service(&instance).is_some_and(|s| s.target().is_none()))
+                .filter(|&(id, e)| id != owner && e.device.borrow().service(&instance).is_some_and(|s| s.target().is_none()))
                 .map(|(id, _)| id)
                 .collect();
             for id in others {
                 touched.note(&self.discovered, id);
-                self.discovered.get_mut(id).device.forget_service(&instance);
+                self.discovered.get_mut(id).device.borrow_mut().forget_service(&instance);
             }
             touched.sync(&mut self.discovered);
         }
@@ -393,7 +396,8 @@ impl Tracker {
 #[derive(Default)]
 pub struct Touched {
     pub order: Vec<Id>,
-    before: HashMap<Id, Option<Device>>,
+    /// The device, which goes on to be what it is, and what it held.
+    before: HashMap<Id, Option<(Shared, Device)>>,
     /// What the tables that find devices hold of each, as of when they were
     /// last made to follow it: what it was before, until then.
     indexed: HashMap<Id, Indexed>,
@@ -407,7 +411,7 @@ impl Touched {
     pub fn note(&mut self, discovered: &Devices, id: Id) {
         if !self.before.contains_key(&id) {
             self.order.push(id);
-            self.before.insert(id, discovered.try_get(id).map(|e| e.device.clone()));
+            self.before.insert(id, discovered.try_get(id).map(|e| (e.device.clone(), e.device.snapshot())));
             self.indexed.insert(id, discovered.indexed_of(id));
         }
     }
@@ -432,12 +436,16 @@ impl Touched {
     pub fn events(&self, discovered: &Devices) -> Vec<Event> {
         let mut events = Vec::new();
         for id in &self.order {
-            let before = self.before[id].clone().map(Rc::new);
-            let after = discovered.try_get(*id).map(|e| Rc::new(e.device.clone()));
-            match (before, after) {
-                (None, Some(after)) => events.push(Event::Added(after)),
-                (Some(before), Some(after)) if before != after => events.push(Event::Updated { before, after }),
-                (Some(before), None) => events.push(Event::Removed(before)),
+            let now = discovered.try_get(*id).map(|e| e.device.clone());
+            match (&self.before[id], now) {
+                (None, Some(now)) => events.push(Event::Added(now)),
+                // A device that went, and another that came in its place.
+                (Some((old, _)), Some(now)) if !old.is(&now) => {
+                    events.push(Event::Removed(old.clone()));
+                    events.push(Event::Added(now));
+                }
+                (Some((_, before)), Some(now)) if *before != *now.borrow() => events.push(Event::Updated(now)),
+                (Some((old, _)), None) => events.push(Event::Removed(old.clone())),
                 _ => {}
             }
         }
@@ -450,10 +458,15 @@ impl Touched {
     pub fn names(&self, discovered: &Devices) -> Vec<String> {
         let mut names = Vec::new();
         for id in &self.order {
-            let now = discovered.try_get(*id).map(|e| &e.device);
-            for device in self.before[id].iter().chain(now) {
+            let mut add = |device: &Device| {
                 names.extend(device.hostname.iter().map(|host| host.to_ascii_lowercase()));
                 names.extend(device.services.iter().map(|svc| svc.instance().to_ascii_lowercase()));
+            };
+            if let Some((_, before)) = &self.before[id] {
+                add(before);
+            }
+            if let Some(entry) = discovered.try_get(*id) {
+                add(&entry.device.borrow());
             }
         }
         names.sort_unstable();
@@ -467,11 +480,12 @@ impl Touched {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A device came.
-    Added(Rc<Device>),
-    /// A device is not as it was: its hostname, addresses or services.
-    Updated { before: Rc<Device>, after: Rc<Device> },
-    /// A device went, as it was.
-    Removed(Rc<Device>),
+    Added(Shared),
+    /// A device is not as it was: its hostname, addresses or services. It is
+    /// the same device, which is what it is now, not what it was.
+    Updated(Shared),
+    /// A device went, as it was last.
+    Removed(Shared),
     /// The questions of a query that no device here owns the name of: for
     /// the reflector to put to the segments whose devices it announces here
     /// ([`Segment::query_question`](crate::segment::Segment::query_question)),
@@ -480,11 +494,11 @@ pub enum Event {
 }
 
 impl Event {
-    /// The device it is of: as it is, or as it was if it went. None for a
+    /// The device it is of: as it is, or as it was last if it went. None for a
     /// question.
-    pub fn device(&self) -> Option<&Device> {
+    pub fn device(&self) -> Option<&Shared> {
         match self {
-            Event::Added(device) | Event::Updated { after: device, .. } | Event::Removed(device) => Some(device),
+            Event::Added(device) | Event::Updated(device) | Event::Removed(device) => Some(device),
             Event::Question(_) => None,
         }
     }
@@ -493,7 +507,7 @@ impl Event {
 /// A discovered device, and when to drop it or ask it again.
 #[derive(Debug)]
 pub struct Entry {
-    pub device: Device,
+    pub device: Shared,
     /// The address of the packet it was first heard of in.
     pub from: IpAddr,
     pub expires: Instant,
@@ -516,7 +530,7 @@ impl Entry {
     /// A device first heard from `from`, with the hostname it has, if it has
     /// one.
     pub fn new(now: Instant, from: IpAddr, hostname: Option<&str>) -> Entry {
-        let device = Device { hostname: hostname.map(String::from), ..Device::default() };
+        let device = Shared::new(Device { hostname: hostname.map(String::from), ..Device::default() });
         Entry { device, from, expires: now, addr_expires: HashMap::new(), began: now, refreshed: None, nudged: None }
     }
 
@@ -524,11 +538,11 @@ impl Entry {
     /// its TTL, as known answers to a query asking `q` (RFC 6762 section 7.1).
     /// None of one without a hostname, which has no records of its own.
     pub fn known_answers(&self, q: &Question, now: Instant) -> Vec<Record> {
-        if self.device.hostname.is_none() {
+        if self.device.borrow().hostname.is_none() {
             return Vec::new();
         }
-        let host_ttl = self.device.ttl.unwrap_or(HOST_TTL);
-        let mut records = self.device.records_for(&Advertise::ALL, q, host_ttl, OTHER_TTL);
+        let host_ttl = self.device.borrow().ttl.unwrap_or(HOST_TTL);
+        let mut records = self.device.borrow().records_for(&Advertise::ALL, q, host_ttl, OTHER_TTL);
         for rec in &mut records {
             let until = addr_of(&rec.data).and_then(|a| self.addr_expires.get(&a)).unwrap_or(&self.expires);
             let left = until.saturating_duration_since(now).as_secs();
@@ -573,11 +587,11 @@ impl Entry {
     /// did not say) but at least `floor` from `now`, and forget when the
     /// addresses it no longer has run out.
     pub fn renew_addrs(&mut self, addrs: &[IpAddr], ttls: &HashMap<IpAddr, u32>, now: Instant, floor: Duration) {
-        for addr in addrs.iter().filter(|a| self.device.has_addr(a)) {
+        for addr in addrs.iter().filter(|a| self.device.borrow().has_addr(a)) {
             let ttl = Duration::from_secs(ttls.get(addr).copied().unwrap_or(0).into());
             self.addr_expires.insert(*addr, now + ttl.max(floor));
         }
-        let device = &self.device;
+        let device = self.device.borrow();
         self.addr_expires.retain(|addr, _| device.has_addr(addr));
     }
 
@@ -594,10 +608,11 @@ impl Entry {
             }
             let new = incoming
                 .iter()
-                .filter(|a| family_of(**a) == family && !gone.contains(a) && !self.device.has_addr(a))
+                .filter(|a| family_of(**a) == family && !gone.contains(a) && !self.device.borrow().has_addr(a))
                 .count();
             let mut held: Vec<IpAddr> = self
                 .device
+                .borrow()
                 .addresses
                 .iter()
                 .filter(|a| a.origin == Origin::Announced)
@@ -608,7 +623,7 @@ impl Entry {
             // Oldest first, and those it did not repeat before those it did.
             held.sort_by_key(|a| (incoming.contains(a), self.addr_expires.get(a).copied()));
             for addr in held.into_iter().filter(|a| !incoming.contains(a)).take(excess) {
-                edit(&mut self.device.addresses).retain(|a| a.ip != addr);
+                edit(&mut self.device.borrow_mut().addresses).retain(|a| a.ip != addr);
                 self.addr_expires.remove(&addr);
             }
         }
@@ -620,18 +635,18 @@ impl Entry {
         for addr in &gone {
             self.addr_expires.remove(addr);
         }
-        edit(&mut self.device.addresses).retain(|a| !gone.contains(&a.ip));
+        edit(&mut self.device.borrow_mut().addresses).retain(|a| !gone.contains(&a.ip));
         !gone.is_empty()
     }
 
     /// Whether there is anything to ask it about: a name or a service.
     pub fn askable(&self) -> bool {
-        self.device.hostname.is_some() || !self.device.services.is_empty()
+        self.device.borrow().hostname.is_some() || !self.device.borrow().services.is_empty()
     }
 
     /// Take over what was learned about this device before its name was known.
     pub fn absorb(&mut self, earlier: Entry, max_services: usize) {
-        self.device.absorb(earlier.device, max_services);
+        self.device.borrow_mut().absorb(earlier.device.snapshot(), max_services);
         self.expires = self.expires.max(earlier.expires);
         self.began = self.began.min(earlier.began);
         for (addr, at) in earlier.addr_expires {
@@ -733,7 +748,7 @@ impl Devices {
     /// The device with the hostname `host`, ignoring case.
     pub fn find_host(&self, host: &str) -> Option<Id> {
         let hash = hash_name(&self.hasher, host);
-        let named = |id: &Id| self.table.get(*id).device.hostname.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(host));
+        let named = |id: &Id| self.table.get(*id).device.borrow().hostname.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(host));
         self.by_name.under(hash).find(named)
     }
 
@@ -746,7 +761,7 @@ impl Devices {
         let hash = hash_addr(&self.hasher, from);
         let first = |id: &Id| {
             let entry = self.table.get(*id);
-            entry.device.hostname.is_none() && entry.from == *from
+            entry.device.borrow().hostname.is_none() && entry.from == *from
         };
         self.by_from.under(hash).find(first)
     }
@@ -756,9 +771,9 @@ impl Devices {
     /// what the tables hold when it is [indexed](Devices::reindex), with
     /// nothing for what they held.
     pub fn create(&mut self, entry: Entry) -> Id {
-        debug_assert!(entry.device.hostname.as_deref().is_none_or(|host| !self.contains_host(host)), "a hostname is had once");
+        debug_assert!(entry.device.borrow().hostname.as_deref().is_none_or(|host| !self.contains_host(host)), "a hostname is had once");
         let from = hash_addr(&self.hasher, &entry.from);
-        let host = entry.device.hostname.as_deref().map(|host| hash_name(&self.hasher, host));
+        let host = entry.device.borrow().hostname.as_deref().map(|host| hash_name(&self.hasher, host));
         let id = self.table.insert(entry);
         self.by_from.add(from, id);
         if let Some(host) = host {
@@ -802,9 +817,9 @@ impl Devices {
 
     /// What the tables would hold of `entry`.
     pub fn indexed(&self, entry: &Entry) -> Indexed {
-        let mut addrs: Vec<u64> = entry.device.addrs().map(|addr| hash_addr(&self.hasher, &addr)).collect();
+        let mut addrs: Vec<u64> = entry.device.borrow().addrs().map(|addr| hash_addr(&self.hasher, &addr)).collect();
         let mut names = Vec::new();
-        entry.device.for_each_name(&Advertise::ALL, |name| names.push(hash_name(&self.hasher, name)));
+        entry.device.borrow().for_each_name(&Advertise::ALL, |name| names.push(hash_name(&self.hasher, name)));
         for hashes in [&mut addrs, &mut names] {
             hashes.sort_unstable();
             hashes.dedup();
@@ -829,7 +844,7 @@ impl Devices {
         let now = self.indexed(entry);
         self.by_addr.move_between(id, &was.addrs, &now.addrs);
         self.by_name.move_between(id, &was.names, &now.names);
-        if entry.device.services.iter().any(|s| s.target().is_none()) {
+        if entry.device.borrow().services.iter().any(|s| s.target().is_none()) {
             self.unresolved.insert(id);
         } else {
             self.unresolved.remove(&id);
@@ -869,7 +884,7 @@ impl Devices {
     /// The devices that have `addr`.
     pub fn ids_with_addr<'a>(&'a self, addr: &'a IpAddr) -> impl Iterator<Item = Id> + 'a {
         let hash = hash_addr(&self.hasher, addr);
-        self.by_addr.under(hash).filter(move |&id| self.table.get(id).device.has_addr(addr))
+        self.by_addr.under(hash).filter(move |&id| self.table.get(id).device.borrow().has_addr(addr))
     }
 
     /// The device that has `addr` and was heard of last, if any does.
@@ -880,7 +895,7 @@ impl Devices {
     /// The devices that answer for `name`, ignoring case.
     pub fn with_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
         let hash = hash_name(&self.hasher, name);
-        self.by_name.under(hash).map(|id| self.table.get(id)).filter(move |entry| entry.device.has_name(&Advertise::ALL, name))
+        self.by_name.under(hash).map(|id| self.table.get(id)).filter(move |entry| entry.device.borrow().has_name(&Advertise::ALL, name))
     }
 
     /// The devices with a service whose host is not known yet.
@@ -893,7 +908,7 @@ impl Devices {
         let hash = hash_addr(&self.hasher, sender);
         let first = |id: &Id| {
             let entry = self.table.get(*id);
-            entry.from == *sender && entry.device.hostname.is_some()
+            entry.from == *sender && entry.device.borrow().hostname.is_some()
         };
         self.by_from.under(hash).filter(first).count()
     }
@@ -931,15 +946,15 @@ impl Devices {
             names += indexed.names.len();
             assert!(indexed.addrs.iter().all(|&h| self.by_addr.holds(h, id)), "an address is indexed: {entry:?}");
             assert!(indexed.names.iter().all(|&h| self.by_name.holds(h, id)), "a name is indexed: {entry:?}");
-            let unresolved_here = entry.device.services.iter().any(|s| s.target().is_none());
+            let unresolved_here = entry.device.borrow().services.iter().any(|s| s.target().is_none());
             assert_eq!(self.unresolved.contains(&id), unresolved_here, "unresolved: {entry:?}");
             unresolved += usize::from(unresolved_here);
-            for addr in entry.device.addrs() {
+            for addr in entry.device.borrow().addrs() {
                 assert!(self.ids_with_addr(&addr).any(|found| found == id), "{addr} finds it");
             }
             froms += 1;
             assert!(self.by_from.holds(hash_addr(&self.hasher, &entry.from), id), "by where from: {entry:?}");
-            match entry.device.hostname.as_deref() {
+            match entry.device.borrow().hostname.as_deref() {
                 Some(host) => assert_eq!(self.find_host(host), Some(id), "a hostname is had once: {entry:?}"),
                 None => assert_eq!(self.find_nameless(&entry.from), Some(id), "one with no hostname per address: {entry:?}"),
             }

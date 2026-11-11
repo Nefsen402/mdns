@@ -1,19 +1,17 @@
-use std::rc::Rc;
-
 use crate::device::edit;
 
 fn added(device: Device) -> Event {
-    Event::Added(Rc::new(device))
+    Event::Added(device.into())
 }
 
 /// An update to `device`, from just as it is: how it changed is not
 /// what a watch shows.
 fn updated(device: Device) -> Event {
-    Event::Updated { before: Rc::new(device.clone()), after: Rc::new(device) }
+    Event::Updated(device.into())
 }
 
 fn removed(device: Device) -> Event {
-    Event::Removed(Rc::new(device))
+    Event::Removed(device.into())
 }
 
 use std::fs;

@@ -691,7 +691,7 @@ fn services_are_announced_as_they_are_advertised() {
     assert_eq!(srv(d.announcement(&how, 120, 4500), 4500), ["Office._ipp._tcp.local"]);
     assert!(d.has_name(&Advertise::ALL, "shell._ssh._tcp.local") && !d.has_name(&how, "shell._ssh._tcp.local"));
     assert!(d.has_name(&Advertise::ALL, "_ssh._tcp.local") && !d.has_name(&how, "_ssh._tcp.local"));
-    let goodbyes = d.replacement(&Advertise::ALL, Advertised { device: &d, how: &how }, 120, 4500);
+    let goodbyes = d.replacement(&Advertise::ALL, Advertised { device: &d, how: &how, host_ttl: 120 }, 120, 4500);
     assert_eq!(srv(goodbyes, 0), ["Bare._ipp._tcp.local", "Shell._ssh._tcp.local"]);
 }
 

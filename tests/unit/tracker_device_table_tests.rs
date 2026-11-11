@@ -22,7 +22,7 @@ fn a_device_is_found_by_its_hostname_whatever_the_case_and_by_address_until_it_h
 
     assert_eq!(devices.len(), 2);
     assert_eq!((devices.find_host("tv.LOCAL"), devices.find_nameless(&from)), (Some(tv), Some(bare)));
-    assert_eq!(devices.get(tv).device.hostname.as_deref(), Some("TV.local"), "spelt as it was announced");
+    assert_eq!(devices.get(tv).device.borrow().hostname.as_deref(), Some("TV.local"), "spelt as it was announced");
     assert!(!devices.contains_host("other.local"));
     assert_eq!(devices.find_nameless(&"10.0.0.8".parse().unwrap()), None);
     assert_eq!(devices.find_nameless(&"10.0.0.1".parse().unwrap()), None, "it has a name");
@@ -31,7 +31,7 @@ fn a_device_is_found_by_its_hostname_whatever_the_case_and_by_address_until_it_h
 
     // Given a hostname, it is found by it, and no longer by where from.
     let was = devices.indexed_of(bare);
-    devices.edit(bare, |entry| entry.device.hostname = Some("Bare.local".into()));
+    devices.edit(bare, |entry| entry.device.borrow_mut().hostname = Some("Bare.local".into()));
     devices.reindex(bare, &was);
     assert_eq!((devices.find_host("bare.local"), devices.find_nameless(&from)), (Some(bare), None));
     devices.check();
@@ -89,19 +89,19 @@ fn the_tables_find_what_a_scan_of_the_devices_does_through_any_mix_of_changes() 
                     // (its host known or not) or fewer, asked again or not.
                     let addr: IpAddr = format!("10.5.{}.{}", pick >> 16 & 7, pick >> 24 & 7).parse().unwrap();
                     match pick >> 32 & 7 {
-                        0 | 1 => entry.device.add_addrs(&[addr]),
-                        2 => edit(&mut entry.device.addresses).retain(|a| a.ip != addr),
+                        0 | 1 => entry.device.borrow_mut().add_addrs(&[addr]),
+                        2 => edit(&mut entry.device.borrow_mut().addresses).retain(|a| a.ip != addr),
                         3 | 4 => {
                             let instance = format!("S{}._x{}._tcp.local", pick >> 40 & 3, pick >> 44 & 1);
                             let kind = format!("_x{}._tcp.local", pick >> 44 & 1);
                             let target = (pick >> 48 & 1 == 0).then(|| "somewhere.local".to_string());
-                            if !entry.device.services.iter().any(|s| s.instance() == instance) {
-                                edit(&mut entry.device.services).push(ServiceParts { instance, kind, target, ..Default::default() }.into());
+                            if !entry.device.borrow().services.iter().any(|s| s.instance() == instance) {
+                                edit(&mut entry.device.borrow_mut().services).push(ServiceParts { instance, kind, target, ..Default::default() }.into());
                             }
                         }
-                        5 => edit(&mut entry.device.services).clear(),
+                        5 => edit(&mut entry.device.borrow_mut().services).clear(),
                         6 => entry.refreshed = Some(start + Duration::from_secs(pick >> 8 & 63)),
-                        _ => edit(&mut entry.device.services).retain(|s| s.target().is_none()),
+                        _ => edit(&mut entry.device.borrow_mut().services).retain(|s| s.target().is_none()),
                     }
                 });
                 devices.reindex(id, &was);
@@ -129,15 +129,15 @@ fn the_tables_find_what_a_scan_of_the_devices_does_through_any_mix_of_changes() 
         for b in 0..8 {
             let addr: IpAddr = format!("10.5.{a}.{b}").parse().unwrap();
             let found = devices.ids_with_addr(&addr).map(|id| devices.get(id)).collect();
-            same(ptrs(found), ptrs(devices.iter().filter(|e| e.device.has_addr(&addr)).collect()));
+            same(ptrs(found), ptrs(devices.iter().filter(|e| e.device.borrow().has_addr(&addr)).collect()));
         }
     }
     for name in ["_x0._tcp.local", "_X1._tcp.LOCAL", "S1._x0._tcp.local", "host7.local", "HOST12.local", "_services._dns-sd._udp.local", "none"] {
-        same(ptrs(devices.with_name(name).collect()), ptrs(devices.iter().filter(|e| e.device.has_name(&Advertise::ALL, name)).collect()));
+        same(ptrs(devices.with_name(name).collect()), ptrs(devices.iter().filter(|e| e.device.borrow().has_name(&Advertise::ALL, name)).collect()));
     }
     same(
         ptrs(devices.with_unresolved().map(|(_, e)| e).collect()),
-        ptrs(devices.iter().filter(|e| e.device.services.iter().any(|s| s.target().is_none())).collect()),
+        ptrs(devices.iter().filter(|e| e.device.borrow().services.iter().any(|s| s.target().is_none())).collect()),
     );
     assert!(devices.with_name("_services._dns-sd._udp.local").count() > 0, "the test finds some");
     assert!(devices.with_unresolved().count() > 0 && devices.ids_with_addr(&"10.5.1.1".parse().unwrap()).count() > 0);

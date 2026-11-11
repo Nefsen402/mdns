@@ -121,7 +121,7 @@ fn a_txt_value_that_is_not_text_is_kept_as_it_came() {
     let srv = record("Dev._x._tcp.local", 120, RData::Srv { priority: 0, weight: 0, port: 1, target: "d.local".into() });
     told(&mut tracker, "10.0.1.5", &message(true, vec![a("d.local", "10.0.1.5", 120), srv, txt]));
     let id = tracker.discovered.find_host("d.local").unwrap();
-    let device = &tracker.discovered.get(id).device;
+    let device = tracker.discovered.get(id).device.borrow();
     assert_eq!(device.services[0].txt().collect::<Vec<_>>(), binary.clone());
 
     // And said again as it was, over the wire and back.
@@ -131,8 +131,9 @@ fn a_txt_value_that_is_not_text_is_kept_as_it_came() {
     assert_eq!(said, [&RData::Txt(binary)]);
 }
 
-/// What happened to a device is one event of it: that it came, what it was
-/// before it changed and what it is, and that it went as it was.
+/// What happened to a device is one event of it: that it came, that it is not
+/// as it was (it is the same device, which is what it is now), and that it went
+/// as it was last.
 #[test]
 fn an_event_says_what_a_device_was_and_what_it_is() {
     let mut tracker = Tracker::default();
@@ -142,17 +143,20 @@ fn an_event_says_what_a_device_was_and_what_it_is() {
     };
     let events = hear(&mut tracker, "10.0.1.5", &message(true, vec![a("tv.local", "10.0.1.5", 120)]));
     let [Event::Added(came)] = &events[..] else { panic!("{events:?}") };
-    assert_eq!(came.addrs().count(), 1);
+    assert_eq!(came.borrow().addrs().count(), 1);
+    let came = came.clone();
 
     let events = hear(&mut tracker, "10.0.1.5", &message(true, vec![a("tv.local", "10.0.1.5", 120)]));
     assert!(events.is_empty(), "heard again just as it was: {events:?}");
 
     let both = message(true, vec![a("tv.local", "10.0.1.5", 120), a("tv.local", "10.0.1.6", 120)]);
     let events = hear(&mut tracker, "10.0.1.5", &both);
-    let [Event::Updated { before, after }] = &events[..] else { panic!("{events:?}") };
-    assert_eq!((before.addrs().count(), after.addrs().count()), (1, 2));
+    let [Event::Updated(now)] = &events[..] else { panic!("{events:?}") };
+    assert_eq!(now.borrow().addrs().count(), 2);
+    assert!(now.is(&came), "the same device, which is what it is now: {events:?}");
 
     let events = hear(&mut tracker, "10.0.1.5", &message(true, vec![a("tv.local", "10.0.1.5", 0)]));
     let [Event::Removed(went)] = &events[..] else { panic!("{events:?}") };
-    assert_eq!(went.addrs().count(), 2, "gone as it was");
+    assert_eq!(went.borrow().addrs().count(), 2, "gone as it was");
+    assert!(went.is(&came));
 }

@@ -708,7 +708,7 @@ fn ask_for_types(groups: &[Group], name: &str, kinds: &[String]) {
 /// as it is filed.
 fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashMap<(String, String), Value>) -> Option<Value> {
     let removed = matches!(notice.event, Event::Removed(_));
-    let device = notice.event.device()?;
+    let device = notice.event.device()?.borrow();
     let key = device.key().map(|k| (notice.interface.clone(), k));
     let was_shown = key.as_ref().is_some_and(|k| shown.contains_key(k));
     match device.only_kinds(kinds) {
@@ -740,11 +740,11 @@ fn narrowed(segment: &str, notice: Notice, kinds: &[String], shown: &mut HashMap
 fn notice_json(segment: &str, notice: &Notice) -> Option<Value> {
     let event = match &notice.event {
         Event::Added(_) => "added",
-        Event::Updated { .. } => "updated",
+        Event::Updated(_) => "updated",
         Event::Removed(_) => "removed",
         Event::Question(_) => return None,
     };
-    Some(event_json(event, segment, &notice.interface, notice.event.device()?, notice.ttl))
+    Some(event_json(event, segment, &notice.interface, &notice.event.device()?.borrow(), notice.ttl))
 }
 
 /// A watch line saying `event` of `device`, which has `ttl` left, on `interface`.
