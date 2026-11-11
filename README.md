@@ -8,8 +8,8 @@ name and services.
 It has four uses, which are the same daemon with a different configuration,
 and **any combination of them runs at once**, from one config file, on the same
 interfaces or on different ones: a router that reflects between two networks,
-tracks a third and advertises itself on the first is one daemon (see
-[all three at once](#all-three-at-once)).
+tunnels to a remote site, tracks a third network and advertises itself on the
+first is one daemon (see [one config for every mode](#one-config-for-every-mode)).
 
 - **[A reflector](#reflecting-between-networks)** for a router with several
   networks (VLANs, a guest or IoT Wi-Fi): your phone on the LAN finds the
@@ -63,9 +63,9 @@ the speaker never hears the phone.
   flood from one sender never reaches another network (a
   [fuzzer](#fuzzing) checks this from outside). Reflection is never transitive,
   so networks that share an interface cannot echo devices back and forth.
-  Clashes are settled by the configuration: the network listed first wins a
-  hostname, and a device on the network itself always comes before a copy of
-  one from elsewhere.
+  Clashes are settled the same way each time: of one hostname found on several
+  networks, the one on the interface with the lowest index wins, and a device on
+  the network itself always comes before a copy of one from elsewhere.
 - **Quiet devices are found.** Many devices never announce themselves and only
   answer when asked. The daemon probes at startup, asks each device to answer
   again just before it would expire, and asks the other networks what clients
@@ -91,18 +91,23 @@ What the model does not hold does not cross:
   a device is announced by (see `mdnsd.conf(5)`).
 - Only mDNS is handled: SSDP/UPnP and LLMNR discovery are not.
 
-## Reflecting between networks
+## One config for every mode
 
-The configuration names groups of interfaces, called segments, whose devices
-are reflected between each other. For a router with a trusted LAN (`br0`), a
-media VLAN and an IoT Wi-Fi:
+Nothing in the config is global but `[Ipc]`, the daemon's own control socket:
+every other setting belongs to an interface, a segment or a name, so the four
+uses are written side by side in one file, and an interface can serve several.
+This one is for a router with a trusted LAN (`br0`), a media VLAN, an IoT Wi-Fi,
+a wired network it only watches (`eth0`) and a WireGuard tunnel to a remote
+site (`wg0`); each block is the mode it says, and any of them can be left out:
 
 ```ini
 # /etc/mdnsd.conf
+
+# Reflecting between networks. A segment reflects between every pair of its
+# interfaces, and an interface may be in several segments.
 #   br0   <-> media : each sees the other's devices
 #   br0   <-  wifi  : br0 sees the IoT devices, wifi sees nothing of br0
 #   media  x  wifi  : never see each other
-
 [Segment]
 Name=media_stuff
 Interfaces=br0,media
@@ -111,7 +116,59 @@ Interfaces=br0,media
 Name="IoT to br0"
 Interfaces=br0,wifi
 Untrusted=wifi
+
+# Reflecting over a tunnel that carries no multicast: Peer= says who is at the
+# other end of wg0, which is a daemon too, with Peer=10.8.0.1 on its own wg0.
+# What it announces is found from br0; nothing of br0 is announced to it.
+[Interface]
+Name=wg0
+Peer=10.8.0.2
+
+[Segment]
+Name=remote
+Interfaces=br0,wg0
+Untrusted=wg0
+
+# Tracking devices for scripts. A segment of one interface reflects nothing:
+# its devices are only tracked, and `mdnsctl devices lan` says what is there.
+[Segment]
+Name=lan
+Interfaces=eth0
+
+# Advertising this host, under .local, on br0, with the services it offers.
+[Advertise]
+Hostname=router.local
+Interface=br0
+Services=_ssh._tcp:22 _http._tcp:8080
+
+# What is kept of devices, for every interface, and for one: the interface
+# named is the exception, the one without a name the rule.
+[Interface]
+MaxAddresses=8
+MaxDevices=1024
+
+[Interface]
+Name=wifi
+MinimumLifetime=1h
+
+# The daemon itself: the control socket of `mdnsctl`, and Avahi's, so that
+# `ping router.local` works with Avahi gone.
+[Ipc]
+Socket=/run/mdnsd/mdnsd.sock
+AvahiSocket=/run/avahi-daemon/socket
 ```
+
+`br0` serves all four here: devices are reflected to it, it is a point of the
+tunnel's segment, the host is advertised on it, and it could be tracked too.
+Which uses a daemon has is what is written: only `[Advertise]` and a
+one-interface `[Segment]` make an advertiser, and a one-interface `[Segment]`
+alone a tracker. The sections below say what each does.
+
+## Reflecting between networks
+
+The configuration names groups of interfaces, called segments, whose devices
+are reflected between each other (the first two `[Segment]` blocks of the
+[config above](#one-config-for-every-mode)).
 
 - A segment reflects between **every pair** of its interfaces, and it may have
   as many as you like: `Interfaces=br0,media,guest,lab` lets all four see each
@@ -149,33 +206,13 @@ reflector (Avahi's `enable-reflector`) over the same interfaces.
 
 mDNS is multicast, and a tunnel such as WireGuard carries no multicast: it
 sends a packet only to a peer whose `AllowedIPs` has the destination, which the
-mDNS group is not. Run a daemon at each end and tell each where the other is,
-and they carry mDNS over the tunnel as unicast, to each other alone. For a
-home network (`br0`) and a remote site, joined by a WireGuard tunnel (`wg0`),
-home on `10.8.0.1` and the remote site on `10.8.0.2`:
-
-```ini
-# /etc/mdnsd.conf, at home
-[Interface]
-Name=wg0
-Peer=10.8.0.2
-
-[Segment]
-Name=remote
-Interfaces=br0,wg0
-Untrusted=wg0
-```
-
-```ini
-# /etc/mdnsd.conf, at the remote site
-[Interface]
-Name=wg0
-Peer=10.8.0.1
-
-[Segment]
-Name=home
-Interfaces=lan,wg0
-```
+mDNS group is not. Run a daemon at each end and tell each where the other is
+(`Peer=` on the tunnel's interface, in the [config above](#one-config-for-every-mode)),
+and they carry mDNS over the tunnel as unicast, to each other alone. For a home
+network (`br0`) and a remote site, joined by a WireGuard tunnel (`wg0`), home on
+`10.8.0.1` and the remote site on `10.8.0.2`, the config above is home's; the
+remote site's is the same with `Peer=10.8.0.1` on its `wg0`, in a segment of its
+own LAN and `wg0`.
 
 The remote site's devices are announced to home through the tunnel, and home
 reflects them into `br0`: the speakers there are found from the LAN here. At
@@ -205,15 +242,9 @@ each sees the other's devices, as two networks of a router do.
 This is not an mDNS client: the daemon is not started for a lookup and gone
 when it is done. It runs all the time, watching the network on your behalf,
 and a script, however short-lived, asks it what it has seen. For that, a
-segment of a single interface is enough: it reflects nothing, and its devices
+segment of a single interface is enough (`lan` in the
+[config above](#one-config-for-every-mode)): it reflects nothing, and its devices
 are only tracked.
-
-```ini
-# /etc/mdnsd.conf
-[Segment]
-Name=lan
-Interfaces=eth0
-```
 
 A client the script runs itself (`avahi-browse`, an mDNS library) only knows
 what answers while it is running, and most devices announce themselves once,
@@ -306,20 +337,9 @@ The daemon can announce the machine it runs on: its name under `.local`, with
 its addresses, and the services it offers. That is what Avahi does when it
 publishes a host and its service files, and it is the part of Avahi that a
 desktop or a router usually wants, so with this, nothing else need run for it.
-
-```ini
-# /etc/mdnsd.conf
-[Advertise]
-Hostname=alexdesktop
-Interface=br
-Services=_ssh._tcp:22 _http._tcp:8080
-
-# The interface it is advertised on is one the daemon listens to: a segment of
-# one interface reflects nothing.
-[Segment]
-Name=lan
-Interfaces=br
-```
+It is the `[Advertise]` block of the [config above](#one-config-for-every-mode),
+with a segment that has the interface, so that the daemon listens on it: a
+segment of one interface reflects nothing.
 
 - `Hostname=` is announced and answered for with **all** of the interface's
   addresses, of both families (global, ULA and link-local), and kept to them as
@@ -340,37 +360,6 @@ Interfaces=br
   (see `mdnsd.conf(5)`).
 
 No conflict detection is done: the name is taken to be yours alone.
-
-### All three at once
-
-Reflecting, tracking and advertising are settings of one config, and none
-gets in the way of another. A router that lets its LAN see the media VLAN,
-tracks the IoT Wi-Fi for scripts and offers ssh on the LAN:
-
-```ini
-# /etc/mdnsd.conf
-[Advertise]
-Hostname=router.local
-Interface=br0
-Services=_ssh._tcp:22
-
-# Reflecting: br0 and media see each other's devices.
-[Segment]
-Name=media_stuff
-Interfaces=br0,media
-Untrusted=media
-
-# Tracking: one interface, so nothing is reflected, and `mdnsctl devices IoT`
-# says what is there.
-[Segment]
-Name=IoT
-Interfaces=wifi
-```
-
-An interface can serve all three: `br0` here is reflected to, and advertised
-on, and could be tracked too. Which of them is wanted is what is written; a
-daemon with only `[Advertise]` and a one-interface `[Segment]` is only an
-advertiser, and one with only a one-interface `[Segment]` only a tracker.
 
 ## Building and running
 
