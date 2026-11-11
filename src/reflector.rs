@@ -203,8 +203,10 @@ impl Reflector {
 
     /// Stop spanning the segment of `interface`, as it is gone: what this
     /// reflector announced on it is withdrawn, and so is what it announced
-    /// elsewhere of what was found on it. What the segment had found is to be
-    /// forgotten and delivered ([`deliver`]) first, for the watches to be told.
+    /// elsewhere of what was found on it, which is each device the segment
+    /// has, and each one that could not be withdrawn already. What the segment
+    /// had found is to be forgotten and delivered ([`deliver`]) first, for the
+    /// watches to be told.
     pub fn remove(&self, interface: &str) {
         let removed = {
             let mut members = self.inner.members.borrow_mut();
@@ -215,13 +217,15 @@ impl Reflector {
             eprintln!("{interface}: withdrawing what was reflected failed: {e:#}");
         }
         let priority = removed.priority();
-        for member in self.inner.snapshot() {
-            if let Err(e) = member.segment.drop_origin(&self.inner.advertise, priority) {
-                eprintln!("{}: withdrawing what was reflected of {interface} failed: {e:#}", member.segment.interface());
+        let mut book = self.inner.book();
+        let mut devices = removed.shared_devices();
+        devices.extend(book.failed.iter().filter(|f| f.priority == priority).map(|f| f.device.clone()));
+        book.failed.retain(|f| f.target.interface() != interface && f.priority != priority);
+        for member in self.inner.snapshot().iter().filter(|m| !m.untrusted) {
+            for device in &devices {
+                self.inner.attempt(&mut book, &member.segment, priority, device, false);
             }
         }
-        let mut book = self.inner.book();
-        book.failed.retain(|f| f.target.interface() != interface && f.priority != priority);
         if book.failed.is_empty() {
             book.retry = None;
         }

@@ -1309,21 +1309,11 @@ impl Segment {
         state.settled(&host, vec![manual])
     }
 
-    /// Forget every device of the segment of `priority` that was to be shown
-    /// as `how` says, as it is gone. Every one is tried; the first error is
-    /// returned.
-    pub fn drop_origin(&self, how: &Rc<Advertise>, priority: u32) -> Result<()> {
-        self.withdraw_where(|m| Rc::ptr_eq(&m.how, how) && m.priority == priority)
-    }
-
     /// Forget everything that was to be shown as `how` says, with goodbyes
     /// for what is then no longer announced. Every one is tried; the first
     /// error is returned.
     pub fn withdraw_all(&self, how: &Rc<Advertise>) -> Result<()> {
-        self.withdraw_where(|m| Rc::ptr_eq(&m.how, how))
-    }
-
-    fn withdraw_where(&self, taken: impl Fn(&Manual) -> bool) -> Result<()> {
+        let taken = |m: &Manual| Rc::ptr_eq(&m.how, how);
         let hosts: Vec<String> = {
             let state = self.state.borrow();
             state.hosts.iter().filter(|h| h.manuals.iter().any(&taken)).map(|h| h.host.to_string()).collect()
@@ -1332,7 +1322,7 @@ impl Segment {
         for host in hosts {
             let mut guard = self.state.borrow_mut();
             let state = &mut *guard;
-            let manuals = state.hosts.take_where(&host, &taken);
+            let manuals = state.hosts.take_where(&host, taken);
             if let Err(e) = state.settled(&host, manuals) {
                 first_err.get_or_insert(e);
             }

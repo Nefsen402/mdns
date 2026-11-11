@@ -841,6 +841,33 @@ fn failed_sends_are_retried_until_they_go_through() {
     assert!(told.iter().any(|r| r.data == RData::A("10.0.1.5".parse().unwrap()) && r.ttl == 0), "{told:?}");
 }
 
+/// A copy whose goodbye could not go out when its device went is not left
+/// behind when its segment goes: it is withdrawn, tried again until it is.
+#[test]
+fn a_copy_whose_goodbye_failed_is_withdrawn_when_its_segment_goes() {
+    let (a, _a_rx) = wired("a");
+    let (b, b_rx) = wired("b");
+    let r = Reflector::new(vec![a.clone(), b.clone()]).unwrap();
+    announce(&a, "10.0.1.5", "tv.local", &["TV"]);
+    deliver_made();
+    assert_eq!(b.manual_devices().len(), 1);
+
+    let (socket, dest) = (UdpSocket::bind("127.0.0.1:0").unwrap(), "[::1]:5353".parse::<SocketAddr>().unwrap());
+    b.attach(Family::V4, fd(socket), dest);
+    a.forget_discovered();
+    deliver_made();
+    assert_eq!(b.manual_devices().len(), 1, "kept: its goodbye did not go out");
+
+    // The device is not a's any more, only a copy of it is left, and a goes.
+    r.remove("a");
+    assert_eq!(b.manual_devices().len(), 1, "still: b cannot send");
+    let retry = r.next_retry().expect("to be tried again");
+    b.attach(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), b_rx.local_addr().unwrap());
+    retry_made(retry);
+    assert!(b.manual_devices().is_empty());
+    assert_eq!(r.next_retry(), None);
+}
+
 /// A device that announces only a link-local IPv6 address, and no IPv4
 /// one, cannot be reflected; once the neighbour table lists a routable
 /// address under its link-layer address, it is, with that address, and

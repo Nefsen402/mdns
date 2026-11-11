@@ -2561,9 +2561,10 @@ fn of_one_name_from_two_segments_the_lowest_is_announced_and_the_next_takes_over
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.2.2")]), "the other takes over");
 
     b.reflect(1, &low, &reflector(0), None).unwrap();
-    b.drop_origin(&reflector(0), 1).unwrap();
+    assert!(b.manual_devices()[0].addrs().eq([ip("10.0.1.1")]), "back, and first");
+    b.withdraw_all(&reflector(0)).unwrap();
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.2.2")]));
-    b.drop_origin(&reflector(1), 2).unwrap();
+    b.unreflect(&reflector(1), &high).unwrap();
     assert!(b.manual_devices().is_empty());
 }
 
