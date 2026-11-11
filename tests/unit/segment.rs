@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 
 use super::*;
+use crate::device::EditService;
 use crate::config::{DEFAULT_MAX_DEVICES, DEFAULT_MIN_LIFETIME};
 use crate::device::{addr_of, edit, Origin, META_QUERY};
 use crate::tracker::MAX_PER_SENDER;

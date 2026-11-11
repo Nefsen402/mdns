@@ -169,6 +169,36 @@ impl From<ServiceParts> for Service {
     }
 }
 
+impl From<ServiceParts> for Rc<Service> {
+    fn from(parts: ServiceParts) -> Rc<Service> {
+        Rc::new(parts.into())
+    }
+}
+
+/// Changing a service that a device holds in an `Rc`, as [`Service::edit`]
+/// does one that is held alone: it is made again only if it is not as it was,
+/// and then a copy, if it is held by a copy of the device too, so that theirs
+/// stays as it was.
+pub trait EditService {
+    fn edit(&mut self, f: impl FnOnce(&mut ServiceParts)) -> bool;
+}
+
+impl EditService for Rc<Service> {
+    fn edit(&mut self, f: impl FnOnce(&mut ServiceParts)) -> bool {
+        let mut parts = self.parts();
+        f(&mut parts);
+        let block = parts.encode().into_boxed_slice();
+        if *block == *self.block {
+            return false;
+        }
+        match Rc::get_mut(self) {
+            Some(service) => service.block = block,
+            None => *self = Rc::new(Service { block }),
+        }
+        true
+    }
+}
+
 impl Default for Service {
     fn default() -> Service {
         ServiceParts::default().into()
@@ -320,7 +350,7 @@ pub struct Device {
     pub addresses: Box<[Address]>,
     /// Those it learned of are in order of their instance names, ignoring
     /// case: names that differ only in case are one and the same.
-    pub services: Box<[Service]>,
+    pub services: Box<[Rc<Service>]>,
     /// The TTL its address records were last announced with, in seconds;
     /// `None` if it has not announced any (it was only heard from).
     pub ttl: Option<u32>,
@@ -799,7 +829,7 @@ impl Device {
     }
 
     /// Its services as `how` would advertise them.
-    pub fn advertised_services<'a>(&'a self, how: &'a Advertise) -> impl Iterator<Item = &'a Service> + 'a {
+    pub fn advertised_services<'a>(&'a self, how: &'a Advertise) -> impl Iterator<Item = &'a Rc<Service>> + 'a {
         self.services.iter().filter(move |s| (!how.resolved_only || s.is_resolved()) && how.allows(s.kind()))
     }
 
@@ -901,7 +931,7 @@ impl Device {
 
     /// Its service called `instance`, ignoring case.
     pub fn service(&self, instance: &str) -> Option<&Service> {
-        self.services.iter().find(|s| s.instance().eq_ignore_ascii_case(instance))
+        self.services.iter().map(|s| &**s).find(|s| s.instance().eq_ignore_ascii_case(instance))
     }
 
     /// Forget its service called `instance`, ignoring case.
@@ -1107,7 +1137,7 @@ impl Device {
     /// until a PTR record states it explicitly. It keeps the spelling it was
     /// first heard with, whatever the case of later records. `None` if it is
     /// new and the device has `max_services` already.
-    fn service_mut(&mut self, instance: &str, max_services: usize) -> Option<&mut Service> {
+    fn service_mut(&mut self, instance: &str, max_services: usize) -> Option<&mut Rc<Service>> {
         let at = match self.services.iter().position(|s| s.instance().eq_ignore_ascii_case(instance)) {
             Some(at) => at,
             None if self.services.len() >= max_services => return None,
@@ -1124,7 +1154,7 @@ impl Device {
     }
 
     /// Add `svc` in its place among the services, and return where that is.
-    fn insert_service(&mut self, svc: Service) -> usize {
+    fn insert_service(&mut self, svc: Rc<Service>) -> usize {
         let key = svc.instance().to_ascii_lowercase();
         let at = self.services.partition_point(|s| s.instance().to_ascii_lowercase() < key);
         edit(&mut self.services).insert(at, svc);
@@ -1203,7 +1233,7 @@ impl Device {
         let Advertised { device: new, how: new_how, .. } = new;
         let mut records = new.announcement(new_how, host_ttl, other_ttl);
         let kept: HashMap<String, &Service> =
-            new.advertised_services(new_how).map(|s| (s.instance().to_ascii_lowercase(), s)).collect();
+            new.advertised_services(new_how).map(|s| (s.instance().to_ascii_lowercase(), &**s)).collect();
         for svc in self.advertised_services(how) {
             match kept.get(&svc.instance().to_ascii_lowercase()) {
                 None => records.extend(self.service_records(svc, 0)),
@@ -1341,7 +1371,7 @@ impl Device {
         for kind in kinds {
             qs.ask(kind, rtype::PTR);
         }
-        let of_kind = |s: &&Service| kinds.iter().any(|k| s.kind().eq_ignore_ascii_case(k));
+        let of_kind = |s: &&Rc<Service>| kinds.iter().any(|k| s.kind().eq_ignore_ascii_case(k));
         for svc in devices.iter().flat_map(|d| &d.services).filter(of_kind).filter(|s| s.target().is_none()) {
             qs.ask(&svc.instance(), rtype::SRV);
             qs.ask(&svc.instance(), rtype::TXT);
@@ -1357,7 +1387,7 @@ impl Device {
     /// The device as far as the service types `kinds` go: its services of
     /// one of them, or `None` if it has none.
     pub fn only_kinds(&self, kinds: &[String]) -> Option<Device> {
-        let services: Vec<Service> =
+        let services: Vec<Rc<Service>> =
             self.services.iter().filter(|s| kinds.iter().any(|k| s.kind().eq_ignore_ascii_case(k))).cloned().collect();
         (!services.is_empty()).then(|| Device { services: services.into(), ..self.clone() })
     }

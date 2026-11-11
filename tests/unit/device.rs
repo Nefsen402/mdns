@@ -658,7 +658,7 @@ fn learned_addresses_can_be_kept_to_families_with_a_link_local_address() {
 /// stops showing it says goodbye to it.
 #[test]
 fn services_are_announced_as_they_are_advertised() {
-    let service = |instance: &str, kind: &str, target: Option<&str>| -> Service {
+    let service = |instance: &str, kind: &str, target: Option<&str>| -> Rc<Service> {
         ServiceParts {
             instance: format!("{instance}.{kind}.local"),
             kind: format!("{kind}.local"),
@@ -693,6 +693,28 @@ fn services_are_announced_as_they_are_advertised() {
     assert!(d.has_name(&Advertise::ALL, "_ssh._tcp.local") && !d.has_name(&how, "_ssh._tcp.local"));
     let goodbyes = d.replacement(&Advertise::ALL, Advertised { device: &d, how: &how, host_ttl: 120 }, 120, 4500);
     assert_eq!(srv(goodbyes, 0), ["Bare._ipp._tcp.local", "Shell._ssh._tcp.local"]);
+}
+
+/// A service is held once by a device and its copies: changing it as it is
+/// does nothing, and changing it gives the changed one a copy of its own, while
+/// the others keep what they had.
+#[test]
+fn a_service_is_held_once_and_copied_only_when_it_is_changed() {
+    let mut device = tv("10.0.1.9", &["TV"]);
+    let copy = device.clone();
+    assert!(Rc::ptr_eq(&device.services[0], &copy.services[0]), "a copy of the device holds the same service");
+
+    assert!(!device.services[0].edit(|p| p.port = 8080), "not changed");
+    assert!(Rc::ptr_eq(&device.services[0], &copy.services[0]), "and not copied");
+
+    assert!(device.services[0].edit(|p| p.port = 81));
+    assert_eq!((device.services[0].port(), copy.services[0].port()), (81, 8080), "the copy has what it had");
+    assert!(!Rc::ptr_eq(&device.services[0], &copy.services[0]));
+
+    // Held by one, it is changed where it is.
+    let at = Rc::as_ptr(&device.services[0]);
+    assert!(device.services[0].edit(|p| p.port = 82));
+    assert_eq!(Rc::as_ptr(&device.services[0]), at);
 }
 
 /// Learned addresses count towards how many of a family are kept.

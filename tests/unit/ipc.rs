@@ -22,6 +22,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::device::EditService;
 
 /// A segment that keeps a device at least five minutes, which is what these
 /// tests of what is listed assume; the default keeps one for its TTL.
