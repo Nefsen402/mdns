@@ -19,7 +19,11 @@ follows_changes = unittest.skipUnless(FOLLOWS_CHANGES, "the daemon does not foll
 
 def conf(body, ipv6=False):
     """A config, with IPv6 left out unless wanted: most scenarios are of IPv4."""
-    return ("" if ipv6 else "[Listen]\nIPv6=off\n") + body
+    if ipv6:
+        return body
+    # In the section for every interface, which there is one of, if the body has it.
+    header = "[Interface]\n"
+    return header + "IPv6=off\n" + (body[len(header):] if body.startswith(header) else body)
 
 
 def alive(owner, rtype=None, data=None):
@@ -744,7 +748,7 @@ class Unicast(Case):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         # A packet from an address that is not on the link is not for the kernel to drop.
         self.lab.net.relax_source_checks()
-        d = self.lab.daemon(f"[Listen]\nIPv4={listen}\nIPv6=off\n[Segment]\nName=s\nInterfaces=ra\n")
+        d = self.lab.daemon(f"[Interface]\nIPv4={listen}\nIPv6=off\n[Segment]\nName=s\nInterfaces=ra\n")
         dev = la.device(source)
         dev.unicast(announcement("tv", source, "TV"), "10.9.1.1")
         return d
@@ -903,8 +907,8 @@ class Startup(Case):
         cases = [
             ("[Segment]\nName=s\nInterfaces=ra\nBogus=1\n", r'line 4: unknown setting "bogus"'),
             ("[Segment]\nName=s\n", r"has no Interfaces="),
-            ("[Listen]\nIPv4=off\nIPv6=off\n[Segment]\nName=s\nInterfaces=ra\n", r"both off"),
-            ("[Listen]\nIPv4=yes\n[Segment]\nName=s\nInterfaces=ra\n", r"must be off, multicast or on"),
+            ("[Interface]\nIPv4=off\nIPv6=off\n[Segment]\nName=s\nInterfaces=ra\n", r"both off"),
+            ("[Interface]\nIPv4=yes\n[Segment]\nName=s\nInterfaces=ra\n", r"must be off, multicast or on"),
             ("[Advertise]\nServices=_ssh._tcp:22\n[Segment]\nName=s\nInterfaces=ra\n", r"no Hostname="),
             ("[Advertise]\nHostname=pc\nInterface=other\n[Segment]\nName=s\nInterfaces=ra\n", r"not in any segment"),
             ("[Advertise]\nHostname=pc\n[Advertise]\nHostname=pc\n[Segment]\nName=s\nInterfaces=ra\n", r"same interface"),

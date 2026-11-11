@@ -231,7 +231,7 @@ Things to know when using it this way:
   on the link anyway. `[Ipc] Mode=0660` limits it to the `mdnsd` group.
 - It shares port 5353 with Avahi or systemd-resolved, so they can stay.
 - It still sends a little: a probe at startup, a question to each device about
-  to expire, sent to the device itself unless `[Listen]` says `multicast`
+  to expire, sent to the device itself unless `[Interface]` says `IPv4=multicast` (and `IPv6=`)
   (`[Interface] RefreshBefore=off` stops that, at the cost of quiet devices dropping
   off when their records run out), and what `--query` asks.
   Without `[Advertise]` it announces nothing of its own.
@@ -348,7 +348,7 @@ and the daemon hands the datagram to that interface, in userspace; one that
 came in on an interface it does not serve is dropped. Sending says which
 interface it goes out of, each time. A datagram is read once, whichever
 interface it came in on. What is sent to port 5353 itself, not to the group, is
-heard unless `[Listen]` says `multicast` for the family (the group alone), as on
+heard unless `[Interface]` says `multicast` for the family (the group alone), as on
 Linux, and then only from a host on the interface's networks or link-local.
 
 Where it does less than on Linux:

@@ -36,7 +36,7 @@ use time::Instant;
 
 use anyhow::{Context, Result};
 
-use config::{AdvertiseConfig, Config, Forward, Interface, Neighbours};
+use config::{AdvertiseConfig, Config, Forward, Interface, Listen, Neighbours};
 use netlink::{Event, Netlink};
 use reflector::Reflector;
 use segment::Segment;
@@ -84,14 +84,20 @@ fn daemon(args: Vec<String>) -> Result<()> {
     };
     let config = Config::load(&path)?;
 
-    let families: Vec<Family> = [(config.ipv4, Family::V4), (config.ipv6, Family::V6)]
-        .into_iter()
-        .filter_map(|(listen, family)| listen.enabled().then_some(family))
-        .collect();
-    let unicast: Vec<Family> = [(config.ipv4, Family::V4), (config.ipv6, Family::V6)]
-        .into_iter()
-        .filter_map(|(listen, family)| listen.unicast().then_some(family))
-        .collect();
+    // What any interface uses, for what is shared by them all: those that are
+    // named, and any other, which has what is set for every interface.
+    let anywhere: Vec<Interface> = config.interfaces().into_iter().chain([config.interface("")]).collect();
+    let used = |on: fn(Listen) -> bool| -> Vec<Family> {
+        let mut used: Vec<Family> = Vec::new();
+        for family in anywhere.iter().flat_map(|interface| families_of(interface, on)) {
+            if !used.contains(&family) {
+                used.push(family);
+            }
+        }
+        used
+    };
+    let families = used(Listen::enabled);
+    let unicast = used(Listen::unicast);
 
     // Hear of interfaces coming and going from before the sockets are opened,
     // so that no change in between is missed.
@@ -156,7 +162,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // there yet is waited for.
     let hub = Rc::new(socket::Hub::new(&families, &unicast).context("opening the sockets")?);
     let interfaces = config.interfaces();
-    let mut ifaces = Ifaces { config: &config, families: families.clone(), unicast, hub, groups: &segments, live: Vec::new(), seen: HashSet::new(), skipped: HashSet::new() };
+    let mut ifaces = Ifaces { config: &config, hub, groups: &segments, live: Vec::new(), seen: HashSet::new(), skipped: HashSet::new() };
     for interface in &interfaces {
         if ifaces.add(&interface.name)? == Opened::Absent {
             eprintln!("{}: not there yet; waiting for it", interface.name);
@@ -207,6 +213,15 @@ fn daemon(args: Vec<String>) -> Result<()> {
     drop(segments);
     let _ = rustix::fs::unlink(config.socket.as_str());
     Ok(())
+}
+
+/// The families `interface` is to use that `on` says of what is listened for
+/// over them.
+fn families_of(interface: &Interface, on: fn(Listen) -> bool) -> Vec<Family> {
+    [(interface.ipv4, Family::V4), (interface.ipv6, Family::V6)]
+        .into_iter()
+        .filter_map(|(listen, family)| on(listen).then_some(family))
+        .collect()
 }
 
 /// Say what is settled for `interface`.
@@ -276,9 +291,6 @@ enum Opened {
 /// so none is kept across that.
 struct Ifaces<'a> {
     config: &'a Config,
-    families: Vec<Family>,
-    /// The families of which what is sent to the daemon itself is heard too.
-    unicast: Vec<Family>,
     hub: Rc<Hub>,
     /// The reflector of each segment of the config, in its order.
     groups: &'a [Group],
@@ -298,6 +310,11 @@ struct Iface {
     advertise: Vec<AdvertiseConfig>,
     /// The interface's index.
     index: u32,
+    /// The families it uses, and those of which what is sent to the daemon
+    /// itself is heard too.
+    families: Vec<Family>,
+    #[cfg_attr(not(all(target_os = "linux", not(feature = "portable-sockets"))), allow(dead_code))]
+    unicast: Vec<Family>,
     /// The families it is there and not listened to over, as it has no address to
     /// join the group by yet (IPv4, where the sockets are shared): they are
     /// joined when it has one.
@@ -336,15 +353,22 @@ impl Ifaces<'_> {
             }
             return Ok(Opened::Absent);
         }
-        let mut iface = Iface::new(&self.config.interface(name), index, self);
+        let interface = self.config.interface(name);
+        if families_of(&interface, Listen::enabled).is_empty() {
+            if self.skipped.insert(name.to_string()) {
+                eprintln!("{name}: IPv4= and IPv6= are both off for it");
+            }
+            return Ok(Opened::Absent);
+        }
+        let mut iface = Iface::new(&interface, index, self);
         iface.take_mtu(socket::mtu(name).ok());
         // Of the families it has no address to join the group over, only what is
         // waited for waits: IPv6 is listened to when IPv4 cannot be yet.
-        iface.missing = self.families.iter().copied().filter(|&f| !socket::joinable(name, f)).collect();
+        iface.missing = iface.families.iter().copied().filter(|&f| !socket::joinable(name, f)).collect();
         if !iface.missing.is_empty() {
             eprintln!("{name}: no IPv4 address yet: IPv4 is listened to when it has one");
         }
-        if iface.missing.len() == self.families.len() {
+        if iface.missing.len() == iface.families.len() {
             return Ok(Opened::Waiting);
         }
         iface.open_sockets(self)?;
@@ -357,7 +381,7 @@ impl Ifaces<'_> {
             eprintln!("{name}: up");
         }
         eprintln!("{name}: {how} (index {index}), listening");
-        iface.addresses_changed(&self.families);
+        iface.addresses_changed();
         for (seg, group) in self.config.segments.iter().zip(self.groups) {
             if seg.has(name) {
                 group.reflector.add(iface.segment.clone())?;
@@ -420,7 +444,7 @@ impl Ifaces<'_> {
                     self.remove(at);
                     self.add(name)?;
                 }
-                Some(at) => self.live[at].addresses_changed(&self.families),
+                Some(at) => self.live[at].addresses_changed(),
                 // Perhaps one that is there, and had no address to be joined to the group by.
                 None => {
                     self.add(name)?;
@@ -441,10 +465,12 @@ impl Iface {
     /// config say of it. It has no sockets until
     /// [`open_sockets`](Iface::open_sockets).
     fn new(interface: &Interface, index: u32, ifaces: &Ifaces) -> Iface {
-        let segment = Segment::new(&interface.name, &ifaces.families);
+        let families = families_of(interface, Listen::enabled);
+        let unicast = families_of(interface, Listen::unicast);
+        let segment = Segment::new(&interface.name, &families);
         segment.set_min_lifetime(interface.min_lifetime);
         segment.set_max_addrs(interface.max_addrs);
-        segment.set_direct(&ifaces.unicast);
+        segment.set_direct(&unicast);
         segment.set_max_devices(interface.max_devices);
         segment.set_max_services(interface.max_services);
         segment.set_reannounce(interface.reannounce);
@@ -466,6 +492,8 @@ impl Iface {
                 .cloned()
                 .collect(),
             index,
+            families,
+            unicast,
             missing: Vec::new(),
             mtu: None,
             sockets: Vec::new(),
@@ -476,8 +504,9 @@ impl Iface {
     #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
     fn open_sockets(&mut self, ifaces: &Ifaces) -> Result<()> {
         let mut sockets = Vec::new();
-        for &family in &ifaces.families {
-            let sock = socket::open(&self.name, family, ifaces.unicast.contains(&family))
+        let _ = ifaces;
+        for &family in &self.families {
+            let sock = socket::open(&self.name, family, self.unicast.contains(&family))
                 .with_context(|| format!("opening {family:?} socket on {}", self.name))?;
             sockets.push(sock);
         }
@@ -498,7 +527,7 @@ impl Iface {
     /// The shared sockets, joined to the group on this interface.
     #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
     fn open_sockets(&mut self, ifaces: &Ifaces) -> Result<()> {
-        for &family in ifaces.families.iter().filter(|f| !self.missing.contains(f)) {
+        for &family in self.families.iter().filter(|f| !self.missing.contains(f)) {
             let (tx, dest) = ifaces
                 .hub
                 .join(&self.name, family)
@@ -512,7 +541,7 @@ impl Iface {
     /// Let go of the sockets: the shared ones leave the group on this interface.
     fn close(self, ifaces: &Ifaces) {
         #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
-        for &family in &ifaces.families {
+        for &family in &self.families {
             ifaces.hub.leave(&self.name, family);
         }
         #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
@@ -521,7 +550,7 @@ impl Iface {
 
     /// The interface's addresses are new: tell its segment the networks it is
     /// on, and announce the advertised name with them.
-    fn addresses_changed(&self, families: &[Family]) {
+    fn addresses_changed(&self) {
         match socket::prefixes(&self.name) {
             Ok(prefixes) => self.segment.set_prefixes(prefixes),
             Err(e) => eprintln!("{}: {e:#}", self.name),
@@ -532,7 +561,7 @@ impl Iface {
         if self.advertise.is_empty() {
             return;
         }
-        let addrs = socket::addresses(&self.name, families).unwrap_or_default();
+        let addrs = socket::addresses(&self.name, &self.families).unwrap_or_default();
         for block in &self.advertise {
             self.segment.advertise(block, &addrs);
         }

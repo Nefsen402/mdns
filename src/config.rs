@@ -278,6 +278,8 @@ struct InterfaceConfig {
     max_addrs: Option<usize>,
     max_devices: Option<usize>,
     max_services: Option<usize>,
+    ipv4: Option<Listen>,
+    ipv6: Option<Listen>,
 }
 
 /// Everything that is settled for one interface, with every default filled in,
@@ -307,6 +309,10 @@ pub struct Interface {
     /// How many services a device heard on it is kept with, at most:
     /// [`DEFAULT_MAX_SERVICES`] unless set.
     pub max_services: usize,
+    /// What it listens for, and announces, over each family: [`Listen::On`]
+    /// unless set.
+    pub ipv4: Listen,
+    pub ipv6: Listen,
     /// Whether what is announced on it is announced again though it has not
     /// changed: if any of its segments says so.
     pub reannounce: bool,
@@ -345,8 +351,6 @@ pub struct Config {
     /// What each `[Interface]` section sets, which [`Config::interface`] makes
     /// the settings of an interface of.
     settings: Vec<InterfaceConfig>,
-    pub ipv4: Listen,
-    pub ipv6: Listen,
     /// Where the IPC server listens.
     pub socket: String,
     /// The permissions of the control socket.
@@ -363,8 +367,6 @@ impl Default for Config {
         Config {
             segments: Vec::new(),
             settings: Vec::new(),
-            ipv4: Listen::default(),
-            ipv6: Listen::default(),
             socket: DEFAULT_SOCKET.to_string(),
             socket_mode: DEFAULT_SOCKET_MODE,
             avahi_socket: None,
@@ -395,6 +397,8 @@ impl Config {
             max_addrs: setting_of(&self.settings, name, DEFAULT_MAX_ADDRS, |i| i.max_addrs),
             max_devices: setting_of(&self.settings, name, DEFAULT_MAX_DEVICES, |i| i.max_devices),
             max_services: setting_of(&self.settings, name, DEFAULT_MAX_SERVICES, |i| i.max_services),
+            ipv4: setting_of(&self.settings, name, Listen::default(), |i| i.ipv4),
+            ipv6: setting_of(&self.settings, name, Listen::default(), |i| i.ipv6),
             reannounce: segments.any(|seg| seg.reannounce),
         }
     }
@@ -539,8 +543,8 @@ impl Config {
                     ("segment", "forwardquestions") => {
                         config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
                     }
-                    ("listen", "ipv4") => config.ipv4 = parse_listen(entry, lineno, "IPv4")?,
-                    ("listen", "ipv6") => config.ipv6 = parse_listen(entry, lineno, "IPv6")?,
+                    ("interface", "ipv4") => settings.last_mut().unwrap().ipv4 = Some(parse_listen(entry, lineno, "IPv4")?),
+                    ("interface", "ipv6") => settings.last_mut().unwrap().ipv6 = Some(parse_listen(entry, lineno, "IPv6")?),
                     ("probe", "probeinterval" | "interval") => {
                         bail!("line {lineno}: ProbeInterval= is now a setting of [Interface]")
                     }
@@ -608,10 +612,15 @@ impl Config {
         if self.segments.is_empty() {
             bail!("no [Segment] defined");
         }
-        if !self.ipv4.enabled() && !self.ipv6.enabled() {
-            bail!("[Listen] IPv4= and IPv6= are both off");
-        }
         let listened = self.interface_names();
+        // What is on for an interface is what its section says, over what the
+        // one for every interface does.
+        for name in listened.iter().filter(|name| !is_pattern(name)) {
+            let on = |get: fn(&InterfaceConfig) -> Option<Listen>| setting_of(settings, name, Listen::default(), get).enabled();
+            if !on(|i| i.ipv4) && !on(|i| i.ipv6) {
+                bail!("interface {name} has IPv4= and IPv6= both off");
+            }
+        }
         for (i, block) in self.advertise.iter().enumerate() {
             let at = advertise_lines[i];
             if block.name.is_empty() {

@@ -290,7 +290,7 @@ fn man_page_documents_every_key_and_its_example_parses() {
     }
     assert!(man.contains(DEFAULT_SOCKET));
 
-    let start = man.find("[Listen]\nIPv4").expect("example in the man page");
+    let start = man.find("[Ipc]\nSocket=/run").expect("example in the man page");
     let example = &man[start..start + man[start..].find("\n.fi").unwrap()];
     let c = Config::parse(example).unwrap();
     assert_eq!(c.segments.len(), 3);
@@ -308,17 +308,19 @@ fn parses_segments() {
         ]
     );
     assert_eq!(c.interfaces().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["br0", "media", "wifi"]);
-    assert_eq!((c.ipv4, c.ipv6), (Listen::On, Listen::On));
+    let br0 = c.interface("br0");
+    assert_eq!((br0.ipv4, br0.ipv6), (Listen::On, Listen::On));
 }
 
 #[test]
 fn keys_are_case_insensitive_and_lists_flexible() {
     let c = Config::parse(
-        "# c\n[Listen]\nIPv6=off\n[SEGMENT]\nNAME = 'a b'\nInterfaces=x y, z\nInterfaces=w\n",
+        "# c\n[Interface]\nIPv6=off\n[SEGMENT]\nNAME = 'a b'\nInterfaces=x y, z\nInterfaces=w\n",
     )
     .unwrap();
     assert_eq!(c.segments, [seg("a b", &["x", "y", "z", "w"])]);
-    assert_eq!((c.ipv4, c.ipv6), (Listen::On, Listen::Off));
+    let x = c.interface("x");
+    assert_eq!((x.ipv4, x.ipv6), (Listen::On, Listen::Off), "what is set for every interface is set for each");
 }
 
 #[test]
@@ -369,30 +371,51 @@ fn syntax_errors_name_their_line() {
 fn semantic_errors_name_their_line() {
     let with = |body: &str| error_of(&format!("\n# comment\n{body}"));
     assert!(with("[Segment]\nName=a\nInterfaces=x\nBogus=1\n").contains("line 6"), "unknown key");
-    assert!(with("[Listen]\nIPv4=maybe\n[Segment]\nName=a\nInterfaces=x\n").contains("line 4"), "bad value");
+    assert!(with("[Interface]\nIPv4=maybe\n[Segment]\nName=a\nInterfaces=x\n").contains("line 4"), "bad value");
     assert!(with("[Segment]\nInterfaces=x\n").contains("line 3"), "segment without a name, at its header");
     assert!(with("[Advertise]\nHostname=router.lan\n").contains("line 4"), "hostname outside .local");
 }
 
 #[test]
 fn a_family_is_listened_to_off_multicast_or_on_and_nothing_else() {
-    let parse = |v: &str| Config::parse(&format!("[Listen]\nIPv4={v}\nIPv6=multicast\n[Segment]\nName=a\nInterfaces=x\n"));
+    let parse = |v: &str| Config::parse(&format!("[Interface]\nIPv4={v}\nIPv6=multicast\n[Segment]\nName=a\nInterfaces=x\n"));
     for (value, listen) in [("off", Listen::Off), ("multicast", Listen::Multicast), ("on", Listen::On), ("ON", Listen::On), ("\"Multicast\"", Listen::Multicast)] {
-        assert_eq!(parse(value).unwrap().ipv4, listen, "{value}");
+        assert_eq!(parse(value).unwrap().interface("x").ipv4, listen, "{value}");
     }
     assert!((Listen::Multicast.enabled(), Listen::Off.enabled()) == (true, false));
     assert_eq!((Listen::On.unicast(), Listen::Multicast.unicast(), Listen::Off.unicast()), (true, false, false));
     // Unset, it is on.
     let c = Config::parse("[Segment]\nName=a\nInterfaces=x\n").unwrap();
-    assert_eq!((c.ipv4, c.ipv6), (Listen::On, Listen::On));
-    // Both off is nothing to listen to.
-    let both_off = error_of("[Listen]\nIPv4=off\nIPv6=off\n[Segment]\nName=a\nInterfaces=x\n");
+    let x = c.interface("x");
+    assert_eq!((x.ipv4, x.ipv6), (Listen::On, Listen::On));
+    // Both off is nothing to listen to, for an interface that is named.
+    let both_off = error_of("[Interface]\nIPv4=off\nIPv6=off\n[Segment]\nName=a\nInterfaces=x\n");
     assert!(both_off.contains("both off"), "{both_off}");
     // Nothing else is one of them, and the error says which line and what was written.
     for other in ["yes", "no", "true", "1", "0", "enabled", ""] {
         let err = parse(other).unwrap_err().to_string();
         assert!(err.contains("line 2") && err.contains("IPv4= must be off, multicast or on"), "{other:?}: {err}");
     }
+}
+
+/// What is set in the section for every interface is what each has, unless its
+/// own section, or one named for a pattern it matches, says otherwise, a setting
+/// at a time.
+#[test]
+fn the_section_for_every_interface_is_what_the_others_start_from() {
+    let c = Config::parse(
+        "[Interface]\nIPv6=off\nMaxDevices=10\n[Interface]\nName=x\nIPv4=multicast\nIPv6=on\n[Interface]\nName=w*\nMaxDevices=20\n[Segment]\nName=a\nInterfaces=x,wlan0,y\n",
+    )
+    .unwrap();
+    let listens = |name: &str| (c.interface(name).ipv4, c.interface(name).ipv6);
+    assert_eq!(listens("x"), (Listen::Multicast, Listen::On), "its own, setting by setting");
+    assert_eq!(listens("y"), (Listen::On, Listen::Off), "what is set for every one, and the default of what is not");
+    assert_eq!((c.interface("y").max_devices, c.interface("wlan0").max_devices, c.interface("x").max_devices), (10, 20, 10));
+    // An interface only named has nothing on if that is what it comes to.
+    let off = error_of("[Interface]\nIPv6=off\n[Interface]\nName=x\nIPv4=off\n[Segment]\nName=a\nInterfaces=x\n");
+    assert!(off.contains("interface x") && off.contains("both off"), "{off}");
+    // Whichever is for every interface, a pattern may match one that has nothing on.
+    assert!(Config::parse("[Interface]\nIPv4=off\nIPv6=off\n[Interface]\nName=x\nIPv6=on\n[Segment]\nName=a\nInterfaces=x,y*\n").is_ok());
 }
 
 #[test]
@@ -589,6 +612,8 @@ fn each_interface_is_settled_once_with_its_defaults_filled_in() {
             max_addrs: DEFAULT_MAX_ADDRS,
             max_devices: DEFAULT_MAX_DEVICES,
             max_services: DEFAULT_MAX_SERVICES,
+            ipv4: Listen::On,
+            ipv6: Listen::On,
             reannounce: false,
         }
     );
@@ -800,7 +825,7 @@ fn rejects_bad_input() {
             "[Segment]\nName=a\nInterfaces=x,y\n[Segment]\nName=b\nInterfaces=y,x,z\n",
             "two segments reflect the same pair",
         ),
-        ("[Listen]\nIPv4=off\nIPv6=off\n[Segment]\nName=a\nInterfaces=x\n", "no families"),
+        ("[Interface]\nIPv4=off\nIPv6=off\n[Segment]\nName=a\nInterfaces=x\n", "no families"),
         ("[Segment]\nName=a\nInterfaces=x\nBogus=1\n", "unknown key"),
         ("[Other]\nName=a\n", "unknown section"),
         ("Name=a\n", "outside a section"),
