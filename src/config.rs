@@ -8,6 +8,7 @@
 //! and the segments it is in into one [`Interface`], by [`Config::interface`].
 
 use core::fmt;
+use core::net::IpAddr;
 use core::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -280,6 +281,8 @@ struct InterfaceConfig {
     max_services: Option<usize>,
     ipv4: Option<Listen>,
     ipv6: Option<Listen>,
+    peers: Option<Vec<IpAddr>>,
+    peer_port: Option<u16>,
 }
 
 /// Everything that is settled for one interface, with every default filled in,
@@ -313,10 +316,20 @@ pub struct Interface {
     /// unless set.
     pub ipv4: Listen,
     pub ipv6: Listen,
+    /// The hosts it talks to alone, as a tunnel does that cannot carry
+    /// multicast: what is announced and asked on it is sent to each, and only
+    /// what they send is heard. None is as everywhere: the groups, over the
+    /// families it listens over.
+    pub peers: Vec<IpAddr>,
+    /// The port that is sent to, and listened at, with a peer.
+    pub peer_port: u16,
     /// Whether what is announced on it is announced again though it has not
     /// changed: if any of its segments says so.
     pub reannounce: bool,
 }
+
+/// The port mDNS is on, which a peer is too unless it is said to be elsewhere.
+pub const MDNS_PORT: u16 = 5353;
 
 /// What is listened for over one family of IP (`IPv4=`, `IPv6=`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -399,6 +412,8 @@ impl Config {
             max_services: setting_of(&self.settings, name, DEFAULT_MAX_SERVICES, |i| i.max_services),
             ipv4: setting_of(&self.settings, name, Listen::default(), |i| i.ipv4),
             ipv6: setting_of(&self.settings, name, Listen::default(), |i| i.ipv6),
+            peers: setting_of(&self.settings, name, Vec::new(), |i| i.peers.clone()),
+            peer_port: setting_of(&self.settings, name, MDNS_PORT, |i| i.peer_port),
             reannounce: segments.any(|seg| seg.reannounce),
         }
     }
@@ -545,6 +560,23 @@ impl Config {
                     }
                     ("interface", "ipv4") => settings.last_mut().unwrap().ipv4 = Some(parse_listen(entry, lineno, "IPv4")?),
                     ("interface", "ipv6") => settings.last_mut().unwrap().ipv6 = Some(parse_listen(entry, lineno, "IPv6")?),
+                    ("interface", "peer") => {
+                        let peers = settings.last_mut().unwrap().peers.get_or_insert_with(Vec::new);
+                        if value.is_empty() {
+                            peers.clear();
+                        } else {
+                            for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+                                let peer = parse_peer(word, lineno)?;
+                                if peers.contains(&peer) {
+                                    bail!("line {lineno}: Peer= has {peer} twice");
+                                }
+                                peers.push(peer);
+                            }
+                        }
+                    }
+                    ("interface", "peerport") => {
+                        settings.last_mut().unwrap().peer_port = Some(parse_peer_port(&value, lineno)?);
+                    }
                     ("probe", "probeinterval" | "interval") => {
                         bail!("line {lineno}: ProbeInterval= is now a setting of [Interface]")
                     }
@@ -617,8 +649,12 @@ impl Config {
         // one for every interface does.
         for name in listened.iter().filter(|name| !is_pattern(name)) {
             let on = |get: fn(&InterfaceConfig) -> Option<Listen>| setting_of(settings, name, Listen::default(), get).enabled();
-            if !on(|i| i.ipv4) && !on(|i| i.ipv6) {
+            let peers = setting_of(settings, name, Vec::new(), |i| i.peers.clone());
+            if peers.is_empty() && !on(|i| i.ipv4) && !on(|i| i.ipv6) {
                 bail!("interface {name} has IPv4= and IPv6= both off");
+            }
+            if let Some(peer) = peers.iter().find(|peer| !if peer.is_ipv4() { on(|i| i.ipv4) } else { on(|i| i.ipv6) }) {
+                bail!("interface {name} has Peer={peer}, which is of a family it has off");
             }
         }
         for (i, block) in self.advertise.iter().enumerate() {
@@ -704,8 +740,14 @@ impl Config {
                 if settings[..i].iter().any(|other| other.name.is_none()) {
                     bail!("[Interface] at line {at} has no Name=, like an earlier one: only one can be for every interface");
                 }
+                if setting.peers.as_ref().is_some_and(|peers| !peers.is_empty()) {
+                    bail!("[Interface] at line {at} has Peer= and no Name=: the peers are of one interface");
+                }
                 continue;
             };
+            if is_pattern(name) && setting.peers.as_ref().is_some_and(|peers| !peers.is_empty()) {
+                bail!("[Interface] {name} (line {at}) has Peer=, which is of one interface, not a pattern");
+            }
             // A pattern is for whichever interfaces it matches, if any.
             if !is_pattern(name) && !self.wants(name) {
                 bail!("[Interface] {name} (line {at}) is not in the Interfaces= of any segment");
@@ -820,6 +862,20 @@ fn parse_limit(value: &str, lineno: usize, key: &str) -> Result<usize> {
         .ok()
         .filter(|&n| n >= 1)
         .ok_or_else(|| anyhow!("line {lineno}: {key}= must be a number of at least 1, or infinity, not {value:?}"))
+}
+
+/// The address of a host a tunnel talks to: one that can be talked to alone.
+fn parse_peer(word: &str, lineno: usize) -> Result<IpAddr> {
+    let peer: IpAddr = word.parse().map_err(|_| anyhow!("line {lineno}: Peer= must be addresses, not {word:?}"))?;
+    if peer.is_unspecified() || peer.is_multicast() {
+        bail!("line {lineno}: Peer= must be the address of a host, not {word:?}");
+    }
+    Ok(peer)
+}
+
+/// The port of a peer: a port, which is not zero.
+fn parse_peer_port(value: &str, lineno: usize) -> Result<u16> {
+    value.parse().ok().filter(|&port| port != 0).ok_or_else(|| anyhow!("line {lineno}: PeerPort= must be a port, not {value:?}"))
 }
 
 /// The minimum lifetime of a device: a time span, where zero means no minimum.

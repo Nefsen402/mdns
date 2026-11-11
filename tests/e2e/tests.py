@@ -340,11 +340,11 @@ class Patterns(Case):
     def test_an_interface_that_is_kept_out_is_not_listened_to(self):
         la, lb = self.two_links()
         lc = self.lab.link("rc", "10.9.3.1/24", "10.9.3.2/24")
-        ha, hc = la.hearer(), lc.hearer()
+        ha, hb, hc = la.hearer(), lb.hearer(), lc.hearer()
         d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=r?,!rc\n"))
         self.assertTrue(d.wait_log(r"rb: here \(index \d+\), listening", 5), self.logs(d))
         la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
-        self.assertTrue(lb.hearer().wait(alive("tv.local", A, "10.9.1.50")), self.logs(d))
+        self.assertTrue(hb.wait(alive("tv.local", A, "10.9.1.50")), self.logs(d))
         lc.device("10.9.3.50").multicast(announcement("cam", "10.9.3.50", "Cam"))
         d.settle()
         self.assertTrue(hc.none(lambda h: h.message.has("tv.local")), "kept out, so told nothing\n" + self.logs(d))
@@ -767,6 +767,88 @@ class Unicast(Case):
         d = self.world("on", source="192.168.77.5")
         d.settle()
         self.assertEqual(d.host("s", "tv.local"), [], "a host routed in is not believed")
+
+
+class Peers(Case):
+    """An interface that talks to a host alone, as a tunnel does that cannot carry
+    multicast: the peer is a device that is the other daemon, and the other
+    interface is a link as any."""
+
+    def daemon(self, config):
+        """The daemon, unless it cannot talk to a peer: a socket for each interface, which
+        the BSDs, and the sockets shared by every interface, do not have, is what it takes."""
+        try:
+            return self.lab.daemon(config)
+        except RuntimeError as e:
+            if "which this system cannot make" in str(e):
+                self.skipTest("a peer needs a socket of the interface's own")
+            raise
+
+    def world(self, interface="Peer=10.9.1.2", segment="Interfaces=ra,rb"):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        lb = self.lab.link("rb", "10.9.2.1/24", "10.9.2.2/24")
+        # A packet from an address that is not on the link is not for the kernel to drop.
+        self.lab.net.relax_source_checks()
+        d = self.daemon(f"[Interface]\nIPv6=off\n[Interface]\nName=ra\n{interface}\n[Segment]\nName=s\n{segment}\n")
+        peer = la.device("10.9.1.2")
+        return la, lb, d, peer
+
+    def test_what_the_peer_sends_is_heard_and_reflected_to_the_other_interface(self):
+        la, lb, d, peer = self.world()
+        hb = lb.hearer()
+        peer.unicast(announcement("tv", "10.9.8.50", "TV"), "10.9.1.1")
+        d.settle()
+        self.assertTrue(d.host("s", "tv.local"), self.logs(d))
+        self.assertTrue(hb.wait(alive("tv.local", A, "10.9.8.50")), self.logs(d))
+
+    def test_what_is_reflected_to_the_peer_is_sent_to_it_alone(self):
+        la, lb, d, peer = self.world()
+        pc = lb.device("10.9.2.50")
+        pc.multicast(announcement("pc", "10.9.2.50", "PC"))
+        d.settle()
+        heard = peer.hearer.wait(alive("pc.local", A, "10.9.2.50"))
+        self.assertTrue(heard, self.logs(d))
+        self.assertFalse(heard.to_group, "to the peer, not to a group")
+        # Nothing went to the group on the interface.
+        self.assertTrue(la.hearer().none(lambda h: h.message.has("pc.local")))
+
+    def test_a_host_that_is_not_the_peer_is_not_heard(self):
+        la, lb, d, peer = self.world()
+        other = la.device("10.9.1.60")
+        other.unicast(announcement("tv", "10.9.8.50", "TV"), "10.9.1.1")
+        other.multicast(announcement("tv", "10.9.8.50", "TV"))
+        d.settle()
+        self.assertEqual(d.host("s", "tv.local"), [], "it is not the peer")
+
+    def test_an_untrusted_peer_is_told_nothing_of_the_others_and_its_devices_are_reflected(self):
+        la, lb, d, peer = self.world(segment="Interfaces=ra,rb\nUntrusted=ra")
+        hb = lb.hearer()
+        peer.unicast(announcement("tv", "10.9.8.50", "TV"), "10.9.1.1")
+        lb.device("10.9.2.50").multicast(announcement("pc", "10.9.2.50", "PC"))
+        d.settle()
+        self.assertTrue(hb.wait(alive("tv.local", A, "10.9.8.50")), self.logs(d))
+        self.assertTrue(peer.hearer.none(lambda h: h.message.has("pc.local")), "nothing is announced to it")
+
+    def test_every_peer_of_an_interface_is_sent_to_and_heard(self):
+        la, lb, d, peer = self.world(interface="Peer=10.9.1.2, 10.9.1.3")
+        second = la.device("10.9.1.3")
+        second.unicast(announcement("nas", "10.9.8.60", "NAS"), "10.9.1.1")
+        lb.device("10.9.2.50").multicast(announcement("pc", "10.9.2.50", "PC"))
+        d.settle()
+        self.assertTrue(d.host("s", "nas.local"), self.logs(d))
+        for who in (peer, second):
+            self.assertTrue(who.hearer.wait(alive("pc.local", A, "10.9.2.50")), self.logs(d))
+
+    def test_a_peer_is_at_the_port_that_is_said(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        lb = self.lab.link("rb", "10.9.2.1/24", "10.9.2.2/24")
+        d = self.daemon("[Interface]\nIPv6=off\n[Interface]\nName=ra\nPeer=10.9.1.2\nPeerPort=5454\n[Segment]\nName=s\nInterfaces=ra,rb\n")
+        peer = la.device("10.9.1.2", port=5454)
+        peer.unicast(announcement("tv", "10.9.8.50", "TV"), "10.9.1.1", port=5454)
+        lb.device("10.9.2.50").multicast(announcement("pc", "10.9.2.50", "PC"))
+        d.settle()
+        self.assertTrue(d.host("s", "tv.local"), self.logs(d))
+        self.assertTrue(peer.hearer.wait(alive("pc.local", A, "10.9.2.50")), self.logs(d))
 
 
 class Questions(Case):

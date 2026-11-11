@@ -1114,6 +1114,8 @@ impl Segment {
     pub fn attach(&self, link: impl Into<Rc<Link>>) {
         let mut state = self.state.borrow_mut();
         state.link = link.into();
+        // Each describes a whole network, not a device.
+        state.tracker.peers = state.link.peers().to_vec();
         state.sync_refresh();
     }
 
@@ -1483,7 +1485,6 @@ impl Segment {
         if h.response || h.opcode != 0 || h.rcode != 0 || query.questions.is_empty() {
             return Ok(());
         }
-        let legacy = from.port() != MDNS_PORT;
         // Answered over the family it was asked over, with everything of
         // both: an A answer brings the AAAA records along.
         let family = family_of(from.ip());
@@ -1491,6 +1492,8 @@ impl Segment {
 
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
+        // A peer asks from the port it is at, as mDNS does, whichever that is.
+        let legacy = from.port() != MDNS_PORT && !state.link.is_peer(from.ip());
         let asked = state.asked(query);
         if !asked.is_empty() {
             state.notify(Event::Question(asked));
@@ -1592,11 +1595,19 @@ impl Segment {
     }
 
     /// Whether a datagram from `from`, sent to `to` if that is known, is to be
-    /// heard. What is sent to the group is, whoever sends it. What is sent to the
+    /// heard. On a link to peers, a peer's is, and no one else's. What is sent
+    /// to the group is, whoever sends it. What is sent to the
     /// daemon itself is only from a host on a network the interface is on, or
     /// link-local: one of any other address came through some router, and an
     /// interface is not where it is to be believed of devices.
     pub fn accepts(&self, from: IpAddr, to: Option<IpAddr>) -> bool {
+        // On a link to peers, what they send, and nothing else: it is who it
+        // is by the tunnel it came through.
+        let state = self.state.borrow();
+        if state.link.peered() {
+            return state.link.is_peer(from);
+        }
+        drop(state);
         match to {
             None => true,
             Some(to) if to.is_multicast() => true,

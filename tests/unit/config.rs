@@ -282,7 +282,7 @@ fn what_the_configuration_takes_as_a_name_is_what_can_be_written() {
 fn man_page_documents_every_key_and_its_example_parses() {
     let man = include_str!("../../man/mdnsd.conf.5");
     for key in [
-        "IPv4=", "IPv6=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
+        "IPv4=", "IPv6=", "Peer=", "PeerPort=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
         "ReflectTTL=", "MaxAddresses=", "MaxDevices=", "MaxServices=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
         "Reannounce=", "ReflectedWhen=", "ReflectedServices=",
     ] {
@@ -416,6 +416,48 @@ fn the_section_for_every_interface_is_what_the_others_start_from() {
     assert!(off.contains("interface x") && off.contains("both off"), "{off}");
     // Whichever is for every interface, a pattern may match one that has nothing on.
     assert!(Config::parse("[Interface]\nIPv4=off\nIPv6=off\n[Interface]\nName=x\nIPv6=on\n[Segment]\nName=a\nInterfaces=x,y*\n").is_ok());
+}
+
+/// An interface can talk to hosts alone instead of to the groups, at a port
+/// that is the mDNS one unless said: the hosts of one interface, more than one
+/// of them, in the families that are on.
+#[test]
+fn an_interface_talks_to_its_peers_alone() {
+    let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+    let peers = |extra: &str| {
+        Config::parse(&format!("[Interface]\nName=wg0\n{extra}\n[Segment]\nName=a\nInterfaces=wg0,br0\n")).map(|c| {
+            let i = c.interface("wg0");
+            (i.peers, i.peer_port)
+        })
+    };
+    assert_eq!(peers("").unwrap(), (vec![], MDNS_PORT));
+    assert_eq!(peers("Peer=10.8.0.2").unwrap(), (vec![ip("10.8.0.2")], MDNS_PORT));
+    assert_eq!(peers("Peer=10.8.0.2, fd00::2\nPeer=10.8.0.3\nPeerPort=5354").unwrap(), (vec![ip("10.8.0.2"), ip("fd00::2"), ip("10.8.0.3")], 5354));
+    assert_eq!(peers("Peer=10.8.0.2\nPeer=").unwrap().0, Vec::<IpAddr>::new(), "empty resets");
+    for (bad, says) in [
+        ("Peer=host.example", "must be addresses"),
+        ("Peer=224.0.0.251", "must be the address of a host"),
+        ("Peer=0.0.0.0", "must be the address of a host"),
+        ("Peer=10.8.0.2 10.8.0.2", "twice"),
+        ("Peer=10.8.0.2:5353", "must be addresses"),
+        ("PeerPort=0", "must be a port"),
+        ("PeerPort=http", "must be a port"),
+        ("Peer=10.8.0.2\nIPv4=off", "family it has off"),
+        ("Peer=fd00::2\nIPv6=off", "family it has off"),
+    ] {
+        let err = peers(bad).unwrap_err().to_string();
+        assert!(err.contains(says), "{bad:?}: {err}");
+    }
+    // With a peer, the groups are not used: both families off is no matter, if the peer's is on.
+    assert!(peers("Peer=10.8.0.2\nIPv6=off").is_ok());
+    // The peers are of one interface.
+    let every = error_of("[Interface]\nPeer=10.8.0.2\n[Segment]\nName=a\nInterfaces=x\n");
+    assert!(every.contains("no Name="), "{every}");
+    let pattern = error_of("[Interface]\nName=wg*\nPeer=10.8.0.2\n[Segment]\nName=a\nInterfaces=wg0\n");
+    assert!(pattern.contains("not a pattern"), "{pattern}");
+    // The port can be set for all.
+    let c = Config::parse("[Interface]\nPeerPort=5354\n[Segment]\nName=a\nInterfaces=x\n").unwrap();
+    assert_eq!(c.interface("x").peer_port, 5354);
 }
 
 #[test]
@@ -614,6 +656,8 @@ fn each_interface_is_settled_once_with_its_defaults_filled_in() {
             max_services: DEFAULT_MAX_SERVICES,
             ipv4: Listen::On,
             ipv6: Listen::On,
+            peers: Vec::new(),
+            peer_port: MDNS_PORT,
             reannounce: false,
         }
     );

@@ -327,7 +327,7 @@ class Device:
     """A device on a link: an address of the far end of it, a socket to send
     from and to hear what is sent to it."""
 
-    def __init__(self, link, addr):
+    def __init__(self, link, addr, port=PORT):
         self.link, self.addr = link, addr
         link.add_peer_addr(addr)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -336,15 +336,15 @@ class Device:
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(addr))
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
-        self.sock.bind((addr, PORT))
+        self.sock.bind((addr, port))
         # What comes to it is heard on the socket it sends from.
         self.hearer = Hearer(link.lab.net, link.peer, addr, group=False, sock=self.sock)
 
     def multicast(self, data):
         self.sock.sendto(data, (GROUP, PORT))
 
-    def unicast(self, data, to):
-        self.sock.sendto(data, (to, PORT))
+    def unicast(self, data, to, port=PORT):
+        self.sock.sendto(data, (to, port))
 
     def close(self):
         self.hearer.close()
@@ -681,8 +681,8 @@ class Link:
     def hearer(self, group=True):
         return self.lab.track(Hearer(self.net, self.peer, self.peer_addr, group))
 
-    def device(self, addr):
-        return self.lab.track(Device(self, addr))
+    def device(self, addr, port=PORT):
+        return self.lab.track(Device(self, addr, port))
 
     def device6(self, addr):
         return self.lab.track(Device6(self, addr))

@@ -139,6 +139,29 @@ media_stuff: 3 devices
 The rules for what is reflected, and when, are in `mdnsd(8)`. Don't run another
 reflector (Avahi's `enable-reflector`) over the same interfaces.
 
+### Over a tunnel
+
+A tunnel that cannot carry multicast, such as WireGuard, can still carry mDNS
+between two daemons, one at each end, if each says where the other is:
+
+```
+# /etc/mdnsd.conf, at home. The tunnel's devices are reflected into br0, and
+# nothing of br0 is announced down it.
+[Interface]
+Name=wg0
+Peer=10.8.0.2
+
+[Segment]
+Name=remote
+Interfaces=br0,wg0
+Untrusted=wg0
+```
+
+At the other end, `Peer=10.8.0.1` on its `wg0`, with `Untrusted=` left out if
+each side is to see the other's devices. What goes over the tunnel is the mDNS
+a link would carry, sent to the peer alone, over the families its address is of;
+`PeerPort=` moves it from the mDNS port, and `Peer=` takes several hosts.
+
 ## Tracking devices for scripts
 
 This is not an mDNS client: the daemon is not started for a lookup and gone

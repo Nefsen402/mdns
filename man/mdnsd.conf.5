@@ -627,6 +627,44 @@ announced runs out as its TTL says: set
 to keep them listed for longer, at the cost that a device that really vanishes
 stays listed, and announced to the other networks, for up to that long.
 .TP
+.B Peer=
+Optional.
+Hosts this interface talks to alone, as addresses separated by commas or
+spaces, and not to the mDNS groups: for a tunnel that cannot carry multicast,
+such as WireGuard, with a daemon at the other end whose interface has this host
+for its peer.
+What is announced and asked on the interface is sent to each of them, and only
+what they send to the daemon is heard, whatever it is sent to: they are who they
+are by the tunnel they come through, and each speaks for the devices of a
+network, so is not limited to 64 hosts as another sender is (see
+.BR MaxDevices= ).
+The interface is used over the families the peers are of, not by
+.B IPv4=
+and
+.BR IPv6= ,
+neither of which may be
+.B off
+for a family of one.
+A device is not asked directly, at an address it has, on such an interface: its
+peer is asked.
+Repeated, it adds peers; empty, it resets.
+It is for the section of one interface, not for every interface or a pattern.
+Where the daemon cannot make sockets of an interface's own (the BSDs, and
+Linux with
+.BR portable-sockets )
+it is an error.
+Put the interface in a segment as any other: untrusted, a peer is told nothing
+of the others and its devices are reflected to them; trusted, they are shown
+each other's.
+.TP
+.B PeerPort=
+Optional.
+The port that peers are sent to, and that is listened at.
+Default
+.BR 5353 ,
+the mDNS port: the peers hear this daemon from it, and the daemon at the other
+end is set to the same.
+.TP
 .B ProbeInterval=
 Also probe this interface for devices this often, as a time span: browse for
 service types and instances.

@@ -2558,6 +2558,48 @@ fn a_segment_taken_down_withdraws_what_it_announced_and_says_its_devices_are_gon
     assert!(b.state.borrow().hosts.is_empty());
 }
 
+/// A segment that talks to a peer hears it alone, takes its questions for mDNS
+/// from whatever port it asks, and lets it describe as many hosts as there is
+/// room for, as it speaks for a network.
+#[test]
+fn a_segment_that_talks_to_a_peer_hears_it_alone_and_as_a_network() {
+    let (rx, tx) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+    rx.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let seg = segment("tun");
+    seg.attach(Link::to_peer(Family::V4, fd(tx), rx.local_addr().unwrap()));
+    let peer = ip("127.0.0.1");
+
+    // What the peer sends to the daemon is heard, whatever it is sent to; what anyone else sends is not,
+    // even to the group.
+    for to in [None, Some(ip("10.8.0.1")), Some(ip("224.0.0.251"))] {
+        assert!(seg.accepts(peer, to), "{to:?}");
+        assert!(!seg.accepts(ip("10.8.0.9"), to), "{to:?}");
+        assert!(!seg.accepts(ip("fe80::9"), to), "{to:?}");
+    }
+
+    // A question from its port, whichever it is, is answered as mDNS is: to the peer, as to the group.
+    seg.add_reflected(OWN, &Shared::new(tv("10.0.2.9", &["TV"]))).unwrap();
+    while recv(&rx).is_some() {}
+    age(&seg, 2);
+    seg.handle(SocketAddr::new(peer, 5399), &query("tv.local", rtype::A, vec![])).unwrap();
+    assert!(recv(&rx).is_some_and(|m| m.answers.iter().any(|r| r.name == "tv.local")), "answered to the peer");
+    // From another port and no peer, it is a legacy resolver, answered by itself and not to the peer.
+    age(&seg, 2);
+    seg.handle(SocketAddr::new(ip("127.0.0.2"), 5399), &query("tv.local", rtype::A, vec![])).unwrap();
+    assert!(recv(&rx).is_none());
+
+    // A peer describes more hosts than any other sender may.
+    let described = |seg: &Segment, from: &str| {
+        for n in 0..70 {
+            hear(seg, from, vec![a_record(&format!("host{n}.local"), &format!("10.9.0.{n}"))]);
+        }
+        seg.devices().len()
+    };
+    assert_eq!(described(&seg, "127.0.0.1"), 70);
+    let other = segment("lan");
+    assert_eq!(described(&other, "10.8.0.9"), crate::tracker::MAX_PER_SENDER);
+}
+
 /// A device is the same one when it is renamed: it is withdrawn under the name
 /// it had, and shown under the one it has.
 #[test]

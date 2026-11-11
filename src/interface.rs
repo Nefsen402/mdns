@@ -1,3 +1,10 @@
+//! What an interface hears and says with.
+//!
+//! A [`Link`] is all that a segment knows of how its interface is reached: it
+//! listens over every family the interface is used over, and what is said goes
+//! to everyone on it, which is each family's group or, for a tunnel that cannot
+//! carry multicast, each of its peers.
+//!
 //! Per-interface mDNS sockets.
 //!
 //! On Linux each socket is pinned to a single interface and bound to the mDNS
@@ -29,7 +36,7 @@ use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
 use crate::runtime::{errno, Why};
 
 
-pub const MDNS_PORT: u16 = 5353;
+pub use crate::config::MDNS_PORT;
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 pub const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 
@@ -49,6 +56,9 @@ pub struct Link {
     /// shared by every interface, which is the hub's.
     listeners: Vec<OwnedFd>,
     outs: Vec<Out>,
+    /// The hosts it talks to alone, instead of to the groups: only what they
+    /// send is heard.
+    peers: Vec<IpAddr>,
 }
 
 /// A way to send over one family, to everyone on the link over it.
@@ -69,6 +79,14 @@ impl Link {
         Link::default().and(family, sender, to)
     }
 
+    /// A link that talks to the peer at `to` alone, over `family` with `sender`,
+    /// and hears only it: for what is not an interface's own, a test's.
+    pub fn to_peer(family: Family, sender: impl Into<Sender>, to: SocketAddr) -> Link {
+        let mut link = Link { peers: alloc::vec![to.ip()], ..Link::default() };
+        link.add(family, sender.into(), alloc::vec![to], false);
+        link
+    }
+
     /// This, and over `family` too.
     pub fn and(mut self, family: Family, sender: impl Into<Sender>, to: SocketAddr) -> Link {
         self.add(family, sender.into(), alloc::vec![to], true);
@@ -80,6 +98,21 @@ impl Link {
     pub(crate) fn add(&mut self, family: Family, sender: Sender, to: Vec<SocketAddr>, direct: bool) {
         self.outs.retain(|out| out.family != family);
         self.outs.push(Out { family, sender, to, direct });
+    }
+
+    /// The hosts it talks to alone, if it does not use the groups.
+    pub fn peers(&self) -> &[IpAddr] {
+        &self.peers
+    }
+
+    /// Whether it talks to peers alone.
+    pub fn peered(&self) -> bool {
+        !self.peers.is_empty()
+    }
+
+    /// Whether `addr` is one of its peers.
+    pub fn is_peer(&self, addr: IpAddr) -> bool {
+        self.peers.contains(&addr)
     }
 
     /// Whether it is used over no family: it says nothing, and hears nothing.
@@ -271,6 +304,27 @@ mod pinned {
         Ok((index, socket))
     }
 
+    /// A socket pinned to `interface` over `family` that does not join the
+    /// group: bound to the wildcard address at `port`, which hears what is
+    /// sent to the daemon. Which of what it hears is from a peer is for
+    /// whoever reads it to say.
+    pub fn peer_socket(interface: &str, family: Family, port: u16) -> Result<(u32, OwnedFd)> {
+        let index = ifindex(interface)?;
+        let socket = udp(family)?;
+        let fd = &socket;
+        sockopt::set_socket_reuseaddr(fd, true).map_err(Why)?;
+        sockopt::set_socket_reuseport(fd, true).map_err(Why)?;
+        bind_device(fd, interface)?;
+        match family {
+            Family::V4 => rustix::net::bind(fd, &SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).map_err(Why)?,
+            Family::V6 => {
+                sockopt::set_ipv6_v6only(fd, true).map_err(Why)?;
+                rustix::net::bind(fd, &SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)).map_err(Why)?;
+            }
+        }
+        Ok((index, socket))
+    }
+
     /// Pin `fd` to `interface`: it hears and sends nothing elsewhere.
     pub(super) fn bind_device(fd: impl AsFd, interface: &str) -> Result<()> {
         let name = interface.as_bytes();
@@ -316,6 +370,34 @@ impl Link {
             rustix::io::ioctl_fionbio(&socket, true).map_err(Why)?;
             let sender = Sender::from(rustix::io::fcntl_dupfd_cloexec(&socket, 0).map_err(Why)?);
             link.add(family, sender, alloc::vec![group_of(family, index)], unicast.contains(&family));
+            link.listeners.push(socket);
+        }
+        Ok(link)
+    }
+
+    /// The link of `interface` that talks to `peers` alone, at `port`, with a
+    /// socket of its own for each family they are of, pinned to it. It keeps
+    /// the source port at `port`, which the peers hear it from.
+    pub fn open_peers(interface: &str, peers: &[IpAddr], port: u16) -> Result<Link> {
+        let mut link = Link { peers: peers.to_vec(), ..Link::default() };
+        for family in [Family::V4, Family::V6] {
+            let of_family: Vec<IpAddr> = peers.iter().copied().filter(|&peer| family_of(peer) == family).collect();
+            if of_family.is_empty() {
+                continue;
+            }
+            let (index, socket) = pinned::peer_socket(interface, family, port)
+                .with_context(|| format!("opening {family:?} socket on {interface}"))?;
+            rustix::io::ioctl_fionbio(&socket, true).map_err(Why)?;
+            let sender = Sender::from(rustix::io::fcntl_dupfd_cloexec(&socket, 0).map_err(Why)?);
+            // A link-local peer is where it is by the interface.
+            let to = of_family
+                .into_iter()
+                .map(|peer| match peer {
+                    IpAddr::V6(v6) if crate::device::is_link_local(&peer) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, index)),
+                    peer => SocketAddr::new(peer, port),
+                })
+                .collect();
+            link.add(family, sender, to, false);
             link.listeners.push(socket);
         }
         Ok(link)

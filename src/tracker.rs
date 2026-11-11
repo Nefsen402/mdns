@@ -54,6 +54,9 @@ pub struct Tracker {
     /// The networks the interface is on: of the neighbour table, only
     /// addresses in one of them are learned.
     pub prefixes: Vec<Prefix>,
+    /// The hosts every device is heard through, if the segment talks to peers
+    /// alone, and not to the group: each speaks for a whole network.
+    pub peers: Vec<IpAddr>,
 }
 
 impl Default for Tracker {
@@ -67,6 +70,7 @@ impl Default for Tracker {
             max_services: DEFAULT_MAX_SERVICES,
             neighbours: NeighbourTable::default(),
             prefixes: Vec::new(),
+            peers: Vec::new(),
         }
     }
 }
@@ -74,9 +78,11 @@ impl Default for Tracker {
 impl Tracker {
     /// Whether a new host may be learned of from `src`: the segment has
     /// fewer than it is set to remember, and `src` first described fewer than
-    /// [`MAX_PER_SENDER`] of them.
+    /// [`MAX_PER_SENDER`] of them, unless it is a peer, which speaks for a
+    /// whole network.
     pub fn room_for(&self, src: IpAddr) -> bool {
-        self.discovered.len() < self.max_devices && self.discovered.described_by(&src) < MAX_PER_SENDER
+        self.discovered.len() < self.max_devices
+            && (self.peers.contains(&src) || self.discovered.described_by(&src) < MAX_PER_SENDER)
     }
 
     /// Bring the addresses learned from the neighbour table up to date for
