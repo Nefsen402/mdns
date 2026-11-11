@@ -23,7 +23,7 @@ use crate::time::Instant;
 use anyhow::{bail, Result};
 
 use crate::config::{glob, Forward, Neighbours, ReflectedWhen};
-use crate::device::Device;
+use crate::device::{Advertise, Device};
 use crate::segment::{Asked, Event, Owner, Segment};
 
 use crate::prelude::*;
@@ -430,7 +430,7 @@ impl Inner {
     fn relay(&self, from: &Segment, before: Option<&Device>, after: Option<&Device>, only: Option<&Segment>) {
         let host = after.and_then(Device::key);
         let old = before.and_then(Device::key).filter(|old| host.as_ref() != Some(old));
-        let shown = after.and_then(|device| device.reflected(self.neighbours, &self.when)).map(Rc::new);
+        let shown = after.and_then(|device| device.reflected(Advertise::reflected(self.neighbours), &self.when)).map(Rc::new);
         let origin = from.interface();
         let mut book = self.book();
         for member in self.snapshot() {
@@ -452,7 +452,7 @@ impl Inner {
     fn attempt(&self, book: &mut Book, target: &Segment, origin: &str, host: &str, device: Option<Rc<Device>>) {
         book.failed.retain(|f| !(f.target.is(target) && &*f.origin == origin && f.host == host));
         let result = match &device {
-            Some(device) => target.reflect(self.owner, origin, Rc::clone(device), self.reflect_ttl),
+            Some(device) => target.reflect(self.owner, origin, Rc::clone(device), Advertise::reflected(self.neighbours), self.reflect_ttl),
             None => target.unreflect(self.owner, origin, host),
         };
         let failed = result.is_err();

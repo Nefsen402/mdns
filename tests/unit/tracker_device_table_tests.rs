@@ -133,7 +133,7 @@ fn the_tables_find_what_a_scan_of_the_devices_does_through_any_mix_of_changes() 
         }
     }
     for name in ["_x0._tcp.local", "_X1._tcp.LOCAL", "S1._x0._tcp.local", "host7.local", "HOST12.local", "_services._dns-sd._udp.local", "none"] {
-        same(ptrs(devices.with_name(name).collect()), ptrs(devices.iter().filter(|e| e.device.has_name(name)).collect()));
+        same(ptrs(devices.with_name(name).collect()), ptrs(devices.iter().filter(|e| e.device.has_name(Advertise::ALL, name)).collect()));
     }
     same(
         ptrs(devices.with_unresolved().map(|(_, e)| e).collect()),

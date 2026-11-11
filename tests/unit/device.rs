@@ -209,6 +209,11 @@ fn three_devices() -> Vec<Device> {
 }
 
 /// The one packet of a reply that fits in one.
+/// The devices as they were heard, with all their addresses.
+fn as_heard(devices: &[Device]) -> Vec<Advertised<'_>> {
+    devices.iter().map(Into::into).collect()
+}
+
 fn only(mut msgs: Vec<Message>) -> Message {
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     msgs.remove(0)
@@ -217,7 +222,7 @@ fn only(mut msgs: Vec<Message>) -> Message {
 #[test]
 fn a_query_response_has_what_each_device_answers_once() {
     let devices = three_devices();
-    let (msgs, answered) = Device::query_response(&devices, &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
+    let (msgs, answered) = Device::query_response(&as_heard(&devices), &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
     let msg = only(msgs);
     assert_eq!(answered, [0, 1], "the printer has nothing of that type");
     let browsed: Vec<&RData> = msg.answers.iter().map(|r| &r.data).collect();
@@ -234,14 +239,14 @@ fn a_query_response_has_what_each_device_answers_once() {
 
     // A record two of them have is given once.
     let (msgs, answered) =
-        Device::query_response(&devices, &query("_services._dns-sd._udp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
+        Device::query_response(&as_heard(&devices), &query("_services._dns-sd._udp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
     let msg = only(msgs);
     assert_eq!(answered, [0, 1, 2]);
     assert_eq!(msg.answers.len(), 2, "_http and _ipp: {:?}", msg.answers);
 
     // Nothing to say is no reply at all.
-    assert!(Device::query_response(&devices, &query("_airplay._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
-    assert!(Device::query_response(&[], &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
+    assert!(Device::query_response(&as_heard(&devices), &query("_airplay._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
+    assert!(Device::query_response(&as_heard(&[]), &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
 }
 
 /// `n` devices `dev0.local`, `dev1.local`, ... each with a service of
@@ -266,7 +271,7 @@ fn sizes(msgs: &[Message]) -> Vec<usize> {
 /// answers before additional ones, each name and type's records together.
 #[test]
 fn records_are_split_into_packets_that_fit() {
-    let records: Vec<Record> = many(30, 40).iter().flat_map(|d| d.announcement(120, 4500)).collect();
+    let records: Vec<Record> = many(30, 40).iter().flat_map(|d| d.announcement(Advertise::ALL, 120, 4500)).collect();
     let packets = responses(&records, &[], 600);
     assert!(packets.len() > 1, "they do not fit in one");
     assert!(sizes(&packets).iter().all(|&s| s <= 600), "{:?}", sizes(&packets));
@@ -310,7 +315,7 @@ fn a_record_too_big_for_a_packet_goes_alone() {
 #[test]
 fn a_large_reply_is_split_over_packets() {
     let devices = many(40, 100);
-    let (packets, answered) = Device::query_response(&devices, &query("_http._tcp.local", rtype::PTR), false, 1452).unwrap();
+    let (packets, answered) = Device::query_response(&as_heard(&devices), &query("_http._tcp.local", rtype::PTR), false, 1452).unwrap();
     assert_eq!(answered.len(), 40);
     assert!(packets.len() > 1);
     assert!(sizes(&packets).iter().all(|&s| s <= 1452), "{:?}", sizes(&packets));
@@ -326,7 +331,7 @@ fn a_large_reply_is_split_over_packets() {
 fn a_legacy_reply_fits_what_the_resolver_takes() {
     let devices = many(40, 100);
     let browse = query("_http._tcp.local", rtype::PTR);
-    let (packets, _) = Device::query_response(&devices, &browse, true, 1452).unwrap();
+    let (packets, _) = Device::query_response(&as_heard(&devices), &browse, true, 1452).unwrap();
     let reply = only(packets);
     assert!(reply.encode().unwrap().len() <= 512);
     assert!(reply.header.truncated, "not every answer fits");
@@ -335,7 +340,7 @@ fn a_legacy_reply_fits_what_the_resolver_takes() {
     // With EDNS0 saying 4096, as much as the interface allows.
     let mut edns = browse.clone();
     edns.additionals.push(Record { name: String::new(), class: 4096, cache_flush: false, ttl: 0, data: RData::Other { rtype: OPT, data: vec![] } });
-    let reply = only(Device::query_response(&devices, &edns, true, 1452).unwrap().0);
+    let reply = only(Device::query_response(&as_heard(&devices), &edns, true, 1452).unwrap().0);
     let size = reply.encode().unwrap().len();
     assert!(size > 512 && size <= 1452, "{size}");
 
@@ -343,8 +348,8 @@ fn a_legacy_reply_fits_what_the_resolver_takes() {
     // (its TXT record is too big), and leaving those out is no truncation.
     let mut one = many(1, 0);
     one[0].services[0].edit(|p| p.txt = vec![format!("a={}", "x".repeat(240)).into_bytes(), format!("b={}", "x".repeat(240)).into_bytes()]);
-    let whole = only(Device::query_response(&one, &browse, false, 1452).unwrap().0);
-    let reply = only(Device::query_response(&one, &browse, true, 1452).unwrap().0);
+    let whole = only(Device::query_response(&as_heard(&one), &browse, false, 1452).unwrap().0);
+    let reply = only(Device::query_response(&as_heard(&one), &browse, true, 1452).unwrap().0);
     assert_eq!(reply.answers.len(), 1);
     assert!(reply.additionals.len() < whole.additionals.len(), "the TXT record does not fit");
     assert!(!reply.header.truncated);
@@ -371,13 +376,13 @@ fn a_legacy_resolver_gets_its_question_back_and_short_ttls_without_cache_flush()
     let mut asked = query("tv.local", rtype::ANY);
     asked.header.id = 0x4242;
 
-    let (msgs, _) = Device::query_response(&devices, &asked, true, DEFAULT_MAX_PACKET).unwrap();
+    let (msgs, _) = Device::query_response(&as_heard(&devices), &asked, true, DEFAULT_MAX_PACKET).unwrap();
     let msg = only(msgs);
     assert_eq!((msg.header.id, msg.questions.clone()), (0x4242, asked.questions.clone()));
     assert!(msg.answers.iter().chain(&msg.additionals).all(|r| r.ttl <= LEGACY_TTL_CAP && !r.cache_flush));
 
     // To the group, none of that.
-    let (msgs, _) = Device::query_response(&devices, &asked, false, DEFAULT_MAX_PACKET).unwrap();
+    let (msgs, _) = Device::query_response(&as_heard(&devices), &asked, false, DEFAULT_MAX_PACKET).unwrap();
     let msg = only(msgs);
     assert_eq!(msg.header.id, 0);
     assert!(msg.questions.is_empty());
@@ -507,29 +512,29 @@ fn a_transition_announces_the_new_and_takes_back_only_what_is_ours() {
     old.nsec = Some(vec![rtype::A].into());
     let goodbyes = |records: &[Record]| records.iter().filter(|r| r.ttl == 0).cloned().collect::<Vec<_>>();
 
-    assert!(Device::transition(Some(&old), Some(&old), &none, false).is_empty(), "nothing changed");
+    assert!(Device::transition(Some((&old).into()), Some((&old).into()), &none, false).is_empty(), "nothing changed");
     assert!(Device::transition(None, None, &none, false).is_empty());
 
-    let shown = Device::transition(None, Some(&old), &none, false);
+    let shown = Device::transition(None, Some((&old).into()), &none, false);
     assert!(shown.iter().any(|r| r.data == RData::A("10.0.1.9".parse().unwrap()) && r.ttl == 300 && r.cache_flush));
     assert!(goodbyes(&shown).is_empty());
 
     // Moved: the new address, and a goodbye for the old one that does not
     // flush the new.
     let moved = Device { addresses: vec![ip("10.0.1.10").into()].into(), ..old.clone() };
-    let bye = goodbyes(&Device::transition(Some(&old), Some(&moved), &none, false));
+    let bye = goodbyes(&Device::transition(Some((&old).into()), Some((&moved).into()), &none, false));
     assert_eq!(bye.len(), 1);
     assert_eq!((&bye[0].data, bye[0].cache_flush), (&RData::A("10.0.1.9".parse().unwrap()), false));
 
     // Withdrawn: everything, none of it flushing.
-    let bye = goodbyes(&Device::transition(Some(&old), None, &none, false));
-    assert_eq!(bye.len(), old.announcement(0, 0).len());
+    let bye = goodbyes(&Device::transition(Some((&old).into()), None, &none, false));
+    assert_eq!(bye.len(), old.announcement(Advertise::ALL, 0, 0).len());
     assert!(bye.iter().all(|r| !r.cache_flush));
 
     // But not what a device on the segment has: a service of the same
     // instance name, or, if one has the hostname, the NSEC.
     let local = |name: &str| name.eq_ignore_ascii_case("kitchen._http._tcp.local");
-    let bye = goodbyes(&Device::transition(Some(&old), None, &local, true));
+    let bye = goodbyes(&Device::transition(Some((&old).into()), None, &local, true));
     assert!(!bye.iter().any(|r| r.name.starts_with("Kitchen.") || r.data == RData::Ptr("Kitchen._http._tcp.local".into())));
     assert!(!bye.iter().any(|r| matches!(r.data, RData::Nsec { .. })));
     assert!(bye.iter().any(|r| r.name.starts_with("Den.")), "{bye:?}");
@@ -560,7 +565,7 @@ fn a_device_is_asked_for_the_addresses_of_its_families() {
 fn a_copys_nsec_names_its_ipv6_addresses_too() {
     let mut d = tv("fd00::9", &[]);
     d.nsec = Some(vec![].into());
-    let types = |d: &Device| match d.nsec_record(120).map(|r| r.data) {
+    let types = |d: &Device| match d.nsec_record(Advertise::ALL, 120).map(|r| r.data) {
         Some(RData::Nsec { types, .. }) => types,
         other => panic!("{other:?}"),
     };
@@ -577,7 +582,7 @@ fn only_questions_of_class_in_or_any_are_answered() {
     let of_class = |class: u16| {
         let mut msg = query("tv.local", rtype::A);
         msg.questions[0].class = class;
-        d.answers(&msg, 120, 4500).0
+        d.answers(Advertise::ALL, &msg, 120, 4500).0
     };
     assert_eq!(of_class(1).len(), 1);
     assert_eq!(of_class(255).len(), 1);
@@ -635,9 +640,12 @@ fn learned_addresses_can_be_kept_to_families_with_a_link_local_address() {
     d.take_addrs(&[ip("fe80::9")], &[], &[], DEFAULT_MAX_ADDRS);
     d.take_neighbours(&[ip("fd00::9"), ip("10.0.1.9")], DEFAULT_MAX_ADDRS);
     assert_eq!(d.addrs().collect::<Vec<_>>(), [ip("10.0.1.9"), ip("fd00::9"), ip("fe80::9")]);
-    let kept = d.with_neighbours_of_link_local_families();
-    assert_eq!(kept.addrs().collect::<Vec<_>>(), [ip("fd00::9"), ip("fe80::9")], "no IPv4 link-local was announced");
-    assert_eq!(d.without_neighbours().addrs().collect::<Vec<_>>(), [ip("fe80::9")]);
+    let advertised = |neighbours, link_local| d.advertised(Advertise { neighbours, link_local }).map(|a| a.ip).collect::<Vec<_>>();
+    assert_eq!(advertised(Neighbours::LinkLocal, true), [ip("fd00::9"), ip("fe80::9")], "no IPv4 link-local was announced");
+    assert_eq!(advertised(Neighbours::Never, true), [ip("fe80::9")]);
+    assert_eq!(advertised(Neighbours::LinkLocal, false), [ip("fd00::9")], "link-local ones mean nothing off the link");
+    assert_eq!(advertised(Neighbours::Always, true), d.addrs().collect::<Vec<_>>());
+    assert_eq!(d.addresses.len(), 3, "none is dropped, only not advertised");
 }
 
 /// Learned addresses count towards how many of a family are kept.
@@ -663,7 +671,7 @@ fn announced_addresses_are_not_turned_away_by_learned_ones() {
 fn a_device_knows_what_it_has_and_what_its_nsec_says_it_has_not() {
     let mut device = tv("10.0.1.9", &["TV"]);
     let knows = |d: &Device, name: &str, qtype: u16| {
-        d.knows(&Question { name: name.into(), qtype, class: 1, unicast_response: false })
+        d.knows(Advertise::ALL, &Question { name: name.into(), qtype, class: 1, unicast_response: false })
     };
     assert!(knows(&device, "TV.local", rtype::A));
     assert!(knows(&device, "tv.local", rtype::ANY));
@@ -691,15 +699,15 @@ fn a_device_has_the_names_of_the_records_it_announces() {
     device.services[1].edit(|p| p.kind = "_Other._tcp.local".into());
     for device in [device.clone(), Device { services: Box::default(), ..device.clone() }, Device { hostname: None, ..device }] {
         let (mut own, mut announced) = (BTreeSet::new(), BTreeSet::new());
-        device.for_each_name(|name| lower(&mut own, name));
+        device.for_each_name(Advertise::ALL, |name| lower(&mut own, name));
         if device.hostname.is_some() {
-            for rec in device.announcement(120, 120) {
+            for rec in device.announcement(Advertise::ALL, 120, 120) {
                 lower(&mut announced, &rec.name);
             }
         }
         assert_eq!(own, announced);
-        assert!(own.iter().all(|name| device.has_name(&name.to_ascii_uppercase())));
-        assert!(!device.has_name("nothing.local"));
+        assert!(own.iter().all(|name| device.has_name(Advertise::ALL, &name.to_ascii_uppercase())));
+        assert!(!device.has_name(Advertise::ALL, "nothing.local"));
     }
 }
 
@@ -728,11 +736,11 @@ fn records_for_a_question_are_only_the_records_it_has() {
     let ask = |name: &str, qtype: u16| Question { name: name.into(), qtype, class: 1, unicast_response: false };
     let mut device = tv("10.0.1.9", &["TV"]);
     device.nsec = Some(vec![rtype::A].into());
-    let records = device.records_for(&ask("_http._tcp.local", rtype::PTR), 120, 4500);
+    let records = device.records_for(Advertise::ALL, &ask("_http._tcp.local", rtype::PTR), 120, 4500);
     let kinds: Vec<u16> = records.iter().map(Record::rtype).collect();
     assert_eq!(kinds, [rtype::PTR]);
-    assert!(device.knows(&ask("tv.local", rtype::AAAA)), "its NSEC says it has none");
-    assert!(device.records_for(&ask("tv.local", rtype::AAAA), 120, 4500).is_empty());
+    assert!(device.knows(Advertise::ALL, &ask("tv.local", rtype::AAAA)), "its NSEC says it has none");
+    assert!(device.records_for(Advertise::ALL, &ask("tv.local", rtype::AAAA), 120, 4500).is_empty());
 }
 
 /// The known answers to each question go along with it, once each, and
@@ -905,7 +913,7 @@ fn a_device_keeps_every_address_it_announces() {
         a_record("tv.local", "10.0.1.7"),
     ]);
     assert_eq!(device.addrs().collect::<Vec<_>>(), [ip("10.0.1.7"), ip("2001:db8::7"), ip("fd00::7"), ip("fe80::7")]);
-    let sent: Vec<RData> = device.announcement(120, 4500).into_iter().filter(|r| r.name == "tv.local").map(|r| r.data).collect();
+    let sent: Vec<RData> = device.announcement(Advertise::ALL, 120, 4500).into_iter().filter(|r| r.name == "tv.local").map(|r| r.data).collect();
     assert_eq!(sent.len(), 4, "{sent:?}");
 }
 
@@ -941,7 +949,7 @@ fn an_address_answer_brings_the_other_familys() {
     let mut device = tv("10.0.1.9", &["TV"]);
     device.add_addrs(&[ip("fd00::9")]);
     for (asked, other) in [(rtype::A, RData::Aaaa("fd00::9".parse().unwrap())), (rtype::AAAA, RData::A("10.0.1.9".parse().unwrap()))] {
-        let (answers, extra) = device.answers(&query("tv.local", asked), 120, 4500);
+        let (answers, extra) = device.answers(Advertise::ALL, &query("tv.local", asked), 120, 4500);
         assert_eq!(answers.len(), 1);
         assert!(extra.iter().any(|r| r.data == other), "{other:?} in {extra:?}");
     }
@@ -1014,11 +1022,11 @@ fn subtypes_are_announced_answered_and_withdrawn() {
     printer.services[0].edit(|p| p.subtypes = vec![name.into()]);
     let subtype = |records: &[Record]| records.iter().find(|r| r.name == name).cloned();
 
-    let r = subtype(&printer.announcement(120, 4500)).expect("announced");
+    let r = subtype(&printer.announcement(Advertise::ALL, 120, 4500)).expect("announced");
     assert_eq!((r.data, r.cache_flush), (RData::Ptr("Office._http._tcp.local".into()), false));
 
     // Browsing by the subtype finds it, with what it takes to resolve it.
-    let (answers, extra) = printer.answers(&query(name, rtype::PTR), 120, 4500);
+    let (answers, extra) = printer.answers(Advertise::ALL, &query(name, rtype::PTR), 120, 4500);
     assert_eq!(answers.len(), 1);
     assert!(subtype(&answers).is_some());
     assert!(extra.iter().any(|r| matches!(r.data, RData::Srv { .. })));
@@ -1027,7 +1035,7 @@ fn subtypes_are_announced_answered_and_withdrawn() {
     // No longer of the subtype: that alone is withdrawn.
     let mut plain = printer.clone();
     plain.services[0].edit(|p| p.subtypes.clear());
-    let records = printer.replacement(&plain, 120, 4500);
+    let records = printer.replacement(Advertise::ALL, (&plain).into(), 120, 4500);
     assert_eq!(subtype(&records).map(|r| r.ttl), Some(0));
     assert_eq!(records.iter().filter(|r| r.ttl == 0).count(), 1);
 }
@@ -1059,28 +1067,28 @@ fn a_reflected_device_denies_only_what_it_denied_itself() {
     let mut v4_only = tv("10.0.1.9", &["TV"]);
     v4_only.nsec = Some(vec![rtype::A].into());
     let nsec_of = |records: &[Record]| records.iter().find(|r| matches!(r.data, RData::Nsec { .. })).cloned();
-    let r = nsec_of(&v4_only.announcement(120, 4500)).expect("announced");
+    let r = nsec_of(&v4_only.announcement(Advertise::ALL, 120, 4500)).expect("announced");
     assert_eq!((r.name.as_str(), r.cache_flush, r.ttl), ("tv.local", true, 120));
     assert_eq!(r.data, RData::Nsec { next: "tv.local".into(), types: vec![rtype::A] });
 
     // Asked for an address it has not got, it says so...
-    let (answers, _) = v4_only.answers(&query("tv.local", rtype::AAAA), 120, 4500);
+    let (answers, _) = v4_only.answers(Advertise::ALL, &query("tv.local", rtype::AAAA), 120, 4500);
     assert_eq!(answers.len(), 1);
     assert!(nsec_of(&answers).is_some());
 
     // ...and its address comes with it.
-    let (answers, extra) = v4_only.answers(&query("tv.local", rtype::A), 120, 4500);
+    let (answers, extra) = v4_only.answers(Advertise::ALL, &query("tv.local", rtype::A), 120, 4500);
     assert!(matches!(answers[..], [Record { data: RData::A(_), .. }]));
     assert!(nsec_of(&extra).is_some());
 
     // It is not among what the name has.
-    let (answers, _) = v4_only.answers(&query("tv.local", rtype::ANY), 120, 4500);
+    let (answers, _) = v4_only.answers(Advertise::ALL, &query("tv.local", rtype::ANY), 120, 4500);
     assert!(nsec_of(&answers).is_none());
 
     // What it announces is never denied, and NSEC itself is not listed.
     let mut said_less = v4_only.clone();
     said_less.nsec = Some(vec![rtype::AAAA, rtype::NSEC, 300].into());
-    match said_less.nsec_record(120).map(|r| r.data) {
+    match said_less.nsec_record(Advertise::ALL, 120).map(|r| r.data) {
         Some(RData::Nsec { types, .. }) => assert_eq!(types, [rtype::A, rtype::AAAA]),
         other => panic!("{other:?}"),
     }
@@ -1088,8 +1096,8 @@ fn a_reflected_device_denies_only_what_it_denied_itself() {
     // A device that said nothing is denied nothing.
     let mut silent = v4_only;
     silent.nsec = None;
-    assert!(silent.nsec_record(120).is_none());
-    assert!(silent.answers(&query("tv.local", rtype::AAAA), 120, 4500).0.is_empty());
+    assert!(silent.nsec_record(Advertise::ALL, 120).is_none());
+    assert!(silent.answers(Advertise::ALL, &query("tv.local", rtype::AAAA), 120, 4500).0.is_empty());
 }
 
 /// A device announces a reverse-mapping PTR for its address. That is kept
@@ -1138,18 +1146,18 @@ fn reverse_mappings_are_announced_answered_and_withdrawn() {
     let of = |records: &[Record]| records.iter().find(|r| r.name == name).cloned();
 
     // Only for an address the device announced one for.
-    assert!(of(&tv("10.0.1.9", &["TV"]).announcement(120, 4500)).is_none());
-    let r = of(&mapped.announcement(120, 4500)).expect("announced");
+    assert!(of(&tv("10.0.1.9", &["TV"]).announcement(Advertise::ALL, 120, 4500)).is_none());
+    let r = of(&mapped.announcement(Advertise::ALL, 120, 4500)).expect("announced");
     assert_eq!((r.data, r.cache_flush), (RData::Ptr("tv.local".into()), true));
 
-    let (answers, _) = mapped.answers(&query(name, rtype::PTR), 120, 4500);
+    let (answers, _) = mapped.answers(Advertise::ALL, &query(name, rtype::PTR), 120, 4500);
     assert_eq!(answers.len(), 1);
     assert!(of(&answers).is_some());
 
     // Moved: the old mapping is withdrawn along with the old address.
     let mut moved = tv("10.0.1.10", &["TV"]);
     moved.reverse = vec![ip("10.0.1.10")].into();
-    let records = mapped.replacement(&moved, 120, 4500);
+    let records = mapped.replacement(Advertise::ALL, (&moved).into(), 120, 4500);
     assert_eq!(of(&records).map(|r| r.ttl), Some(0));
     assert!(records.iter().any(|r| r.name == "10.1.0.10.in-addr.arpa" && r.ttl > 0));
 }

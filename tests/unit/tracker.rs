@@ -125,7 +125,7 @@ fn a_txt_value_that_is_not_text_is_kept_as_it_came() {
     assert_eq!(device.services[0].txt().collect::<Vec<_>>(), binary.clone());
 
     // And said again as it was, over the wire and back.
-    let announced = message(true, device.announcement(120, 120)).encode().expect("it can be announced");
+    let announced = message(true, device.announcement(Advertise::ALL, 120, 120)).encode().expect("it can be announced");
     let again = Message::parse(&announced).unwrap();
     let said: Vec<&RData> = again.answers.iter().map(|r| &r.data).filter(|d| matches!(d, RData::Txt(_))).collect();
     assert_eq!(said, [&RData::Txt(binary)]);
