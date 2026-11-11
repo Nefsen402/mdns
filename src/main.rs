@@ -638,7 +638,7 @@ fn event_loop(
         // in on, and to none if that is not one of ours.
         for (&fd, _) in shared.iter().zip(&fds[shared_at..clients]).filter(|(_, p)| poll::ready(p)) {
             ifaces.hub.receive(fd, |index, from, to, datagram| {
-                if let Some(iface) = ifaces.live.iter().find(|i| i.index == index) {
+                if let Some(iface) = ifaces.live.iter().find(|i| i.index == index).filter(|i| interface::hears(&i.interface, to)) {
                     iface.segment.hear(from, to, datagram);
                 }
             });

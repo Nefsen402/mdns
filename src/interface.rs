@@ -75,6 +75,18 @@ pub fn unicast(interface: &Interface) -> Vec<Family> {
         .collect()
 }
 
+/// Whether `interface` takes a datagram sent to `to`, if that is known: what is
+/// sent to the group always, and what is sent to the daemon itself only over a
+/// family it hears that over. A socket of an interface's own hears no more than
+/// that already; the sockets shared by every interface, which hear what any of
+/// them does, have to be held to it.
+pub fn hears(interface: &Interface, to: Option<IpAddr>) -> bool {
+    match to {
+        Some(to) if !to.is_multicast() => unicast(interface).contains(&family_of(to)),
+        _ => true,
+    }
+}
+
 /// The families of `interface` that it cannot be listened to over yet, as it
 /// has no address to join the group by: they are joined when it has one. A
 /// peer's is not a group to join, and needs no address of the interface's.

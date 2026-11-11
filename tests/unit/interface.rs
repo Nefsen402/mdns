@@ -236,3 +236,22 @@ fn a_link_says_to_everyone_answers_the_askers_side_and_asks_hosts_directly() {
     Link::default().send(b"nobody").unwrap();
     Link::default().reply(Family::V4, None, b"nobody").unwrap();
 }
+
+/// An interface takes what is sent to the group, and what is sent to the
+/// daemon itself only over the families it says it hears that over.
+#[test]
+fn an_interface_takes_what_is_sent_to_the_daemon_over_the_families_it_hears_that_over() {
+    let interface = |config: &str| {
+        crate::config::Config::parse(&format!("{config}[Segment]\nName=a\nInterfaces=x\n")).unwrap().interface("x")
+    };
+    let (group4, group6, own4, own6) = (Some(ip("224.0.0.251")), Some(ip("ff02::fb")), Some(ip("10.0.0.1")), Some(ip("fd00::1")));
+    let all = interface("");
+    assert!([group4, group6, own4, own6, None].into_iter().all(|to| hears(&all, to)));
+    let group_only = interface("[Interface]\nIPv4=multicast\n");
+    assert!(hears(&group_only, group4) && hears(&group_only, group6) && hears(&group_only, None));
+    assert!(!hears(&group_only, own4), "not over the family that is to hear the group alone");
+    assert!(hears(&group_only, own6), "but over the other");
+    let neither = interface("[Interface]\nIPv4=multicast\nIPv6=multicast\n");
+    assert!(!hears(&neither, own4) && !hears(&neither, own6));
+    assert!(hears(&neither, group4) && hears(&neither, group6));
+}

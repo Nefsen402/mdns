@@ -763,6 +763,20 @@ class Unicast(Case):
         d.settle()
         self.assertEqual(d.host("s", "tv.local"), [])
 
+    def test_it_is_heard_on_the_interface_that_listens_for_it_and_not_on_the_one_that_does_not(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        lb = self.lab.link("rb", "10.9.2.1/24", "10.9.2.2/24")
+        self.lab.net.relax_source_checks()
+        d = self.lab.daemon(
+            "[Interface]\nIPv6=off\n[Interface]\nName=ra\nIPv4=multicast\n"
+            "[Segment]\nName=a\nInterfaces=ra\n[Segment]\nName=b\nInterfaces=rb\n"
+        )
+        la.device("10.9.1.50").unicast(announcement("tv", "10.9.1.50", "TV"), "10.9.1.1")
+        lb.device("10.9.2.50").unicast(announcement("nas", "10.9.2.50", "NAS"), "10.9.2.1")
+        d.settle()
+        self.assertTrue(d.host("b", "nas.local"), self.logs(d))
+        self.assertEqual(d.host("a", "tv.local"), [], "ra is to hear the group alone, whatever rb does")
+
     def test_it_is_not_heard_from_a_host_that_is_not_on_the_link(self):
         d = self.world("on", source="192.168.77.5")
         d.settle()
