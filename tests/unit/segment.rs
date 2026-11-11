@@ -7,7 +7,6 @@ use super::*;
 use crate::device::EditService;
 use crate::config::{DEFAULT_MAX_DEVICES, DEFAULT_MIN_LIFETIME};
 use crate::device::{addr_of, edit, Origin, META_QUERY};
-use crate::tracker::MAX_PER_SENDER;
 use std::collections::BTreeSet;
 use crate::codec::RData;
 
@@ -1000,17 +999,9 @@ fn a_device_is_asked_again_before_its_address_runs_out() {
 }
 
 #[test]
-fn one_sender_may_describe_only_so_many_hosts() {
+fn a_host_that_is_described_again_is_kept_up_to_date() {
     let seg = segment("test");
-    for i in 0..MAX_PER_SENDER + 10 {
-        hear(&seg, "10.0.1.1", vec![a_record(&format!("h{i}.local"), &format!("10.0.2.{}", i % 250 + 1))]);
-    }
-    let named = |seg: &Segment| seg.devices().iter().filter(|d| d.hostname.is_some()).count();
-    assert_eq!(named(&seg), MAX_PER_SENDER);
-
-    hear(&seg, "10.0.1.2", vec![a_record("other.local", "10.0.1.2")]);
-    assert_eq!(named(&seg), MAX_PER_SENDER + 1, "another sender is not held back");
-
+    hear(&seg, "10.0.1.1", vec![a_record("h0.local", "10.0.2.1")]);
     hear(&seg, "10.0.1.1", vec![a_record("h0.local", "10.0.3.3")]);
     let h0 = seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("h0.local")).unwrap();
     assert_eq!(v4(&h0), Some(ip("10.0.3.3")), "what it described is kept up to date");
@@ -2558,11 +2549,10 @@ fn a_segment_taken_down_withdraws_what_it_announced_and_says_its_devices_are_gon
     assert!(b.state.borrow().hosts.is_empty());
 }
 
-/// A segment that talks to a peer hears it alone, takes its questions for mDNS
-/// from whatever port it asks, and lets it describe as many hosts as there is
-/// room for, as it speaks for a network.
+/// A segment that talks to a peer hears it alone, and takes its questions for
+/// mDNS from whatever port it asks.
 #[test]
-fn a_segment_that_talks_to_a_peer_hears_it_alone_and_as_a_network() {
+fn a_segment_that_talks_to_a_peer_hears_it_alone() {
     let (rx, tx) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
     rx.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let seg = segment("tun");
@@ -2587,17 +2577,6 @@ fn a_segment_that_talks_to_a_peer_hears_it_alone_and_as_a_network() {
     age(&seg, 2);
     seg.handle(SocketAddr::new(ip("127.0.0.2"), 5399), &query("tv.local", rtype::A, vec![])).unwrap();
     assert!(recv(&rx).is_none());
-
-    // A peer describes more hosts than any other sender may.
-    let described = |seg: &Segment, from: &str| {
-        for n in 0..70 {
-            hear(seg, from, vec![a_record(&format!("host{n}.local"), &format!("10.9.0.{n}"))]);
-        }
-        seg.devices().len()
-    };
-    assert_eq!(described(&seg, "127.0.0.1"), 70);
-    let other = segment("lan");
-    assert_eq!(described(&other, "10.8.0.9"), crate::tracker::MAX_PER_SENDER);
 }
 
 /// A device is the same one when it is renamed: it is withdrawn under the name

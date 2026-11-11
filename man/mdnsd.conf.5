@@ -532,7 +532,6 @@ as far as memory allows.
 A device takes about 1.6 KiB, and what the daemon does each time it wakes grows
 with the number of devices it has, so a larger limit is for a network that
 needs it.
-At most 64 hosts are learned of from any one sender, whatever this is.
 .TP
 .B MaxServices=
 How many services a device is kept with, and reflected with, at most; more are
@@ -635,9 +634,7 @@ such as WireGuard, with a daemon at the other end whose interface has this host
 for its peer.
 What is announced and asked on the interface is sent to each of them, and only
 what they send to the daemon is heard, whatever it is sent to: they are who they
-are by the tunnel they come through, and each speaks for the devices of a
-network, so is not limited to 64 hosts as another sender is (see
-.BR MaxDevices= ).
+are by the tunnel they come through.
 The interface is used over the families the peers are of, not by
 .B IPv4=
 and

@@ -24,12 +24,6 @@ use crate::time::Instant;
 /// without bound by announcing endless made-up types.
 pub const MAX_TYPES: usize = 256;
 
-/// Hosts first described by any one sender, so that one inventing endless
-/// devices (or many forged ones) cannot fill the segment, which has room for
-/// [`DEFAULT_MAX_DEVICES`] unless set otherwise. A sleep proxy or Thread
-/// border router speaks for several hosts, but not for this many.
-pub const MAX_PER_SENDER: usize = 64;
-
 /// How long after asking a device on its link-local address, so that the
 /// kernel looks up its link-layer address, it is not asked so again.
 const NUDGE_GAP: Duration = Duration::from_secs(60);
@@ -54,9 +48,6 @@ pub struct Tracker {
     /// The networks the interface is on: of the neighbour table, only
     /// addresses in one of them are learned.
     pub prefixes: Vec<Prefix>,
-    /// The hosts every device is heard through, if the segment talks to peers
-    /// alone, and not to the group: each speaks for a whole network.
-    pub peers: Vec<IpAddr>,
 }
 
 impl Default for Tracker {
@@ -70,21 +61,11 @@ impl Default for Tracker {
             max_services: DEFAULT_MAX_SERVICES,
             neighbours: NeighbourTable::default(),
             prefixes: Vec::new(),
-            peers: Vec::new(),
         }
     }
 }
 
 impl Tracker {
-    /// Whether a new host may be learned of from `src`: the segment has
-    /// fewer than it is set to remember, and `src` first described fewer than
-    /// [`MAX_PER_SENDER`] of them, unless it is a peer, which speaks for a
-    /// whole network.
-    pub fn room_for(&self, src: IpAddr) -> bool {
-        self.discovered.len() < self.max_devices
-            && (self.peers.contains(&src) || self.discovered.described_by(&src) < MAX_PER_SENDER)
-    }
-
     /// Bring the addresses learned from the neighbour table up to date for
     /// the devices of `keys`, noting in `touched` those that change: the
     /// routable addresses listed under the link-layer address of one it
@@ -275,7 +256,7 @@ impl Tracker {
 
         for report in &reports {
             let known = self.discovered.find_host(&report.host);
-            if known.is_none() && !self.room_for(src) {
+            if known.is_none() && self.discovered.len() >= self.max_devices {
                 continue;
             }
             // Goodbyes alone for a device not known here (one that already
@@ -907,16 +888,6 @@ impl Devices {
     /// The devices with a service whose host is not known yet.
     pub fn with_unresolved(&self) -> impl Iterator<Item = (Id, &Entry)> {
         self.unresolved.iter().map(|&id| (id, self.table.get(id)))
-    }
-
-    /// How many devices with a hostname `sender` first described.
-    pub fn described_by(&self, sender: &IpAddr) -> usize {
-        let hash = hash_addr(&self.hasher, sender);
-        let first = |id: &Id| {
-            let entry = self.table.get(*id);
-            entry.from == *sender && entry.device.borrow().hostname.is_some()
-        };
-        self.by_from.under(hash).filter(first).count()
     }
 
     /// The soonest anything of a device is due: when something of one runs

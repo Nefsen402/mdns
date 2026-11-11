@@ -1114,8 +1114,6 @@ impl Segment {
     pub fn attach(&self, link: impl Into<Rc<Link>>) {
         let mut state = self.state.borrow_mut();
         state.link = link.into();
-        // Each describes a whole network, not a device.
-        state.tracker.peers = state.link.peers().to_vec();
         state.sync_refresh();
     }
 

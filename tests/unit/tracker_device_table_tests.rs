@@ -26,8 +26,6 @@ fn a_device_is_found_by_its_hostname_whatever_the_case_and_by_address_until_it_h
     assert!(!devices.contains_host("other.local"));
     assert_eq!(devices.find_nameless(&"10.0.0.8".parse().unwrap()), None);
     assert_eq!(devices.find_nameless(&"10.0.0.1".parse().unwrap()), None, "it has a name");
-    assert_eq!(devices.described_by(&"10.0.0.1".parse().unwrap()), 1);
-    assert_eq!(devices.described_by(&from), 0, "it has none");
 
     // Given a hostname, it is found by it, and no longer by where from.
     let was = devices.indexed_of(bare);
