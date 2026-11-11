@@ -23,10 +23,10 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::AdvertiseConfig;
+use crate::config::{Advertise, AdvertiseConfig};
 use crate::runtime::Why;
 use crate::device::{
-    family_of, is_link_local, is_type, responses, service_ttl, Advertise, Advertised, Device, ServiceParts,
+    family_of, is_link_local, is_type, responses, service_ttl, Advertised, Device, ServiceParts,
     DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
 };
 use crate::socket::{Family, Prefix, Sender, MDNS_PORT};
@@ -169,50 +169,56 @@ pub enum Owner {
 /// One owner's wish to have a device announced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Claim {
-    /// A device made for it, announced as it is, with the TTL of its address.
-    Owned { device: Rc<Device>, host_ttl: u32 },
+    /// A device made for it, announced as it is (`how` is [`Advertise::ALL`]),
+    /// with the TTL of its address.
+    Owned { device: Rc<Device>, how: Rc<Advertise>, host_ttl: u32 },
     /// A device of another segment, as it is to be shown here, with the
-    /// addresses `how` says, and the TTL of its address `host_ttl` if given,
+    /// addresses and services `how` says, and the TTL of its address `host_ttl` if given,
     /// or else its own.
-    Reflected { device: Rc<Device>, how: Advertise, host_ttl: Option<u32> },
+    Reflected { device: Rc<Device>, how: Rc<Advertise>, host_ttl: Option<u32> },
 }
 
 impl Claim {
     /// The device as it is to be announced, and the TTL of its address.
     fn resolve(&self) -> (Shown, u32) {
         match self {
-            Claim::Owned { device, host_ttl } => (Shown { device: Rc::clone(device), how: Advertise::ALL }, *host_ttl),
+            Claim::Owned { device, how, host_ttl } => (Shown { device: Rc::clone(device), how: Rc::clone(how) }, *host_ttl),
             Claim::Reflected { device, how, host_ttl } => {
                 let ttl = host_ttl.unwrap_or_else(|| device.ttl.map_or(HOST_TTL, |ttl| ttl.max(MIN_REFLECT_TTL)));
-                (Shown { device: Rc::clone(device), how: *how }, ttl)
+                (Shown { device: Rc::clone(device), how: Rc::clone(how) }, ttl)
             }
         }
     }
 }
 
 /// A device as it is shown on a segment: all of it is kept, and `how` says
-/// which of its addresses are put in the records it is announced with. The
+/// which of its addresses and services are put in the records it is
+/// announced with. The
 /// device is the claim's: what is shown is not a copy of it with other
 /// addresses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Shown {
     device: Rc<Device>,
-    how: Advertise,
+    how: Rc<Advertise>,
 }
 
 impl Shown {
     fn has_name(&self, name: &str) -> bool {
-        self.device.has_name(self.how, name)
+        self.device.has_name(&self.how, name)
     }
 
     fn for_each_name(&self, f: impl FnMut(&str)) {
-        self.device.for_each_name(self.how, f);
+        self.device.for_each_name(&self.how, f);
     }
 
-    /// The device with only the addresses it is shown with: for what is
-    /// reported of it, not for what is announced.
+    /// The device with only the addresses and services it is shown with: for
+    /// what is reported of it, not for what is announced.
     fn made(&self) -> Device {
-        Device { addresses: self.device.advertised(self.how).copied().collect(), ..(*self.device).clone() }
+        Device {
+            addresses: self.device.advertised(&self.how).copied().collect(),
+            services: self.device.advertised_services(&self.how).cloned().collect(),
+            ..(*self.device).clone()
+        }
     }
 }
 
@@ -356,7 +362,7 @@ impl Manual {
     /// The shortest TTL anything of it is announced with: it has to be
     /// announced again before that runs out.
     fn shortest_ttl(&self) -> u32 {
-        let services = self.shown.iter().flat_map(|d| &d.device.services).map(|svc| service_ttl(svc, self.other_ttl));
+        let services = self.shown.iter().flat_map(|d| d.device.advertised_services(&d.how)).map(|svc| service_ttl(svc, self.other_ttl));
         services.chain([self.host_ttl]).min().unwrap_or(self.host_ttl)
     }
 
@@ -836,8 +842,8 @@ impl State {
                     .filter(|(origin, _)| *origin == lowest)
                     .map(|(_, wanted)| wanted)
                     .reduce(|(shown, ttl), (other, other_ttl)| {
-                        let both = shown.device.union(shown.how, &other.device, other.how);
-                        (Shown { device: Rc::new(both), how: Advertise::ALL }, ttl.max(other_ttl))
+                        let both = shown.device.union(&shown.how, &other.device, &other.how);
+                        (Shown { device: Rc::new(both), how: Rc::new(Advertise::ALL) }, ttl.max(other_ttl))
                     })?
             }
         };
@@ -865,8 +871,8 @@ impl State {
         let old = m.shown.as_ref().map(|d| Device { ttl: Some(m.host_ttl), ..(*d.device).clone() });
         let new = want.as_ref().map(|(shown, host_ttl)| Device { ttl: Some(*host_ttl), ..(*shown.device).clone() });
         let host_here = self.tracker.discovered.contains_host(key);
-        let old = old.as_ref().zip(m.shown.as_ref()).map(|(device, shown)| Advertised { device, how: shown.how });
-        let new = new.as_ref().zip(want.as_ref()).map(|(device, (shown, _))| Advertised { device, how: shown.how });
+        let old = old.as_ref().zip(m.shown.as_ref()).map(|(device, shown)| Advertised { device, how: &shown.how });
+        let new = new.as_ref().zip(want.as_ref()).map(|(device, (shown, _))| Advertised { device, how: &shown.how });
         let records = Device::transition(old, new, &|instance| self.is_local(instance), host_here);
         let sent = !records.is_empty();
         if sent {
@@ -905,7 +911,7 @@ impl State {
             .iter()
             .filter(|q| !(self.is_local(&q.name) || self.tracker.discovered.contains_host(&q.name)))
             .map(|q| {
-                let answered = self.manual.with_shown_name(&q.name).any(|m| m.shown.as_ref().is_some_and(|d| d.device.knows(d.how, q)));
+                let answered = self.manual.with_shown_name(&q.name).any(|m| m.shown.as_ref().is_some_and(|d| d.device.knows(&d.how, q)));
                 Asked { question: q.clone(), answered }
             })
             .collect()
@@ -919,7 +925,7 @@ impl State {
     /// take them for a conflict, and once it announces, the copy gives way.
     /// The daemon's own name answers a probe however recently it went out:
     /// that answer defends it, which section 6 exempts from the wait.
-    fn answering(&self, query: &Message, now: Instant, legacy: bool, probing: bool, family: Family) -> Vec<(String, Device, Advertise)> {
+    fn answering(&self, query: &Message, now: Instant, legacy: bool, probing: bool, family: Family) -> Vec<(String, Device, Rc<Advertise>)> {
         // Only those with records under a name asked for can answer.
         let mut keys: Vec<String> = query.questions.iter().flat_map(|q| self.manual.hosts_showing(&q.name)).collect();
         keys.sort_unstable();
@@ -934,7 +940,7 @@ impl State {
             if !legacy && !probing && now.saturating_duration_since(m.last_sent.over(family)) < MIN_MULTICAST_GAP {
                 continue;
             }
-            out.push((key, Device { ttl: Some(m.host_ttl), ..(*device.device).clone() }, device.how));
+            out.push((key, Device { ttl: Some(m.host_ttl), ..(*device.device).clone() }, Rc::clone(&device.how)));
         }
         out
     }
@@ -1189,7 +1195,7 @@ impl Segment {
         let Some(key) = device.key() else {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
         };
-        self.claim(ClaimKey::owned(owner), &key, Claim::Owned { device: Rc::new(device), host_ttl })
+        self.claim(ClaimKey::owned(owner), &key, Claim::Owned { device: Rc::new(device), how: Rc::new(Advertise::ALL), host_ttl })
     }
 
     /// Announce `device`, one that is on the segment of `origin` (an
@@ -1200,7 +1206,7 @@ impl Segment {
     /// name from the same segment that more than one owner shows is announced
     /// as what they show of it together; from another segment, the lowest
     /// segment's is, and the other takes over when it goes.
-    pub fn reflect(&self, owner: Owner, origin: &str, device: Rc<Device>, how: Advertise, host_ttl: Option<Duration>) -> Result<bool> {
+    pub fn reflect(&self, owner: Owner, origin: &str, device: Rc<Device>, how: Rc<Advertise>, host_ttl: Option<Duration>) -> Result<bool> {
         let Some(host) = device.key() else {
             return Err(anyhow!("a reflected device needs a hostname to announce"));
         };
@@ -1333,7 +1339,7 @@ impl Segment {
         for key in manual.hosts_all() {
             let Some(m) = manual.get(&key) else { continue };
             let Some(device) = &m.shown else { continue };
-            match send(outbound, *max_packet, &device.device.announcement(device.how, m.host_ttl, m.other_ttl)) {
+            match send(outbound, *max_packet, &device.device.announcement(&device.how, m.host_ttl, m.other_ttl)) {
                 Ok(()) => {
                     manual.edit(&key, |m| {
                         m.announced = now;
@@ -1420,7 +1426,7 @@ impl Segment {
             .manual
             .iter()
             .filter_map(|m| match m.claims.get(&ClaimKey::owned(Owner::Own)) {
-                Some(Claim::Owned { device, host_ttl }) => Some(((**device).clone(), Duration::from_secs(u64::from(*host_ttl)))),
+                Some(Claim::Owned { device, host_ttl, .. }) => Some(((**device).clone(), Duration::from_secs(u64::from(*host_ttl)))),
                 _ => None,
             })
             .collect()
@@ -1451,7 +1457,7 @@ impl Segment {
                 };
                 let announced = match &m.shown {
                     Some(device) => {
-                        send(&state.outbound, state.max_packet, &device.device.announcement(device.how, m.host_ttl, m.other_ttl))?;
+                        send(&state.outbound, state.max_packet, &device.device.announcement(&device.how, m.host_ttl, m.other_ttl))?;
                         true
                     }
                     None => false,
@@ -1505,7 +1511,7 @@ impl Segment {
         let probing = !query.authorities.is_empty();
         let answering = state.answering(query, now, legacy, probing, family);
         let keys: Vec<&String> = answering.iter().map(|(key, ..)| key).collect();
-        let devices: Vec<Advertised> = answering.iter().map(|(_, device, how)| Advertised { device, how: *how }).collect();
+        let devices: Vec<Advertised> = answering.iter().map(|(_, device, how)| Advertised { device, how }).collect();
         let Some((msgs, answered)) = Device::query_response(&devices, query, legacy, state.max_packet) else {
             return Ok(());
         };

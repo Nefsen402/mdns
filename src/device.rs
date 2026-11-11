@@ -13,7 +13,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use hashbrown::{HashMap, HashSet};
 use core::net::IpAddr;
 
-use crate::config::{Neighbours, ReflectedWhen, DEFAULT_MAX_ADDRS};
+use crate::config::{Advertise, Neighbours, ReflectedWhen, DEFAULT_MAX_ADDRS};
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_SERVICES;
 use crate::codec::{self, rtype, Header, Message, Question, RData, Record};
@@ -330,48 +330,18 @@ pub struct Device {
     pub reverse: Box<[IpAddr]>,
 }
 
-/// Which of the addresses of a [`Device`] are advertised: what its records
-/// are made of. It is not the device's: a device keeps all it was given, and
-/// whoever shows it says which of them to put in its records. A device heard
-/// of is shown with all of them; one reflected to another network, with those
-/// that network can make use of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Advertise {
-    /// Which of the addresses it was given from the neighbour table.
-    pub neighbours: Neighbours,
-    /// Whether its link-local addresses, which only mean something on its own
-    /// link.
-    pub link_local: bool,
-}
-
-impl Advertise {
-    /// All of them: a device is as it was heard.
-    pub const ALL: Advertise = Advertise { neighbours: Neighbours::Always, link_local: true };
-
-    /// As a device is to be reflected: no link-local address, and of those
-    /// from the neighbour table, those `neighbours` lets through.
-    pub fn reflected(neighbours: Neighbours) -> Advertise {
-        Advertise { neighbours, link_local: false }
-    }
-}
-
-impl Default for Advertise {
-    fn default() -> Advertise {
-        Advertise::ALL
-    }
-}
-
-/// A device as it is shown: with the addresses `how` says.
+/// A device as it is shown: with the addresses and services `how` says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Advertised<'a> {
     pub device: &'a Device,
-    pub how: Advertise,
+    pub how: &'a Advertise,
 }
 
 impl<'a> From<&'a Device> for Advertised<'a> {
-    /// As it was heard, with all its addresses.
+    /// As it was heard, with everything it has.
     fn from(device: &'a Device) -> Advertised<'a> {
-        Advertised { device, how: Advertise::ALL }
+        static ALL: Advertise = Advertise::ALL;
+        Advertised { device, how: &ALL }
     }
 }
 
@@ -743,13 +713,18 @@ impl Device {
     }
 
     /// The IPs of [its addresses as `how` would advertise them](Device::advertised).
-    pub fn advertised_addrs(&self, how: Advertise) -> impl Iterator<Item = IpAddr> + '_ {
+    pub fn advertised_addrs<'a>(&'a self, how: &'a Advertise) -> impl Iterator<Item = IpAddr> + 'a {
         self.advertised(how).map(|a| a.ip)
+    }
+
+    /// Its services as `how` would advertise them.
+    pub fn advertised_services<'a>(&'a self, how: &'a Advertise) -> impl Iterator<Item = &'a Service> + 'a {
+        self.services.iter().filter(move |s| (!how.resolved_only || s.is_resolved()) && how.allows(s.kind()))
     }
 
     /// Its addresses as `how` would advertise them, with where each was
     /// learned.
-    pub fn advertised(&self, how: Advertise) -> impl Iterator<Item = &Address> + '_ {
+    pub fn advertised<'a>(&'a self, how: &'a Advertise) -> impl Iterator<Item = &'a Address> + 'a {
         // A family it announced a link-local address of: it speaks it, if
         // only on its own link.
         let speaks = |v4: bool| {
@@ -782,28 +757,16 @@ impl Device {
         }
     }
 
-    /// This device as it is announced on another network, or nothing if it is
-    /// not to be: only those services whose host and port are known (a copy
-    /// would have to make up the rest) and whose type `when` reflects. It is
-    /// reflected only if it has what `when` asks for: a hostname for the
-    /// address record, a routable address to put in it among those `how`
-    /// advertises (a device known only by a link-local one cannot be reached
-    /// from another network), and a service to give clients a reason to care
-    /// (bare chatty clients such as phones are skipped).
-    ///
-    /// The copy has all its addresses: which are announced is for whoever
-    /// shows it to say, with `how`, as the records are made.
-    pub fn reflected(&self, how: Advertise, when: &ReflectedWhen) -> Option<Device> {
-        let shown = |s: &&Service| s.is_resolved() && when.kinds.allows(s.kind());
-        let fit = (!when.hostname || self.hostname.is_some())
+    /// Whether this device is to be announced on another network, as `how`
+    /// says: only if it has what `when` asks for: a hostname for the address
+    /// record, a routable address to put in it among those `how` advertises (a
+    /// device known only by a link-local one cannot be reached from another
+    /// network), and a service to give clients a reason to care (bare chatty
+    /// clients such as phones are skipped).
+    pub fn reflectable(&self, how: &Advertise, when: &ReflectedWhen) -> bool {
+        (!when.hostname || self.hostname.is_some())
             && (!when.address || self.advertised(how).next().is_some())
-            && (!when.service || self.services.iter().any(|s| shown(&s)));
-        if !fit {
-            return None;
-        }
-        let mut device = self.clone();
-        edit(&mut device.services).retain(|s| shown(&s));
-        Some(device)
+            && (!when.service || self.advertised_services(how).next().is_some())
     }
 
     /// This device together with `other`, of the same host: what either has,
@@ -811,8 +774,12 @@ impl Device {
     /// one reflector reflects from the same segment, each as it is to show it
     /// (`how`, and `other_how` for `other`). The addresses it has are those
     /// advertised of either, which is all there is of the two.
-    pub fn union(&self, how: Advertise, other: &Device, other_how: Advertise) -> Device {
-        let mut device = Device { addresses: self.advertised(how).copied().collect(), ..self.clone() };
+    pub fn union(&self, how: &Advertise, other: &Device, other_how: &Advertise) -> Device {
+        let mut device = Device {
+            addresses: self.advertised(how).copied().collect(),
+            services: self.advertised_services(how).cloned().collect(),
+            ..self.clone()
+        };
         for address in other.advertised(other_how) {
             match device.addresses.iter_mut().find(|a| a.ip == address.ip) {
                 Some(mine) => {
@@ -824,7 +791,7 @@ impl Device {
             }
         }
         device.addresses.sort_by_key(|a| addr_order(&a.ip));
-        for service in &other.services {
+        for service in other.advertised_services(other_how) {
             if device.service(&service.instance()).is_none() {
                 device.insert_service(service.clone());
             }
@@ -1099,27 +1066,29 @@ impl Device {
     /// and for each service its type, its instance and its subtypes, and the
     /// type enumeration if it has any. None if it has no hostname, and so no
     /// records. A name may come twice.
-    pub fn for_each_name(&self, how: Advertise, mut f: impl FnMut(&str)) {
+    pub fn for_each_name(&self, how: &Advertise, mut f: impl FnMut(&str)) {
         let Some(host) = &self.hostname else { return };
         f(host);
         for addr in self.advertised_addrs(how).filter(|addr| self.reverse.contains(addr)) {
             f(&codec::reverse_name(addr));
         }
-        for svc in &self.services {
+        let mut any = false;
+        for svc in self.advertised_services(how) {
+            any = true;
             f(&svc.kind());
             f(&svc.instance());
             for sub in svc.subtypes() {
                 f(sub);
             }
         }
-        if !self.services.is_empty() {
+        if any {
             f(SERVICE_ENUMERATION);
         }
     }
 
     /// Whether its announcement has records under `name`, ignoring case:
     /// whether it can answer a question asking for that name.
-    pub fn has_name(&self, how: Advertise, name: &str) -> bool {
+    pub fn has_name(&self, how: &Advertise, name: &str) -> bool {
         let mut found = false;
         self.for_each_name(how, |own| found |= own.eq_ignore_ascii_case(name));
         found
@@ -1127,18 +1096,19 @@ impl Device {
 
     /// The records that announce it. A TTL of 0 turns them into goodbyes.
     /// Callers must have checked that it has a hostname.
-    pub fn announcement(&self, how: Advertise, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
+    pub fn announcement(&self, how: &Advertise, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
         let host = self.hostname.clone().expect("hostname checked on add");
         let mut records: Vec<Record> =
             self.advertised_addrs(how).map(|addr| record(host.clone(), true, host_ttl, address_data(addr))).collect();
         records.extend(self.nsec_record(how, host_ttl));
         records.extend(self.reverse_records(how, host_ttl));
 
-        for svc in &self.services {
+        for svc in self.advertised_services(how) {
             records.extend(self.service_records(svc, service_ttl(svc, other_ttl)));
         }
         // DNS-SD service type enumeration, once per distinct type.
-        let kinds: BTreeMap<String, &str> = self.services.iter().map(|s| (s.kind().to_ascii_lowercase(), s.kind())).collect();
+        let kinds: BTreeMap<String, &str> =
+            self.advertised_services(how).map(|s| (s.kind().to_ascii_lowercase(), s.kind())).collect();
         for kind in kinds.into_values() {
             records.push(record(SERVICE_ENUMERATION.into(), false, other_ttl, RData::Ptr(kind.to_string())));
         }
@@ -1148,12 +1118,12 @@ impl Device {
     /// The records that take a segment from announcing this device to
     /// announcing `new` under the same hostname: all of `new`, and goodbyes
     /// for the services and addresses of this one that `new` does not have.
-    pub fn replacement(&self, how: Advertise, new: Advertised, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
+    pub fn replacement(&self, how: &Advertise, new: Advertised, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
         let Advertised { device: new, how: new_how } = new;
         let mut records = new.announcement(new_how, host_ttl, other_ttl);
         let kept: HashMap<String, &Service> =
-            new.services.iter().map(|s| (s.instance().to_ascii_lowercase(), s)).collect();
-        for svc in &self.services {
+            new.advertised_services(new_how).map(|s| (s.instance().to_ascii_lowercase(), s)).collect();
+        for svc in self.advertised_services(how) {
             match kept.get(&svc.instance().to_ascii_lowercase()) {
                 None => records.extend(self.service_records(svc, 0)),
                 Some(now) => {
@@ -1179,7 +1149,7 @@ impl Device {
     /// The reverse-mapping PTRs of its addresses, for those it announced one
     /// for itself: a device with several hostnames names one of them, and two
     /// copies saying different things would flush each other.
-    fn reverse_records(&self, how: Advertise, ttl: u32) -> Vec<Record> {
+    fn reverse_records(&self, how: &Advertise, ttl: u32) -> Vec<Record> {
         let Some(host) = &self.hostname else { return Vec::new() };
         self.advertised_addrs(how)
             .filter(|addr| self.reverse.contains(addr))
@@ -1191,7 +1161,7 @@ impl Device {
     /// itself: never more than it denied, so whatever it has that is announced
     /// is listed too. A responder may only deny what it owns (RFC 6762 section
     /// 6.1), so a device that said nothing gets none.
-    pub fn nsec_record(&self, how: Advertise, ttl: u32) -> Option<Record> {
+    pub fn nsec_record(&self, how: &Advertise, ttl: u32) -> Option<Record> {
         let host = self.hostname.clone()?;
         let said = self.nsec.as_ref()?;
         let ours = self.advertised_addrs(how).map(|addr| match addr {
@@ -1313,7 +1283,7 @@ impl Device {
 
     /// Its records that answer `q`, with these TTLs, without the additional
     /// records an answer brings, nor an NSEC saying it has none.
-    pub fn records_for(&self, how: Advertise, q: &Question, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
+    pub fn records_for(&self, how: &Advertise, q: &Question, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
         let (mut records, _) = self.answers(how, &query(core::slice::from_ref(q)), host_ttl, other_ttl);
         records.retain(|r| r.rtype() != rtype::NSEC);
         records
@@ -1321,7 +1291,7 @@ impl Device {
 
     /// Whether it has an answer to `q`: a record, or, by its NSEC, the word
     /// that there is none.
-    pub fn knows(&self, how: Advertise, q: &Question) -> bool {
+    pub fn knows(&self, how: &Advertise, q: &Question) -> bool {
         !self.answers(how, &query(core::slice::from_ref(q)), 1, 1).0.is_empty()
     }
 
@@ -1396,7 +1366,7 @@ impl Device {
         let mut additionals: Vec<Record> = Vec::new();
         let mut answered = Vec::new();
         for (i, Advertised { device, how }) in devices.iter().enumerate() {
-            let (a, x) = device.answers(*how, query, device.ttl.unwrap_or(HOST_TTL), OTHER_TTL);
+            let (a, x) = device.answers(how, query, device.ttl.unwrap_or(HOST_TTL), OTHER_TTL);
             if a.is_empty() {
                 continue;
             }
@@ -1446,7 +1416,7 @@ impl Device {
     /// Its records that match `query`, with known-answer suppression
     /// applied, plus the additional records a client will want next (RFC 6763
     /// section 12): a PTR brings its SRV and TXT, and an SRV brings its address.
-    pub fn answers(&self, how: Advertise, query: &Message, host_ttl: u32, other_ttl: u32) -> (Vec<Record>, Vec<Record>) {
+    pub fn answers(&self, how: &Advertise, query: &Message, host_ttl: u32, other_ttl: u32) -> (Vec<Record>, Vec<Record>) {
         let all = self.announcement(how, host_ttl, other_ttl);
 
         let mut answers: Vec<Record> = Vec::new();

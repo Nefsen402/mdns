@@ -10,13 +10,13 @@ use alloc::collections::BTreeSet;
 
 use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
 
-use crate::device::{addr_of, Advertise, edit, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
+use crate::device::{addr_of, edit, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
 use alloc::rc::Rc;
 
 use crate::segment::Asked;
 use crate::codec::{Message, Question, RData, Record};
 use crate::prelude::*;
-use crate::config::{DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
+use crate::config::{Advertise, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
 use crate::socket::{Family, Prefix};
 use crate::table::{hash_addr, hash_name, Id, Multi, Table};
 use crate::time::Instant;
@@ -528,7 +528,7 @@ impl Entry {
             return Vec::new();
         }
         let host_ttl = self.device.ttl.unwrap_or(HOST_TTL);
-        let mut records = self.device.records_for(Advertise::ALL, q, host_ttl, OTHER_TTL);
+        let mut records = self.device.records_for(&Advertise::ALL, q, host_ttl, OTHER_TTL);
         for rec in &mut records {
             let until = addr_of(&rec.data).and_then(|a| self.addr_expires.get(&a)).unwrap_or(&self.expires);
             let left = until.saturating_duration_since(now).as_secs();
@@ -804,7 +804,7 @@ impl Devices {
     pub fn indexed(&self, entry: &Entry) -> Indexed {
         let mut addrs: Vec<u64> = entry.device.addrs().map(|addr| hash_addr(&self.hasher, &addr)).collect();
         let mut names = Vec::new();
-        entry.device.for_each_name(Advertise::ALL, |name| names.push(hash_name(&self.hasher, name)));
+        entry.device.for_each_name(&Advertise::ALL, |name| names.push(hash_name(&self.hasher, name)));
         for hashes in [&mut addrs, &mut names] {
             hashes.sort_unstable();
             hashes.dedup();
@@ -880,7 +880,7 @@ impl Devices {
     /// The devices that answer for `name`, ignoring case.
     pub fn with_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
         let hash = hash_name(&self.hasher, name);
-        self.by_name.under(hash).map(|id| self.table.get(id)).filter(move |entry| entry.device.has_name(Advertise::ALL, name))
+        self.by_name.under(hash).map(|id| self.table.get(id)).filter(move |entry| entry.device.has_name(&Advertise::ALL, name))
     }
 
     /// The devices with a service whose host is not known yet.

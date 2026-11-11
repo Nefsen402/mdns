@@ -482,7 +482,7 @@ fn segments_choose_what_a_device_needs_to_be_reflected() {
 #[test]
 fn segments_choose_which_service_types_are_reflected() {
     let kinds = |extra: &str| {
-        Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}")).unwrap().segments[0].reflected_when.kinds.clone()
+        Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}")).unwrap().segments[0].advertise.clone()
     };
     assert!(kinds("").is_all());
     let only = kinds("ReflectedServices=_IPP._tcp, _airplay._tcp.local.");
@@ -512,7 +512,7 @@ fn segments_choose_which_service_types_are_reflected() {
 fn segments_choose_which_neighbour_addresses_to_reflect() {
     let segments = |extra: &str| {
         let c = Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=z")).unwrap();
-        (c.segments[0].neighbour_addresses, c.segments[1].neighbour_addresses)
+        (c.segments[0].advertise.neighbours, c.segments[1].advertise.neighbours)
     };
     assert_eq!(segments(""), (Neighbours::LinkLocal, Neighbours::LinkLocal));
     assert_eq!(segments("NeighbourAddresses=always"), (Neighbours::Always, Neighbours::LinkLocal));

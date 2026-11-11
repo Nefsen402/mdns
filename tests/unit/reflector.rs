@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
 use super::*;
+use crate::config::{Advertise, Neighbours};
 use crate::device::Device;
 
 /// `socket` as the segment takes a socket.
@@ -263,7 +264,7 @@ fn a_device_without_services_is_reflected_only_if_asked_to() {
         let (b, _brx) = wired("b");
         let when = ReflectedWhen { service, ..ReflectedWhen::default() };
         let _r =
-            Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), when, None)
+            Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Advertise::default(), when, None)
                 .unwrap();
 
         announce(&a, "10.0.1.6", "bare.local", &[]);
@@ -309,18 +310,14 @@ fn only_the_services_of_the_types_asked_for_are_reflected() {
         // The config refuses this; the reflector does what it is told.
         let (a, _arx) = wired("a");
         let (b, _brx) = wired("b");
-        let when = ReflectedWhen {
-            service,
-            kinds: crate::config::Config::parse(&format!("[Segment]\nName=s\nInterfaces=a,b\nReflectedServices={kinds}"))
-                .unwrap()
-                .segments[0]
-                .reflected_when
-                .kinds
-                .clone(),
-            ..ReflectedWhen::default()
-        };
+        let when = ReflectedWhen { service, ..ReflectedWhen::default() };
+        let advertise = crate::config::Config::parse(&format!("[Segment]\nName=s\nInterfaces=a,b\nReflectedServices={kinds}"))
+            .unwrap()
+            .segments[0]
+            .advertise
+            .clone();
         let _r =
-            Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), when, None)
+            Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), advertise, when, None)
                 .unwrap();
         announce_kinds(&a, "10.0.1.7", "mixed.local", &[("Office", "_ipp._tcp"), ("Shell", "_ssh._tcp")]);
         announce_kinds(&a, "10.0.1.8", "shell.local", &[("Box", "_ssh._tcp")]);
@@ -354,7 +351,7 @@ fn a_device_without_a_routable_address_is_reflected_only_if_asked_to() {
         let (b, _brx) = wired_v6("b");
         let when = ReflectedWhen { address, ..ReflectedWhen::default() };
         let _r =
-            Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), when, None)
+            Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Advertise::default(), when, None)
                 .unwrap();
 
         announce6(&a, "fe80::6", "mute.local", &["fe80::6"], "Mute");
@@ -507,7 +504,7 @@ fn a_configured_reflect_ttl_wins_for_the_address_and_leaves_the_services_alone()
     let (a, _arx) = wired("a");
     let (b, brx) = wired("b");
     let ttl = Some(Duration::from_secs(900));
-    let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Neighbours::default(), ReflectedWhen::default(), ttl).unwrap();
+    let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), Advertise::default(), ReflectedWhen::default(), ttl).unwrap();
 
     announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
     wait_for(|| b.manual_devices().len() == 1);
@@ -522,7 +519,7 @@ fn segments_sharing_an_interface_each_reflect_with_their_own_ttl() {
     let (media, _mrx) = wired("media");
     let (wifi, _wrx) = wired("wifi");
     let ttl = Some(Duration::from_secs(900));
-    let _media = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], Forward::default(), Neighbours::default(), ReflectedWhen::default(), ttl);
+    let _media = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], Forward::default(), Advertise::default(), ReflectedWhen::default(), ttl);
     let _wifi = Reflector::new(1, vec![br0.clone(), wifi.clone()]).unwrap();
 
     announce_ttl(&media, "10.0.2.5", "tv.local", &["TV"], 300, 600);
@@ -741,7 +738,7 @@ fn a_question_nothing_answers_is_asked_where_the_answer_could_come_from() {
     let (wifi, wifi_rx) = wired("wifi");
     let segments = vec![br0.clone(), media.clone(), wifi.clone()];
     let _r =
-        Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, Neighbours::default(), ReflectedWhen::default(), None).unwrap();
+        Reflector::with_options(0, segments, &["wifi".to_string()], Forward::Unknown, Advertise::default(), ReflectedWhen::default(), None).unwrap();
 
     ask(&br0, "10.0.0.50", "printer.local");
     deliver_made();
@@ -777,7 +774,7 @@ fn a_browse_a_copy_answers_is_asked_elsewhere_as_configured() {
     for forward in [Forward::Always, Forward::Unknown, Forward::Never] {
         let (br0, _br0_rx) = wired("br0");
         let (media, media_rx) = wired("media");
-        let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward, Neighbours::default(), ReflectedWhen::default(), None).unwrap();
+        let _r = Reflector::with_options(0, vec![br0.clone(), media.clone()], &[], forward, Advertise::default(), ReflectedWhen::default(), None).unwrap();
         announce(&media, "10.0.2.7", "tv.local", &["TV"]);
         wait_for(|| br0.manual_devices().len() == 1);
         drain(&media_rx);
@@ -890,7 +887,9 @@ fn a_segment_chooses_which_neighbour_addresses_to_reflect() {
     ] {
         let (a, _arx) = wired("a");
         let (b, _brx) = wired("b");
-        let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), mode, ReflectedWhen::default(), None).unwrap();
+        let mut advertise = Advertise::default();
+        advertise.neighbours = mode;
+        let _r = Reflector::with_options(0, vec![a.clone(), b.clone()], &[], Forward::default(), advertise, ReflectedWhen::default(), None).unwrap();
         a.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
         for (addr, mac) in [("10.0.1.9", 9), ("fd00::9", 9), ("fe80::8", 8), ("fd00::8", 8)] {
             a.neighbour(ip(addr), Some(vec![2, 0, 0, 0, 0, mac]));

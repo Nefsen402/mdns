@@ -649,7 +649,7 @@ fn an_announcement_too_big_for_the_mtu_goes_in_packets_that_fit() {
     for svc in &mut device.services {
         svc.edit(|p| p.txt = vec![format!("k={}", "v".repeat(60)).into_bytes()]);
     }
-    let expected = device.announcement(Advertise::ALL, HOST_TTL, OTHER_TTL).len();
+    let expected = device.announcement(&Advertise::ALL, HOST_TTL, OTHER_TTL).len();
     seg.add_manual_ttl(Owner::Reflector(0), device, Duration::from_secs(HOST_TTL.into())).unwrap();
 
     let mut buf = [0u8; 9000];
@@ -2419,7 +2419,7 @@ fn shown(seg: &Segment, host: &str) -> Rc<Device> {
 /// `target` is shown the device of `origin` called `host` as it is now, by
 /// the first reflector.
 fn reflect_of(target: &Segment, origin: &Segment, host: &str) -> Result<bool> {
-    target.reflect(Owner::Reflector(0), origin.interface(), shown(origin, host), Advertise::ALL, None)
+    target.reflect(Owner::Reflector(0), origin.interface(), shown(origin, host), Rc::new(Advertise::ALL), None)
 }
 
 #[test]
@@ -2477,8 +2477,8 @@ fn what_two_reflectors_show_of_a_device_of_one_segment_is_announced_together() {
     let two = Rc::new(tv("10.0.1.1", &["Two"]));
     for (first, second) in [(&one, &two), (&two, &one)] {
         let (b, _rx) = wired();
-        b.reflect(Owner::Reflector(0), "ra", Rc::clone(first), Advertise::ALL, None).unwrap();
-        b.reflect(Owner::Reflector(1), "ra", Rc::clone(second), Advertise::ALL, None).unwrap();
+        b.reflect(Owner::Reflector(0), "ra", Rc::clone(first), Rc::new(Advertise::ALL), None).unwrap();
+        b.reflect(Owner::Reflector(1), "ra", Rc::clone(second), Rc::new(Advertise::ALL), None).unwrap();
         let shown = b.manual_devices();
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].services.len(), 2, "{shown:?}");
@@ -2498,8 +2498,8 @@ fn of_one_name_from_two_segments_the_lowest_is_announced_and_the_next_takes_over
     let (b, _rx) = wired();
     let (low, high) = (Rc::new(tv("10.0.1.1", &["Low"])), Rc::new(tv("10.0.2.2", &["High"])));
     // Shown in the order that is not the segments'.
-    b.reflect(Owner::Reflector(1), "rz", Rc::clone(&high), Advertise::ALL, None).unwrap();
-    b.reflect(Owner::Reflector(0), "ra", Rc::clone(&low), Advertise::ALL, None).unwrap();
+    b.reflect(Owner::Reflector(1), "rz", Rc::clone(&high), Rc::new(Advertise::ALL), None).unwrap();
+    b.reflect(Owner::Reflector(0), "ra", Rc::clone(&low), Rc::new(Advertise::ALL), None).unwrap();
     let shown = b.manual_devices();
     assert_eq!(shown.len(), 1);
     assert!(shown[0].addrs().eq([ip("10.0.1.1")]), "{shown:?}");
@@ -2507,7 +2507,7 @@ fn of_one_name_from_two_segments_the_lowest_is_announced_and_the_next_takes_over
     b.unreflect(Owner::Reflector(0), "ra", "tv.local").unwrap();
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.2.2")]), "the other takes over");
 
-    b.reflect(Owner::Reflector(0), "ra", low, Advertise::ALL, None).unwrap();
+    b.reflect(Owner::Reflector(0), "ra", low, Rc::new(Advertise::ALL), None).unwrap();
     b.drop_origin(Owner::Reflector(0), "ra").unwrap();
     assert!(b.manual_devices()[0].addrs().eq([ip("10.0.2.2")]));
     b.drop_origin(Owner::Reflector(1), "rz").unwrap();
@@ -2543,11 +2543,11 @@ fn a_device_without_a_hostname_or_a_ttl_of_zero_is_not_reflected() {
     let bare = a.state.borrow().tracker.discovered.find_nameless(&ip("10.0.1.5"));
     assert!(bare.is_none(), "heard from the address of a named device");
     let named = shown(&a, "tv.local");
-    let err = b.reflect(Owner::Reflector(0), a.interface(), Rc::clone(&named), Advertise::ALL, Some(Duration::ZERO)).unwrap_err();
+    let err = b.reflect(Owner::Reflector(0), a.interface(), Rc::clone(&named), Rc::new(Advertise::ALL), Some(Duration::ZERO)).unwrap_err();
     assert!(format!("{err}").contains("zero"));
     assert!(b.manual_devices().is_empty());
     // The TTL it is given is the one its address is announced with.
-    b.reflect(Owner::Reflector(0), a.interface(), named, Advertise::ALL, Some(Duration::from_secs(900))).unwrap();
+    b.reflect(Owner::Reflector(0), a.interface(), named, Rc::new(Advertise::ALL), Some(Duration::from_secs(900))).unwrap();
     assert_eq!(b.state.borrow().manual["tv.local"].host_ttl, 900);
 }
 

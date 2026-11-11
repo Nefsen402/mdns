@@ -132,6 +132,71 @@ pub enum Neighbours {
     Never,
 }
 
+/// What of a device is put in the records that announce it, which it is not
+/// the device's to say: a device keeps all it was given, and whoever shows it
+/// says which of its addresses and services to announce. A reflector makes
+/// one when it is set up (`NeighbourAddresses=`, `ReflectedServices=`) and
+/// every segment it shows a device on keeps it with the device.
+///
+/// The default is what a reflector shows of a device: the addresses it can be
+/// reached at from another network, and the services whose host and port are
+/// known, of any type. [`Advertise::ALL`] is a device as it was heard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Advertise {
+    /// Which of the addresses it was given from the neighbour table.
+    pub neighbours: Neighbours,
+    /// Whether its link-local addresses, which only mean something on its own
+    /// link.
+    pub link_local: bool,
+    /// Whether only those of its services whose host and port are known (a
+    /// copy would have to make up the rest).
+    pub resolved_only: bool,
+    /// The service types that are shown (`ReflectedServices=`), such as
+    /// `_ipp._tcp`: only those in `only` if it has any, and never those in
+    /// `not`. Types are kept in lowercase, without the `.local`.
+    only: BTreeSet<String>,
+    not: BTreeSet<String>,
+}
+
+impl Advertise {
+    /// Everything: a device as it was heard.
+    pub const ALL: Advertise = Advertise {
+        neighbours: Neighbours::Always,
+        link_local: true,
+        resolved_only: false,
+        only: BTreeSet::new(),
+        not: BTreeSet::new(),
+    };
+
+    /// Whether the service type `kind`, as devices have it (`_ipp._tcp.local`),
+    /// is shown.
+    pub fn allows(&self, kind: &str) -> bool {
+        if self.is_all() {
+            return true;
+        }
+        let kind = kind.trim_end_matches('.');
+        let kind = kind.strip_suffix(".local").unwrap_or(kind).to_ascii_lowercase();
+        !self.not.contains(&kind) && (self.only.is_empty() || self.only.contains(&kind))
+    }
+
+    /// Whether every service type is.
+    pub fn is_all(&self) -> bool {
+        self.only.is_empty() && self.not.is_empty()
+    }
+
+    /// The service types as they were written: those named, and those kept
+    /// out with a `!` before.
+    pub fn words(&self) -> Vec<String> {
+        self.only.iter().cloned().chain(self.not.iter().map(|k| format!("!{k}"))).collect()
+    }
+}
+
+impl Default for Advertise {
+    fn default() -> Advertise {
+        Advertise { neighbours: Neighbours::default(), link_local: false, resolved_only: true, ..Advertise::ALL }
+    }
+}
+
 /// What a device must have been heard to have, to be reflected from a segment
 /// (`ReflectedWhen=`): a routable address, a hostname, and a service whose
 /// host and port are known. Everything unless set; a device with no service,
@@ -141,44 +206,11 @@ pub struct ReflectedWhen {
     pub address: bool,
     pub hostname: bool,
     pub service: bool,
-    /// Which of a device's services are reflected with it
-    /// (`ReflectedServices=`).
-    pub kinds: ServiceKinds,
 }
 
 impl Default for ReflectedWhen {
     fn default() -> ReflectedWhen {
-        ReflectedWhen { address: true, hostname: true, service: true, kinds: ServiceKinds::default() }
-    }
-}
-
-/// The service types that are reflected (`ReflectedServices=`), such as
-/// `_ipp._tcp`: only those in `only` if it has any, and never those in `not`.
-/// Types are kept in lowercase, without the `.local`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ServiceKinds {
-    only: BTreeSet<String>,
-    not: BTreeSet<String>,
-}
-
-impl ServiceKinds {
-    /// Whether the service type `kind`, as devices have it (`_ipp._tcp.local`),
-    /// is reflected.
-    pub fn allows(&self, kind: &str) -> bool {
-        let kind = kind.trim_end_matches('.');
-        let kind = kind.strip_suffix(".local").unwrap_or(kind).to_ascii_lowercase();
-        !self.not.contains(&kind) && (self.only.is_empty() || self.only.contains(&kind))
-    }
-
-    /// Whether every type is.
-    pub fn is_all(&self) -> bool {
-        self.only.is_empty() && self.not.is_empty()
-    }
-
-    /// The types as they were written: those named, and those kept out with a
-    /// `!` before.
-    pub fn words(&self) -> Vec<String> {
-        self.only.iter().cloned().chain(self.not.iter().map(|k| format!("!{k}"))).collect()
+        ReflectedWhen { address: true, hostname: true, service: true }
     }
 }
 
@@ -198,9 +230,10 @@ pub struct SegmentConfig {
     pub probe_interval: Option<Option<Duration>>,
     /// Which questions asked on one of its interfaces are put to the others.
     pub forward: Forward,
-    /// Which of the addresses a device was given from the neighbour table are
-    /// reflected with it.
-    pub neighbour_addresses: Neighbours,
+    /// What of a device is reflected with it: which of the addresses it was
+    /// given from the neighbour table (`NeighbourAddresses=`) and which
+    /// service types (`ReflectedServices=`).
+    pub advertise: Advertise,
     /// Whether what is reflected onto its interfaces is announced again
     /// before its TTL runs out though it has not changed.
     pub reannounce: bool,
@@ -478,26 +511,23 @@ impl Config {
                         settings.last_mut().unwrap().min_lifetime = Some(parse_lifetime(&value, lineno)?);
                     }
                     ("segment", "neighbouraddresses") => {
-                        config.segments.last_mut().unwrap().neighbour_addresses = parse_neighbours(&value, lineno)?;
+                        config.segments.last_mut().unwrap().advertise.neighbours = parse_neighbours(&value, lineno)?;
                     }
                     ("segment", "reannounce") => {
                         config.segments.last_mut().unwrap().reannounce = !value.is_empty() && parse_bool(entry, lineno)?;
                     }
                     ("segment", "reflectedwhen") => {
-                        // The services are `ReflectedServices=`'s, whichever comes first.
-                        let when = &mut config.segments.last_mut().unwrap().reflected_when;
-                        let kinds = core::mem::take(&mut when.kinds);
-                        *when = ReflectedWhen { kinds, ..parse_reflected_when(&value, lineno)? };
+                        config.segments.last_mut().unwrap().reflected_when = parse_reflected_when(&value, lineno)?;
                     }
                     ("segment", "reflectedservices") => {
                         // Repeated, it adds; an empty assignment resets, as everywhere.
-                        let more = parse_service_kinds(&value, lineno)?;
-                        let kinds = &mut config.segments.last_mut().unwrap().reflected_when.kinds;
+                        let (only, not) = parse_service_kinds(&value, lineno)?;
+                        let advertise = &mut config.segments.last_mut().unwrap().advertise;
                         if value.is_empty() {
-                            *kinds = more;
+                            (advertise.only, advertise.not) = (only, not);
                         } else {
-                            kinds.only.extend(more.only);
-                            kinds.not.extend(more.not);
+                            advertise.only.extend(only);
+                            advertise.not.extend(not);
                         }
                     }
                     ("segment", "reflectttl") => {
@@ -617,7 +647,7 @@ impl Config {
             if let Some(both) = seg.included().find(|i| seg.excluded().any(|x| glob(x, i))) {
                 bail!("segment {:?} (line {at}) has Interfaces={both}, which it also keeps out", seg.name);
             }
-            if !seg.reflected_when.kinds.is_all() && !seg.reflected_when.service {
+            if !seg.advertise.is_all() && !seg.reflected_when.service {
                 bail!(
                     "segment {:?} (line {at}) has ReflectedServices= without enabling service filtering: add service to ReflectedWhen=",
                     seg.name
@@ -846,7 +876,7 @@ fn parse_reflected_when(value: &str, lineno: usize) -> Result<ReflectedWhen> {
     if value.is_empty() {
         return Ok(ReflectedWhen::default());
     }
-    let mut when = ReflectedWhen { address: false, hostname: false, service: false, kinds: ServiceKinds::default() };
+    let mut when = ReflectedWhen { address: false, hostname: false, service: false };
     for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()) {
         match word.to_ascii_lowercase().as_str() {
             "address" => when.address = true,
@@ -862,8 +892,9 @@ fn parse_reflected_when(value: &str, lineno: usize) -> Result<ReflectedWhen> {
     Ok(when)
 }
 
-fn parse_service_kinds(value: &str, lineno: usize) -> Result<ServiceKinds> {
-    let mut kinds = ServiceKinds::default();
+/// The service types named, and those kept out.
+fn parse_service_kinds(value: &str, lineno: usize) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let (mut only, mut not) = (BTreeSet::new(), BTreeSet::new());
     for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()) {
         let (excluded, name) = match word.strip_prefix('!') {
             Some(name) => (true, name),
@@ -880,9 +911,9 @@ fn parse_service_kinds(value: &str, lineno: usize) -> Result<ServiceKinds> {
         if !valid {
             bail!("line {lineno}: invalid ReflectedServices {word:?}: a service type such as _ipp._tcp, or !_ssh._tcp to keep one out");
         }
-        if excluded { kinds.not.insert(name) } else { kinds.only.insert(name) };
+        if excluded { not.insert(name) } else { only.insert(name) };
     }
-    Ok(kinds)
+    Ok((only, not))
 }
 
 fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {

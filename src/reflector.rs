@@ -22,8 +22,8 @@ use crate::time::Instant;
 
 use anyhow::{bail, Result};
 
-use crate::config::{glob, Forward, Neighbours, ReflectedWhen};
-use crate::device::{Advertise, Device};
+use crate::config::{glob, Advertise, Forward, ReflectedWhen};
+use crate::device::Device;
 use crate::segment::{Asked, Event, Owner, Segment};
 
 use crate::prelude::*;
@@ -61,9 +61,9 @@ struct Inner {
     /// they are here or not.
     untrusted: Vec<String>,
     forward: Forward,
-    /// Which of the addresses a device was given from the neighbour table are
-    /// reflected with it.
-    neighbours: Neighbours,
+    /// What of a device is reflected with it, made once for all the segments
+    /// it is shown on.
+    advertise: Rc<Advertise>,
     /// What a device has to have to be reflected.
     when: ReflectedWhen,
     /// The TTL the address records of what it reflects are announced with;
@@ -118,21 +118,20 @@ impl Reflector {
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
     pub fn with_untrusted(rank: u32, segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
-        Self::with_options(rank, segments, untrusted, Forward::default(), Neighbours::default(), ReflectedWhen::default(), None)
+        Self::with_options(rank, segments, untrusted, Forward::default(), Advertise::default(), ReflectedWhen::default(), None)
     }
 
     /// Like [`with_untrusted`](Reflector::with_untrusted), putting the
     /// questions asked on each segment to the others as `forward` says,
-    /// reflecting the addresses a device was given from the neighbour table as
-    /// `neighbours` says, reflecting the devices that have what `when` asks
-    /// for, and announcing what it reflects with the address TTL
+    /// reflecting as much of a device as `advertise` says, reflecting the
+    /// devices that have what `when` asks for, and announcing what it reflects with the address TTL
     /// `reflect_ttl`, if given, in place of each device's own.
     pub fn with_options(
         rank: u32,
         segments: Vec<Segment>,
         untrusted: &[String],
         forward: Forward,
-        neighbours: Neighbours,
+        advertise: Advertise,
         when: ReflectedWhen,
         reflect_ttl: Option<Duration>,
     ) -> Result<Reflector> {
@@ -153,7 +152,7 @@ impl Reflector {
             members: RefCell::new(members),
             untrusted,
             forward,
-            neighbours,
+            advertise: Rc::new(advertise),
             when,
             reflect_ttl,
             book: RefCell::default(),
@@ -430,7 +429,7 @@ impl Inner {
     fn relay(&self, from: &Segment, before: Option<&Device>, after: Option<&Device>, only: Option<&Segment>) {
         let host = after.and_then(Device::key);
         let old = before.and_then(Device::key).filter(|old| host.as_ref() != Some(old));
-        let shown = after.and_then(|device| device.reflected(Advertise::reflected(self.neighbours), &self.when)).map(Rc::new);
+        let shown = after.filter(|device| device.reflectable(&self.advertise, &self.when)).map(|device| Rc::new(device.clone()));
         let origin = from.interface();
         let mut book = self.book();
         for member in self.snapshot() {
@@ -452,7 +451,7 @@ impl Inner {
     fn attempt(&self, book: &mut Book, target: &Segment, origin: &str, host: &str, device: Option<Rc<Device>>) {
         book.failed.retain(|f| !(f.target.is(target) && &*f.origin == origin && f.host == host));
         let result = match &device {
-            Some(device) => target.reflect(self.owner, origin, Rc::clone(device), Advertise::reflected(self.neighbours), self.reflect_ttl),
+            Some(device) => target.reflect(self.owner, origin, Rc::clone(device), Rc::clone(&self.advertise), self.reflect_ttl),
             None => target.unreflect(self.owner, origin, host),
         };
         let failed = result.is_err();
