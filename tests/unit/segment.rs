@@ -2630,7 +2630,7 @@ fn a_device_without_a_hostname_or_a_ttl_of_zero_is_not_reflected() {
     assert!(b.reflected_devices().is_empty());
     // The TTL it is given is the one its address is announced with.
     b.reflect(a.priority(), &named, &reflector(0), Some(Duration::from_secs(900))).unwrap();
-    assert_eq!(b.state.borrow().hosts["tv.local"].host_ttl, 900);
+    assert_eq!(b.state.borrow().hosts["tv.local"].host_ttl(), 900);
 }
 
 // What a full segment costs. Not a test: run it with

@@ -164,10 +164,12 @@ pub const OWN: u32 = 0;
 type ReflectedKey = (usize, usize);
 
 /// A device reflected here, which is a wish to have it announced: the device
-/// itself, held where it is heard and so as it is now, and how much of it to show. It is told apart by
-/// the device, which is the same device however it changes, and by how it is
-/// to be shown, which is a reflector's own (another may show the same device
-/// otherwise); the reflector says when to look at it again.
+/// itself, held where it is heard and so as it is now, and how much of it to
+/// show. It is told apart by the device, which is the same device however it
+/// changes, and by how it is to be shown, which is a reflector's own (another
+/// may show the same device otherwise); the reflector says when to look at it
+/// again. What a host last announced ([`Host::shown`]) is one too, of a copy of
+/// the device, which [`Reflected::frozen`] makes.
 #[derive(Clone)]
 struct Reflected {
     /// Which wins where the same hostname is wanted announced by more than
@@ -204,33 +206,30 @@ impl Reflected {
     fn host(&self) -> Option<String> {
         self.device.borrow().key()
     }
-}
 
-/// A device as it is shown on a segment: as it was when it was last announced,
-/// so that what is no longer so can be said goodbye to, and `how` says which
-/// of its addresses and services are put in the records it is announced with.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Shown {
-    device: Rc<Device>,
-    how: Rc<Advertise>,
-}
+    /// A device as it was when it was announced, so that what is no longer
+    /// so can be said goodbye to: of `device`, a copy that nothing else holds,
+    /// shown as `how` says with `host_ttl`, of the `priority` it won with.
+    fn frozen(device: Shared, priority: u32, how: Rc<Advertise>, host_ttl: u32) -> Reflected {
+        Reflected { priority, device, how, host_ttl: Some(host_ttl) }
+    }
 
-impl Shown {
     fn has_name(&self, name: &str) -> bool {
-        self.device.has_name(&self.how, name)
+        self.device.borrow().has_name(&self.how, name)
     }
 
     fn for_each_name(&self, f: impl FnMut(&str)) {
-        self.device.for_each_name(&self.how, f);
+        self.device.borrow().for_each_name(&self.how, f);
     }
 
     /// The device with only the addresses and services it is shown with: for
     /// what is reported of it, not for what is announced.
     fn made(&self) -> Device {
+        let device = self.device.borrow();
         Device {
-            addresses: self.device.advertised(&self.how).copied().collect(),
-            services: self.device.advertised_services(&self.how).cloned().collect(),
-            ..(*self.device).clone()
+            addresses: device.advertised(&self.how).copied().collect(),
+            services: device.advertised_services(&self.how).cloned().collect(),
+            ..device.clone()
         }
     }
 }
@@ -250,7 +249,7 @@ struct Host {
     /// What is announced: what the winner was, less what devices on this
     /// segment have themselves (see [`State::wanted`]). `None` while a device
     /// here has the hostname.
-    shown: Option<Shown>,
+    shown: Option<Reflected>,
     /// When the full record set was last multicast; drives re-announcement.
     announced: Instant,
     /// Whether that was what changed, still to be announced a second time
@@ -261,8 +260,7 @@ struct Host {
     last_sent: Sent,
     /// Not before this, after sending failed.
     retry: Option<Instant>,
-    /// The TTLs it is announced with: of its address records, and of the rest.
-    host_ttl: u32,
+    /// The TTL it is announced with, of the records that are not its address.
     other_ttl: u32,
     /// What the tables that find it hold of it.
     held: Held,
@@ -278,7 +276,6 @@ impl Host {
             repeat: false,
             last_sent: Sent::both(now),
             retry: None,
-            host_ttl: HOST_TTL,
             other_ttl: OTHER_TTL,
             held: Held::default(),
         }
@@ -287,8 +284,18 @@ impl Host {
     /// The shortest TTL anything of it is announced with: it has to be
     /// announced again before that runs out.
     fn shortest_ttl(&self) -> u32 {
-        let services = self.shown.iter().flat_map(|d| d.device.advertised_services(&d.how)).map(|svc| service_ttl(svc, self.other_ttl));
-        services.chain([self.host_ttl]).min().unwrap_or(self.host_ttl)
+        let mut shortest = self.host_ttl();
+        if let Some(shown) = &self.shown {
+            for svc in shown.device.borrow().advertised_services(&shown.how) {
+                shortest = shortest.min(service_ttl(svc, self.other_ttl));
+            }
+        }
+        shortest
+    }
+
+    /// The TTL its address records are announced with.
+    fn host_ttl(&self) -> u32 {
+        self.shown.as_ref().map_or(HOST_TTL, Reflected::host_ttl)
     }
 
     /// When it is next due for re-announcing, or for another try after
@@ -297,7 +304,7 @@ impl Host {
     /// segment re-announces `unchanged` ones.
     fn reannounce_at(&self, unchanged: bool) -> Option<Instant> {
         let after = |gap: Duration| self.announced.checked_add(gap).unwrap_or(self.announced);
-        let due = |_: &Shown| match (self.repeat, unchanged) {
+        let due = |_: &Reflected| match (self.repeat, unchanged) {
             (true, _) => Some(after(ANNOUNCE_REPEAT)),
             (false, true) => Some(after(reannounce_after(self.shortest_ttl()))),
             (false, false) => None,
@@ -445,7 +452,7 @@ impl Hosts {
         }
         // What is wanted, by everyone who wants it.
         for reflected in &host.reflected {
-            reflected.device.borrow().for_each_name(&reflected.how, |name| names.push(hash_name(hasher, name)));
+            reflected.for_each_name(|name| names.push(hash_name(hasher, name)));
         }
         names.sort_unstable();
         names.dedup();
@@ -545,7 +552,7 @@ impl Hosts {
     fn with_claimed_name<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Host> + 'a {
         let hash = hash_name(&self.hasher, name);
         self.by_name.under(hash).map(|id| self.table.get(id)).filter(move |host| {
-            host.reflected.iter().any(|m| m.device.borrow().has_name(&m.how, name))
+            host.reflected.iter().any(|m| m.has_name(name))
                 || host.shown.as_ref().is_some_and(|shown| shown.has_name(name))
         })
     }
@@ -789,7 +796,8 @@ impl State {
         for m in self.hosts.iter() {
             if let Some(at) = m.reannounce_at(self.reannounce) {
                 // By the name as announced.
-                f("re-announce", &m.shown.as_ref().and_then(|d| d.device.hostname.as_deref()).unwrap_or(&m.host), at);
+                let name = m.shown.as_ref().and_then(|d| d.device.borrow().hostname.clone());
+                f("re-announce", &name.as_deref().unwrap_or(&m.host), at);
             }
         }
     }
@@ -821,7 +829,7 @@ impl State {
     /// here has the hostname. Announced on top of a device here, a copy would
     /// be a conflict, and the device would rename itself. The advertised name
     /// is ours, and announced whatever is here.
-    fn wanted(&self, key: &str, host: &Host) -> Option<(Shown, u32)> {
+    fn wanted(&self, key: &str, host: &Host) -> Option<Reflected> {
         let first = host.reflected.first()?;
         // What other segments' devices of the name there are: the lowest
         // segment's is announced, as everyone who reflects it shows it, and
@@ -836,9 +844,9 @@ impl State {
             [only] => {
                 // What was shown stays if it is what it would be, not a copy of it again.
                 let live = only.device.borrow();
-                let same = host.shown.as_ref().filter(|s| s.how == only.how && s.device.same_but_ttl(&live));
-                let device = same.map_or_else(|| Rc::new(live.clone()), |s| Rc::clone(&s.device));
-                Shown { device, how: Rc::clone(&only.how) }
+                let same = host.shown.as_ref().filter(|s| s.how == only.how && s.device.borrow().same_but_ttl(&live));
+                let device = same.map_or_else(|| Shared::new(live.clone()), |s| s.device.clone());
+                Reflected::frozen(device, only.priority, Rc::clone(&only.how), host_ttl)
             }
             [first, ref rest @ ..] => {
                 let mut device = first.device.borrow().clone();
@@ -847,22 +855,22 @@ impl State {
                     device = device.union(&how, &next.device.borrow(), &next.how);
                     how = Rc::new(Advertise::ALL);
                 }
-                Shown { device: Rc::new(device), how }
+                Reflected::frozen(Shared::new(device), first.priority, how, host_ttl)
             }
             [] => return None,
         };
         if first.priority == OWN {
-            return Some((shown, host_ttl));
+            return Some(shown);
         }
         if self.tracker.discovered.contains_host(key) {
             return None;
         }
         let local = |instance: &str| self.is_local(instance);
-        let without = match shown.device.without(&local) {
-            Cow::Owned(without) => Some(Rc::new(without)),
+        let without = match shown.device.borrow().without(&local) {
+            Cow::Owned(without) => Some(without),
             Cow::Borrowed(_) => None,
         };
-        Some((Shown { device: without.unwrap_or(shown.device), how: shown.how }, host_ttl))
+        Some(Reflected { device: without.map_or(shown.device, Shared::new), ..shown })
     }
 
     /// Put `reflected` among what is wanted announced, and settle what is
@@ -920,10 +928,12 @@ impl State {
         };
         let want = self.wanted(key, m);
         // Each with the TTL its address is announced with.
-        let old = m.shown.as_ref().map(|s| Advertised { device: &s.device, how: &s.how, host_ttl: m.host_ttl });
-        let new = want.as_ref().map(|(s, host_ttl)| Advertised { device: &s.device, how: &s.how, host_ttl: *host_ttl });
+        let (old_device, new_device) = (m.shown.as_ref().map(|s| s.device.borrow()), want.as_ref().map(|s| s.device.borrow()));
+        let old = m.shown.as_ref().zip(old_device.as_deref()).map(|(s, device)| Advertised { device, how: &s.how, host_ttl: s.host_ttl() });
+        let new = want.as_ref().zip(new_device.as_deref()).map(|(s, device)| Advertised { device, how: &s.how, host_ttl: s.host_ttl() });
         let host_here = self.tracker.discovered.contains_host(key);
         let records = Device::transition(old, new, &|instance| self.is_local(instance), host_here);
+        drop((old_device, new_device));
         let sent = !records.is_empty();
         if sent {
             send(&self.outbound, self.max_packet, &records)?;
@@ -937,13 +947,7 @@ impl State {
                 m.last_sent = Sent::both(now);
                 m.retry = None;
             }
-            match want {
-                Some((shown, host_ttl)) => {
-                    m.shown = Some(shown);
-                    m.host_ttl = host_ttl;
-                }
-                None => m.shown = None,
-            }
+            m.shown = want;
         });
         Ok(sent)
     }
@@ -961,7 +965,7 @@ impl State {
             .iter()
             .filter(|q| !(self.is_local(&q.name) || self.tracker.discovered.contains_host(&q.name)))
             .map(|q| {
-                let answered = self.hosts.with_shown_name(&q.name).any(|m| m.shown.as_ref().is_some_and(|d| d.device.knows(&d.how, q)));
+                let answered = self.hosts.with_shown_name(&q.name).any(|m| m.shown.as_ref().is_some_and(|d| d.device.borrow().knows(&d.how, q)));
                 Asked { question: q.clone(), answered }
             })
             .collect()
@@ -975,7 +979,7 @@ impl State {
     /// take them for a conflict, and once it announces, the copy gives way.
     /// The daemon's own name answers a probe however recently it went out:
     /// that answer defends it, which section 6 exempts from the wait.
-    fn answering(&self, query: &Message, now: Instant, legacy: bool, probing: bool, family: Family) -> Vec<(String, Shown, u32)> {
+    fn answering(&self, query: &Message, now: Instant, legacy: bool, probing: bool, family: Family) -> Vec<(String, Reflected)> {
         // Only those with records under a name asked for can answer.
         let mut keys: Vec<String> = query.questions.iter().flat_map(|q| self.hosts.hosts_showing(&q.name)).collect();
         keys.sort_unstable();
@@ -990,7 +994,7 @@ impl State {
             if !legacy && !probing && now.saturating_duration_since(m.last_sent.over(family)) < MIN_MULTICAST_GAP {
                 continue;
             }
-            out.push((key, device.clone(), m.host_ttl));
+            out.push((key, device.clone()));
         }
         out
     }
@@ -1363,7 +1367,8 @@ impl Segment {
         for key in hosts.hosts_all() {
             let Some(m) = hosts.get(&key) else { continue };
             let Some(device) = &m.shown else { continue };
-            match send(outbound, *max_packet, &device.device.announcement(&device.how, m.host_ttl, m.other_ttl)) {
+            let records = device.device.borrow().announcement(&device.how, device.host_ttl(), m.other_ttl);
+            match send(outbound, *max_packet, &records) {
                 Ok(()) => {
                     hosts.edit(&key, |m| {
                         m.announced = now;
@@ -1473,7 +1478,7 @@ impl Segment {
     /// shown of the one that won.
     pub fn reflected_devices(&self) -> Vec<Device> {
         let state = self.state.borrow_mut();
-        state.hosts.iter().filter_map(|m| m.shown.as_ref().map(Shown::made)).collect()
+        state.hosts.iter().filter_map(|m| m.shown.as_ref().map(Reflected::made)).collect()
     }
 
     /// Announce a second time what changed a second ago ([`ANNOUNCE_REPEAT`]),
@@ -1494,7 +1499,7 @@ impl Segment {
                 };
                 let announced = match &m.shown {
                     Some(device) => {
-                        send(&state.outbound, state.max_packet, &device.device.announcement(&device.how, m.host_ttl, m.other_ttl))?;
+                        send(&state.outbound, state.max_packet, &device.device.borrow().announcement(&device.how, device.host_ttl(), m.other_ttl))?;
                         true
                     }
                     None => false,
@@ -1548,8 +1553,12 @@ impl Segment {
         let probing = !query.authorities.is_empty();
         let answering = state.answering(query, now, legacy, probing, family);
         let keys: Vec<&String> = answering.iter().map(|(key, ..)| key).collect();
-        let devices: Vec<Advertised> =
-            answering.iter().map(|(_, shown, host_ttl)| Advertised { device: &shown.device, how: &shown.how, host_ttl: *host_ttl }).collect();
+        let borrowed: Vec<_> = answering.iter().map(|(_, shown)| shown.device.borrow()).collect();
+        let devices: Vec<Advertised> = answering
+            .iter()
+            .zip(&borrowed)
+            .map(|((_, shown), device)| Advertised { device, how: &shown.how, host_ttl: shown.host_ttl() })
+            .collect();
         let Some((msgs, answered)) = Device::query_response(&devices, query, legacy, state.max_packet) else {
             return Ok(());
         };
