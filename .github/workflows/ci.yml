@@ -273,6 +273,9 @@ jobs:
           freebsd-version
           sudo pkg install -y python3
           chmod +x freebsd-binaries/mdnsd freebsd-binaries/mdnsctl freebsd-binaries/tests/*
+          # Linux's loopback is all of 127.0.0.0/8, and a unit test sends to an address of it
+          # that is not 127.0.0.1; FreeBSD's is only 127.0.0.1, until it is given the other.
+          sudo ifconfig lo0 alias 127.0.0.2/32
           for t in freebsd-binaries/tests/*; do "$t"; done
           # With the clock the end-to-end tests move: without it they skip what
           # needs it, and still pass.

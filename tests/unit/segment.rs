@@ -2574,6 +2574,8 @@ fn a_segment_that_talks_to_a_peer_hears_it_alone() {
     seg.handle(SocketAddr::new(peer, 5399), &query("tv.local", rtype::A, vec![])).unwrap();
     assert!(recv(&rx).is_some_and(|m| m.answers.iter().any(|r| r.name == "tv.local")), "answered to the peer");
     // From another port and no peer, it is a legacy resolver, answered by itself and not to the peer.
+    // 127.0.0.2 is an address of the host on Linux; FreeBSD's loopback has to be given it (see the CI
+    // job that runs the unit tests there).
     age(&seg, 2);
     seg.handle(SocketAddr::new(ip("127.0.0.2"), 5399), &query("tv.local", rtype::A, vec![])).unwrap();
     assert!(recv(&rx).is_none());
