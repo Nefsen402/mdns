@@ -78,7 +78,7 @@ pub struct Question {
     pub unicast_response: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RData {
     A(Ipv4Addr),
     Aaaa(Ipv6Addr),
@@ -101,7 +101,7 @@ pub enum RData {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Record {
     pub name: String,
     pub class: u16,

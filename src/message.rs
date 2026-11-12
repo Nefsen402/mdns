@@ -143,12 +143,15 @@ pub fn responses(answers: &[Record], additionals: &[Record], limit: usize) -> Ve
 
 /// `records` grouped by name and type, in the order each set first appears.
 fn rrsets(records: &[Record]) -> Vec<Vec<&Record>> {
+    let mut at: HashMap<(u16, String), usize> = HashMap::new();
     let mut sets: Vec<Vec<&Record>> = Vec::new();
     for rec in records {
-        let same = |set: &&mut Vec<&Record>| set[0].rtype() == rec.rtype() && set[0].name.eq_ignore_ascii_case(&rec.name);
-        match sets.iter_mut().find(same) {
-            Some(set) => set.push(rec),
-            None => sets.push(vec![rec]),
+        match at.get(&(rec.rtype(), rec.name.to_ascii_lowercase())) {
+            Some(&i) => sets[i].push(rec),
+            None => {
+                at.insert((rec.rtype(), rec.name.to_ascii_lowercase()), sets.len());
+                sets.push(vec![rec]);
+            }
         }
     }
     sets
@@ -365,11 +368,82 @@ pub fn transition(old: Option<Advertised>, new: Option<Advertised>, local: &dyn 
     records
 }
 
-/// The reply to `query` from a responder that has `devices`: what each of
+/// A query, read once for answering it: the names it asks about, each once
+/// whatever the types and the number of times asked, and the answers it
+/// already has, found by name and data. So no answer is looked for among all
+/// the questions or all the known answers, and what a packet repeats costs
+/// nothing.
+pub struct Request<'a> {
+    pub message: &'a Message,
+    /// The names asked about, in lowercase, in the order they were first asked,
+    /// with what is asked of each.
+    names: Vec<(String, Asking)>,
+    /// The longest TTL the asker holds each record it already has with.
+    known: HashMap<(String, &'a RData), u32>,
+}
+
+/// The types asked of one name.
+#[derive(Default)]
+struct Asking {
+    /// ANY was asked.
+    any: bool,
+    types: HashSet<u16>,
+    /// The types in the order they were first asked.
+    order: Vec<u16>,
+}
+
+impl<'a> Request<'a> {
+    pub fn new(message: &'a Message) -> Request<'a> {
+        let mut at: HashMap<String, usize> = HashMap::new();
+        let mut names: Vec<(String, Asking)> = Vec::new();
+        for q in &message.questions {
+            // Only the Internet class is answered, and any.
+            if q.class != 1 && q.class != 255 {
+                continue;
+            }
+            let lower = q.name.to_ascii_lowercase();
+            let i = match at.get(&lower) {
+                Some(&i) => i,
+                None => {
+                    names.push((lower.clone(), Asking::default()));
+                    at.insert(lower, names.len() - 1);
+                    names.len() - 1
+                }
+            };
+            let asking = &mut names[i].1;
+            asking.any |= q.qtype == rtype::ANY;
+            if asking.types.insert(q.qtype) {
+                asking.order.push(q.qtype);
+            }
+        }
+        let mut known: HashMap<(String, &RData), u32> = HashMap::new();
+        for k in &message.answers {
+            let ttl = known.entry((k.name.to_ascii_lowercase(), &k.data)).or_insert(0);
+            *ttl = (*ttl).max(k.ttl);
+        }
+        Request { message, names, known }
+    }
+
+    /// The names asked about, in lowercase, once each: what the indices of
+    /// [`query_response`] are of.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// Whether the asker already holds `record`, with at least half its life
+    /// left (RFC 6762 section 7.1).
+    fn holds(&self, record: &Record) -> bool {
+        self.known.get(&(record.name.to_ascii_lowercase(), &record.data)).is_some_and(|&ttl| ttl >= record.ttl / 2)
+    }
+}
+
+/// The reply to `request` from a responder that has `devices`: what each of
 /// them answers, once each, each with the TTL of its address
 /// ([`HOST_TTL`](crate::device::HOST_TTL) if it has none) and of its services, in as many packets
-/// of at most `limit` bytes as it takes ([`responses`]). Returns them with
-/// the indices of the devices that answered, or `None` if none did.
+/// of at most `limit` bytes as it takes ([`responses`]). Of each device, only
+/// the names of the request that `asked` says (by index, see
+/// [`Request::names`]) are looked into. Returns the packets with the indices
+/// of the devices that answered, or `None` if none did.
 ///
 /// A `legacy` resolver, asking from a port other than 5353, gets one reply
 /// it can take (RFC 6762 section 6.7): its question and id echoed, no TTL
@@ -380,25 +454,30 @@ pub fn transition(old: Option<Advertised>, new: Option<Advertised>, local: &dyn 
 /// records that do not fit are only left out.
 pub fn query_response(
     devices: &[Advertised],
-    query: &Message,
+    asked: &[Vec<usize>],
+    request: &Request,
     legacy: bool,
     limit: usize,
 ) -> Option<(Vec<Message>, Vec<usize>)> {
+    let query = request.message;
     let mut answers: Vec<Record> = Vec::new();
     let mut additionals: Vec<Record> = Vec::new();
+    let (mut in_answers, mut in_additionals): (HashSet<Record>, HashSet<Record>) = (HashSet::new(), HashSet::new());
     let mut answered = Vec::new();
-    for (i, Advertised { device, how, host_ttl }) in devices.iter().enumerate() {
-        let (a, x) = device.answers(how, query, *host_ttl, OTHER_TTL);
+    for (i, (Advertised { device, how, host_ttl }, names)) in devices.iter().zip(asked).enumerate() {
+        let (a, x) = device.answers_to(how, request, names, *host_ttl, OTHER_TTL);
         if a.is_empty() {
             continue;
         }
         for r in a {
-            if !answers.contains(&r) {
+            if !in_answers.contains(&r) {
+                in_answers.insert(r.clone());
                 answers.push(r);
             }
         }
         for r in x {
-            if !additionals.contains(&r) {
+            if !in_additionals.contains(&r) {
+                in_additionals.insert(r.clone());
                 additionals.push(r);
             }
         }
@@ -423,12 +502,15 @@ pub fn query_response(
     let mut msg = response();
     msg.header.id = query.header.id;
     msg.questions = query.questions.clone();
+    // A section is full at the first record that does not fit: what is left
+    // is not tried, which would cost the size of the reply for each.
     for (additional, records) in [(false, &answers), (true, &additionals)] {
         for rec in records {
             section(&mut msg, additional).push(legacy(rec));
             if size(&msg) > limit {
                 section(&mut msg, additional).pop();
                 msg.header.truncated |= !additional;
+                break;
             }
         }
     }
@@ -545,102 +627,173 @@ impl Device {
 
     /// Whether it has an answer to `q`: a record, or, by its NSEC, the word
     /// that there is none.
+    #[cfg(test)]
     pub fn knows(&self, how: &Advertise, q: &Question) -> bool {
-        !self.answers(how, &query(core::slice::from_ref(q)), 1, 1).0.is_empty()
+        let mut coverage = Coverage::default();
+        coverage.add(self, how, &q.name);
+        (q.class == 1 || q.class == 255) && coverage.knows(q.qtype)
     }
 
     /// Its records that match `query`, with known-answer suppression
     /// applied, plus the additional records a client will want next (RFC 6763
     /// section 12): a PTR brings its SRV and TXT, and an SRV brings its address.
     pub fn answers(&self, how: &Advertise, query: &Message, host_ttl: u32, other_ttl: u32) -> (Vec<Record>, Vec<Record>) {
-        let all = self.announcement(how, host_ttl, other_ttl);
+        let request = Request::new(query);
+        let names: Vec<usize> = (0..request.names.len()).collect();
+        self.answers_to(how, &request, &names, host_ttl, other_ttl)
+    }
 
-        let mut answers: Vec<Record> = Vec::new();
-        for q in &query.questions {
-            if q.class != 1 && q.class != 255 {
-                continue;
-            }
-            let mut found = false;
-            for rec in &all {
+    /// Like [`Device::answers`], of the names of `request` that `names` says
+    /// (by index) and no others: for a device that is asked only about some of
+    /// the names of a query, which is all most of them are. Its records are made
+    /// once, and found by name, and nothing is looked for twice.
+    pub fn answers_to(
+        &self,
+        how: &Advertise,
+        request: &Request,
+        names: &[usize],
+        host_ttl: u32,
+        other_ttl: u32,
+    ) -> (Vec<Record>, Vec<Record>) {
+        let all = self.announcement(how, host_ttl, other_ttl);
+        let mut under: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, rec) in all.iter().enumerate() {
+            under.entry(rec.name.to_ascii_lowercase()).or_default().push(i);
+        }
+
+        let mut seen: HashSet<&Record> = HashSet::new();
+        let mut answers: Vec<&Record> = Vec::new();
+        for &n in names {
+            let (name, asking) = &request.names[n];
+            let Some(here) = under.get(name) else { continue };
+            let mut types: HashSet<u16> = HashSet::new();
+            let mut nsecs: Vec<&Record> = Vec::new();
+            for &i in here {
+                let rec = &all[i];
+                types.insert(rec.rtype());
+                if matches!(rec.data, RData::Nsec { .. }) {
+                    nsecs.push(rec);
+                }
                 // An NSEC is not one of the records a name has.
-                let type_ok = (q.qtype == rtype::ANY && rec.rtype() != rtype::NSEC) || q.qtype == rec.rtype();
-                if type_ok && rec.name.eq_ignore_ascii_case(&q.name) {
-                    found = true;
-                    if !answers.contains(rec) {
-                        answers.push(rec.clone());
-                    }
+                let type_ok = (asking.any && rec.rtype() != rtype::NSEC) || asking.types.contains(&rec.rtype());
+                if type_ok && seen.insert(rec) {
+                    answers.push(rec);
                 }
             }
             // A type the name has not got, by its NSEC: say so (RFC 6762
             // section 6.1), so the asker need not wait for an answer.
-            let denies = |r: &&Record| {
-                r.name.eq_ignore_ascii_case(&q.name)
-                    && matches!(&r.data, RData::Nsec { types, .. } if !types.contains(&q.qtype))
-            };
-            if !found
-                && q.qtype != rtype::ANY
-                && let Some(nsec) = all.iter().find(denies).filter(|r| !answers.contains(r))
-            {
-                answers.push(nsec.clone());
+            if nsecs.is_empty() {
+                continue;
+            }
+            for &qtype in &asking.order {
+                if qtype == rtype::ANY || types.contains(&qtype) {
+                    continue;
+                }
+                let denies = |r: &&&Record| matches!(&r.data, RData::Nsec { types, .. } if !types.contains(&qtype));
+                if let Some(&nsec) = nsecs.iter().find(denies)
+                    && seen.insert(nsec)
+                {
+                    answers.push(nsec);
+                }
             }
         }
 
         // The asker already holds this record with at least half its life left.
-        let known = |r: &Record| {
-            query.answers.iter().any(|k| k.name.eq_ignore_ascii_case(&r.name) && k.data == r.data && k.ttl >= r.ttl / 2)
-        };
-        answers.retain(|r| !known(r));
+        answers.retain(|r| !request.holds(r));
         if answers.is_empty() {
-            return (answers, Vec::new());
+            return (Vec::new(), Vec::new());
         }
 
-        let mut extra: Vec<Record> = Vec::new();
-        let instances: Vec<&String> = answers
-            .iter()
-            .filter_map(|r| match &r.data {
-                RData::Ptr(instance) => Some(instance),
+        // What each next group of records is of, in the order the device has
+        // them, and not what is in `seen` already.
+        let pick = |of: Vec<String>, ok: fn(&RData) -> bool, seen: &HashSet<&Record>| -> Vec<&Record> {
+            let mut at: Vec<usize> =
+                of.iter().filter_map(|name| under.get(name)).flatten().copied().filter(|&i| ok(&all[i].data) && !seen.contains(&all[i])).collect();
+            at.sort_unstable();
+            at.dedup();
+            at.into_iter().map(|i| &all[i]).collect()
+        };
+        fn lower(records: &[&Record], of: fn(&RData) -> Option<&String>) -> Vec<String> {
+            records.iter().filter_map(|r| of(&r.data)).map(|name| name.to_ascii_lowercase()).collect()
+        }
+
+        seen = answers.iter().copied().collect();
+        let mut extra: Vec<&Record> = Vec::new();
+        fn target(data: &RData) -> Option<&String> {
+            match data {
+                RData::Srv { target, .. } => Some(target),
                 _ => None,
-            })
-            .collect();
-        for rec in &all {
-            let wanted = matches!(rec.data, RData::Srv { .. } | RData::Txt(_))
-                && instances.iter().any(|i| rec.name.eq_ignore_ascii_case(i));
-            if wanted && !answers.contains(rec) {
-                extra.push(rec.clone());
             }
         }
-        let targets: Vec<String> = answers
-            .iter()
-            .chain(&extra)
-            .filter_map(|r| match &r.data {
-                RData::Srv { target, .. } => Some(target.clone()),
+        fn instance(data: &RData) -> Option<&String> {
+            match data {
+                RData::Ptr(instance) => Some(instance),
                 _ => None,
-            })
-            .collect();
-        for rec in &all {
-            let wanted = matches!(rec.data, RData::A(_) | RData::Aaaa(_))
-                && targets.iter().any(|t| rec.name.eq_ignore_ascii_case(t));
-            if wanted && !answers.contains(rec) && !extra.contains(rec) {
-                extra.push(rec.clone());
             }
+        }
+        // A PTR brings the SRV and TXT of its instance.
+        for rec in pick(lower(&answers, instance), |d| matches!(d, RData::Srv { .. } | RData::Txt(_)), &seen) {
+            seen.insert(rec);
+            extra.push(rec);
+        }
+        // An SRV brings the addresses of its target.
+        let both: Vec<&Record> = answers.iter().chain(&extra).copied().collect();
+        for rec in pick(lower(&both, target), |d| matches!(d, RData::A(_) | RData::Aaaa(_)), &seen) {
+            seen.insert(rec);
+            extra.push(rec);
         }
         // An address comes with the name's addresses of the other family, and
         // the NSEC that says which kinds of address there are (RFC 6762
         // section 6.2): so a client asking over IPv4 learns of IPv6 too.
-        let hosts: Vec<String> = answers
+        let both: Vec<&Record> = answers.iter().chain(&extra).copied().collect();
+        let hosts: Vec<String> = both
             .iter()
-            .chain(&extra)
             .filter(|r| matches!(r.data, RData::A(_) | RData::Aaaa(_)))
-            .map(|r| r.name.clone())
+            .map(|r| r.name.to_ascii_lowercase())
             .collect();
-        for rec in &all {
-            let wanted = matches!(rec.data, RData::A(_) | RData::Aaaa(_) | RData::Nsec { .. })
-                && hosts.iter().any(|h| rec.name.eq_ignore_ascii_case(h));
-            if wanted && !answers.contains(rec) && !extra.contains(rec) {
-                extra.push(rec.clone());
+        for rec in pick(hosts, |d| matches!(d, RData::A(_) | RData::Aaaa(_) | RData::Nsec { .. }), &seen) {
+            seen.insert(rec);
+            extra.push(rec);
+        }
+        (answers.into_iter().cloned().collect(), extra.into_iter().cloned().collect())
+    }
+}
+
+/// What the devices announced under one name between them answer of each
+/// type that might be asked of it: a record of it, or, by an NSEC, the word
+/// that there is none. Built once for a name, whatever types are asked.
+#[derive(Default)]
+pub struct Coverage {
+    /// The types of the records under the name.
+    types: HashSet<u16>,
+    /// What each NSEC under the name says it has.
+    nsecs: Vec<Vec<u16>>,
+}
+
+impl Coverage {
+    /// Count what `device`, shown as `how`, has under `name`.
+    pub fn add(&mut self, device: &Device, how: &Advertise, name: &str) {
+        if device.hostname.is_none() {
+            return;
+        }
+        for rec in device.announcement(how, 1, 1).iter().filter(|r| r.name.eq_ignore_ascii_case(name)) {
+            self.types.insert(rec.rtype());
+            if let RData::Nsec { types, .. } = &rec.data
+                && !self.nsecs.contains(types)
+            {
+                self.nsecs.push(types.clone());
             }
         }
-        (answers, extra)
+    }
+
+    /// Whether a question of `qtype` of the name has an answer: any record
+    /// for ANY (an NSEC is not one of the records a name has), else one of
+    /// the type, or an NSEC that says there is none.
+    pub fn knows(&self, qtype: u16) -> bool {
+        if qtype == rtype::ANY {
+            return self.types.iter().any(|&t| t != rtype::NSEC);
+        }
+        self.types.contains(&qtype) || self.nsecs.iter().any(|types| !types.contains(&qtype))
     }
 }
 

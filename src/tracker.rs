@@ -209,11 +209,16 @@ impl Tracker {
         // that owns the name, and anything the sender was only known by. One
         // that announces others in its place (a temporary IPv6 address giving
         // way to the next) is not; it only loses the one.
-        let still = |name: &str| records().any(|r| r.ttl > 0 && addr_of(&r.data).is_some() && r.name.eq_ignore_ascii_case(name));
-        let leaving: Vec<&str> = records()
-            .filter(|r| r.ttl == 0 && addr_of(&r.data) == Some(src) && !still(&r.name))
-            .map(|r| r.name.as_str())
-            .collect();
+        let goodbyes: Vec<&Record> = records().filter(|r| r.ttl == 0 && addr_of(&r.data) == Some(src)).collect();
+        let leaving: Vec<&str> = if goodbyes.is_empty() {
+            Vec::new()
+        } else {
+            let still: HashSet<String> = records()
+                .filter(|r| r.ttl > 0 && addr_of(&r.data).is_some())
+                .map(|r| r.name.to_ascii_lowercase())
+                .collect();
+            goodbyes.into_iter().filter(|r| !still.contains(&r.name.to_ascii_lowercase())).map(|r| r.name.as_str()).collect()
+        };
         if !leaving.is_empty() {
             let mut gone: Vec<Id> = leaving.iter().filter_map(|name| self.discovered.find_host(name)).collect();
             gone.extend(self.discovered.find_nameless(&src));

@@ -3344,3 +3344,38 @@ fn live_respond() {
         }
     }
 }
+
+/// A query with several names is put to each device about the names it has
+/// records under, and each is answered once however many times a name is asked.
+#[test]
+fn each_device_is_asked_about_the_names_it_has_and_a_repeated_question_costs_nothing() {
+    let (seg, _rx) = wired();
+    for i in 0..2 {
+        let mut device = tv("10.4.0.1", &["X"]);
+        device.hostname = Some(format!("x{i}.local"));
+        device.services[0].edit(|p| p.instance = format!("X{i}._http._tcp.local"));
+        device.services[0].edit(|p| p.target = device.hostname.clone());
+        seg.add_reflected(FIRST, &Shared::new(device)).unwrap();
+    }
+    seg.take_events();
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let from = client.local_addr().unwrap();
+    let ask = |questions: Vec<Question>| {
+        let header = Header { id: 7, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 };
+        let msg = Message { header, questions, answers: vec![], authorities: vec![], additionals: vec![] };
+        seg.handle(from, &msg.encode().unwrap()).unwrap();
+        let reply = recv(&client).expect("a reply");
+        reply.answers.into_iter().map(|r| (r.rtype(), r.name)).map(|(t, n)| (n, t)).collect::<Vec<_>>()
+    };
+
+    let both = ask(vec![question("_http._tcp.local", rtype::PTR), question("x1.local", rtype::A), question("nobody.local", rtype::A)]);
+    let count = |answers: &[(String, u16)], name: &str, rtype: u16| answers.iter().filter(|(n, t)| n == name && *t == rtype).count();
+    assert_eq!(count(&both, "_http._tcp.local", rtype::PTR), 2, "both devices have the service: {both:?}");
+    assert_eq!(count(&both, "x1.local", rtype::A), 1, "{both:?}");
+    assert_eq!(count(&both, "x0.local", rtype::A), 0, "x0 was not asked for: {both:?}");
+
+    let once = ask(vec![question("x1.local", rtype::A)]);
+    let often = ask(vec![question("x1.local", rtype::A), question("X1.local", rtype::A), question("x1.local", rtype::A)]);
+    assert_eq!(once, often);
+}

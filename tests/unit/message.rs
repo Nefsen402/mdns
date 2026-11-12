@@ -6,7 +6,7 @@ use crate::device::*;
 #[test]
 fn a_query_response_has_what_each_device_answers_once() {
     let devices = three_devices();
-    let (msgs, answered) = query_response(&as_heard(&devices), &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
+    let (msgs, answered) = answer(&as_heard(&devices), &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
     let msg = only(msgs);
     assert_eq!(answered, [0, 1], "the printer has nothing of that type");
     let browsed: Vec<&RData> = msg.answers.iter().map(|r| &r.data).collect();
@@ -23,14 +23,14 @@ fn a_query_response_has_what_each_device_answers_once() {
 
     // A record two of them have is given once.
     let (msgs, answered) =
-        query_response(&as_heard(&devices), &query("_services._dns-sd._udp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
+        answer(&as_heard(&devices), &query("_services._dns-sd._udp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).unwrap();
     let msg = only(msgs);
     assert_eq!(answered, [0, 1, 2]);
     assert_eq!(msg.answers.len(), 2, "_http and _ipp: {:?}", msg.answers);
 
     // Nothing to say is no reply at all.
-    assert!(query_response(&as_heard(&devices), &query("_airplay._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
-    assert!(query_response(&as_heard(&[]), &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
+    assert!(answer(&as_heard(&devices), &query("_airplay._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
+    assert!(answer(&as_heard(&[]), &query("_http._tcp.local", rtype::PTR), false, DEFAULT_MAX_PACKET).is_none());
 }
 
 /// Records are put in as few packets as keep within the limit, in order,
@@ -81,7 +81,7 @@ fn a_record_too_big_for_a_packet_goes_alone() {
 #[test]
 fn a_large_reply_is_split_over_packets() {
     let devices = many(40, 100);
-    let (packets, answered) = query_response(&as_heard(&devices), &query("_http._tcp.local", rtype::PTR), false, 1452).unwrap();
+    let (packets, answered) = answer(&as_heard(&devices), &query("_http._tcp.local", rtype::PTR), false, 1452).unwrap();
     assert_eq!(answered.len(), 40);
     assert!(packets.len() > 1);
     assert!(sizes(&packets).iter().all(|&s| s <= 1452), "{:?}", sizes(&packets));
@@ -97,7 +97,7 @@ fn a_large_reply_is_split_over_packets() {
 fn a_legacy_reply_fits_what_the_resolver_takes() {
     let devices = many(40, 100);
     let browse = query("_http._tcp.local", rtype::PTR);
-    let (packets, _) = query_response(&as_heard(&devices), &browse, true, 1452).unwrap();
+    let (packets, _) = answer(&as_heard(&devices), &browse, true, 1452).unwrap();
     let reply = only(packets);
     assert!(reply.encode().unwrap().len() <= 512);
     assert!(reply.header.truncated, "not every answer fits");
@@ -106,7 +106,7 @@ fn a_legacy_reply_fits_what_the_resolver_takes() {
     // With EDNS0 saying 4096, as much as the interface allows.
     let mut edns = browse.clone();
     edns.additionals.push(Record { name: String::new(), class: 4096, cache_flush: false, ttl: 0, data: RData::Other { rtype: OPT, data: vec![] } });
-    let reply = only(query_response(&as_heard(&devices), &edns, true, 1452).unwrap().0);
+    let reply = only(answer(&as_heard(&devices), &edns, true, 1452).unwrap().0);
     let size = reply.encode().unwrap().len();
     assert!(size > 512 && size <= 1452, "{size}");
 
@@ -114,8 +114,8 @@ fn a_legacy_reply_fits_what_the_resolver_takes() {
     // (its TXT record is too big), and leaving those out is no truncation.
     let mut one = many(1, 0);
     one[0].services[0].edit(|p| p.txt = vec![format!("a={}", "x".repeat(240)).into_bytes(), format!("b={}", "x".repeat(240)).into_bytes()]);
-    let whole = only(query_response(&as_heard(&one), &browse, false, 1452).unwrap().0);
-    let reply = only(query_response(&as_heard(&one), &browse, true, 1452).unwrap().0);
+    let whole = only(answer(&as_heard(&one), &browse, false, 1452).unwrap().0);
+    let reply = only(answer(&as_heard(&one), &browse, true, 1452).unwrap().0);
     assert_eq!(reply.answers.len(), 1);
     assert!(reply.additionals.len() < whole.additionals.len(), "the TXT record does not fit");
     assert!(!reply.header.truncated);
@@ -142,13 +142,13 @@ fn a_legacy_resolver_gets_its_question_back_and_short_ttls_without_cache_flush()
     let mut asked = query("tv.local", rtype::ANY);
     asked.header.id = 0x4242;
 
-    let (msgs, _) = query_response(&as_heard(&devices), &asked, true, DEFAULT_MAX_PACKET).unwrap();
+    let (msgs, _) = answer(&as_heard(&devices), &asked, true, DEFAULT_MAX_PACKET).unwrap();
     let msg = only(msgs);
     assert_eq!((msg.header.id, msg.questions.clone()), (0x4242, asked.questions.clone()));
     assert!(msg.answers.iter().chain(&msg.additionals).all(|r| r.ttl <= LEGACY_TTL_CAP && !r.cache_flush));
 
     // To the group, none of that.
-    let (msgs, _) = query_response(&as_heard(&devices), &asked, false, DEFAULT_MAX_PACKET).unwrap();
+    let (msgs, _) = answer(&as_heard(&devices), &asked, false, DEFAULT_MAX_PACKET).unwrap();
     let msg = only(msgs);
     assert_eq!(msg.header.id, 0);
     assert!(msg.questions.is_empty());
@@ -617,6 +617,13 @@ fn three_devices() -> Vec<Device> {
 
 /// The one packet of a reply that fits in one.
 /// The devices as they were heard, with all their addresses.
+/// The reply to `query` from `devices`, each asked about every name in it.
+fn answer(devices: &[Advertised], query: &Message, legacy: bool, limit: usize) -> Option<(Vec<Message>, Vec<usize>)> {
+    let request = Request::new(query);
+    let every: Vec<usize> = (0..request.names().count()).collect();
+    query_response(devices, &vec![every; devices.len()], &request, legacy, limit)
+}
+
 fn as_heard(devices: &[Device]) -> Vec<Advertised<'_>> {
     devices.iter().map(Into::into).collect()
 }
@@ -633,4 +640,103 @@ fn asked(queries: &[Message]) -> Vec<(String, u16)> {
 
 fn q(name: &str, qtype: u16) -> (String, u16) {
     (name.to_string(), qtype)
+}
+
+/// A query that asks the same thing over and over, which a packet can do
+/// hundreds of times over, is answered as it is when it is asked once.
+#[test]
+fn a_question_asked_many_times_is_answered_once() {
+    let devices = many(3, 10);
+    let one = query("_http._tcp.local", rtype::PTR);
+    // A legacy reply gives the questions back as they were asked, so there is
+    // room for what answers them only of a few.
+    for (legacy, repeats) in [(false, 500), (true, 3)] {
+        let mut over_and_over = one.clone();
+        over_and_over.questions = vec![one.questions[0].clone(); repeats];
+        let once = answer(&as_heard(&devices), &one, legacy, DEFAULT_MAX_PACKET).unwrap();
+        let often = answer(&as_heard(&devices), &over_and_over, legacy, DEFAULT_MAX_PACKET).unwrap();
+        assert_eq!(once.1, often.1, "the same devices answer");
+        let answers = |msgs: &[Message]| msgs.iter().flat_map(|m| m.answers.clone()).collect::<Vec<_>>();
+        assert_eq!(answers(&once.0), answers(&often.0), "legacy={legacy}");
+    }
+}
+
+/// One name asked for in many types is looked into once: each type it has
+/// is answered, and a type it has not, which its NSEC denies, by that once.
+#[test]
+fn a_name_asked_for_in_many_types_is_answered_once_for_each_it_has_and_denied_once() {
+    let mut device = tv("10.0.1.9", &["TV"]);
+    device.nsec = Some(vec![rtype::A].into());
+    let mut q = query("tv.local", rtype::A);
+    let first = q.questions[0].clone();
+    q.questions = [rtype::A, rtype::AAAA].into_iter().chain(1000..1400).map(|qtype| Question { qtype, ..first.clone() }).collect();
+    let devices = [device];
+    let (msgs, answered) = answer(&as_heard(&devices), &q, false, DEFAULT_MAX_PACKET).unwrap();
+    assert_eq!(answered, [0]);
+    let msg = only(msgs);
+    let of = |rtype: u16| msg.answers.iter().filter(|r| r.rtype() == rtype).count();
+    assert_eq!((of(rtype::A), of(rtype::NSEC)), (1, 1), "{:?}", msg.answers);
+}
+
+/// What the asker already has is found by name and data, whatever the case of
+/// the name, and only that record is held back.
+#[test]
+fn a_known_answer_holds_back_only_the_record_it_is_of() {
+    let devices = many(2, 10);
+    let mut q = query("_http._tcp.local", rtype::PTR);
+    let held = ptr("_HTTP._tcp.local", "Device 0._http._tcp.local");
+    q.answers = vec![held, ptr("_http._tcp.local", "Device 1._http._tcp.local")];
+    q.answers[1].ttl = 1; // far too little of its life left to count
+    let (msgs, _) = answer(&as_heard(&devices), &q, false, DEFAULT_MAX_PACKET).unwrap();
+    let sent: Vec<&str> = msgs.iter().flat_map(|m| &m.answers).filter_map(|r| match &r.data {
+        RData::Ptr(instance) => Some(instance.as_str()),
+        _ => None,
+    }).collect();
+    assert_eq!(sent, ["Device 1._http._tcp.local"]);
+}
+
+/// A device with the same kind of service as thousands is answered for in
+/// time proportional to what there is: four times the devices take about four
+/// times as long, not sixteen.
+#[test]
+fn answering_for_many_devices_takes_time_in_proportion() {
+    fn crowd(n: usize) -> Vec<Device> {
+        (0..n)
+            .map(|i| {
+                let mut d = tv(&format!("10.1.{}.{}", i / 250, i % 250 + 1), &[]);
+                d.hostname = Some(format!("dev{i}.local"));
+                d.services = (0..32)
+                    .map(|j| {
+                        ServiceParts {
+                            instance: format!("Dev {i} svc {j}._http._tcp.local"),
+                            kind: "_http._tcp.local".into(),
+                            port: 80,
+                            target: d.hostname.clone(),
+                            ..ServiceParts::default()
+                        }
+                        .into()
+                    })
+                    .collect();
+                d
+            })
+            .collect()
+    }
+    // The best of two, of one packet that asks for what every one has.
+    let time = |devices: &[Device], legacy: bool| {
+        let mut q = query("_http._tcp.local", rtype::PTR);
+        q.questions = vec![q.questions[0].clone(); 200];
+        (0..2)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                std::hint::black_box(answer(&as_heard(devices), &q, legacy, DEFAULT_MAX_PACKET));
+                start.elapsed().as_secs_f64()
+            })
+            .fold(f64::MAX, f64::min)
+    };
+    let (small, large) = (crowd(16), crowd(128));
+    for legacy in [false, true] {
+        let (few, many) = (time(&small, legacy), time(&large, legacy));
+        // Eight times the devices: linear is eight, quadratic sixty-four.
+        assert!(many < few * 24.0, "legacy={legacy}: {few:.4}s for 16 devices, {many:.4}s for 128");
+    }
 }

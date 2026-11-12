@@ -9,9 +9,9 @@
 //! [`Segment`](crate::segment::Segment).
 
 use core::fmt;
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use hashbrown::{DefaultHashBuilder, HashMap};
+use hashbrown::{DefaultHashBuilder, HashMap, HashSet};
 use core::net::{IpAddr, SocketAddr};
 
 use core::cell::RefCell;
@@ -27,7 +27,7 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::config::{Advertise, AdvertiseConfig};
 use crate::device::{is_type, Advertised, Device, ServiceParts, Shared, HOST_TTL, OTHER_TTL};
-use crate::message::{self, responses, service_ttl, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
+use crate::message::{self, responses, service_ttl, Coverage, Request, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
 use crate::addr::{family_of, is_link_local, Family, Prefix};
 use crate::listener::{Link, MDNS_PORT};
 use crate::codec::{Message, Question, Record};
@@ -911,15 +911,34 @@ impl State {
         if !query.authorities.is_empty() {
             return Vec::new();
         }
-        query
-            .questions
-            .iter()
-            .filter(|q| !(self.is_local(&q.name) || self.tracker.discovered.contains_host(&q.name)))
-            .map(|q| {
-                let answered = self.hosts.with_shown_name(&q.name).any(|m| m.shown.as_ref().is_some_and(|d| d.device.borrow().knows(&d.how, q)));
-                Asked { question: q.clone(), answered }
-            })
-            .collect()
+        // Each question once, and what answers a name found once, however
+        // many types of it are asked: `None` for a name a device here owns.
+        let mut seen: HashSet<(String, u16, u16)> = HashSet::new();
+        let mut covered: HashMap<String, Option<Coverage>> = HashMap::new();
+        let mut out = Vec::new();
+        for q in &query.questions {
+            let lower = q.name.to_ascii_lowercase();
+            if !seen.insert((lower.clone(), q.qtype, q.class)) {
+                continue;
+            }
+            let coverage = covered.entry(lower).or_insert_with(|| {
+                if self.is_local(&q.name) || self.tracker.discovered.contains_host(&q.name) {
+                    return None;
+                }
+                let mut coverage = Coverage::default();
+                for host in self.hosts.with_shown_name(&q.name) {
+                    if let Some(shown) = &host.shown {
+                        coverage.add(&shown.device.borrow(), &shown.how, &q.name);
+                    }
+                }
+                Some(coverage)
+            });
+            if let Some(coverage) = coverage {
+                let answered = (q.class == 1 || q.class == 255) && coverage.knows(q.qtype);
+                out.push(Asked { question: q.clone(), answered });
+            }
+        }
+        out
     }
 
     /// The devices this interface answers queries for, by hostname: what is
@@ -930,13 +949,17 @@ impl State {
     /// take them for a conflict, and once it announces, the copy gives way.
     /// The daemon's own name answers a probe however recently it went out:
     /// that answer defends it, which section 6 exempts from the wait.
-    fn answering(&self, query: &Message, now: Instant, legacy: bool, probing: bool) -> Vec<(String, Reflected)> {
-        // Only those with records under a name asked for can answer.
-        let mut keys: Vec<String> = query.questions.iter().flat_map(|q| self.hosts.hosts_showing(&q.name)).collect();
-        keys.sort_unstable();
-        keys.dedup();
+    fn answering(&self, request: &Request, now: Instant, legacy: bool, probing: bool) -> Vec<(String, Reflected, Vec<usize>)> {
+        // Only those with records under a name asked for can answer, and each
+        // is asked of the names it has records under, not of them all.
+        let mut asked: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, name) in request.names().enumerate() {
+            for key in self.hosts.hosts_showing(name) {
+                asked.entry(key).or_default().push(i);
+            }
+        }
         let mut out = Vec::new();
-        for key in keys {
+        for (key, names) in asked {
             let Some(m) = self.hosts.get(&key) else { continue };
             let Some(device) = &m.shown else { continue };
             if probing && m.reflected.first().map(|m| m.priority) != Some(OWN) {
@@ -945,7 +968,7 @@ impl State {
             if !legacy && !probing && now.saturating_duration_since(m.last_sent) < MIN_MULTICAST_GAP {
                 continue;
             }
-            out.push((key, device.clone()));
+            out.push((key, device.clone(), names));
         }
         out
     }
@@ -1490,15 +1513,17 @@ impl Interface {
             state.notify(Event::Question(asked));
         }
         let probing = !query.authorities.is_empty();
-        let answering = state.answering(query, now, legacy, probing);
+        let request = Request::new(query);
+        let answering = state.answering(&request, now, legacy, probing);
         let keys: Vec<&String> = answering.iter().map(|(key, ..)| key).collect();
-        let borrowed: Vec<_> = answering.iter().map(|(_, shown)| shown.device.borrow()).collect();
+        let asked: Vec<Vec<usize>> = answering.iter().map(|(.., names)| names.clone()).collect();
+        let borrowed: Vec<_> = answering.iter().map(|(_, shown, _)| shown.device.borrow()).collect();
         let devices: Vec<Advertised> = answering
             .iter()
             .zip(&borrowed)
-            .map(|((_, shown), device)| Advertised { device, how: &shown.how, host_ttl: shown.host_ttl() })
+            .map(|((_, shown, _), device)| Advertised { device, how: &shown.how, host_ttl: shown.host_ttl() })
             .collect();
-        let Some((msgs, answered)) = message::query_response(&devices, query, legacy, state.max_packet) else {
+        let Some((msgs, answered)) = message::query_response(&devices, &asked, &request, legacy, state.max_packet) else {
             return Ok(());
         };
         for msg in &msgs {
