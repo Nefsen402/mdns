@@ -453,7 +453,7 @@ fn a_question_is_asked_again_once_it_is_older_than_the_time_it_is_remembered_for
         for at in state.forwarded.values_mut() {
             *at -= by;
         }
-        for (_, at) in state.asked.order.iter_mut() {
+        for (_, at, _) in state.asked.order.iter_mut() {
             *at -= by;
         }
     };
@@ -514,6 +514,65 @@ fn what_an_interface_asked_in_a_probe_is_not_asked_again_when_it_is_asked_elsewh
         *at -= FORWARD_GAP;
     }
     assert_eq!(seg.query_question(&[question("_ipp._tcp.local", rtype::PTR)]).unwrap(), 1);
+}
+
+/// A device that is gone is not there to answer what was asked of it: what is
+/// asked for its name, its types and its instances is asked again.
+#[test]
+fn a_question_is_asked_again_once_the_device_that_answered_it_is_gone() {
+    let (seg, rx) = wired();
+    seg.set_forward(Forward::Once);
+    hear(&seg, "10.0.1.5", vec![a_record("plug.local", "10.0.1.5"), ptr("_http._tcp.local", "Plug._http._tcp.local"), srv("Plug._http._tcp.local", 80, "plug.local")]);
+    let questions = [
+        question("plug.local", rtype::A),
+        question("_http._tcp.local", rtype::PTR),
+        question("Plug._http._tcp.local", rtype::SRV),
+        question("other.local", rtype::A),
+    ];
+    assert_eq!(seg.query_question(&questions).unwrap(), 4);
+    while recv(&rx).is_some() {}
+    let later = |seg: &Interface| {
+        for at in seg.state.borrow_mut().forwarded.values_mut() {
+            *at -= FORWARD_GAP;
+        }
+    };
+    later(&seg);
+    assert_eq!(seg.query_question(&questions).unwrap(), 0, "asked");
+
+    // The device runs out: what it answered is asked again, and what it did
+    // not is not.
+    seg.expire(Instant::now() + Duration::from_secs(2 * 3600));
+    assert!(seg.devices().is_empty());
+    later(&seg);
+    assert_eq!(seg.query_question(&questions).unwrap(), 3);
+    assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([
+        q("plug.local", rtype::A),
+        q("_http._tcp.local", rtype::PTR),
+        q("Plug._http._tcp.local", rtype::SRV),
+    ]));
+}
+
+/// A question forgotten before its turn leaves its place, which is passed over
+/// when it comes: the question put there again since is not taken for it.
+#[test]
+fn a_place_a_forgotten_question_left_is_not_taken_for_the_one_put_there_again() {
+    let mut remembered = Remembered::default();
+    let now = Instant::now();
+    let first = question("a.local", rtype::A);
+    remembered.insert(&first, now);
+    remembered.forget("A.local", &[rtype::A]);
+    assert!(!remembered.contains(&first));
+    remembered.insert(&first, now);
+    for i in 0..MAX_REMEMBERED - 2 {
+        remembered.insert(&question(&format!("x{i}.local"), rtype::A), now);
+    }
+    assert_eq!(remembered.order.len(), MAX_REMEMBERED);
+    // The next one pushes out the stale place, and not the question.
+    remembered.insert(&question("y.local", rtype::A), now);
+    assert!(remembered.contains(&first), "its place is the one after the stale one");
+    // And the one after pushes it out, in its turn.
+    remembered.insert(&question("z.local", rtype::A), now);
+    assert!(!remembered.contains(&first));
 }
 
 /// However many made-up questions are asked, only so many are remembered, the

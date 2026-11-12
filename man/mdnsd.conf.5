@@ -377,6 +377,38 @@ its TTL runs out, and is answered (RFC 6762 section 5.2).
 What is new or has changed is announced twice, a second apart, either way.
 An interface in several segments re-announces if any of them says so.
 .TP
+.B Active=
+Optional boolean, default
+.BR yes .
+Whether the interfaces of this segment ask of their own accord, as the daemon
+does: a probe at startup and every
+.BR ProbeInterval= ,
+asking a device to answer again before its records run out
+.RB ( RefreshBefore= ),
+and a nudge for a neighbour's address.
+With
+.BR no ,
+none of those: the daemon asks only what something asks it to, as an ordinary
+mDNS client does.
+What it has heard is kept for as long as the records say, and each question that
+a device that is gone had answered is forgotten, so that the next asks again.
+What something asks for is still asked: a lookup through the Avahi socket
+.RB ( AvahiSocket=
+of
+.BR [Ipc] ),
+a
+.BR "mdnsctl watch \-\-query" ,
+a question put by another interface of the segment
+.RB ( ForwardQuestions= ),
+and
+.BR "mdnsctl probe" .
+So are the answers to what is asked of the daemon, and what is announced:
+reflected devices, and
+.BR [Advertise] .
+It is for using the daemon as a client of one network, with a segment of that
+interface alone.
+An interface in several segments is active only if all of them are.
+.TP
 .B ReflectTTL=
 Optional.
 How long other networks keep the address of a device this segment reflects onto

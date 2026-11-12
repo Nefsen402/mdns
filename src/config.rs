@@ -232,7 +232,7 @@ impl Default for ReflectedWhen {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentConfig {
     pub name: String,
     /// The interfaces of the segment: names, or patterns of them (`enp*`), and
@@ -249,11 +249,32 @@ pub struct SegmentConfig {
     /// Whether what is reflected onto its interfaces is announced again
     /// before its TTL runs out though it has not changed.
     pub reannounce: bool,
+    /// Whether its interfaces ask of their own accord (`Active=`), as they do
+    /// unless it says no: probes at startup and periodically, devices asked to
+    /// answer again before they run out, a nudge for a neighbour's address. Not
+    /// active, they ask only what something asks them to: a client through the
+    /// Avahi socket or a watch, or the segment's other interfaces.
+    pub active: bool,
     /// What a device has to have to be reflected (`ReflectedWhen=`).
     pub reflected_when: ReflectedWhen,
     /// The TTL of the address records of the devices it reflects; `None`
     /// (the default) announces each with the TTL it announced itself with.
     pub reflect_ttl: Option<Duration>,
+}
+
+impl Default for SegmentConfig {
+    fn default() -> SegmentConfig {
+        SegmentConfig {
+            name: String::new(),
+            interfaces: Vec::new(),
+            untrusted: Vec::new(),
+            advertise: Advertise::default(),
+            reannounce: false,
+            active: true,
+            reflected_when: ReflectedWhen::default(),
+            reflect_ttl: None,
+        }
+    }
 }
 
 impl SegmentConfig {
@@ -346,6 +367,11 @@ pub struct Interface {
     /// Whether what is announced on it is announced again though it has not
     /// changed: if any of its segments says so.
     pub reannounce: bool,
+    /// Whether it asks of its own accord, unless a segment of it says no: if
+    /// not, it is not probed, nor are its devices asked to answer again,
+    /// whatever else says, and it asks only what something asks it to, as a
+    /// client does.
+    pub active: bool,
 }
 
 /// The port mDNS is on, which a peer is too unless it is said to be elsewhere.
@@ -421,11 +447,12 @@ impl Config {
     /// has what is set for all of them, and nothing of its segments.
     pub fn interface(&self, name: &str) -> Interface {
         let mut segments = self.segments.iter().filter(|seg| seg.has(name));
+        let active = segments.clone().all(|seg| seg.active);
         Interface {
             name: name.to_string(),
             min_lifetime: setting_of(&self.settings, name, DEFAULT_MIN_LIFETIME, |i| i.min_lifetime),
-            refresh_before: setting_of(&self.settings, name, Some(DEFAULT_REFRESH_BEFORE), |i| i.refresh_before),
-            probe_interval: setting_of(&self.settings, name, None, |i| i.probe_interval),
+            refresh_before: setting_of(&self.settings, name, Some(DEFAULT_REFRESH_BEFORE), |i| i.refresh_before).filter(|_| active),
+            probe_interval: setting_of(&self.settings, name, None, |i| i.probe_interval).filter(|_| active),
             forward: setting_of(&self.settings, name, Forward::default(), |i| i.forward),
             probe_services: setting_of(&self.settings, name, Vec::new(), |i| Some(i.probe_services.clone()).filter(|kinds| !kinds.is_empty())),
             max_addrs: setting_of(&self.settings, name, DEFAULT_MAX_ADDRS, |i| i.max_addrs),
@@ -436,6 +463,7 @@ impl Config {
             peers: setting_of(&self.settings, name, Vec::new(), |i| i.peers.clone()),
             peer_port: setting_of(&self.settings, name, MDNS_PORT, |i| i.peer_port),
             reannounce: segments.any(|seg| seg.reannounce),
+            active,
         }
     }
 
@@ -563,6 +591,10 @@ impl Config {
                     }
                     ("segment", "reannounce") => {
                         config.segments.last_mut().unwrap().reannounce = !value.is_empty() && parse_bool(entry, lineno)?;
+                    }
+                    ("segment", "active") => {
+                        // An empty assignment resets, as everywhere.
+                        config.segments.last_mut().unwrap().active = value.is_empty() || parse_bool(entry, lineno)?;
                     }
                     ("segment", "reflectedwhen") => {
                         config.segments.last_mut().unwrap().reflected_when = parse_reflected_when(&value, lineno)?;

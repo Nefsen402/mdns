@@ -654,17 +654,24 @@ struct State {
     forwarded: HashMap<(String, u16), Instant>,
     /// Which of the questions asked on other interfaces it asks here.
     forward: Forward,
+    /// Whether it asks of its own accord: see
+    /// [`SegmentConfig::active`](crate::config::SegmentConfig::active).
+    active: bool,
     /// The questions it has put on its link, for [`Forward::Once`].
     asked: Remembered,
 }
 
 /// Questions, by lowercase name and type, in the order they were put on the
-/// link, up to [`MAX_REMEMBERED`].
+/// link, up to [`MAX_REMEMBERED`]. One that is forgotten before its turn
+/// leaves its place in the order, which is passed over when it comes, and not
+/// taken for the one that was put there again since.
 #[derive(Default)]
 struct Remembered {
-    seen: HashSet<(String, u16)>,
-    /// With when each was put on the link, oldest first.
-    order: VecDeque<((String, u16), Instant)>,
+    /// Each with the number of the entry that is it.
+    seen: HashMap<(String, u16), u64>,
+    /// With when each was put on the link, and its number, oldest first.
+    order: VecDeque<((String, u16), Instant, u64)>,
+    puts: u64,
 }
 
 impl Remembered {
@@ -673,32 +680,62 @@ impl Remembered {
     }
 
     fn contains(&self, question: &Question) -> bool {
-        self.seen.contains(&Self::key(question))
+        self.seen.contains_key(&Self::key(question))
     }
 
     fn insert(&mut self, question: &Question, now: Instant) {
         let key = Self::key(question);
-        if self.seen.contains(&key) {
+        if self.seen.contains_key(&key) {
             return;
         }
-        if self.order.len() >= MAX_REMEMBERED
-            && let Some((oldest, _)) = self.order.pop_front()
-        {
-            self.seen.remove(&oldest);
+        if self.order.len() >= MAX_REMEMBERED {
+            self.drop_oldest();
         }
-        self.seen.insert(key.clone());
-        self.order.push_back((key, now));
+        self.puts += 1;
+        self.seen.insert(key.clone(), self.puts);
+        self.order.push_back((key, now, self.puts));
+    }
+
+    /// Let go of the oldest place, and of the question in it if it is still
+    /// there.
+    fn drop_oldest(&mut self) {
+        if let Some((key, _, put)) = self.order.pop_front()
+            && self.seen.get(&key) == Some(&put)
+        {
+            self.seen.remove(&key);
+        }
     }
 
     /// Forget the questions that were asked `span` ago or longer.
     fn forget_older(&mut self, now: Instant, span: Duration) {
-        while let Some((_, at)) = self.order.front() {
-            if now.saturating_duration_since(*at) < span {
-                break;
+        while self.order.front().is_some_and(|(_, at, _)| now.saturating_duration_since(*at) >= span) {
+            self.drop_oldest();
+        }
+    }
+
+    /// Forget what was asked of `name`, of each of the types a question of it
+    /// is asked in, so that it is asked again.
+    fn forget(&mut self, name: &str, types: &[u16]) {
+        let name = name.to_ascii_lowercase();
+        for &qtype in types {
+            self.seen.remove(&(name.clone(), qtype));
+        }
+    }
+
+    /// Forget the questions a device could have answered, as it is gone: of
+    /// its name, of the types it offered, and of their instances. Whatever
+    /// asks for them next, asks.
+    fn forget_device(&mut self, device: &Device) {
+        use crate::codec::rtype::{A, AAAA, ANY, PTR, SRV, TXT};
+        if let Some(host) = &device.hostname {
+            self.forget(host, &[A, AAAA, ANY]);
+        }
+        for service in device.services.iter() {
+            self.forget(service.kind(), &[PTR, ANY]);
+            for subtype in service.subtypes() {
+                self.forget(subtype, &[PTR, ANY]);
             }
-            if let Some((key, _)) = self.order.pop_front() {
-                self.seen.remove(&key);
-            }
+            self.forget(service.instance(), &[SRV, TXT, ANY]);
         }
     }
 
@@ -755,7 +792,9 @@ impl State {
     /// and put the events out.
     fn report(&mut self, mut touched: Touched, now: Instant) {
         for (ll, device) in core::mem::take(&mut touched.nudges) {
-            nudge(&self.link, ll, &message::refresh_queries(core::slice::from_ref(&device), self.max_packet));
+            if self.active {
+                nudge(&self.link, ll, &message::refresh_queries(core::slice::from_ref(&device), self.max_packet));
+            }
         }
         let names = touched.names(&self.tracker.discovered);
         let events = touched.events(&self.tracker.discovered);
@@ -763,6 +802,11 @@ impl State {
             self.settle_for(&names, now);
         }
         for event in events {
+            // A device that is gone is not there to answer what was asked of it,
+            // so what asks for it next is to ask.
+            if let Event::Removed(device) = &event {
+                self.asked.forget_device(&device.borrow());
+            }
             self.notify(event);
         }
         #[cfg(test)]
@@ -1081,6 +1125,7 @@ impl Interface {
                 own: Rc::new(Advertise::ALL),
                 // Those made first win, unless told otherwise.
                 priority: NEXT_PRIORITY.fetch_add(1, Ordering::Relaxed),
+                active: true,
                 ..State::default()
             })),
         }
@@ -1753,6 +1798,14 @@ impl Interface {
     /// it asks on its link: all, none, or each once.
     pub fn set_forward(&self, forward: Forward) {
         self.state.borrow_mut().forward = forward;
+    }
+
+    /// Whether it asks of its own accord, which is so unless it is told it is
+    /// not: if not, no neighbour is nudged for its address. (That it is not
+    /// probed, nor are devices asked to answer again, is for whoever sets those
+    /// not to.)
+    pub fn set_active(&self, active: bool) {
+        self.state.borrow_mut().active = active;
     }
 
     /// Probe on its own every `every`, the first one that long from now, as

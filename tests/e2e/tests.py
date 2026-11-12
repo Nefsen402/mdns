@@ -1312,6 +1312,20 @@ class Timers(Case):
         self.assertTrue(d.advance_until(lambda: not self.probing(d), step=1))
         self.assertTrue(ha.none(asks("_ssh._tcp.local", PTR)) and hb.none(asks("_http._tcp.local", PTR)), "and not for the other's")
 
+    def test_an_interface_that_is_not_active_asks_nothing_of_its_own_accord(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        ha = la.hearer()
+        d = self.lab.daemon(conf("[Interface]\nProbeInterval=1min\n[Segment]\nName=s\nInterfaces=ra\nActive=no\n"))
+        # A device that is heard of, and would be asked to answer again before it ran out.
+        la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
+        d.settle()
+        self.assertTrue(d.host("s", "tv.local"), self.logs(d))
+        d.advance(3600)
+        self.assertTrue(ha.none(lambda h: not h.message.response and h.src == la.router_addr), "not a question\n" + self.logs(d))
+        # What it is asked for, it asks.
+        ctl = d.ctl_start("probe", "s")
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE))), "but when asked\n" + self.logs(d))
+
     def test_an_interface_with_no_probe_interval_is_only_probed_at_startup_and_on_request(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         ha = la.hearer()

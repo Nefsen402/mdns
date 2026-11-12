@@ -226,6 +226,9 @@ fn describe(interface: &config::Interface) {
     if interface.reannounce {
         eprintln!("{name}: announcing reflected devices again at 80% of their TTL, changed or not");
     }
+    if !interface.active {
+        eprintln!("{name}: not active, asking only what is asked: no probe, and devices are not asked to answer again before they expire");
+    }
     let forwarding = match interface.forward {
         Forward::Always => "every question asked on the others of its segments".to_string(),
         Forward::Once => "each question asked on the others of its segments, once".to_string(),
@@ -240,6 +243,7 @@ fn describe(interface: &config::Interface) {
             "{name}: asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
             before.as_secs()
         ),
+        None if !interface.active => {}
         None => eprintln!("{name}: refreshing devices before they expire is off"),
     }
     match interface.probe_interval {
@@ -258,6 +262,7 @@ fn describe(interface: &config::Interface) {
                 );
             }
         }
+        None if !interface.active => {}
         None => eprintln!("{name}: not probing periodically (no ProbeInterval= for it): only at startup and on request"),
     }
 }
@@ -382,8 +387,11 @@ impl Ifaces<'_> {
                 group.segment.add(iface.interface.clone())?;
             }
         }
-        // Whoever is there may never have been asked about.
-        iface.interface.start_probe(how);
+        // Whoever is there may never have been asked about, unless nothing is
+        // asked of its own accord.
+        if iface.settings.active {
+            iface.interface.start_probe(how);
+        }
         self.live.push(iface);
         Ok(Opened::Listening)
     }
@@ -475,6 +483,7 @@ impl Iface {
         interface.set_probe_interval(settings.probe_interval);
         interface.set_probe_types(&settings.probe_services);
         interface.set_forward(settings.forward);
+        interface.set_active(settings.active);
         // Where the same hostname is found on more than one, the lowest
         // interface's device is the one reflected; an interface keeps its index.
         interface.set_priority(index.max(1));

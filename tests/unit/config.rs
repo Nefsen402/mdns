@@ -520,6 +520,38 @@ fn forwarding_questions_is_set_per_interface_and_once_by_default() {
     assert!(segment.contains("line 4") && segment.contains("unknown setting"), "{segment}");
 }
 
+/// A segment can say its interfaces are not active, and then they ask only what
+/// is asked of them: they are not probed, nor are their devices asked to answer
+/// again, whatever else says.
+#[test]
+fn a_segment_can_say_its_interfaces_are_not_active() {
+    let c = Config::parse(
+        "[Interface]\nProbeInterval=1min\nRefreshBefore=30s\n\
+         [Segment]\nName=client\nInterfaces=eth0\nActive=no\n\
+         [Segment]\nName=router\nInterfaces=br0,eth1\n\
+         [Segment]\nName=also\nInterfaces=eth1\nActive=no\n",
+    )
+    .unwrap();
+    let of = |name: &str| {
+        let i = c.interface(name);
+        (i.active, i.probe_interval.map(|d| d.as_secs()), i.refresh_before.map(|d| d.as_secs()))
+    };
+    assert_eq!(of("eth0"), (false, None, None));
+    assert_eq!(of("br0"), (true, Some(60), Some(30)));
+    assert_eq!(of("eth1"), (false, None, None), "in a segment that is not active, whatever the other says");
+    assert_eq!(of("nonesuch"), (true, Some(60), Some(30)));
+    let default = Config::parse("[Segment]\nName=a\nInterfaces=x\n").unwrap();
+    assert!(default.interface("x").active, "active unless it is said not");
+    let yes = Config::parse("[Segment]\nName=a\nInterfaces=x\nActive=no\nActive=yes\n").unwrap();
+    assert!(yes.interface("x").active, "the last counts");
+    let reset = Config::parse("[Segment]\nName=a\nInterfaces=x\nActive=no\nActive=\n").unwrap();
+    assert!(reset.interface("x").active, "empty resets");
+    let bad = error_of("[Segment]\nName=a\nInterfaces=x\nActive=sometimes");
+    assert!(bad.contains("line 4") && bad.contains("invalid boolean"), "{bad}");
+    let interface = error_of("[Interface]\nActive=no\n[Segment]\nName=a\nInterfaces=x");
+    assert!(interface.contains("line 2") && interface.contains("unknown setting"), "a segment's, not an interface's: {interface}");
+}
+
 /// A config is read from its file, and an error says which file, and,
 /// for what is in it, which line.
 #[test]
@@ -693,6 +725,7 @@ fn each_interface_is_settled_once_with_its_defaults_filled_in() {
             peers: Vec::new(),
             peer_port: MDNS_PORT,
             reannounce: false,
+            active: true,
         }
     );
 }

@@ -5,7 +5,7 @@ of the devices on each network it is told to watch, makes chosen ones visible on
 other networks, lets scripts ask it what is there, and announces the host's own
 name and services.
 
-It has four uses, which are the same daemon with a different configuration,
+It has five uses, which are the same daemon with a different configuration,
 and **any combination of them runs at once**, from one config file, on the same
 interfaces or on different ones: a router that reflects between two networks,
 tunnels to a remote site, tracks a third network and advertises itself on the
@@ -26,6 +26,9 @@ first is one daemon (see [one config for every mode](#one-config-for-every-mode)
 - **[An advertiser](#advertising-this-host)** of the host it runs on: its name
   and the services it offers (ssh, say), announced and answered for as Avahi's
   own publishing does, so that Avahi is not needed for it.
+- **[A client for `nss-mdns`](#a-client-for-nss-mdns)**: only the Avahi socket
+  answers lookups, and the daemon asks only when one comes in, sending nothing
+  of its own accord, as an ordinary mDNS client does.
 
 ## How it works: devices, not packets
 
@@ -94,11 +97,11 @@ What the model does not hold does not cross:
 ## One config for every mode
 
 Nothing in the config is global but `[Ipc]`, the daemon's own control socket:
-every other setting belongs to an interface, a segment or a name, so the four
+every other setting belongs to an interface, a segment or a name, so the five
 uses are written side by side in one file, and an interface can serve several.
 This one is for a router with a trusted LAN (`br0`), a media VLAN, an IoT Wi-Fi,
-a wired network it only watches (`eth0`) and a WireGuard tunnel to a remote
-site (`wg0`); each block is the mode it says, and any of them can be left out:
+a wired network it only watches (`eth0`), another it only looks names up on
+(`eth1`) and a WireGuard tunnel to a remote site (`wg0`); each block is the mode it says, and any of them can be left out:
 
 ```ini
 # /etc/mdnsd.conf
@@ -134,6 +137,14 @@ Untrusted=wg0
 [Segment]
 Name=lan
 Interfaces=eth0
+
+# Looking names up as a client does, for nss-mdns through the Avahi socket
+# below: on eth1 it is not active, asking only when asked, and what it hears
+# expires as its TTLs say.
+[Segment]
+Name=client
+Interfaces=eth1
+Active=no
 
 # Advertising this host, under .local, on br0, with the services it offers.
 [Advertise]
@@ -367,6 +378,27 @@ segment of one interface reflects nothing.
   (see `mdnsd.conf(5)`).
 
 No conflict detection is done: the name is taken to be yours alone.
+
+## A client for nss-mdns
+
+`nss-mdns`, which makes `ping printer.local` work, asks Avahi's socket for the
+address of a name. With `[Ipc] AvahiSocket=` the daemon answers it; with
+`Active=no` on the segment (`client` in the
+[config above](#one-config-for-every-mode)) it does so as an ordinary mDNS
+client would, asking only when something asks it to. It sends no probe, at
+startup or every `ProbeInterval=`, asks no device to answer again before its
+records run out, and nudges no neighbour for its address. What it has heard is
+kept as long as the records say and no longer.
+
+- A lookup of a name it does not know asks for it on every interface of the
+  segment, and waits a little for what answers. What a watch asks for with
+  `--query`, and what another interface of the segment is asked, is asked too.
+- A device whose records ran out is gone, and the questions it answered are
+  forgotten with it, so that the next lookup asks again, though by default each
+  question is asked only once (`ForwardQuestions=` in `mdnsd.conf(5)`).
+- Replies to the questions it hears, and what `[Advertise]` or another
+  segment announces, are not "of its own accord", and go on as they are. A
+  client is a segment of one interface, which reflects nothing.
 
 ## Building and running
 
