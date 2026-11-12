@@ -663,7 +663,12 @@ answer is reflected:
 .B always
 asks every one each time,
 .B once
-(the default) each the first time only, and
+(the default) each the first time only,
+a time span, such as
+.B 1h
+or
+.BR 30min ,
+each the first time and again once it was asked that long ago, and
 .B never
 none.
 A device that only answers when asked is found by being asked; with
@@ -683,10 +688,16 @@ A device that joins later and neither announces itself nor is asked for by a
 probe (see
 .BR ProbeInterval= )
 is found when a new question is asked, or by
-.BR "mdnsctl probe" .
+.BR "mdnsctl probe" ,
+or, with a time, when a question older than it is asked again: a client that
+keeps looking asks again, with the time between asks growing to an hour
+(RFC 6762 section 5.2), and
+.B 1h
+is about that.
 What the interface has asked itself, in a probe, counts.
 It remembers the last 4096 questions, and forgets them all when it forgets its
-devices, as when it goes away and comes back.
+devices, as when it goes away and comes back, and with a time each when it is
+that old.
 Questions about a name a device on the asking interface owns, and those of a
 device probing for its names, are never asked elsewhere; nor are those of an
 untrusted interface.

@@ -665,7 +665,8 @@ struct State {
 #[derive(Default)]
 struct Remembered {
     seen: HashSet<(String, u16)>,
-    order: VecDeque<(String, u16)>,
+    /// With when each was put on the link, oldest first.
+    order: VecDeque<((String, u16), Instant)>,
 }
 
 impl Remembered {
@@ -677,18 +678,30 @@ impl Remembered {
         self.seen.contains(&Self::key(question))
     }
 
-    fn insert(&mut self, question: &Question) {
+    fn insert(&mut self, question: &Question, now: Instant) {
         let key = Self::key(question);
         if self.seen.contains(&key) {
             return;
         }
         if self.order.len() >= MAX_REMEMBERED
-            && let Some(oldest) = self.order.pop_front()
+            && let Some((oldest, _)) = self.order.pop_front()
         {
             self.seen.remove(&oldest);
         }
         self.seen.insert(key.clone());
-        self.order.push_back(key);
+        self.order.push_back((key, now));
+    }
+
+    /// Forget the questions that were asked `span` ago or longer.
+    fn forget_older(&mut self, now: Instant, span: Duration) {
+        while let Some((_, at)) = self.order.front() {
+            if now.saturating_duration_since(*at) < span {
+                break;
+            }
+            if let Some((key, _)) = self.order.pop_front() {
+                self.seen.remove(&key);
+            }
+        }
     }
 
     fn clear(&mut self) {
@@ -699,11 +712,11 @@ impl Remembered {
 
 impl State {
     /// Remember the questions of `queries`, which were just put on the link, if
-    /// it matters: only [`Forward::Once`] goes by what was asked before.
-    fn note_asked(&mut self, queries: &[Message]) {
-        if self.forward == Forward::Once {
+    /// it matters: only what goes by what was asked before does.
+    fn note_asked(&mut self, queries: &[Message], now: Instant) {
+        if self.forward.remembers() {
             for question in queries.iter().flat_map(|query| &query.questions) {
-                self.asked.insert(question);
+                self.asked.insert(question, now);
             }
         }
     }
@@ -1605,9 +1618,12 @@ impl Interface {
             return Ok(0);
         }
         state.forwarded.retain(|_, at| now.saturating_duration_since(*at) < FORWARD_GAP);
+        if let Forward::After(span) = state.forward {
+            state.asked.forget_older(now, span);
+        }
         let mut fresh = Vec::new();
         for q in questions {
-            if state.forward == Forward::Once && state.asked.contains(q) {
+            if state.forward.remembers() && state.asked.contains(q) {
                 continue;
             }
             let key = (q.name.to_ascii_lowercase(), q.qtype);
@@ -1619,7 +1635,7 @@ impl Interface {
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
         let queries = message::forward_queries(fresh, known, state.max_packet);
         let asked = ask(&state.link, &queries)?;
-        state.note_asked(&queries);
+        state.note_asked(&queries, Instant::now());
         Ok(asked)
     }
 
@@ -1852,7 +1868,7 @@ impl Interface {
         let types = state.tracker.types.iter().chain(&state.probe_types).cloned().collect();
         let queries = message::probe_queries(&devices, &types, state.max_packet);
         let asked = ask(&state.link, &queries)?;
-        state.note_asked(&queries);
+        state.note_asked(&queries, Instant::now());
         Ok(asked)
     }
 
@@ -1872,7 +1888,7 @@ impl Interface {
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
         let queries = message::type_queries(&devices, kinds, known, state.max_packet);
         let asked = ask(&state.link, &queries)?;
-        state.note_asked(&queries);
+        state.note_asked(&queries, Instant::now());
         Ok(asked)
     }
 

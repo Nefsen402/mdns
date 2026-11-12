@@ -162,6 +162,22 @@ class Reflecting(Case):
         d.settle()
         self.assertTrue(hb.none(asks("_ipp._tcp.local", PTR)))
 
+    def test_a_question_is_forwarded_again_when_it_is_older_than_the_time_it_is_remembered_for(self):
+        la, lb = self.two_links()
+        hb = lb.hearer()
+        d = self.lab.daemon(conf("[Interface]\nName=rb\nForwardQuestions=10min\n[Segment]\nName=s\nInterfaces=ra,rb\n"))
+        asker = la.device("10.9.1.50")
+        asker.multicast(query(("_ipp._tcp.local", PTR)))
+        self.assertTrue(hb.wait(asks("_ipp._tcp.local", PTR, src=lb.router_addr), 5), "the first time\n" + self.logs(d))
+        d.advance(300)
+        heard = hb.count()
+        asker.multicast(query(("_ipp._tcp.local", PTR)))
+        d.settle()
+        self.assertTrue(hb.none(asks("_ipp._tcp.local", PTR), since=heard), "remembered, five minutes on\n" + self.logs(d))
+        d.advance(400)
+        asker.multicast(query(("_ipp._tcp.local", PTR)))
+        self.assertTrue(hb.wait(asks("_ipp._tcp.local", PTR, src=lb.router_addr), 5, since=heard), "forgotten, so asked\n" + self.logs(d))
+
     def test_a_question_is_forwarded_once_when_the_interface_says_once(self):
         la, lb = self.two_links()
         hb = lb.hearer()

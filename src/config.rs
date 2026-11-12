@@ -119,8 +119,19 @@ pub enum Forward {
     /// before it expires, as a client that holds on to what it learned would.
     #[default]
     Once,
+    /// Each question again once it was asked this long ago: `Once`, with what
+    /// it asked forgotten as it gets older, so that a device that joined
+    /// since, and says nothing, is found by the next time it is asked.
+    After(Duration),
     /// None: only what devices announce, or answer a probe with, is reflected.
     Never,
+}
+
+impl Forward {
+    /// Whether it goes by the questions it asked before.
+    pub fn remembers(self) -> bool {
+        matches!(self, Forward::Once | Forward::After(_))
+    }
 }
 
 /// Which of the addresses a device was given from the neighbour table a
@@ -1016,7 +1027,12 @@ fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
         "always" => Ok(Forward::Always),
         "once" => Ok(Forward::Once),
         "never" => Ok(Forward::Never),
-        _ => bail!("line {lineno}: invalid ForwardQuestions {value:?}: always, once or never"),
+        // A time: remembered for that long. None at all is every time.
+        _ => match parse_timespan(value) {
+            Ok(span) if span.is_zero() => Ok(Forward::Always),
+            Ok(span) => Ok(Forward::After(span)),
+            Err(_) => bail!("line {lineno}: invalid ForwardQuestions {value:?}: always, once, never or a time such as 1h"),
+        },
     }
 }
 

@@ -506,8 +506,16 @@ fn forwarding_questions_is_set_per_interface_and_once_by_default() {
         "the named one is the exception"
     );
     assert_eq!(forward("[Interface]\nForwardQuestions=never\nForwardQuestions="), (Forward::Once, Forward::Once));
-    let bad = error_of("[Interface]\nForwardQuestions=sometimes\n[Segment]\nName=a\nInterfaces=x");
-    assert!(bad.contains("line 2") && bad.contains("ForwardQuestions"), "{bad}");
+    // A time is how long a question is remembered; none at all is not to.
+    let secs = |s: u64| Forward::After(Duration::from_secs(s));
+    assert_eq!(forward("[Interface]\nForwardQuestions=1h"), (secs(3600), secs(3600)));
+    assert_eq!(forward("[Interface]\nName=y\nForwardQuestions=30min"), (Forward::Once, secs(1800)));
+    assert_eq!(forward("[Interface]\nForwardQuestions=1h 30min"), (secs(5400), secs(5400)));
+    assert_eq!(forward("[Interface]\nForwardQuestions=0"), (Forward::Always, Forward::Always));
+    for bad in ["sometimes", "1 parsec", "-5min"] {
+        let err = error_of(&format!("[Interface]\nForwardQuestions={bad}\n[Segment]\nName=a\nInterfaces=x"));
+        assert!(err.contains("line 2") && err.contains("ForwardQuestions") && err.contains("a time such as 1h"), "{bad}: {err}");
+    }
     let segment = error_of("[Segment]\nName=a\nInterfaces=x\nForwardQuestions=never");
     assert!(segment.contains("line 4") && segment.contains("unknown setting"), "{segment}");
 }

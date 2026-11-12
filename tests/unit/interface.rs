@@ -439,6 +439,49 @@ fn an_interface_asks_the_questions_it_is_told_to_as_it_is_set_to() {
     assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([q("_http._tcp.local", rtype::PTR), q("_ipp._tcp.local", rtype::TXT)]));
 }
 
+/// With a time, a question is remembered for that long: asked again once it
+/// is older, and not before.
+#[test]
+fn a_question_is_asked_again_once_it_is_older_than_the_time_it_is_remembered_for() {
+    let span = Duration::from_secs(3600);
+    let (seg, rx) = wired();
+    seg.set_forward(Forward::After(span));
+    let ipp = [question("_ipp._tcp.local", rtype::PTR)];
+    let older = |seg: &Interface, by: Duration| {
+        let mut state = seg.state.borrow_mut();
+        for at in state.forwarded.values_mut() {
+            *at -= by;
+        }
+        for (_, at) in state.asked.order.iter_mut() {
+            *at -= by;
+        }
+    };
+    assert_eq!(seg.query_question(&ipp).unwrap(), 1);
+    recv(&rx).unwrap();
+
+    // Not for a good while.
+    older(&seg, span - Duration::from_secs(60));
+    assert_eq!(seg.query_question(&ipp).unwrap(), 0, "still remembered");
+    assert!(recv(&rx).is_none());
+
+    // And once it is older than that, it is asked, and is remembered from then.
+    older(&seg, Duration::from_secs(61));
+    assert_eq!(seg.query_question(&ipp).unwrap(), 1, "forgotten, so asked");
+    recv(&rx).unwrap();
+    older(&seg, Duration::from_secs(61));
+    assert_eq!(seg.query_question(&ipp).unwrap(), 0, "remembered again");
+    assert_eq!(seg.state.borrow().asked.order.len(), 1);
+
+    // What is forgotten is the older, not what was asked since.
+    older(&seg, span);
+    seg.query_question(&[question("_http._tcp.local", rtype::PTR)]).unwrap();
+    recv(&rx).unwrap();
+    older(&seg, Duration::from_secs(60));
+    let ipp_and_http = [question("_ipp._tcp.local", rtype::PTR), question("_http._tcp.local", rtype::PTR)];
+    assert_eq!(seg.query_question(&ipp_and_http).unwrap(), 1, "the one that is older only");
+    assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([q("_ipp._tcp.local", rtype::PTR)]));
+}
+
 /// What the interface asked itself is asked before: a probe of a type, and
 /// a question asked of it, are done once the one is, and only then.
 #[test]

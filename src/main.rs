@@ -227,9 +227,12 @@ fn describe(interface: &config::Interface) {
         eprintln!("{name}: announcing reflected devices again at 80% of their TTL, changed or not");
     }
     let forwarding = match interface.forward {
-        Forward::Always => "every question asked on the others of its segments",
-        Forward::Once => "each question asked on the others of its segments, once",
-        Forward::Never => "no questions of the others of its segments",
+        Forward::Always => "every question asked on the others of its segments".to_string(),
+        Forward::Once => "each question asked on the others of its segments, once".to_string(),
+        Forward::After(span) => {
+            format!("each question asked on the others of its segments, again once it was asked {}s ago", span.as_secs())
+        }
+        Forward::Never => "no questions of the others of its segments".to_string(),
     };
     eprintln!("{name}: asking {forwarding}");
     match interface.refresh_before {
