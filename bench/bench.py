@@ -22,7 +22,7 @@ It prints a line of JSON for each N:
                          interface, with N there already
 
 With --unicast each device is announced to the daemon's own address and not to
-the group (it needs --own-address), and --listen MODE is what `[Listen] IPv4=`
+the group (it needs --own-address), and --listen MODE is what `[Interface] IPv4=`
 says (off, multicast or on): a daemon hears the unicast only if it says on. With --offlink the unicast is from
 addresses that are not on the interface's network, as a host routed in through it
 would send from.
@@ -277,7 +277,7 @@ def run_once(daemon, n, probes, rundir):
     resource.setrlimit(resource.RLIMIT_NOFILE, (resource.getrlimit(resource.RLIMIT_NOFILE)[1],) * 2)
     conf = os.path.join(rundir, "mdnsd.conf")
     with open(conf, "w") as f:
-        f.write(f"[Listen]\nIPv4={LISTEN}\nIPv6=off\n[Ipc]\nSocket={rundir}/mdnsd.sock\n[Segment]\nName=bench\nInterfaces=mdns-a,mdns-b\n")
+        f.write(f"[Interface]\nIPv4={LISTEN}\nIPv6=off\n[Ipc]\nSocket={rundir}/mdnsd.sock\n[Segment]\nName=bench\nInterfaces=mdns-a,mdns-b\n")
     for iface in ("mdns-a", "mdns-b", "fuzz-a", "fuzz-b"):
         sh("ip", "link", "del", iface, check=False)
     sh("ip", "link", "add", "mdns-a", "type", "veth", "peer", "name", "fuzz-a")
