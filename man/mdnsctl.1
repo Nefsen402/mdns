@@ -64,7 +64,11 @@ after it: the TTL, in seconds, its address records were announced with, if it
 announced any, followed by its
 services: instance, type, port, target, the
 .B ttl=
-its records were announced with,
+its SRV record was announced with (the PTR and TXT records have their own, in
+the JSON as
+.B ptr_ttl
+and
+.BR txt_ttl ),
 .B sub=
 and the subtypes it is of (such as
 .B _universal
@@ -394,7 +398,7 @@ it lists everything, including addresses and service details:
 .nf
 .RS
   br0   10.0.0.10, fd00::10  printer.local  addr-ttl=120
-      Printer  _http._tcp.local  :631 -> printer.local  ttl=4500  [rp=ipp, ty=hp]
+      Printer  _http._tcp.local  :631 -> printer.local  ttl=120  [rp=ipp, ty=hp]
   wifi  10.0.1.7             \-
 IoT to br0: 2 devices
 .RE

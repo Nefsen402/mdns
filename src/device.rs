@@ -69,13 +69,18 @@ pub struct ServiceParts {
     /// The subtypes it said it is of, by the name of their PTR record, such as
     /// `_universal._sub._ipp._tcp.local` (an AirPrint printer).
     pub subtypes: Vec<String>,
-    /// The TTL its records were last announced with, in seconds: that of the
-    /// SRV record, or else of the PTR or TXT; 0 if not known.
-    pub ttl: u32,
+    /// The TTL its SRV record was last announced with, in seconds; 0 if not
+    /// known. A record with a host name in it is conventionally 120 seconds.
+    pub srv_ttl: u32,
+    /// The same of its PTR record, and the PTR records of its subtypes: 0 if
+    /// not known. Conventionally 75 minutes, as the TXT record's is.
+    pub ptr_ttl: u32,
+    /// The same of its TXT record.
+    pub txt_ttl: u32,
 }
 
-/// The port and the TTL, which come first in a block.
-const SERVICE_HEADER: usize = 6;
+/// The port and the three TTLs, which come first in a block.
+const SERVICE_HEADER: usize = 14;
 
 impl ServiceParts {
     /// The block they make.
@@ -109,7 +114,9 @@ impl ServiceParts {
             + txt().map(|s| s.len() + 1).sum::<usize>();
         let mut out = Vec::with_capacity(size);
         out.extend(self.port.to_le_bytes());
-        out.extend(self.ttl.to_le_bytes());
+        for ttl in [self.srv_ttl, self.ptr_ttl, self.txt_ttl] {
+            out.extend(ttl.to_le_bytes());
+        }
         for n in [self.instance.as_str(), self.kind.as_str(), target].into_iter().chain(subtypes()) {
             out.extend(n.as_bytes());
             out.push(0);
@@ -175,7 +182,7 @@ impl core::fmt::Debug for Service {
             .field("target", &self.target())
             .field("txt", &self.txt().collect::<Vec<_>>())
             .field("subtypes", &self.subtypes().collect::<Vec<_>>())
-            .field("ttl", &self.ttl())
+            .field("ttls", &[self.srv_ttl(), self.ptr_ttl(), self.txt_ttl()])
             .finish()
     }
 }
@@ -217,9 +224,26 @@ impl Service {
         self.block.get(0..2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
     }
 
-    /// The TTL its records were last announced with, in seconds, or 0.
-    pub fn ttl(&self) -> u32 {
-        self.block.get(2..SERVICE_HEADER).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    /// The TTL of its `n`th TTL in the block, or 0.
+    fn ttl_at(&self, n: usize) -> u32 {
+        let at = 2 + 4 * n;
+        self.block.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// The TTL its SRV record was last announced with, in seconds, or 0.
+    pub fn srv_ttl(&self) -> u32 {
+        self.ttl_at(0)
+    }
+
+    /// The TTL its PTR record, and those of its subtypes, were last announced
+    /// with, in seconds, or 0.
+    pub fn ptr_ttl(&self) -> u32 {
+        self.ttl_at(1)
+    }
+
+    /// The TTL its TXT record was last announced with, in seconds, or 0.
+    pub fn txt_ttl(&self) -> u32 {
+        self.ttl_at(2)
     }
 
     /// Full instance name, e.g. `Printer._http._tcp.local`.
@@ -269,7 +293,9 @@ impl Service {
             target: self.target().map(String::from),
             txt: self.txt().map(<[u8]>::to_vec).collect(),
             subtypes: self.subtypes().map(String::from).collect(),
-            ttl: self.ttl(),
+            srv_ttl: self.srv_ttl(),
+            ptr_ttl: self.ptr_ttl(),
+            txt_ttl: self.txt_ttl(),
         }
     }
 
@@ -1016,21 +1042,23 @@ impl Device {
                             && !svc.subtypes().any(|sub| rec.name.eq_ignore_ascii_case(sub))
                             && svc.subtypes().count() < MAX_SUBTYPES
                         {
-                            svc.edit(|p| p.subtypes.push(rec.name.clone()));
+                            svc.edit(|p| {
+                                p.subtypes.push(rec.name.clone());
+                                if p.ptr_ttl == 0 {
+                                    p.ptr_ttl = rec.ttl;
+                                }
+                            });
                         }
                         continue;
                     }
                     if rec.ttl == 0 {
                         self.forget_service(instance);
                     } else if let Some(svc) = self.service_mut(instance, max_services)
-                        && (svc.kind() != rec.name || svc.ttl() == 0)
+                        && (svc.kind() != rec.name || svc.ptr_ttl() == 0)
                     {
                         svc.edit(|p| {
                             p.kind = rec.name.clone();
-                            // The SRV record's TTL is the one that counts, if known.
-                            if p.ttl == 0 {
-                                p.ttl = rec.ttl;
-                            }
+                            p.ptr_ttl = rec.ttl;
                         });
                     }
                 }
@@ -1038,12 +1066,12 @@ impl Device {
                     if rec.ttl == 0 {
                         self.forget_service(&rec.name);
                     } else if let Some(svc) = self.service_mut(&rec.name, max_services)
-                        && (svc.port() != *port || svc.target() != Some(target.as_str()) || svc.ttl() != rec.ttl)
+                        && (svc.port() != *port || svc.target() != Some(target.as_str()) || svc.srv_ttl() != rec.ttl)
                     {
                         svc.edit(|p| {
                             p.port = *port;
                             p.target = Some(target.clone());
-                            p.ttl = rec.ttl;
+                            p.srv_ttl = rec.ttl;
                         });
                     }
                 }
@@ -1055,13 +1083,11 @@ impl Device {
                 RData::Txt(strings) => {
                     if rec.ttl != 0
                         && let Some(svc) = self.service_mut(&rec.name, max_services)
-                        && (svc.ttl() == 0 || !svc.txt().eq(strings.iter().filter(|s| !s.is_empty()).map(Vec::as_slice)))
+                        && (svc.txt_ttl() == 0 || !svc.txt().eq(strings.iter().filter(|s| !s.is_empty()).map(Vec::as_slice)))
                     {
                         svc.edit(|p| {
                             p.txt = strings.iter().filter(|s| !s.is_empty()).cloned().collect();
-                            if p.ttl == 0 {
-                                p.ttl = rec.ttl;
-                            }
+                            p.txt_ttl = rec.ttl;
                         });
                     }
                 }

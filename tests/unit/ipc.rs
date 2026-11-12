@@ -174,7 +174,7 @@ fn devices_carry_services_and_escape_json() {
         "{out}"
     );
     assert!(
-        out.contains(r#"{"instance":"My \"TV\"._http._tcp.local","type":"_http._tcp.local","port":80,"target":"tv.local","txt":["k=v"],"subtypes":[],"ttl":120}"#),
+        out.contains(r#"{"instance":"My \"TV\"._http._tcp.local","type":"_http._tcp.local","port":80,"target":"tv.local","txt":["k=v"],"subtypes":[],"ttl":120,"ptr_ttl":120,"txt_ttl":120}"#),
         "{out}"
     );
     assert!(out.contains(r#""interface":"b","hostname":null,"addresses":["10.0.2.1"]"#), "{out}");

@@ -218,15 +218,35 @@ fn query(questions: &[Question]) -> Message {
     }
 }
 
-/// The TTL to announce `svc` with: the one it announced itself with (at least
-/// [`MIN_REFLECT_TTL`]) or, if that is not known, `other_ttl`. Zero stays zero:
-/// that is a goodbye.
-pub fn service_ttl(svc: &Service, other_ttl: u32) -> u32 {
-    match (other_ttl, svc.ttl()) {
+/// The TTLs to announce the records of a service with: each its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceTtls {
+    pub srv: u32,
+    /// Of the PTR record, and those of its subtypes.
+    pub ptr: u32,
+    pub txt: u32,
+}
+
+impl ServiceTtls {
+    /// What a service is taken back with.
+    pub const GONE: ServiceTtls = ServiceTtls { srv: 0, ptr: 0, txt: 0 };
+
+    /// The shortest of them: it is announced again before that runs out.
+    pub fn shortest(self) -> u32 {
+        self.srv.min(self.ptr).min(self.txt)
+    }
+}
+
+/// The TTLs to announce `svc` with: those of each of its records that it
+/// announced itself with (at least [`MIN_REFLECT_TTL`]) or, of one that it did
+/// not say, `other_ttl`. Zero stays zero: that is a goodbye.
+pub fn service_ttls(svc: &Service, other_ttl: u32) -> ServiceTtls {
+    let of = |said: u32| match (other_ttl, said) {
         (0, _) => 0,
         (_, 0) => other_ttl,
         (_, ttl) => ttl.max(MIN_REFLECT_TTL),
-    }
+    };
+    ServiceTtls { srv: of(svc.srv_ttl()), ptr: of(svc.ptr_ttl()), txt: of(svc.txt_ttl()) }
 }
 
 fn address_data(addr: IpAddr) -> RData {
@@ -350,8 +370,22 @@ pub struct Request<'a> {
     /// The names asked about, in lowercase, in the order they were first asked,
     /// with what is asked of each.
     names: Vec<(String, Asking)>,
-    /// The longest TTL the asker holds each record it already has with.
-    known: HashMap<(String, &'a RData), u32>,
+    /// The longest TTL the asker holds each record it already has with, by its
+    /// name and what it says, with the names in both without regard to case.
+    known: HashMap<(String, RData), u32>,
+}
+
+/// `data` with the names in it in lowercase, as DNS compares them: a PTR or SRV
+/// target, and the next name of an NSEC. What is not a name is as it is.
+fn folded(data: &RData) -> RData {
+    match data {
+        RData::Ptr(name) => RData::Ptr(name.to_ascii_lowercase()),
+        RData::Srv { priority, weight, port, target } => {
+            RData::Srv { priority: *priority, weight: *weight, port: *port, target: target.to_ascii_lowercase() }
+        }
+        RData::Nsec { next, types } => RData::Nsec { next: next.to_ascii_lowercase(), types: types.clone() },
+        other => other.clone(),
+    }
 }
 
 /// The types asked of one name.
@@ -388,9 +422,9 @@ impl<'a> Request<'a> {
                 asking.order.push(q.qtype);
             }
         }
-        let mut known: HashMap<(String, &RData), u32> = HashMap::new();
+        let mut known: HashMap<(String, RData), u32> = HashMap::new();
         for k in &message.answers {
-            let ttl = known.entry((k.name.to_ascii_lowercase(), &k.data)).or_insert(0);
+            let ttl = known.entry((k.name.to_ascii_lowercase(), folded(&k.data))).or_insert(0);
             *ttl = (*ttl).max(k.ttl);
         }
         Request { message, names, known }
@@ -405,7 +439,7 @@ impl<'a> Request<'a> {
     /// Whether the asker already holds `record`, with at least half its life
     /// left (RFC 6762 section 7.1).
     fn holds(&self, record: &Record) -> bool {
-        self.known.get(&(record.name.to_ascii_lowercase(), &record.data)).is_some_and(|&ttl| ttl >= record.ttl / 2)
+        self.known.get(&(record.name.to_ascii_lowercase(), folded(&record.data))).is_some_and(|&ttl| ttl >= record.ttl / 2)
     }
 }
 
@@ -500,7 +534,7 @@ impl Device {
         records.extend(self.reverse_records(how, host_ttl));
 
         for svc in self.advertised_services(how) {
-            records.extend(self.service_records(svc, service_ttl(svc, other_ttl)));
+            records.extend(self.service_records(svc, service_ttls(svc, other_ttl)));
         }
         // DNS-SD service type enumeration, once per distinct type.
         let kinds: BTreeMap<String, &str> =
@@ -521,7 +555,7 @@ impl Device {
             new.advertised_services(new_how).map(|s| (s.instance().to_ascii_lowercase(), &**s)).collect();
         for svc in self.advertised_services(how) {
             match kept.get(&svc.instance().to_ascii_lowercase()) {
-                None => records.extend(self.service_records(svc, 0)),
+                None => records.extend(self.service_records(svc, ServiceTtls::GONE)),
                 Some(now) => {
                     let gone =
                         svc.subtypes().filter(|sub| !now.subtypes().any(|n| n.eq_ignore_ascii_case(sub)));
@@ -571,17 +605,17 @@ impl Device {
         Some(record(host, true, ttl, data))
     }
 
-    fn service_records(&self, svc: &Service, ttl: u32) -> Vec<Record> {
+    fn service_records(&self, svc: &Service, ttls: ServiceTtls) -> Vec<Record> {
         let target = svc.target().map(String::from).or_else(|| self.hostname.clone()).unwrap_or_default();
         let subtypes =
-            svc.subtypes().map(|sub| record(sub.to_string(), false, ttl, RData::Ptr(svc.instance().to_string())));
+            svc.subtypes().map(|sub| record(sub.to_string(), false, ttls.ptr, RData::Ptr(svc.instance().to_string())));
         let mut records = vec![
-            record(svc.kind().to_string(), false, ttl, RData::Ptr(svc.instance().to_string())),
-            record(svc.instance().to_string(), true, ttl, RData::Srv { priority: 0, weight: 0, port: svc.port(), target }),
+            record(svc.kind().to_string(), false, ttls.ptr, RData::Ptr(svc.instance().to_string())),
+            record(svc.instance().to_string(), true, ttls.srv, RData::Srv { priority: 0, weight: 0, port: svc.port(), target }),
             record(
                 svc.instance().to_string(),
                 true,
-                ttl,
+                ttls.txt,
                 RData::Txt(svc.txt().map(|t| t.to_vec()).collect()),
             ),
         ];

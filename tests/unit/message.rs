@@ -627,12 +627,12 @@ fn a_name_asked_for_in_many_types_is_answered_once_for_each_it_has_and_denied_on
 }
 
 /// What the asker already has is found by name and data, whatever the case of
-/// the name, and only that record is held back.
+/// either, and only that record is held back.
 #[test]
 fn a_known_answer_holds_back_only_the_record_it_is_of() {
     let devices = many(2, 10);
     let mut q = query("_http._tcp.local", rtype::PTR);
-    let held = ptr("_HTTP._tcp.local", "Device 0._http._tcp.local");
+    let held = ptr("_HTTP._tcp.local", "DEVICE 0._Http._TCP.local");
     q.answers = vec![held, ptr("_http._tcp.local", "Device 1._http._tcp.local")];
     q.answers[1].ttl = 1; // far too little of its life left to count
     let (msgs, _) = answer(&as_heard(&devices), &q, false, DEFAULT_MAX_PACKET).unwrap();
@@ -641,6 +641,73 @@ fn a_known_answer_holds_back_only_the_record_it_is_of() {
         _ => None,
     }).collect();
     assert_eq!(sent, ["Device 1._http._tcp.local"]);
+}
+
+/// Names are compared as DNS compares them: what a known answer says is the
+/// same if its names differ only in case, and nothing else is.
+#[test]
+fn the_names_in_what_a_record_says_are_compared_without_regard_to_case() {
+    assert_eq!(folded(&RData::Ptr("Dev 0._HTTP._tcp.local".into())), RData::Ptr("dev 0._http._tcp.local".into()));
+    let srv = |target: &str| RData::Srv { priority: 1, weight: 2, port: 80, target: target.into() };
+    assert_eq!(folded(&srv("TV.Local")), srv("tv.local"));
+    assert_ne!(folded(&srv("tv.local")), folded(&RData::Srv { priority: 1, weight: 2, port: 81, target: "tv.local".into() }));
+    let nsec = |next: &str| RData::Nsec { next: next.into(), types: vec![rtype::A] };
+    assert_eq!(folded(&nsec("TV.local")), nsec("tv.local"));
+    // Text is not a name: its case is what it says.
+    assert_ne!(folded(&RData::Txt(vec![b"Key=Value".to_vec()])), folded(&RData::Txt(vec![b"key=value".to_vec()])));
+}
+
+/// Each record of a service is announced with the TTL it was announced with,
+/// as those of a device whose PTR and TXT are for 75 minutes and SRV for two
+/// are, and one whose TTL is not known is announced with the usual one.
+#[test]
+fn each_record_of_a_service_is_announced_with_its_own_ttl() {
+    let service = |srv_ttl, ptr_ttl, txt_ttl| -> Rc<Service> {
+        ServiceParts {
+            instance: "Office._ipp._tcp.local".into(),
+            kind: "_ipp._tcp.local".into(),
+            port: 631,
+            target: Some("tv.local".into()),
+            subtypes: vec!["_universal._sub._ipp._tcp.local".into()],
+            srv_ttl,
+            ptr_ttl,
+            txt_ttl,
+            ..ServiceParts::default()
+        }
+        .into()
+    };
+    let announced = |svc: Rc<Service>, host_ttl, other_ttl| {
+        let mut d = tv("10.0.1.9", &[]);
+        d.services = vec![svc].into();
+        let mut ttls: Vec<(u16, bool, u32)> = d
+            .announcement(&Advertise::ALL, host_ttl, other_ttl)
+            .into_iter()
+            .filter(|r| r.name.to_ascii_lowercase().contains("office") || r.name.contains("_ipp"))
+            .filter(|r| !r.name.starts_with("_services"))
+            .map(|r| (r.rtype(), r.name.contains("_sub"), r.ttl))
+            .collect();
+        ttls.sort();
+        ttls
+    };
+    // As said: the PTR, and that of its subtype, the TXT, and the SRV.
+    assert_eq!(
+        announced(service(120, 4500, 3000), 120, 4500),
+        [(rtype::PTR, false, 4500), (rtype::PTR, true, 4500), (rtype::TXT, false, 3000), (rtype::SRV, false, 120)]
+    );
+    // Not said: the usual, and not what another record said.
+    assert_eq!(
+        announced(service(120, 0, 0), 120, 4500),
+        [(rtype::PTR, false, 4500), (rtype::PTR, true, 4500), (rtype::TXT, false, 4500), (rtype::SRV, false, 120)]
+    );
+    // Too short is not announced, for it would be announced again at once.
+    assert_eq!(announced(service(5, 7, 4500), 120, 4500).iter().map(|r| r.2).collect::<Vec<_>>(), [MIN_REFLECT_TTL, MIN_REFLECT_TTL, 4500, MIN_REFLECT_TTL]);
+    // Goodbyes are all zero.
+    assert!(announced(service(120, 4500, 3000), 0, 0).iter().all(|r| r.2 == 0));
+    // It is announced again before the shortest runs out.
+    assert_eq!(service_ttls(&service(120, 4500, 3000), 4500).shortest(), 120);
+    assert_eq!(service_ttls(&service(300, 100, 3000), 4500).shortest(), 100);
+    assert_eq!(service_ttls(&service(0, 0, 0), 4500), ServiceTtls { srv: 4500, ptr: 4500, txt: 4500 });
+    assert_eq!(service_ttls(&service(120, 4500, 3000), 0), ServiceTtls::GONE);
 }
 
 /// A device with the same kind of service as thousands is answered for in

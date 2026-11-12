@@ -27,7 +27,7 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::config::{Advertise, AdvertiseConfig, Forward};
 use crate::device::{Advertised, Device, ServiceParts, Shared, HOST_TTL, OTHER_TTL};
-use crate::message::{self, responses, service_ttl, Request, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
+use crate::message::{self, responses, service_ttls, Request, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
 use crate::addr::{family_of, is_link_local, Family, Prefix};
 use crate::listener::{Link, MDNS_PORT};
 use crate::codec::{Message, Question, Record};
@@ -242,7 +242,7 @@ impl Host {
         let mut shortest = self.host_ttl();
         if let Some(shown) = &self.shown {
             for svc in shown.device.borrow().advertised_services(&shown.how) {
-                shortest = shortest.min(service_ttl(svc, self.other_ttl));
+                shortest = shortest.min(service_ttls(svc, self.other_ttl).shortest());
             }
         }
         shortest

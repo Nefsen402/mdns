@@ -161,7 +161,6 @@ fn tv(addr: &str, instances: &[&str]) -> Device {
                     port: 8080,
                     target: None,
                     txt: vec![b"a=b".to_vec()],
-                    ttl: 0,
                     ..ServiceParts::default()
                 }
                 .into()
@@ -3149,7 +3148,7 @@ fn a_name_can_be_announced_with_its_own_ttl_and_is_kept_up_at_80_percent_of_it()
 fn tv_with_ttls(addr: Option<u32>, svc: u32) -> Device {
     let mut device = tv("10.0.1.1", &["TV"]);
     device.ttl = addr;
-    device.services[0].edit(|p| p.ttl = svc);
+    device.services[0].edit(|p| (p.srv_ttl, p.ptr_ttl, p.txt_ttl) = (svc, svc, svc));
     device
 }
 

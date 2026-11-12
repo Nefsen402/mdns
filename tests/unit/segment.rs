@@ -494,10 +494,11 @@ fn reflected_devices_are_announced_with_the_ttls_they_announced_themselves_with(
 
     announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
     wait_for(|| b.reflected_devices().len() == 1);
-    assert_eq!(announced_ttls(&brx), (vec![300], vec![600, 600, 600]));
+    // The PTR and SRV as it said, and the TXT, which it did not, as is usual for one.
+    assert_eq!(announced_ttls(&brx), (vec![300], vec![600, 600, crate::device::OTHER_TTL]));
     // What the device said is on record, too.
     assert_eq!(a.devices()[0].ttl, Some(300));
-    assert_eq!(a.devices()[0].services[0].ttl(), 600);
+    assert_eq!((a.devices()[0].services[0].srv_ttl(), a.devices()[0].services[0].ptr_ttl()), (600, 600));
 }
 
 #[test]
@@ -509,7 +510,7 @@ fn a_configured_reflect_ttl_wins_for_the_address_and_leaves_the_services_alone()
 
     announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
     wait_for(|| b.reflected_devices().len() == 1);
-    assert_eq!(announced_ttls(&brx), (vec![900], vec![600, 600, 600]));
+    assert_eq!(announced_ttls(&brx), (vec![900], vec![600, 600, crate::device::OTHER_TTL]));
 }
 
 /// An interface in two segments shows what each reflects onto it with

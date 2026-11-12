@@ -10,7 +10,9 @@ fn parts() -> ServiceParts {
         target: Some("tv.local".into()),
         txt: vec![b"a=b".to_vec(), vec![0xff, 0x00, 0x80], b"flag".to_vec()],
         subtypes: vec!["_a._sub._http._tcp.local".into(), "_b._sub._http._tcp.local".into()],
-        ttl: 4500,
+        srv_ttl: 120,
+        ptr_ttl: 4500,
+        txt_ttl: 3000,
     }
 }
 
@@ -21,15 +23,17 @@ fn a_service_gives_back_what_it_was_made_of_in_a_block_with_no_room_to_spare() {
     let service = Service::from(parts());
     assert_eq!(service.parts(), parts());
     assert_eq!(
-        (service.instance(), service.kind(), service.port(), service.target(), service.ttl()),
-        ("Living Room\\. TV._http._tcp.local", "_http._tcp.local", 8080, Some("tv.local"), 4500)
+        (service.instance(), service.kind(), service.port(), service.target()),
+        ("Living Room\\. TV._http._tcp.local", "_http._tcp.local", 8080, Some("tv.local"))
     );
+    // Each record's own.
+    assert_eq!((service.srv_ttl(), service.ptr_ttl(), service.txt_ttl()), (120, 4500, 3000));
     assert_eq!(service.subtypes().collect::<Vec<_>>(), ["_a._sub._http._tcp.local", "_b._sub._http._tcp.local"]);
     // A TXT value may be any bytes, a NUL among them.
     assert_eq!(service.txt().collect::<Vec<_>>(), [&b"a=b"[..], &[0xff, 0x00, 0x80], b"flag"]);
-    // The port and TTL, three names and the subtypes with their ends, and the TXT data.
+    // The port and three TTLs, three names and the subtypes with their ends, and the TXT data.
     let names = ["Living Room\\. TV._http._tcp.local", "_http._tcp.local", "tv.local"].map(str::len);
-    let size = 6 + names.iter().sum::<usize>() + 3 + (25 + 25) + 1 + (3 + 1 + 3 + 1 + 4 + 1);
+    let size = 14 + names.iter().sum::<usize>() + 3 + (25 + 25) + 1 + (3 + 1 + 3 + 1 + 4 + 1);
     assert_eq!(service.block.len(), size);
 }
 
@@ -38,7 +42,7 @@ fn a_service_gives_back_what_it_was_made_of_in_a_block_with_no_room_to_spare() {
 #[test]
 fn a_service_with_little_known_of_it_says_so() {
     for service in [Service::default(), ServiceParts { instance: "x._a._tcp.local".into(), ..Default::default() }.into()] {
-        assert_eq!((service.port(), service.ttl(), service.target()), (0, 0, None));
+        assert_eq!((service.port(), service.srv_ttl(), service.ptr_ttl(), service.txt_ttl(), service.target()), (0, 0, 0, 0, None));
         assert!(service.subtypes().next().is_none() && service.txt().next().is_none());
         assert!(!service.is_resolved());
     }
@@ -502,15 +506,17 @@ fn names_that_differ_only_in_case_are_one_and_the_same() {
 }
 
 #[test]
-fn the_ttls_a_device_announces_are_kept_and_the_address_ones_do_not_get_the_services() {
+fn the_ttls_a_device_announces_are_kept_each_with_its_record_and_the_address_ones_do_not_get_the_services() {
     let device = heard(vec![
         a_record("d.local", "10.0.1.30"),
         record("D._x._tcp.local".into(), true, 4500, RData::Srv { priority: 0, weight: 0, port: 1, target: "d.local".into() }),
         record("_x._tcp.local".into(), false, 100, RData::Ptr("D._x._tcp.local".into())),
+        record("D._x._tcp.local".into(), true, 3000, RData::Txt(vec![b"k=v".to_vec()])),
     ]);
     assert_eq!(device.ttl, Some(120));
-    // The SRV record's TTL counts, not the PTR's.
-    assert_eq!(device.services[0].ttl(), 4500);
+    // Of each record, its own: the SRV's does not stand for the others.
+    let service = &device.services[0];
+    assert_eq!((service.srv_ttl(), service.ptr_ttl(), service.txt_ttl()), (4500, 100, 3000));
 }
 
 /// A printer says it is an AirPrint one with a subtype PTR next to its

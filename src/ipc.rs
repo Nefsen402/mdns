@@ -943,7 +943,10 @@ fn device_json(interface: &str, d: &Device) -> Value {
                 // Text where it is: a value that is not is shown as the nearest.
                 "txt": s.txt().map(|t| String::from_utf8_lossy(t)).collect::<Vec<_>>(),
                 "subtypes": s.subtypes().collect::<Vec<_>>(),
-                "ttl": (s.ttl() != 0).then_some(s.ttl()),
+                // Each record's, as it was announced: the SRV's is `ttl`.
+                "ttl": (s.srv_ttl() != 0).then_some(s.srv_ttl()),
+                "ptr_ttl": (s.ptr_ttl() != 0).then_some(s.ptr_ttl()),
+                "txt_ttl": (s.txt_ttl() != 0).then_some(s.txt_ttl()),
             })
         })
         .collect();
