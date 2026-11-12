@@ -50,7 +50,7 @@ fn a_device_is_found_by_its_hostname_whatever_the_case_and_by_address_until_it_h
 #[test]
 fn the_tables_find_what_a_scan_of_the_devices_does_through_any_mix_of_changes() {
     let mut devices = Devices::default();
-    devices.set_refresh(Some(Duration::from_secs(30)));
+    devices.set_refresh(Some(Duration::from_secs(30)), false, &[]);
     let mut model: HashMap<String, Id> = HashMap::new();
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = move || {

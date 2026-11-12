@@ -183,9 +183,21 @@ impl Tracker {
         for &id in &stale {
             touched.note(&self.discovered, id);
         }
+        // A device that has no address left, because its last ran out, is gone
+        // though its other records have not: nothing can reach it, nothing is
+        // announced of it, and what answers a question about it, while it is
+        // kept, keeps the question from being asked.
+        let mut stale = stale;
         for id in running {
             touched.note(&self.discovered, id);
-            self.discovered.edit(id, |entry| entry.expire_addrs(now));
+            let gone = self.discovered.edit(id, |entry| {
+                let had = !entry.device.borrow().addresses.is_empty();
+                entry.expire_addrs(now);
+                had && entry.device.borrow().addresses.is_empty()
+            });
+            if gone == Some(true) {
+                stale.push(id);
+            }
         }
         for id in stale {
             self.discovered.remove(id);
@@ -704,6 +716,11 @@ pub(crate) struct Devices {
     /// How long before one would run out they are asked to answer again; none
     /// if they are not.
     refresh: Option<Duration>,
+    /// Whether only the devices that have a service of one of `watched` are:
+    /// all of them are if it is not.
+    only_watched: bool,
+    /// The service types, in lowercase, that something is looking for.
+    watched: Vec<String>,
     hasher: DefaultHashBuilder,
 }
 
@@ -802,8 +819,17 @@ impl Devices {
     /// the soonest it or one of its addresses runs out, and not again until
     /// the gap has passed since it was last asked. Not if it is to be
     /// dropped by then, nor if there is nothing to ask it.
-    fn refresh_at(&self, entry: &Entry) -> Option<Instant> {
-        entry.refresh_due(self.refresh?)
+    pub fn refresh_at(&self, entry: &Entry) -> Option<Instant> {
+        let before = self.refresh?;
+        self.refreshes(entry).then(|| entry.refresh_due(before)).flatten()
+    }
+
+    /// Whether `entry` is asked to answer again before it runs out, if there is
+    /// a way to ask: all are, unless only those that something is looking for
+    /// are, the ones that have a service of a type it watches.
+    pub fn refreshes(&self, entry: &Entry) -> bool {
+        !self.only_watched
+            || entry.device.borrow().services.iter().any(|svc| self.watched.iter().any(|kind| svc.kind().eq_ignore_ascii_case(kind)))
     }
 
     /// What the tables would hold of `entry`.
@@ -857,13 +883,16 @@ impl Devices {
     }
 
     /// Set how long before they run out devices are asked to answer again, or
-    /// that they are not. It is what [`Devices::refresh_at`] goes by, so the
-    /// times they are held under are made again.
-    pub fn set_refresh(&mut self, before: Option<Duration>) {
-        if self.refresh == before {
+    /// that they are not, and whether only those with a service of one of the
+    /// types `watched` (in lowercase) are. It is what [`Devices::refresh_at`]
+    /// goes by, so the times they are held under are made again.
+    pub fn set_refresh(&mut self, before: Option<Duration>, only_watched: bool, watched: &[String]) {
+        if self.refresh == before && self.only_watched == only_watched && self.watched == watched {
             return;
         }
         self.refresh = before;
+        self.only_watched = only_watched;
+        self.watched = watched.to_vec();
         self.by_refresh.clear();
         for id in self.table.ids().collect::<Vec<_>>() {
             if let Some(at) = self.refresh_at(self.table.get(id)) {

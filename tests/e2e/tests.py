@@ -4,7 +4,7 @@ import signal
 import subprocess
 import unittest
 
-from lab import A, AAAA, FOLLOWS_CHANGES, FREEBSD, PTR, SRV, TXT, Lab, announcement, a, aaaa, query, response, sh, ptr, srv, txt, until
+from lab import A, AAAA, FOLLOWS_CHANGES, FREEBSD, PTR, SRV, TXT, Lab, Watch, announcement, a, aaaa, query, response, sh, ptr, srv, txt, until
 
 BINARY = os.environ["E2E_DAEMON"]
 CTL = os.environ.get("E2E_CTL")
@@ -1224,6 +1224,39 @@ class Timers(Case):
         self.assertTrue(d.host("s", "dev.local"))
         d.advance(30)
         self.assertFalse(d.host("s", "dev.local"), "and goes when it is not heard from again")
+
+    def test_where_nothing_is_active_only_the_devices_a_watch_is_for_are_asked_to_answer_again(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        d = self.lab.daemon(conf("[Interface]\nRefreshBefore=30s\nMinimumLifetime=40s\n[Segment]\nName=s\nInterfaces=ra\nActive=no\n"))
+        dev, other = la.device("10.9.1.50"), la.device("10.9.1.51")
+        dev.multicast(announcement("dev", "10.9.1.50", "Dev", kind="_http._tcp", ttl=40))
+        other.multicast(announcement("other", "10.9.1.51", "Other", kind="_ipp._tcp", ttl=40))
+        d.settle()
+        self.assertTrue(d.host("s", "dev.local") and d.host("s", "other.local"), self.logs(d))
+        # A watch for one type is open.
+        watch = self.lab.track(Watch([self.lab.ctl, "-s", d.socket_path, "watch", "--query", "_http._tcp", "s"]))
+        self.assertTrue(watch.wait("dev.local", 5), "the watch has it\n" + self.logs(d))
+        asked, other_asked = dev.hearer.count(), other.hearer.count()
+        d.advance(29)
+        self.assertTrue(dev.hearer.none(asks("dev.local", A), since=asked), "not yet")
+        d.advance(2)
+        got = dev.hearer.seen(asks("dev.local", A), asked) or dev.hearer.wait(asks("dev.local", A), 5, since=asked)
+        self.assertTrue(got, "the device the watch is for is asked\n" + self.logs(d))
+        self.assertTrue(other.hearer.none(asks("other.local", A), since=other_asked), "the other, which nothing is looking for, is not")
+
+    def test_a_device_with_no_address_left_is_gone_though_its_services_are_not(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        d = self.lab.daemon(conf("[Interface]\nMinimumLifetime=40s\n[Segment]\nName=s\nInterfaces=ra\nActive=no\n"))
+        dev = la.device("10.9.1.50")
+        # An address of forty seconds, and a service of seventy-five minutes.
+        dev.multicast(response(a("dev.local", "10.9.1.50", 40), ptr("_http._tcp.local", "Dev._http._tcp.local"),
+                               srv("Dev._http._tcp.local", 80, "dev.local", ttl=4500), txt("Dev._http._tcp.local", "k=v")))
+        d.settle()
+        self.assertTrue(d.host("s", "dev.local"), self.logs(d))
+        d.advance(30)
+        self.assertTrue(d.host("s", "dev.local"), "its address has not run out")
+        d.advance(15)
+        self.assertFalse(d.host("s", "dev.local"), "gone with its last address, whatever else of it is good\n" + self.logs(d))
 
     def test_a_device_with_a_short_ttl_is_asked_three_quarters_of_the_way_in_and_not_at_once(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")

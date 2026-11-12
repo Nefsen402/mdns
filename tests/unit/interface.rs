@@ -2286,6 +2286,68 @@ fn refresh_retries_after_a_gap_and_stops_once_the_device_has_answered() {
     assert!(recv(&rx).is_none());
 }
 
+/// A device whose last address has run out is gone, though its other records
+/// have not: it cannot be reached, nothing of it is announced, and while it is
+/// kept what is known of it keeps what was asked for it from being asked.
+#[test]
+fn a_device_is_gone_when_its_last_address_runs_out_though_its_other_records_have_not() {
+    let seg = interface("test");
+    let two_addresses = |ttl| record("plug.local".into(), true, ttl, RData::A("10.0.1.6".parse().unwrap()));
+    hear(&seg, "10.0.1.5", vec![
+        a_record("plug.local", "10.0.1.5"),
+        two_addresses(4500),
+        ptr("_http._tcp.local", "Plug._http._tcp.local"),
+        srv("Plug._http._tcp.local", 80, "plug.local"),
+    ]);
+    hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), ptr("_ipp._tcp.local", "TV._ipp._tcp.local"), srv("TV._ipp._tcp.local", 631, "tv.local")]);
+    assert_eq!(seg.devices().len(), 2);
+    let events = seg.subscribe();
+
+    // The addresses of two minutes have run out, as late as a device is kept at
+    // least; the services have not.
+    seg.expire(Instant::now() + FLOOR + Duration::from_secs(10));
+    let left = seg.devices();
+    assert_eq!(left.iter().filter_map(|d| d.hostname.as_deref()).collect::<Vec<_>>(), ["plug.local"], "the TV has no address left");
+    assert_eq!(left[0].addrs().collect::<Vec<_>>(), [ip("10.0.1.6")], "one that has another is kept");
+    let told: Vec<Event> = events.try_iter().collect();
+    assert!(told.iter().any(|e| matches!(e, Event::Removed(d) if d.borrow().hostname.as_deref() == Some("tv.local"))), "{told:?}");
+}
+
+/// Where the interface asks nothing of its own accord, the devices that a watch
+/// is for are asked to answer again before they run out, and no others; and
+/// when the watch is no more, they are not.
+#[test]
+fn an_interface_that_is_not_active_asks_to_answer_again_only_the_devices_a_watch_is_for() {
+    let (seg, rx) = wired();
+    seg.set_active(false);
+    seg.set_refresh_before(Some(Duration::from_secs(60)));
+    let at120 = |r: Record| Record { ttl: 120, ..r };
+    seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+    hear(&seg, "10.0.1.8", vec![
+        a_record("cam.local", "10.0.1.8"),
+        at120(ptr("_rtsp._tcp.local", "Cam._rtsp._tcp.local")),
+        srv("Cam._rtsp._tcp.local", 554, "cam.local"),
+    ]);
+    let t = Instant::now() + Duration::from_secs(250);
+    let before = Duration::from_secs(60);
+
+    // Nothing is looked for: nothing is asked.
+    assert_eq!(seg.refresh(t, before).unwrap(), 0);
+    assert!(recv(&rx).is_none());
+
+    // A watch for one type: its devices are, and the printer is not.
+    seg.set_watched(&["_RTSP._tcp.local".to_string()]);
+    assert!(seg.refresh(t, before).unwrap() > 0);
+    let names: Vec<String> = recv(&rx).unwrap().questions.into_iter().map(|q| q.name).collect();
+    assert!(names.contains(&"cam.local".to_string()) && names.iter().all(|n| !n.to_ascii_lowercase().contains("printer")), "{names:?}");
+
+    // Nor is a due time listed for what is not looked for.
+    let listed: Vec<String> = seg.pending().into_iter().filter(|p| p.what == "refresh").map(|p| p.who).collect();
+    assert_eq!(listed, ["cam.local"]);
+    seg.set_watched(&[]);
+    assert!(seg.pending().into_iter().all(|p| p.what != "refresh"), "none when nothing is looked for");
+}
+
 #[test]
 fn refresh_leaves_devices_known_only_by_address_alone() {
     let (seg, rx) = wired();

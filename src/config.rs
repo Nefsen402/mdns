@@ -253,7 +253,8 @@ pub struct SegmentConfig {
     /// unless it says no: probes at startup and periodically, devices asked to
     /// answer again before they run out, a nudge for a neighbour's address. Not
     /// active, they ask only what something asks them to: a client through the
-    /// Avahi socket or a watch, or the segment's other interfaces.
+    /// Avahi socket or a watch, or the segment's other interfaces; and the
+    /// devices a watch is for, which are kept up while it is open.
     pub active: bool,
     /// What a device has to have to be reflected (`ReflectedWhen=`).
     pub reflected_when: ReflectedWhen,
@@ -368,9 +369,9 @@ pub struct Interface {
     /// changed: if any of its segments says so.
     pub reannounce: bool,
     /// Whether it asks of its own accord, unless a segment of it says no: if
-    /// not, it is not probed, nor are its devices asked to answer again,
-    /// whatever else says, and it asks only what something asks it to, as a
-    /// client does.
+    /// not, it is not probed, and only what something is looking for (a watch
+    /// of a service type) is asked to answer again before it runs out, whatever
+    /// else says, and it asks only what something asks it to, as a client does.
     pub active: bool,
 }
 
@@ -451,7 +452,7 @@ impl Config {
         Interface {
             name: name.to_string(),
             min_lifetime: setting_of(&self.settings, name, DEFAULT_MIN_LIFETIME, |i| i.min_lifetime),
-            refresh_before: setting_of(&self.settings, name, Some(DEFAULT_REFRESH_BEFORE), |i| i.refresh_before).filter(|_| active),
+            refresh_before: setting_of(&self.settings, name, Some(DEFAULT_REFRESH_BEFORE), |i| i.refresh_before),
             probe_interval: setting_of(&self.settings, name, None, |i| i.probe_interval).filter(|_| active),
             forward: setting_of(&self.settings, name, Forward::default(), |i| i.forward),
             probe_services: setting_of(&self.settings, name, Vec::new(), |i| Some(i.probe_services.clone()).filter(|kinds| !kinds.is_empty())),

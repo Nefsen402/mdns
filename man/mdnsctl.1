@@ -203,6 +203,12 @@ by default each question once, so one it has asked before is not asked again,
 and what answered it is known already.
 A device that loses its last service of the type is shown as
 .BR removed .
+Where the daemon asks nothing of its own accord
+.RB ( Active=no
+in
+.BR mdnsd.conf (5)),
+the devices of the type are asked to answer again before they run out for as
+long as the watch is open, so that it keeps what it is for.
 .IP
 It exits with status 2 if the daemon stops or the connection is lost, and
 quietly with status 0 if its output is closed, as with

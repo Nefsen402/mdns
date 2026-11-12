@@ -494,7 +494,7 @@ fn a_client_that_does_not_read_is_let_go() {
     c.flush(now + Duration::from_millis(100));
     assert_eq!(c.stalled, Some(now + Duration::from_millis(100)));
 
-    let mut server = Server { listener: fd(UnixListener::bind(temp_socket("stalled")).unwrap()), clients: vec![c], next_watch: 0 };
+    let mut server = Server { listener: fd(UnixListener::bind(temp_socket("stalled")).unwrap()), clients: vec![c], next_watch: 0, watched: false };
     server.tick(&[], now + Duration::from_millis(150));
     assert_eq!(server.clients.len(), 1, "not yet");
     server.tick(&[], now + Duration::from_millis(100) + STREAM_WRITE);
@@ -663,6 +663,50 @@ fn watch_with_a_query_shows_what_is_there_and_asks_as_the_interface_says() {
     announce(&seg, "10.0.1.9", "plug.local", "Plug");
     let added = h.json(&mut reader);
     assert_eq!((added["event"].as_str(), added["device"]["hostname"].as_str()), (Some("added"), Some("plug.local")));
+    let _ = fs::remove_file(&path);
+}
+
+/// Where an interface asks nothing of its own accord, the types that watches
+/// are for are told to it, as long as they are open: that is what keeps up the
+/// devices they are for.
+#[test]
+fn the_interfaces_are_told_the_types_the_watches_open_are_for() {
+    let (seg, _rx) = wired("wifi");
+    seg.set_active(false);
+    let groups = vec![Group { name: "IoT".into(), segment: Segment::new(vec![seg.clone()]).unwrap() }];
+    let path = temp_socket("watch-types");
+    let mut h = Harness::new(&path, groups);
+    h.pump();
+    assert!(seg.watched().is_empty());
+
+    // A watch that is for no type is for none.
+    let (mut plain, mut plain_reader) = connect(&path);
+    h.ask(&mut plain, &mut plain_reader, "watch IoT");
+    h.pump();
+    assert!(seg.watched().is_empty());
+
+    let (mut first, mut first_reader) = connect(&path);
+    h.ask(&mut first, &mut first_reader, "watch --query=_http._tcp --query=_Shelly._tcp IoT");
+    h.pump();
+    assert_eq!(seg.watched(), ["_http._tcp.local", "_shelly._tcp.local"]);
+
+    // The types of all of them, each once.
+    let (mut second, mut second_reader) = connect(&path);
+    h.ask(&mut second, &mut second_reader, "watch --query=_http._tcp --query=_hue._tcp IoT");
+    h.pump();
+    assert_eq!(seg.watched(), ["_http._tcp.local", "_hue._tcp.local", "_shelly._tcp.local"]);
+
+    // A watch that is closed is not one: what it was for goes.
+    drop(first);
+    drop(first_reader);
+    h.pump();
+    h.pump();
+    assert_eq!(seg.watched(), ["_http._tcp.local", "_hue._tcp.local"]);
+    drop(second);
+    drop(second_reader);
+    h.pump();
+    h.pump();
+    assert!(seg.watched().is_empty(), "{:?}", seg.watched());
     let _ = fs::remove_file(&path);
 }
 

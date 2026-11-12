@@ -52,7 +52,9 @@
 //! on an interface, as it is set to (`ForwardQuestions=`), so a type already
 //! asked for is not asked for again, where each question is asked once. A
 //! device that loses its last service of the type is `removed` from the
-//! watch. `devices` only lists what is known: to ask for a type and see what
+//! watch. Where an interface asks nothing of its own accord (`Active=no`), the
+//! devices of the type are asked to answer again before they run out for as
+//! long as the watch is open, and no others are. `devices` only lists what is known: to ask for a type and see what
 //! answers, watch with a query for as long as you care to wait, as `mdnsctl
 //! devices --query` does.
 //!
@@ -136,6 +138,9 @@ pub struct Server {
     listener: OwnedFd,
     clients: Vec<Client>,
     next_watch: u64,
+    /// Whether the interfaces were told of types that are watched, which is
+    /// then to be taken back when the watches are closed.
+    watched: bool,
 }
 
 /// A connection to the control socket.
@@ -187,7 +192,7 @@ impl Server {
     pub fn bind(path: &str, mode: rustix::fs::RawMode) -> Result<Server> {
         let listener = bind(path, mode)?;
         eprintln!("ipc: listening on {path}");
-        Ok(Server { listener, clients: Vec::new(), next_watch: 0 })
+        Ok(Server { listener, clients: Vec::new(), next_watch: 0, watched: false })
     }
 
     /// The descriptors to wait on: the listener, readable when someone
@@ -247,6 +252,7 @@ impl Server {
     /// what has happened to the watches, write what can be written, and let
     /// go of clients that are done, gone, idle or not reading.
     pub fn tick(&mut self, groups: &[Group], now: Instant) {
+        self.sync_watched(groups);
         let watching = self.watches();
         let notices: Vec<(&str, Notice)> =
             groups.iter().flat_map(|g| g.segment.take_notices().into_iter().map(move |n| (g.name.as_str(), n))).collect();
@@ -294,6 +300,28 @@ impl Server {
             }
         }
         self.clients.retain(|c| !c.gone && !(c.closing && c.output.is_empty()));
+    }
+
+    /// Tell each interface which service types the watches open now are for, so
+    /// that a device of one is kept up (asked to answer again before it runs
+    /// out) though the interface asks nothing of its own accord. A watch that is
+    /// closed is not one: what it was for is told as it is no longer.
+    fn sync_watched(&mut self, groups: &[Group]) {
+        let mut wanted: HashMap<String, Vec<String>> = HashMap::new();
+        for c in &self.clients {
+            if let State::Watching(watch) = &c.state {
+                for link in links_of(groups, &watch.name).iter().filter(|_| !watch.query.kinds.is_empty()) {
+                    wanted.entry(link.interface().to_string()).or_default().extend(watch.query.kinds.iter().cloned());
+                }
+            }
+        }
+        if wanted.is_empty() && !self.watched {
+            return;
+        }
+        for link in links_of(groups, "") {
+            link.set_watched(wanted.get(link.interface()).map_or(&[][..], Vec::as_slice));
+        }
+        self.watched = !wanted.is_empty();
     }
 
     /// When [`Server::tick`] next has something to do of its own accord: a

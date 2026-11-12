@@ -393,9 +393,14 @@ kept as long as the records say and no longer.
 - A lookup of a name it does not know asks for it on every interface of the
   segment, and waits a little for what answers. What a watch asks for with
   `--query`, and what another interface of the segment is asked, is asked too.
-- A device whose records ran out is gone, and the questions it answered are
-  forgotten with it, so that the next lookup asks again, though by default each
-  question is asked only once (`ForwardQuestions=` in `mdnsd.conf(5)`).
+- A device whose records ran out is gone, and so is one whose last address ran
+  out (its address is the shortest, two minutes, and nothing asks it again). The
+  questions it answered are forgotten with it, so that the next lookup asks
+  again, though by default each question is asked only once
+  (`ForwardQuestions=` in `mdnsd.conf(5)`).
+- A watch (`mdnsctl watch --query`) keeps its devices up: those with a service
+  of the type are asked to answer again before they run out, as long as it is
+  open, and no others are.
 - Replies to the questions it hears, and what `[Advertise]` or another
   segment announces, are not "of its own accord", and go on as they are. A
   client is a segment of one interface, which reflects nothing.

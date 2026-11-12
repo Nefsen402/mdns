@@ -240,10 +240,10 @@ fn describe(interface: &config::Interface) {
     eprintln!("{name}: asking {forwarding}");
     match interface.refresh_before {
         Some(before) => eprintln!(
-            "{name}: asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
+            "{name}: asking {} to answer again {}s before they would expire, or three quarters of the way through a shorter life",
+            if interface.active { "devices" } else { "the devices a watch is for" },
             before.as_secs()
         ),
-        None if !interface.active => {}
         None => eprintln!("{name}: refreshing devices before they expire is off"),
     }
     match interface.probe_interval {

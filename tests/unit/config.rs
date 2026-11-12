@@ -522,7 +522,7 @@ fn forwarding_questions_is_set_per_interface_and_once_by_default() {
 
 /// A segment can say its interfaces are not active, and then they ask only what
 /// is asked of them: they are not probed, nor are their devices asked to answer
-/// again, whatever else says.
+/// again but those a watch is for, whatever else says.
 #[test]
 fn a_segment_can_say_its_interfaces_are_not_active() {
     let c = Config::parse(
@@ -536,9 +536,10 @@ fn a_segment_can_say_its_interfaces_are_not_active() {
         let i = c.interface(name);
         (i.active, i.probe_interval.map(|d| d.as_secs()), i.refresh_before.map(|d| d.as_secs()))
     };
-    assert_eq!(of("eth0"), (false, None, None));
+    // Not probed; the margin is kept, for the devices a watch is for.
+    assert_eq!(of("eth0"), (false, None, Some(30)));
     assert_eq!(of("br0"), (true, Some(60), Some(30)));
-    assert_eq!(of("eth1"), (false, None, None), "in a segment that is not active, whatever the other says");
+    assert_eq!(of("eth1"), (false, None, Some(30)), "in a segment that is not active, whatever the other says");
     assert_eq!(of("nonesuch"), (true, Some(60), Some(30)));
     let default = Config::parse("[Segment]\nName=a\nInterfaces=x\n").unwrap();
     assert!(default.interface("x").active, "active unless it is said not");

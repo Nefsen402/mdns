@@ -657,6 +657,10 @@ struct State {
     /// Whether it asks of its own accord: see
     /// [`SegmentConfig::active`](crate::config::SegmentConfig::active).
     active: bool,
+    /// The service types, in lowercase, that something is looking for: a watch
+    /// of one. A device of one is asked to answer again before it runs out
+    /// though the interface asks nothing of its own accord.
+    watched: Vec<String>,
     /// The questions it has put on its link, for [`Forward::Once`].
     asked: Remembered,
 }
@@ -840,14 +844,13 @@ impl State {
     /// answer again, when that, or whether there is a way to ask, changed.
     fn sync_refresh(&mut self) {
         let before = self.upkeep.before.filter(|_| !self.link.is_empty());
-        self.tracker.discovered.set_refresh(before);
+        self.tracker.discovered.set_refresh(before, !self.active, &self.watched);
     }
 
     /// Every time something is due, as what is to be done (`expire`,
     /// `refresh` or `re-announce`), to whom, and when. What
     /// [`State::next_due`] and [`Interface::pending`] are made of.
     fn for_each_deadline(&self, f: &mut dyn FnMut(&'static str, &dyn fmt::Display, Instant)) {
-        let before = self.upkeep.before;
         for e in self.tracker.discovered.iter() {
             let hostname = e.device.borrow().hostname.clone();
             let who: &dyn fmt::Display = match &hostname {
@@ -859,7 +862,7 @@ impl State {
             for (addr, &at) in e.addr_expires.iter().filter(|&(_, at)| *at < e.expires) {
                 f("expire", &Labelled(who, addr), at);
             }
-            if let Some(at) = before.filter(|_| !self.link.is_empty()).and_then(|before| e.refresh_due(before)) {
+            if let Some(at) = self.tracker.discovered.refresh_at(e).filter(|_| !self.link.is_empty()) {
                 f("refresh", who, at);
             }
         }
@@ -1810,7 +1813,30 @@ impl Interface {
     /// probed, nor are devices asked to answer again, is for whoever sets those
     /// not to.)
     pub fn set_active(&self, active: bool) {
-        self.state.borrow_mut().active = active;
+        let mut state = self.state.borrow_mut();
+        state.active = active;
+        state.sync_refresh();
+    }
+
+    /// The service types that something is looking for, for tests.
+    #[cfg(test)]
+    pub(crate) fn watched(&self) -> Vec<String> {
+        self.state.borrow().watched.clone()
+    }
+
+    /// The service types that something is looking for now, from a watch of
+    /// them, and no others: a device with a service of one is asked to answer
+    /// again before it runs out, as a device is where the interface asks of its
+    /// own accord, and not asked when it is not one.
+    pub fn set_watched(&self, kinds: &[String]) {
+        let mut kinds: Vec<String> = kinds.iter().map(|kind| kind.to_ascii_lowercase()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        let mut state = self.state.borrow_mut();
+        if state.watched != kinds {
+            state.watched = kinds;
+            state.sync_refresh();
+        }
     }
 
     /// Probe on its own every `every`, the first one that long from now, as
@@ -1956,7 +1982,7 @@ impl Interface {
             let recent = entry.refreshed.is_some_and(|t| now.saturating_duration_since(t) < gap);
             // Its own time to be asked, which is later than `before` ahead of
             // it for one with a short TTL.
-            if !entry.askable() || recent || entry.refresh_due(before).is_none_or(|at| at > now) {
+            if !entry.askable() || !discovered.refreshes(entry) || recent || entry.refresh_due(before).is_none_or(|at| at > now) {
                 continue;
             }
             // A device that sleeps may ignore the group, and still answers what
