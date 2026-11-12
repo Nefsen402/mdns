@@ -19,7 +19,7 @@ use crate::config::{Advertise, Neighbours, ReflectedWhen, DEFAULT_MAX_ADDRS};
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_SERVICES;
 use crate::codec::{self, rtype, Header, Message, Question, RData, Record};
-use crate::listener::Family;
+use crate::addr::{family_of, is_link_local, Family};
 
 use crate::prelude::*;
 
@@ -510,11 +510,6 @@ impl From<IpAddr> for Address {
     }
 }
 
-/// The family of `addr`.
-pub fn family_of(addr: IpAddr) -> Family {
-    if addr.is_ipv4() { Family::V4 } else { Family::V6 }
-}
-
 /// Put addresses in the order a device keeps them: routable before
 /// link-local, IPv4 before IPv6, then by address.
 fn sort_addrs(addrs: &mut [IpAddr]) {
@@ -525,15 +520,6 @@ fn sort_addrs(addrs: &mut [IpAddr]) {
 /// link-local, IPv4 before IPv6.
 fn addr_order(addr: &IpAddr) -> (bool, bool, IpAddr) {
     (is_link_local(addr), addr.is_ipv6(), *addr)
-}
-
-/// Link-local: IPv6 `fe80::/10` and IPv4 `169.254.0.0/16`. Valid on one link
-/// only, so never to be handed to another network.
-pub fn is_link_local(addr: &IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(a) => a.is_link_local(),
-        IpAddr::V6(a) => a.segments()[0] & 0xffc0 == 0xfe80,
-    }
 }
 
 /// What one response says about one host: the addresses it announced for it,

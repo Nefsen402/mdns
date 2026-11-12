@@ -33,6 +33,7 @@ use rustix::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
 use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
 
+use crate::addr::{Family, Prefix};
 use crate::config;
 use crate::runtime::{errno, Why};
 
@@ -40,12 +41,6 @@ use crate::runtime::{errno, Why};
 pub use crate::config::MDNS_PORT;
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 pub const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Family {
-    V4,
-    V6,
-}
 
 /// The families `interface` is used over: those of its peers, if it has any,
 /// and else those it listens over.
@@ -446,7 +441,7 @@ impl Link {
             let to = of_family
                 .into_iter()
                 .map(|peer| match peer {
-                    IpAddr::V6(v6) if crate::device::is_link_local(&peer) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, index)),
+                    IpAddr::V6(v6) if crate::addr::is_link_local(&peer) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, index)),
                     peer => SocketAddr::new(peer, port),
                 })
                 .collect();
@@ -481,38 +476,6 @@ impl Hub {
 
     pub fn receive(&self, _fd: RawFd, _deliver: impl FnMut(u32, SocketAddr, Option<IpAddr>, &[u8])) {}
 }
-/// A network an interface is on: an address of the interface, and the length
-/// of the prefix that makes the network of it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Prefix {
-    pub addr: IpAddr,
-    pub len: u8,
-}
-
-impl Prefix {
-    /// Whether `ip` is in this network.
-    pub fn contains(&self, ip: &IpAddr) -> bool {
-        let bits = |a: &IpAddr| match a {
-            IpAddr::V4(a) => (u128::from(a.to_bits()) << 96, 32),
-            IpAddr::V6(a) => (a.to_bits(), 128),
-        };
-        let ((net, width), (ip, other)) = (bits(&self.addr), bits(ip));
-        if width != other {
-            return false;
-        }
-        let len = u32::from(self.len).min(width);
-        let mask = if len == 0 { 0 } else { u128::MAX << (128 - len) };
-        net & mask == ip & mask
-    }
-}
-
-/// The network written as `addr/len`, for tests.
-#[cfg(test)]
-pub fn prefix(net: &str) -> Prefix {
-    let (addr, len) = net.split_once('/').unwrap();
-    Prefix { addr: addr.parse().unwrap(), len: len.parse().unwrap() }
-}
-
 /// Look at each entry of the list of the interfaces' addresses, as getifaddrs
 /// has it, that has a name and an address.
 fn each_address(mut f: impl FnMut(&libc::ifaddrs)) -> Result<()> {

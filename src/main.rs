@@ -11,6 +11,7 @@ mod runtime;
 // Shared with mdnsctl, whose options take values; the daemon's take none.
 #[allow(dead_code)]
 mod args;
+mod addr;
 mod avahi_compat;
 mod codec;
 mod config;
@@ -40,7 +41,8 @@ use config::{AdvertiseConfig, Config, Forward, Neighbours};
 use netlink::{Event, Netlink};
 use segment::Segment;
 use interface::Interface;
-use listener::{Family, Hub, Link};
+use addr::Family;
+use listener::{Hub, Link};
 
 /// What every module takes from alloc, as std's prelude would give it.
 mod prelude {

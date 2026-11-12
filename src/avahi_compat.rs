@@ -37,12 +37,13 @@ use crate::time::Instant;
 
 use anyhow::Result;
 
-use crate::device::{is_link_local, Device};
+use crate::addr::{is_link_local, Family};
+use crate::device::Device;
 use crate::ipc::links_of;
 use crate::codec::{rtype, Question};
 use crate::poll;
 use crate::runtime::Why;
-use crate::listener::{self, Family};
+use crate::listener;
 use crate::Group;
 
 use crate::prelude::*;

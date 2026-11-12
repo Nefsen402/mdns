@@ -29,7 +29,8 @@ fn interface(name: &str) -> Interface {
 
 use crate::device::{record, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
 use crate::codec::{self, rtype, Header};
-use crate::listener::{prefix, Link};
+use crate::addr::prefix;
+use crate::listener::Link;
 
 /// Its first routable IPv4 or IPv6 address, and link-local one.
 fn v4(d: &Device) -> Option<IpAddr> {
@@ -39,10 +40,10 @@ fn v6(d: &Device) -> Option<IpAddr> {
     d.routable().find(|a| a.is_ipv6())
 }
 fn ll4(d: &Device) -> Option<IpAddr> {
-    d.addrs().find(|a| a.is_ipv4() && crate::device::is_link_local(a))
+    d.addrs().find(|a| a.is_ipv4() && crate::addr::is_link_local(a))
 }
 fn ll6(d: &Device) -> Option<IpAddr> {
-    d.addrs().find(|a| a.is_ipv6() && crate::device::is_link_local(a))
+    d.addrs().find(|a| a.is_ipv6() && crate::addr::is_link_local(a))
 }
 
 fn ip(s: &str) -> IpAddr {

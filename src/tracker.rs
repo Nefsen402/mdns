@@ -10,13 +10,12 @@ use alloc::collections::BTreeSet;
 
 use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
 
-use crate::device::{addr_of, edit, Shared, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
+use crate::device::{addr_of, edit, Shared, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
 
-use crate::interface::Asked;
 use crate::codec::{Message, Question, RData, Record};
 use crate::prelude::*;
 use crate::config::{Advertise, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
-use crate::listener::{Family, Prefix};
+use crate::addr::{family_of, is_link_local, Family, Prefix};
 use crate::table::{hash_addr, hash_name, Id, Multi, Table};
 use crate::time::Instant;
 
@@ -460,6 +459,15 @@ impl Touched {
         names.dedup();
         names
     }
+}
+
+/// A question asked on an interface, as the tracker passes it on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asked {
+    pub question: Question,
+    /// Whether something announced here has an answer to it already. For a
+    /// browse, that is one answer, not necessarily all of them.
+    pub answered: bool,
 }
 
 /// A change to the devices of an interface, or a question asked on it: what

@@ -26,7 +26,8 @@ use anyhow::{bail, Result};
 
 use crate::config::{glob, Advertise, Forward, ReflectedWhen};
 use crate::device::Shared;
-use crate::interface::{Asked, Event, Interface};
+use crate::interface::Interface;
+use crate::tracker::{Asked, Event};
 
 use crate::prelude::*;
 

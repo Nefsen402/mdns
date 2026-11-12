@@ -12,7 +12,8 @@ fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
     unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
 }
 use crate::codec::{rtype, Header, Message, Question, RData, Record};
-use crate::listener::{prefix, Family, Link};
+use crate::addr::{prefix, Family};
+use crate::listener::Link;
 
 /// Its first routable IPv4 or IPv6 address, and link-local one.
 fn v4(d: &Device) -> Option<IpAddr> {
@@ -22,7 +23,7 @@ fn v6(d: &Device) -> Option<IpAddr> {
     d.routable().find(|a| a.is_ipv6())
 }
 fn ll6(d: &Device) -> Option<IpAddr> {
-    d.addrs().find(|a| a.is_ipv6() && crate::device::is_link_local(a))
+    d.addrs().find(|a| a.is_ipv6() && crate::addr::is_link_local(a))
 }
 
 /// A segment whose "multicast group" is a local socket we can read.

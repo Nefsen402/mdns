@@ -105,8 +105,9 @@ use crate::segment::Notice;
 use crate::device::{is_type, Device, Origin};
 use crate::runtime::Why;
 use crate::poll;
-use crate::interface::{Event, Probed, Interface};
-use crate::listener::Family;
+use crate::interface::{Probed, Interface};
+use crate::tracker::Event;
+use crate::addr::Family;
 use crate::Group;
 
 use crate::prelude::*;

@@ -27,11 +27,13 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::config::{Advertise, AdvertiseConfig};
 use crate::device::{
-    family_of, is_link_local, is_type, responses, service_ttl, Advertised, Device, ServiceParts, Shared,
+    is_type, responses, service_ttl, Advertised, Device, ServiceParts, Shared,
     DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
 };
-use crate::listener::{Family, Link, Prefix, MDNS_PORT};
+use crate::addr::{family_of, is_link_local, Family, Prefix};
+use crate::listener::{Link, MDNS_PORT};
 use crate::codec::{Message, Question, Record};
+use crate::tracker::{Asked, Event};
 
 use crate::prelude::*;
 
@@ -85,17 +87,6 @@ const MIN_MAX_PACKET: usize = 512;
 /// The most a packet may be let grow to, however large an interface's MTU:
 /// mDNS's own limit (RFC 6762 section 17).
 const MAX_MAX_PACKET: usize = 9000;
-
-pub use crate::tracker::Event;
-
-/// A question asked on an interface, as passed on to the segment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Asked {
-    pub question: Question,
-    /// Whether something announced here has an answer to it already. For a
-    /// browse, that is one answer, not necessarily all of them.
-    pub answered: bool,
-}
 
 /// Something an interface's timer is waiting to do: see [`Interface::pending`].
 #[derive(Clone, Debug, PartialEq, Eq)]
