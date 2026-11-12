@@ -1,6 +1,6 @@
 //! What is known about a device on an interface: its hostname, addresses and
 //! services. Kept by [`Interface`](crate::interface::Interface), and announced on
-//! other interfaces by the [`Reflector`](crate::reflector::Reflector).
+//! other interfaces by the [`Segment`](crate::segment::Segment).
 //!
 //! A response is read into one [`Report`] per host it describes, which a
 //! [`Device`] then takes in with [`Device::learn`]; a device is turned back
@@ -882,7 +882,7 @@ impl Device {
 
     /// This device together with `other`, of the same host: what either has,
     /// whichever is which. It is what is announced of a device that more than
-    /// one reflector reflects from the same interface, each as it is to show it
+    /// one segment reflects from the same interface, each as it is to show it
     /// (`how`, and `other_how` for `other`). The addresses it has are those
     /// advertised of either, which is all there is of the two.
     pub fn union(&self, how: &Advertise, other: &Device, other_how: &Advertise) -> Device {
@@ -923,7 +923,7 @@ impl Device {
         device
     }
 
-    /// What identifies it among the reflected devices and to the reflector: its
+    /// What identifies it among the reflected devices and to the segment: its
     /// hostname, case-insensitively.
     pub fn key(&self) -> Option<String> {
         self.hostname.as_ref().map(|h| h.to_ascii_lowercase())

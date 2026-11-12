@@ -102,7 +102,7 @@ pub const DEFAULT_MAX_DEVICES: usize = 1024;
 /// flood, not a device. See `[Interface] MaxServices=`.
 pub const DEFAULT_MAX_SERVICES: usize = 64;
 
-/// Which of the questions asked on one of a reflector's segments it puts to
+/// Which of the questions asked on one of a segment's interfaces it puts to
 /// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
 /// device on the asking segment owns: it answers for itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,7 +118,7 @@ pub enum Forward {
 }
 
 /// Which of the addresses a device was given from the neighbour table a
-/// reflector reflects with it (`NeighbourAddresses=`). They are learned, and
+/// segment reflects with it (`NeighbourAddresses=`). They are learned, and
 /// listed, whichever.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Neighbours {
@@ -135,11 +135,11 @@ pub enum Neighbours {
 
 /// What of a device is put in the records that announce it, which it is not
 /// the device's to say: a device keeps all it was given, and whoever shows it
-/// says which of its addresses and services to announce. A reflector makes
+/// says which of its addresses and services to announce. A segment makes
 /// one when it is set up (`NeighbourAddresses=`, `ReflectedServices=`) and
 /// every segment it shows a device on keeps it with the device.
 ///
-/// The default is what a reflector shows of a device: the addresses it can be
+/// The default is what a segment shows of a device: the addresses it can be
 /// reached at from another network, and the services whose host and port are
 /// known, of any type. [`Advertise::ALL`] is a device as it was heard.
 #[derive(Clone, Debug, PartialEq, Eq)]

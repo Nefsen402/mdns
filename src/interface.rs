@@ -88,7 +88,7 @@ const MAX_MAX_PACKET: usize = 9000;
 
 pub use crate::tracker::Event;
 
-/// A question asked on an interface, as passed on to the reflector.
+/// A question asked on an interface, as passed on to the segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Asked {
     pub question: Question,
@@ -128,8 +128,8 @@ type ReflectedKey = (usize, usize);
 /// A device reflected here, which is a wish to have it announced: the device
 /// itself, held where it is heard and so as it is now, and how much of it to
 /// show. It is told apart by the device, which is the same device however it
-/// changes, and by how it is to be shown, which is a reflector's own (another
-/// may show the same device otherwise); the reflector says when to look at it
+/// changes, and by how it is to be shown, which is a segment's own (another
+/// may show the same device otherwise); the segment says when to look at it
 /// again. What a host last announced ([`Host::shown`]) is one too, of a copy of
 /// the device, which [`Reflected::frozen`] makes.
 #[derive(Clone)]
@@ -361,7 +361,7 @@ impl Host {
 /// it, has records under, and when it is held as due. It is kept with the
 /// device, not worked out again, as a claim on a device of another interface has
 /// the names of that device, which can change without this being told, until
-/// the reflector says to look again.
+/// the segment says to look again.
 #[derive(Default, Debug, PartialEq, Eq)]
 struct Held {
     names: Vec<u64>,
@@ -981,7 +981,7 @@ impl State {
 /// One interface, and the two device lists kept for it: devices discovered on
 /// the wire, and devices reflected onto it, over every
 /// family it serves: one list, whichever family a device was heard over.
-/// Cheap to clone; clones share state, so its link, the reflectors spanning
+/// Cheap to clone; clones share state, so its link, the segments spanning
 /// it and the control socket can each hold one.
 #[derive(Clone)]
 pub struct Interface {
@@ -1481,7 +1481,7 @@ impl Interface {
     /// them for a conflict, and once it announces, the copy gives way.
     ///
     /// What it has no answer to is passed on as an [`Event::Question`], for
-    /// the reflector to ask elsewhere.
+    /// the segment to ask elsewhere.
     fn respond(&self, from: SocketAddr, query: &Message) -> Result<()> {
         let h = &query.header;
         if h.response || h.opcode != 0 || h.rcode != 0 || query.questions.is_empty() {

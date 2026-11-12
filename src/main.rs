@@ -18,7 +18,7 @@ mod device;
 mod ipc;
 mod netlink;
 mod poll;
-mod reflector;
+mod segment;
 mod interface;
 mod signal;
 mod listener;
@@ -38,7 +38,7 @@ use anyhow::{Context, Result};
 
 use config::{AdvertiseConfig, Config, Forward, Neighbours};
 use netlink::{Event, Netlink};
-use reflector::Reflector;
+use segment::Segment;
 use interface::Interface;
 use listener::{Family, Hub, Link};
 
@@ -72,7 +72,7 @@ fn run(args: Vec<String>) -> c_int {
 /// One configured segment, over every family the daemon listens on.
 pub struct Group {
     pub name: String,
-    pub reflector: Reflector,
+    pub segment: Segment,
 }
 
 fn daemon(args: Vec<String>) -> Result<()> {
@@ -112,14 +112,14 @@ fn daemon(args: Vec<String>) -> Result<()> {
         Err(e) => return Err(e).context("listening for interface changes (netlink)"),
     };
 
-    // One reflector per configured segment, over the interfaces that are
+    // One segment as the config has them, over the interfaces that are
     // there, which come and go. Where segments share an interface and both
     // want a hostname announced there, they show it together if it is of the
     // same interface, and otherwise the lowest interface's device wins.
     let mut segments = Vec::new();
     for seg in &config.segments {
-        let reflector =
-            Reflector::with_options(Vec::new(), &seg.untrusted, seg.forward, seg.advertise.clone(), seg.reflected_when.clone(), seg.reflect_ttl)
+        let segment =
+            Segment::with_options(Vec::new(), &seg.untrusted, seg.forward, seg.advertise.clone(), seg.reflected_when.clone(), seg.reflect_ttl)
             .with_context(|| format!("starting segment {:?}", seg.name))?;
         eprintln!("segment {:?}: {}", seg.name, seg.interfaces.join(", "));
         if !seg.untrusted.is_empty() {
@@ -153,7 +153,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
         if let Some(ttl) = seg.reflect_ttl {
             eprintln!("segment {:?}: announcing reflected devices with a TTL of {}s", seg.name, ttl.as_secs());
         }
-        segments.push(Group { name: seg.name.clone(), reflector });
+        segments.push(Group { name: seg.name.clone(), segment });
     }
 
     // One entry per interface that is there, however many segments use it,
@@ -197,18 +197,18 @@ fn daemon(args: Vec<String>) -> Result<()> {
     // The loop has stopped, and the upkeep with it, while the goodbyes go
     // out: the watches are told. Each segment is taken down, which withdraws
     // what is announced on it and says that its devices are gone, for the
-    // reflectors to withdraw their copies of them elsewhere. Once all are
+    // segments to withdraw their copies of them elsewhere. Once all are
     // down nothing is announced.
     server.shut_down();
     drop(server);
     drop(avahi);
-    let links: Vec<Interface> = ifaces.live.iter().map(|i| i.segment.clone()).collect();
-    for link in &links {
-        if let Err(e) = link.destroy() {
-            eprintln!("{}: withdrawing what was announced failed: {e:#}", link.interface());
+    let interfaces: Vec<Interface> = ifaces.live.iter().map(|i| i.interface.clone()).collect();
+    for interface in &interfaces {
+        if let Err(e) = interface.destroy() {
+            eprintln!("{}: withdrawing what was announced failed: {e:#}", interface.interface());
         }
     }
-    reflector::deliver(&segments.iter().map(|g| &g.reflector).collect::<Vec<_>>());
+    segment::deliver(&segments.iter().map(|g| &g.segment).collect::<Vec<_>>());
     drop(ifaces);
     drop(segments);
     let _ = rustix::fs::unlink(config.socket.as_str());
@@ -287,7 +287,7 @@ enum Opened {
 struct Ifaces<'a> {
     config: &'a Config,
     hub: Rc<Hub>,
-    /// The reflector of each segment of the config, in its order.
+    /// Each segment of the config, in its order.
     groups: &'a [Group],
     live: Vec<Iface>,
     /// The names of those that have been there, for saying one is back.
@@ -300,8 +300,8 @@ struct Ifaces<'a> {
 /// on it.
 struct Iface {
     /// What is settled for it, which its sockets are made from.
-    interface: config::Interface,
-    segment: Interface,
+    settings: config::Interface,
+    interface: Interface,
     /// The names to advertise with this host's addresses here.
     advertise: Vec<AdvertiseConfig>,
     /// The interface's index.
@@ -375,11 +375,11 @@ impl Ifaces<'_> {
         iface.addresses_changed();
         for (seg, group) in self.config.segments.iter().zip(self.groups) {
             if seg.has(name) {
-                group.reflector.add(iface.segment.clone())?;
+                group.segment.add(iface.interface.clone())?;
             }
         }
         // Whoever is there may never have been asked about.
-        iface.segment.start_probe(how);
+        iface.interface.start_probe(how);
         self.live.push(iface);
         Ok(Opened::Listening)
     }
@@ -390,11 +390,11 @@ impl Ifaces<'_> {
     fn remove(&mut self, at: usize) {
         let iface = self.live.remove(at);
         // Nothing is heard or sent until it is back.
-        iface.segment.detach_all();
-        iface.segment.forget_discovered();
-        let reflectors: Vec<&Reflector> = self.groups.iter().map(|g| &g.reflector).collect();
-        reflector::deliver(&reflectors);
-        for r in &reflectors {
+        iface.interface.detach_all();
+        iface.interface.forget_discovered();
+        let segments: Vec<&Segment> = self.groups.iter().map(|g| &g.segment).collect();
+        segment::deliver(&segments);
+        for r in &segments {
             r.remove(iface.name());
         }
         iface.close(self);
@@ -443,7 +443,7 @@ impl Ifaces<'_> {
             },
             Event::Neighbour { index, ip, mac } => {
                 if let Some(iface) = self.live.iter().find(|i| i.index == *index) {
-                    iface.segment.neighbour(*ip, mac.clone());
+                    iface.interface.neighbour(*ip, mac.clone());
                 }
             }
         }
@@ -453,35 +453,35 @@ impl Ifaces<'_> {
 
 impl Iface {
     fn name(&self) -> &str {
-        &self.interface.name
+        &self.settings.name
     }
 
     /// The entry for `interface`, with what the names to advertise in the
     /// config say of it. It has no sockets until
     /// [`open_sockets`](Iface::open_sockets).
-    fn new(interface: &config::Interface, index: u32, ifaces: &Ifaces) -> Iface {
-        let segment = Interface::new(&interface.name);
-        segment.set_min_lifetime(interface.min_lifetime);
-        segment.set_max_addrs(interface.max_addrs);
-        segment.set_max_devices(interface.max_devices);
-        segment.set_max_services(interface.max_services);
-        segment.set_reannounce(interface.reannounce);
-        segment.set_refresh_before(interface.refresh_before);
+    fn new(settings: &config::Interface, index: u32, ifaces: &Ifaces) -> Iface {
+        let interface = Interface::new(&settings.name);
+        interface.set_min_lifetime(settings.min_lifetime);
+        interface.set_max_addrs(settings.max_addrs);
+        interface.set_max_devices(settings.max_devices);
+        interface.set_max_services(settings.max_services);
+        interface.set_reannounce(settings.reannounce);
+        interface.set_refresh_before(settings.refresh_before);
         // The rounds run in the event loop; the interval is between starts.
-        segment.set_probe_interval(interface.probe_interval);
-        segment.set_probe_types(&interface.probe_services);
+        interface.set_probe_interval(settings.probe_interval);
+        interface.set_probe_types(&settings.probe_services);
         // Where the same hostname is found on more than one, the lowest
         // interface's device is the one reflected; an interface keeps its index.
-        segment.set_priority(index.max(1));
+        interface.set_priority(index.max(1));
 
         Iface {
-            interface: interface.clone(),
-            segment,
+            settings: settings.clone(),
+            interface,
             advertise: ifaces
                 .config
                 .advertise
                 .iter()
-                .filter(|a| a.interfaces.is_empty() || a.interfaces.iter().any(|i| config::glob(i, &interface.name)))
+                .filter(|a| a.interfaces.is_empty() || a.interfaces.iter().any(|i| config::glob(i, &settings.name)))
                 .cloned()
                 .collect(),
             index,
@@ -495,14 +495,14 @@ impl Iface {
     #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
     fn open_sockets(&mut self, ifaces: &Ifaces) -> Result<()> {
         let _ = ifaces;
-        self.use_link(Link::open(&self.interface)?);
+        self.use_link(Link::open(&self.settings)?);
         Ok(())
     }
 
     /// The shared sockets, joined to the group on this interface.
     #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
     fn open_sockets(&mut self, ifaces: &Ifaces) -> Result<()> {
-        self.use_link(ifaces.hub.link(&self.interface)?);
+        self.use_link(ifaces.hub.link(&self.settings)?);
         Ok(())
     }
 
@@ -512,13 +512,13 @@ impl Iface {
             eprintln!("listening on {} ({:?})", self.name(), family);
         }
         self.link = Rc::new(link);
-        self.segment.attach(Rc::clone(&self.link));
+        self.interface.attach(Rc::clone(&self.link));
     }
 
     /// Let go of the sockets: the shared ones leave the group on this interface.
     fn close(self, ifaces: &Ifaces) {
         #[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
-        for family in listener::families(&self.interface) {
+        for family in listener::families(&self.settings) {
             ifaces.hub.leave(self.name(), family);
         }
         #[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
@@ -529,7 +529,7 @@ impl Iface {
     /// on, and announce the advertised name with them.
     fn addresses_changed(&self) {
         match listener::prefixes(self.name()) {
-            Ok(prefixes) => self.segment.set_prefixes(prefixes),
+            Ok(prefixes) => self.interface.set_prefixes(prefixes),
             Err(e) => eprintln!("{}: {e:#}", self.name()),
         }
         // Announce the names to advertise with all of this host's addresses on
@@ -538,9 +538,9 @@ impl Iface {
         if self.advertise.is_empty() {
             return;
         }
-        let addrs = listener::addresses(self.name(), &listener::families(&self.interface)).unwrap_or_default();
+        let addrs = listener::addresses(self.name(), &listener::families(&self.settings)).unwrap_or_default();
         for block in &self.advertise {
-            self.segment.advertise(block, &addrs);
+            self.interface.advertise(block, &addrs);
         }
     }
 
@@ -548,7 +548,7 @@ impl Iface {
     /// are kept within what it leaves.
     fn take_mtu(&mut self, mtu: Option<u32>) {
         let Some(mtu) = mtu.filter(|&m| Some(m) != self.mtu) else { return };
-        let max_packet = self.segment.set_mtu(mtu);
+        let max_packet = self.interface.set_mtu(mtu);
         let how = if self.mtu.is_some() { "now" } else { "is" };
         eprintln!("{}: MTU {how} {mtu}: packets of at most {max_packet} bytes", self.name());
         self.mtu = Some(mtu);
@@ -562,7 +562,7 @@ impl Iface {
     /// Handle everything the socket `fd` has heard, if it is one of this
     /// interface's: the event loop found it readable.
     fn receive(&self, fd: RawFd) {
-        self.link.drain(fd, self.name(), |from, to, datagram| self.segment.hear(from, to, datagram));
+        self.link.drain(fd, self.name(), |from, to, datagram| self.interface.hear(from, to, datagram));
     }
 }
 
@@ -583,7 +583,7 @@ fn config_path(args: Vec<String>) -> Result<Option<String>, args::Error> {
 
 /// The event loop: read what `links` hear, follow what netlink reports for
 /// them, and run each link's upkeep when it is due, handing what changes to
-/// the reflectors of `groups`; and serve the control socket's clients through
+/// the segments of `groups`; and serve the control socket's clients through
 /// `server`; until a shutdown signal comes, whose name is returned. Should
 /// netlink fail, interfaces are no longer followed, and the daemon goes on
 /// as they are. Nothing changes but what the loop does, so what it is to
@@ -596,7 +596,7 @@ fn event_loop(
     avahi: &mut Option<avahi_compat::Server>,
 ) -> Result<&'static str> {
     let groups = ifaces.groups;
-    let reflectors: Vec<&Reflector> = groups.iter().map(|g| &g.reflector).collect();
+    let segments: Vec<&Segment> = groups.iter().map(|g| &g.segment).collect();
     let mut netlink = netlink;
     if let Some(netlink) = netlink.as_mut() {
         // What is there already, and what is known of its neighbours.
@@ -605,8 +605,8 @@ fn event_loop(
         }
     }
     loop {
-        let upkeep = ifaces.live.iter().filter_map(|i| i.segment.next_due());
-        let next = upkeep.chain(reflectors.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).chain(avahi.as_ref().and_then(|a| a.next_due())).min();
+        let upkeep = ifaces.live.iter().filter_map(|i| i.interface.next_due());
+        let next = upkeep.chain(segments.iter().filter_map(|r| r.next_retry())).chain(server.next_due()).chain(avahi.as_ref().and_then(|a| a.next_due())).min();
         // The signals and netlink, then every link's sockets, each with the
         // link it is of, then the sockets shared by the interfaces, if there
         // are any, then the control socket and its clients.
@@ -639,8 +639,8 @@ fn event_loop(
         // in on, and to none if that is not one of ours.
         for (&fd, _) in shared.iter().zip(&fds[shared_at..clients]).filter(|(_, p)| poll::ready(p)) {
             ifaces.hub.receive(fd, |index, from, to, datagram| {
-                if let Some(iface) = ifaces.live.iter().find(|i| i.index == index).filter(|i| listener::hears(&i.interface, to)) {
-                    iface.segment.hear(from, to, datagram);
+                if let Some(iface) = ifaces.live.iter().find(|i| i.index == index).filter(|i| listener::hears(&i.settings, to)) {
+                    iface.interface.hear(from, to, datagram);
                 }
             });
         }
@@ -662,12 +662,12 @@ fn event_loop(
         }
         let now = Instant::now();
         for iface in ifaces.live.iter() {
-            if iface.segment.next_due().is_some_and(|at| at <= now) {
-                iface.segment.upkeep(now);
+            if iface.interface.next_due().is_some_and(|at| at <= now) {
+                iface.interface.upkeep(now);
             }
         }
-        reflector::deliver(&reflectors);
-        for r in &reflectors {
+        segment::deliver(&segments);
+        for r in &segments {
             r.retry(now);
         }
         server.tick(groups, now);

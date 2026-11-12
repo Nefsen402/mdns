@@ -101,7 +101,7 @@ use crate::time::Instant;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::reflector::Notice;
+use crate::segment::Notice;
 use crate::device::{is_type, Device, Origin};
 use crate::runtime::Why;
 use crate::poll;
@@ -251,7 +251,7 @@ impl Server {
     pub fn tick(&mut self, groups: &[Group], now: Instant) {
         let watching = self.watches();
         let notices: Vec<(&str, Notice)> =
-            groups.iter().flat_map(|g| g.reflector.take_notices().into_iter().map(move |n| (g.name.as_str(), n))).collect();
+            groups.iter().flat_map(|g| g.segment.take_notices().into_iter().map(move |n| (g.name.as_str(), n))).collect();
         let links = links_of(groups, "");
         for i in 0..self.clients.len() {
             let c = &mut self.clients[i];
@@ -645,7 +645,7 @@ fn service_type(name: &str) -> Result<String, Value> {
 /// empty, each once.
 pub fn links_of(groups: &[Group], name: &str) -> Vec<Interface> {
     let mut links: Vec<Interface> = Vec::new();
-    for seg in groups.iter().filter(|g| name.is_empty() || g.name == name).flat_map(|g| g.reflector.segments()) {
+    for seg in groups.iter().filter(|g| name.is_empty() || g.name == name).flat_map(|g| g.segment.interfaces()) {
         if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);
         }
@@ -663,7 +663,7 @@ struct Watch {
 }
 
 /// Start following the devices of the named segment, on every interface and
-/// family of it: its reflectors' notices are streamed from now on.
+/// family of it: its segment's notices are streamed from now on.
 fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
     let (query, name) = query_args(arg)?;
     let name = segment_arg(name);
@@ -787,16 +787,16 @@ fn segments(groups: &[Group]) -> Value {
         .into_iter()
         .map(|name| {
             let members: Vec<&Group> = groups.iter().filter(|g| g.name == name).collect();
-            let interfaces: Vec<String> = members[0].reflector.segments().iter().map(|s| s.interface().to_string()).collect();
+            let interfaces: Vec<String> = members[0].segment.interfaces().iter().map(|s| s.interface().to_string()).collect();
             let mut families: Vec<&str> = members
                 .iter()
-                .flat_map(|g| g.reflector.segments())
+                .flat_map(|g| g.segment.interfaces())
                 .flat_map(|seg| seg.families().to_vec())
                 .map(family_name)
                 .collect();
             families.sort_unstable();
             families.dedup();
-            let untrusted = members[0].reflector.untrusted();
+            let untrusted = members[0].segment.untrusted();
             json!({ "name": name, "interfaces": interfaces, "untrusted": untrusted, "families": families })
         })
         .collect();
@@ -823,7 +823,7 @@ fn devices(groups: &[Group], name: &str) -> Value {
 
     let mut list = Vec::new();
     for g in members {
-        for seg in g.reflector.segments() {
+        for seg in g.segment.interfaces() {
             let mut found = seg.devices();
             found.sort_by_key(|d| (d.key(), d.addrs().collect::<Vec<_>>()));
             list.extend(found.iter().map(|d| device_json(seg.interface(), d)));
@@ -904,7 +904,7 @@ fn timer_list(groups: &[Group]) -> Value {
     // Each link's upkeep, and what it is waiting to do. A link that is in
     // several segments is listed once.
     let mut links: Vec<Interface> = Vec::new();
-    for seg in groups.iter().flat_map(|g| g.reflector.segments()) {
+    for seg in groups.iter().flat_map(|g| g.segment.interfaces()) {
         if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);
         }

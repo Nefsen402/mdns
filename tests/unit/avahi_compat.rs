@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use super::*;
 use crate::listener::Link;
 use crate::codec::{Header, Message, RData, Record};
-use crate::reflector::Reflector;
+use crate::segment::Segment;
 use crate::interface::Interface;
 
 fn ip(s: &str) -> IpAddr {
@@ -58,8 +58,8 @@ fn group_on_lo() -> (Vec<Group>, Interface, UdpSocket) {
     rx.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
     let seg = Interface::new(listener::LOOPBACK);
     seg.attach(Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap()));
-    let reflector = Reflector::new(vec![seg.clone()]).unwrap();
-    (vec![Group { name: "lan".into(), reflector }], seg, rx)
+    let segment = Segment::new(vec![seg.clone()]).unwrap();
+    (vec![Group { name: "lan".into(), segment }], seg, rx)
 }
 
 fn hear(seg: &Interface, from: &str, host: &str, addrs: &[&str]) {

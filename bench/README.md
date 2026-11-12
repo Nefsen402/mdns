@@ -25,4 +25,4 @@ they change with the number of devices, not as times on a real network.
 
 The unit tests have measurements of their own, for the pieces of the daemon
 (`cargo test --release scale -- --ignored --nocapture --test-threads=1`, and
-`reflecting_one_more`); they are in `src/segment.rs` and `src/reflector.rs`.
+`reflecting_one_more`); they are in `src/interface.rs` and `src/segment.rs`.

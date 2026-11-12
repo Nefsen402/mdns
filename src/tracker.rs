@@ -474,7 +474,7 @@ pub enum Event {
     /// A device went, as it was last.
     Removed(Shared),
     /// The questions of a query that no device here owns the name of: for
-    /// the reflector to put to the interfaces whose devices it announces here
+    /// the segment to put to the interfaces whose devices it announces here
     /// ([`Interface::query_question`](crate::interface::Interface::query_question)),
     /// as it is configured to.
     Question(Vec<Asked>),

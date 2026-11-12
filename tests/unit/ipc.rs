@@ -27,7 +27,7 @@ use crate::device::EditService;
 
 /// A segment that keeps a device at least five minutes, which is what these
 /// tests of what is listed assume; the default keeps one for its TTL.
-fn segment(name: &str) -> Interface {
+fn interface(name: &str) -> Interface {
     let seg = Interface::new(name);
     seg.set_min_lifetime(Duration::from_secs(300));
     seg
@@ -39,11 +39,11 @@ fn fd(socket: impl std::os::fd::IntoRawFd) -> rustix::fd::OwnedFd {
     unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
 }
 use crate::codec::{Header, Message, RData, Record};
-use crate::reflector::{deliver_made, Reflector};
+use crate::segment::{deliver_made, Segment};
 
 /// A segment that is used over `family`, to somewhere nobody listens.
 fn linked(name: &str, family: Family) -> Interface {
-    let seg = segment(name);
+    let seg = interface(name);
     let socket = fd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
     seg.attach(Link::to(family, socket, "127.0.0.1:9".parse().unwrap()));
     seg
@@ -51,8 +51,8 @@ fn linked(name: &str, family: Family) -> Interface {
 
 fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Interface>) {
     let segs: Vec<Interface> = interfaces.iter().map(|i| linked(i, family)).collect();
-    let reflector = Reflector::new(segs.clone()).unwrap();
-    (Group { name: name.into(), reflector }, segs)
+    let segment = Segment::new(segs.clone()).unwrap();
+    (Group { name: name.into(), segment }, segs)
 }
 
 fn ip(s: &str) -> IpAddr {
@@ -130,7 +130,7 @@ fn timers_say_what_each_one_is_waiting_for() {
 }
 
 #[test]
-fn lists_segments_merging_families() {
+fn lists_interfaces_merging_families() {
     let (m4, _) = group("media", Family::V4, &["a", "b"]);
     let (m6, _) = group("media", Family::V6, &["a", "b"]);
     let (iot, _) = group("iot", Family::V4, &["c"]);
@@ -142,10 +142,10 @@ fn lists_segments_merging_families() {
 }
 
 #[test]
-fn segments_say_which_interfaces_are_untrusted() {
+fn interfaces_say_which_interfaces_are_untrusted() {
     let segs: Vec<Interface> = ["br0", "wifi"].iter().map(|i| linked(i, Family::V4)).collect();
-    let reflector = Reflector::with_untrusted(segs, &["wifi".to_string()]).unwrap();
-    let groups = [Group { name: "IoT to br0".into(), reflector }];
+    let segment = Segment::with_untrusted(segs, &["wifi".to_string()]).unwrap();
+    let groups = [Group { name: "IoT to br0".into(), segment }];
     assert_eq!(
         handle(&groups, &Watches::default(), "segments"),
         r#"{"ok":true,"segments":[{"name":"IoT to br0","interfaces":["br0","wifi"],"untrusted":["wifi"],"families":["v4"]}]}"#
@@ -153,7 +153,7 @@ fn segments_say_which_interfaces_are_untrusted() {
 }
 
 #[test]
-fn lists_devices_of_a_segment() {
+fn lists_devices_of_a_interface() {
     let (iot, segs) = group("IoT to br0", Family::V4, &["c"]);
     segs[0].observe(ip("10.0.3.9"));
     assert_eq!(
@@ -235,7 +235,7 @@ fn the_host_is_listed_as_it_advertises_itself() {
 fn a_watch_for_a_type_the_host_offers_shows_it_present_and_for_another_does_not() {
     let (seg, _rx) = wired("a");
     advertise_self(&seg);
-    let groups = vec![Group { name: "lan".into(), reflector: Reflector::new(vec![seg.clone()]).unwrap() }];
+    let groups = vec![Group { name: "lan".into(), segment: Segment::new(vec![seg.clone()]).unwrap() }];
     let present = |arg: &str| follow(&groups, arg).ok().unwrap().present;
     let lines = present("--query=_ssh._tcp lan");
     assert_eq!(lines.len(), 1, "{lines:?}");
@@ -246,15 +246,15 @@ fn a_watch_for_a_type_the_host_offers_shows_it_present_and_for_another_does_not(
 }
 
 #[test]
-fn probes_each_interface_once_even_when_segments_share_it() {
+fn probes_each_interface_once_even_when_interfaces_share_it() {
     let (a, b, c) = (
-        segment("a"),
-        segment("b"),
-        segment("c"),
+        interface("a"),
+        interface("b"),
+        interface("c"),
     );
     let groups = [
-        Group { name: "x".into(), reflector: Reflector::new(vec![a.clone(), b.clone()]).unwrap() },
-        Group { name: "y".into(), reflector: Reflector::new(vec![a, c]).unwrap() },
+        Group { name: "x".into(), segment: Segment::new(vec![a.clone(), b.clone()]).unwrap() },
+        Group { name: "y".into(), segment: Segment::new(vec![a, c]).unwrap() },
     ];
     let interfaces = |request: &str| -> Vec<String> {
         let reply: Value = serde_json::from_str(&handle(&groups, &Watches::default(), request)).unwrap();
@@ -274,7 +274,7 @@ fn probes_each_interface_once_even_when_segments_share_it() {
 #[test]
 fn probe_reports_what_was_sent_per_interface() {
     // No link is attached to it, so nothing is sent.
-    let g = Group { name: "media".into(), reflector: Reflector::new(vec![segment("a")]).unwrap() };
+    let g = Group { name: "media".into(), segment: Segment::new(vec![interface("a")]).unwrap() };
     assert_eq!(
         handle(&[g], &Watches::default(), "probe media"),
         r#"{"ok":true,"probed":[{"interface":"a","queries":0,"error":null}]}"#
@@ -345,7 +345,7 @@ fn temp_socket(tag: &str) -> PathBuf {
 }
 
 /// The server at `path`, with `groups`, run the way the event loop runs
-/// it, with the segments' upkeep and the reflectors' deliveries, a turn
+/// it, with the segments' upkeep and the segments' deliveries, a turn
 /// at a time, as a test waits for what a client is told.
 struct Harness {
     server: Server,
@@ -363,12 +363,12 @@ impl Harness {
         poll::wait(&mut fds, Some(Duration::from_millis(1))).unwrap();
         self.server.ready(&fds);
         let now = Instant::now();
-        for seg in self.groups.iter().flat_map(|g| g.reflector.segments()) {
+        for seg in self.groups.iter().flat_map(|g| g.segment.interfaces()) {
             if seg.next_due().is_some_and(|at| at <= now) {
                 seg.upkeep(now);
             }
         }
-        crate::reflector::deliver(&self.groups.iter().map(|g| &g.reflector).collect::<Vec<_>>());
+        crate::segment::deliver(&self.groups.iter().map(|g| &g.segment).collect::<Vec<_>>());
         self.server.tick(&self.groups, now);
     }
 
@@ -451,7 +451,7 @@ fn serves_requests_over_the_socket() {
 fn probe_is_answered_once_done_while_the_rest_goes_on() {
     let (seg, _rx) = wired("wifi");
     let path = temp_socket("probe");
-    let mut h = Harness::new(&path, vec![Group { name: "IoT".into(), reflector: Reflector::new(vec![seg.clone()]).unwrap() }]);
+    let mut h = Harness::new(&path, vec![Group { name: "IoT".into(), segment: Segment::new(vec![seg.clone()]).unwrap() }]);
 
     let (mut stream, mut reader) = connect(&path);
     writeln!(stream, "probe IoT").unwrap();
@@ -544,11 +544,11 @@ fn watch_streams_changes_until_the_daemon_stops() {
     let _ = fs::remove_file(&path);
 }
 
-/// A segment on `interface` that sends to the returned socket.
-fn wired(interface: &str) -> (Interface, std::net::UdpSocket) {
+/// An interface called `name` that sends to the returned socket.
+fn wired(name: &str) -> (Interface, std::net::UdpSocket) {
     let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-    let seg = segment(interface);
+    let seg = interface(name);
     seg.attach(Link::to(Family::V4, fd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap()));
     (seg, rx)
 }
@@ -589,7 +589,7 @@ fn query_options_take_service_types_and_how_often_to_ask() {
 #[test]
 fn devices_lists_what_is_known_and_asks_nothing() {
     let (a, a_rx) = wired("a");
-    let groups = [Group { name: "IoT".into(), reflector: Reflector::new(vec![a.clone()]).unwrap() }];
+    let groups = [Group { name: "IoT".into(), segment: Segment::new(vec![a.clone()]).unwrap() }];
     announce(&a, "10.0.1.7", "tv.local", "TV");
     let ask = |request: &str| handle(&groups, &Watches::default(), request);
     let reply: Value = serde_json::from_str(&ask("devices IoT")).unwrap();
@@ -603,7 +603,7 @@ fn devices_lists_what_is_known_and_asks_nothing() {
 #[test]
 fn watch_with_a_query_shows_what_is_there_asks_and_asks_again() {
     let (seg, rx) = wired("wifi");
-    let groups = vec![Group { name: "IoT".into(), reflector: Reflector::new(vec![seg.clone()]).unwrap() }];
+    let groups = vec![Group { name: "IoT".into(), segment: Segment::new(vec![seg.clone()]).unwrap() }];
     announce(&seg, "10.0.1.7", "tv.local", "TV");
     let path = temp_socket("watch-query");
     let mut h = Harness::new(&path, groups);
@@ -639,7 +639,7 @@ fn a_watch_for_a_type_narrows_what_it_shows() {
     let kinds = ["_http._tcp.local".to_string()];
     let mut shown = HashMap::new();
     let tv = |services: bool| {
-        let seg = segment("wifi");
+        let seg = interface("wifi");
         announce(&seg, "10.0.1.7", "tv.local", "TV");
         let mut d = seg.devices().remove(0);
         if !services {
@@ -728,7 +728,7 @@ fn watchers_lists_the_open_watches_and_who_holds_them() {
 /// updated or removed. Questions are not changes, and are not shown.
 #[test]
 fn a_watch_line_says_what_happened() {
-    let seg = segment("wifi");
+    let seg = interface("wifi");
     announce(&seg, "10.0.1.7", "tv.local", "TV");
     let tv = seg.devices().remove(0);
     let line = |event| notice_json("IoT", &Notice { interface: "wifi".into(), event, ttl: Duration::from_secs(120) });

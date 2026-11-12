@@ -1,17 +1,19 @@
-//! Reflects devices between segments, over every address family they serve.
+//! A logical mDNS segment: interfaces whose mDNS is merged, as far as mDNS
+//! traffic goes, into one continuous segment, over every address family they
+//! serve.
 //!
-//! Every device discovered on a segment is announced on all the *other*
-//! segments, and withdrawn again when it goes away. A segment that announces
-//! the device of another does not keep a copy of it: it is given a handle to
-//! the device, to read it as it is, and the reflector says when to look at it
-//! again, as it changes, or to withdraw it. What the reflector knows is which
-//! hostnames it could not reflect, to try again; a failed send is simply
-//! retried, and no copy can outlive its source, as there is none to outlive.
-//! Dropping the reflector withdraws everything.
+//! Every device discovered on an interface is announced on all the *other*
+//! interfaces of the segment, and withdrawn again when it goes away. An
+//! interface that announces the device of another does not keep a copy of it:
+//! it is given a handle to the device, to read it as it is, and the segment says
+//! when to look at it again, as it changes, or to withdraw it. What the segment
+//! knows is which hostnames it could not reflect, to try again; a failed send is
+//! simply retried, and no copy can outlive its source, as there is none to
+//! outlive. Dropping the segment withdraws everything.
 //!
-//! Every segment reflects to every other one in the same reflector; which
-//! interfaces share a reflector is the caller's policy. A reflector with a
-//! single segment only tracks and reflects nothing.
+//! A segment with a single interface only tracks: there is no other to reflect
+//! to. Which interfaces share a segment is the caller's policy (`[Segment]` in
+//! the config).
 
 use core::cell::{RefCell, RefMut};
 use alloc::rc::Rc;
@@ -34,11 +36,11 @@ const MAX_NOTICES: usize = 4096;
 /// How long after a send failed it is tried again.
 const RETRY: Duration = Duration::from_secs(5);
 
-/// A change to a device discovered on one of a reflector's segments, as
-/// [`Reflector::watch`] delivers it.
+/// A change to a device discovered on one of a segment's interfaces, as
+/// [`Interface::watch`] delivers it.
 #[derive(Clone, Debug)]
 pub struct Notice {
-    /// The segment the device was discovered on.
+    /// The interface the device was discovered on.
     pub interface: String,
     pub event: Event,
     /// How much longer the daemon keeps the device if it is not heard from
@@ -46,19 +48,19 @@ pub struct Notice {
     pub ttl: Duration,
 }
 
-pub struct Reflector {
+pub struct Segment {
     inner: Rc<Inner>,
 }
 
 struct Inner {
-    /// The segments it spans, and whether each is untrusted: it is not
+    /// The interfaces it spans, and whether each is untrusted: it is not
     /// announced anything. They come and go with their interfaces.
     members: RefCell<Vec<Member>>,
-    /// The interfaces whose segments are untrusted, by name or pattern, whether
+    /// The interfaces whose interfaces are untrusted, by name or pattern, whether
     /// they are here or not.
     untrusted: Vec<String>,
     forward: Forward,
-    /// What of a device is reflected with it, made once for all the segments
+    /// What of a device is reflected with it, made once for all the interfaces
     /// it is shown on.
     advertise: Rc<Advertise>,
     /// What a device has to have to be reflected.
@@ -79,14 +81,14 @@ struct Member {
 
 #[derive(Default)]
 struct Book {
-    /// What could not be shown on, or withdrawn from, a segment, to be tried
+    /// What could not be shown on, or withdrawn from, an interface, to be tried
     /// again.
     failed: Vec<Failed>,
     /// When to try again, as a send failed.
     retry: Option<Instant>,
 }
 
-/// One thing a segment could not be told: that a device of the segment of
+/// One thing an interface could not be told: that a device of the interface of
 /// `priority` is to be shown, or, if not `show`, withdrawn.
 struct Failed {
     target: Interface,
@@ -95,30 +97,30 @@ struct Failed {
     show: bool,
 }
 
-impl Reflector {
-    /// Start reflecting between `segments`, which must be on different
-    /// interfaces, and may be none yet: [`add`](Reflector::add) and
-    /// [`remove`](Reflector::remove) say what comes and goes. Devices already
+impl Segment {
+    /// Start reflecting between `interfaces`, which must be on different
+    /// interfaces, and may be none yet: [`add`](Interface::add) and
+    /// [`remove`](Interface::remove) say what comes and goes. Devices already
     /// discovered are reflected before this returns.
     ///
-    /// Where reflectors share an interface and more than one wants a hostname
-    /// announced there, the device of the segment with the lowest priority is
+    /// Where segments share an interface and more than one wants a hostname
+    /// announced there, the device of the interface with the lowest priority is
     /// (see [`Interface::priority`]), and the next takes over when it goes.
-    pub fn new(segments: Vec<Interface>) -> Result<Reflector> {
+    pub fn new(segments: Vec<Interface>) -> Result<Segment> {
         Self::with_untrusted(segments, &[])
     }
 
-    /// Like [`new`](Reflector::new), but the segments on the interfaces named
+    /// Like [`new`](Interface::new), but the interfaces on the interfaces named
     /// in `untrusted`, now or when added, are announced nothing: their devices are still
     /// announced to the others, but they do not learn about the devices of the
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
-    pub fn with_untrusted(segments: Vec<Interface>, untrusted: &[String]) -> Result<Reflector> {
+    pub fn with_untrusted(segments: Vec<Interface>, untrusted: &[String]) -> Result<Segment> {
         Self::with_options(segments, untrusted, Forward::default(), Advertise::default(), ReflectedWhen::default(), None)
     }
 
-    /// Like [`with_untrusted`](Reflector::with_untrusted), putting the
-    /// questions asked on each segment to the others as `forward` says,
+    /// Like [`with_untrusted`](Interface::with_untrusted), putting the
+    /// questions asked on each interface to the others as `forward` says,
     /// reflecting as much of a device as `advertise` says, reflecting the
     /// devices that have what `when` asks for, and announcing what it reflects with the address TTL
     /// `reflect_ttl`, if given, in place of each device's own.
@@ -129,7 +131,7 @@ impl Reflector {
         advertise: Advertise,
         when: ReflectedWhen,
         reflect_ttl: Option<Duration>,
-    ) -> Result<Reflector> {
+    ) -> Result<Segment> {
         for (i, seg) in segments.iter().enumerate() {
             if segments[..i].iter().any(|o| o.interface() == seg.interface()) {
                 bail!("more than one segment for interface {}", seg.interface());
@@ -164,22 +166,22 @@ impl Reflector {
 
         #[cfg(test)]
         MADE.with(|made| made.borrow_mut().push(Rc::downgrade(&inner)));
-        Ok(Reflector { inner })
+        Ok(Segment { inner })
     }
 }
 
-impl Reflector {
-    /// The segments this reflector spans, in the order they came.
-    pub fn segments(&self) -> Vec<Interface> {
+impl Segment {
+    /// The interfaces this segment spans, in the order they came.
+    pub fn interfaces(&self) -> Vec<Interface> {
         self.inner.snapshot().into_iter().map(|m| m.segment).collect()
     }
 
-    /// The interfaces whose segments are announced nothing, of those it spans.
+    /// The interfaces whose interfaces are announced nothing, of those it spans.
     pub fn untrusted(&self) -> Vec<String> {
         self.inner.snapshot().into_iter().filter(|m| m.untrusted).map(|m| m.segment.interface().to_string()).collect()
     }
 
-    /// Span `segment` too, as its interface has come: what the others have is
+    /// Span `interface` too, as its interface has come: what the others have is
     /// announced on it (unless it is untrusted), and what it finds is
     /// announced on them. It must not be on an interface already spanned.
     pub fn add(&self, segment: Interface) -> Result<()> {
@@ -201,10 +203,10 @@ impl Reflector {
         Ok(())
     }
 
-    /// Stop spanning the segment of `interface`, as it is gone: what this
-    /// reflector announced on it is withdrawn, and so is what it announced
-    /// elsewhere of what was found on it, which is each device the segment
-    /// has, and each one that could not be withdrawn already. What the segment
+    /// Stop spanning the interface of `interface`, as it is gone: what this
+    /// segment announced on it is withdrawn, and so is what it announced
+    /// elsewhere of what was found on it, which is each device the interface
+    /// has, and each one that could not be withdrawn already. What the interface
     /// had found is to be forgotten and delivered ([`deliver`]) first, for the
     /// watches to be told.
     pub fn remove(&self, interface: &str) {
@@ -232,15 +234,15 @@ impl Reflector {
     }
 
     /// A [`Notice`] of every device that appeared, changed or went on the
-    /// segments this reflector spans since last asked, oldest first. Only so
+    /// interfaces this segment spans since last asked, oldest first. Only so
     /// many are kept for one who never asks.
     pub fn take_notices(&self) -> Vec<Notice> {
         core::mem::take(&mut *self.inner.notices.borrow_mut())
     }
 }
 
-impl Reflector {
-    /// Act on `event`, a change on `segment`, if that is one this reflector
+impl Segment {
+    /// Act on `event`, a change on `interface`, if that is one this segment
     /// spans.
     pub fn handle(&self, segment: &Interface, event: Event) {
         self.inner.handle(segment, event);
@@ -260,11 +262,11 @@ impl Reflector {
     }
 }
 
-/// Hand what has changed on each segment of `reflectors` to every one of
-/// them that spans it, in the order it happened. A segment several
-/// reflectors share is taken from once.
-pub fn deliver(reflectors: &[&Reflector]) {
-    deliver_to(&reflectors.iter().map(|r| &*r.inner).collect::<Vec<_>>());
+/// Hand what has changed on each interface of `segments` to every one of
+/// them that spans it, in the order it happened. An interface several
+/// segments share is taken from once.
+pub fn deliver(segments: &[&Segment]) {
+    deliver_to(&segments.iter().map(|r| &*r.inner).collect::<Vec<_>>());
 }
 
 fn deliver_to(inners: &[&Inner]) {
@@ -306,14 +308,14 @@ fn log(interface: &str, event: &Event) {
     eprintln!("{interface}: {what} {name} ({addrs}{services})");
 }
 
-// The reflectors made on this thread, for tests to deliver to as the event
+// The segments made on this thread, for tests to deliver to as the event
 // loop would.
 #[cfg(test)]
 thread_local! {
     static MADE: RefCell<Vec<alloc::rc::Weak<Inner>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Deliver what has changed to the reflectors made on this thread that are
+/// Deliver what has changed to the segments made on this thread that are
 /// still there, as the event loop does after anything happens.
 #[cfg(test)]
 pub fn deliver_made() {
@@ -321,7 +323,7 @@ pub fn deliver_made() {
     deliver_to(&inners.iter().map(|i| &**i).collect::<Vec<_>>());
 }
 
-/// Have the reflectors made on this thread retry as if it were `now`.
+/// Have the segments made on this thread retry as if it were `now`.
 #[cfg(test)]
 pub fn retry_made(now: Instant) {
     let inners: Vec<Rc<Inner>> = MADE.with(|made| made.borrow().iter().filter_map(alloc::rc::Weak::upgrade).collect());
@@ -333,10 +335,10 @@ pub fn retry_made(now: Instant) {
     }
 }
 
-impl Drop for Reflector {
+impl Drop for Segment {
     fn drop(&mut self) {
         // Nothing is wanted any more: what it announced is withdrawn.
-        for seg in self.segments() {
+        for seg in self.interfaces() {
             if let Err(e) = seg.withdraw_all(&self.inner.advertise) {
                 eprintln!("{}: withdrawing what was reflected failed: {e:#}", seg.interface());
             }
@@ -349,7 +351,7 @@ impl Inner {
         self.book.borrow_mut()
     }
 
-    /// The segments it spans now, with whether each is untrusted.
+    /// The interfaces it spans now, with whether each is untrusted.
     fn snapshot(&self) -> Vec<Member> {
         self.members.borrow().clone()
     }
@@ -388,8 +390,8 @@ impl Inner {
     }
 
     /// Put the questions asked on `src`, those [`Forward`] lets through, to
-    /// the other segments: those whose devices are announced on it, so whose
-    /// answers will be. An untrusted segment is announced nothing, so its
+    /// the other interfaces: those whose devices are announced on it, so whose
+    /// answers will be. An untrusted interface is announced nothing, so its
     /// questions are put nowhere.
     fn forward(&self, src: usize, asked: &[Asked]) {
         let members = self.snapshot();
@@ -418,11 +420,11 @@ impl Inner {
         }
     }
 
-    /// Show `device`, one of `from`, on the other segments, those that are
+    /// Show `device`, one of `from`, on the other interfaces, those that are
     /// announced anything, or only on `only`: as it is to be shown there
     /// ([`Device::reflectable`]), or withdraw it if it is not to be, or has
-    /// gone (`gone`). It is the one device that every segment shows, which is
-    /// as it is now; the segments are told when it changes, to look again.
+    /// gone (`gone`). It is the one device that every interface shows, which is
+    /// as it is now; the interfaces are told when it changes, to look again.
     ///
     /// Failures are logged and kept, so that [`Inner::reconcile`] tries again.
     fn relay(&self, from: &Interface, device: &Shared, gone: bool, only: Option<&Interface>) {
@@ -438,13 +440,13 @@ impl Inner {
         }
     }
 
-    /// Whether `device` is to be shown on other segments, as it is now.
+    /// Whether `device` is to be shown on other interfaces, as it is now.
     fn reflectable(&self, device: &Shared) -> bool {
         let device = device.borrow();
         device.hostname.is_some() && device.reflectable(&self.advertise, &self.when)
     }
 
-    /// Show `device` on `target`, a device of the segment of `priority`, or
+    /// Show `device` on `target`, a device of the interface of `priority`, or
     /// withdraw it if not `show`, and keep it to try again if that fails.
     fn attempt(&self, book: &mut Book, target: &Interface, priority: u32, device: &Shared, show: bool) {
         book.failed.retain(|f| !(f.target.is(target) && f.device.is(device)));
@@ -476,5 +478,5 @@ impl Inner {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/reflector.rs"]
+#[path = "../tests/unit/segment.rs"]
 mod tests;
