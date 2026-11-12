@@ -1668,7 +1668,12 @@ impl Interface {
     /// [`MAX_FORWARDED`] are waiting it out. Returns how many were asked. A
     /// no-op when the interface has no sender attached.
     pub fn query_question(&self, questions: &[Question]) -> Result<usize> {
-        let now = Instant::now();
+        self.query_question_at(questions, Instant::now())
+    }
+
+    /// [`Interface::query_question`] at `now`, which a test gives to be later,
+    /// as a clock that began a moment ago cannot be put back to be earlier.
+    fn query_question_at(&self, questions: &[Question], now: Instant) -> Result<usize> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         if state.link.is_empty() {
@@ -1689,7 +1694,7 @@ impl Interface {
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
         let queries = message::forward_queries(fresh, known, state.max_packet);
         let asked = ask(&state.link, &queries)?;
-        state.note_asked(&queries, Instant::now());
+        state.note_asked(&queries, now);
         Ok(asked)
     }
 

@@ -402,26 +402,23 @@ fn a_question_is_passed_on_unless_a_device_here_owns_its_name() {
 /// its own say: all of them, none, or each once.
 #[test]
 fn an_interface_asks_the_questions_it_is_told_to_as_it_is_set_to() {
-    let later = |seg: &Interface| {
-        for at in seg.state.borrow_mut().forwarded.values_mut() {
-            *at -= FORWARD_GAP;
-        }
-    };
+    // Later is a time given, not a clock put back: it may have begun a moment ago.
+    let start = Instant::now();
+    let at = |secs: u64| start + Duration::from_secs(secs);
     let ipp = [question("_ipp._tcp.local", rtype::PTR)];
 
     // Always: every time it is asked, as soon as it may be.
     let (seg, rx) = wired();
     seg.set_forward(Forward::Always);
-    assert_eq!(seg.query_question(&ipp).unwrap(), 1);
+    assert_eq!(seg.query_question_at(&ipp, at(0)).unwrap(), 1);
     recv(&rx).unwrap();
-    later(&seg);
-    assert_eq!(seg.query_question(&ipp).unwrap(), 1, "asked again");
+    assert_eq!(seg.query_question_at(&ipp, at(2)).unwrap(), 1, "asked again");
     recv(&rx).unwrap();
 
     // Never: nothing, nor is it remembered.
     let (seg, rx) = wired();
     seg.set_forward(Forward::Never);
-    assert_eq!(seg.query_question(&ipp).unwrap(), 0);
+    assert_eq!(seg.query_question_at(&ipp, at(0)).unwrap(), 0);
     assert!(recv(&rx).is_none());
     assert!(seg.state.borrow().asked.order.is_empty());
 
@@ -429,13 +426,12 @@ fn an_interface_asks_the_questions_it_is_told_to_as_it_is_set_to() {
     // long after; another question is new.
     let (seg, rx) = wired();
     seg.set_forward(Forward::Once);
-    assert_eq!(seg.query_question(&ipp).unwrap(), 1);
+    assert_eq!(seg.query_question_at(&ipp, at(0)).unwrap(), 1);
     recv(&rx).unwrap();
-    later(&seg);
-    assert_eq!(seg.query_question(&[question("_IPP._tcp.local", rtype::PTR)]).unwrap(), 0, "asked before");
+    assert_eq!(seg.query_question_at(&[question("_IPP._tcp.local", rtype::PTR)], at(1_000_000)).unwrap(), 0, "asked before");
     assert!(recv(&rx).is_none());
     let both = [question("_ipp._tcp.local", rtype::PTR), question("_http._tcp.local", rtype::PTR), question("_ipp._tcp.local", rtype::TXT)];
-    assert_eq!(seg.query_question(&both).unwrap(), 2, "the others are new");
+    assert_eq!(seg.query_question_at(&both, at(1_000_002)).unwrap(), 2, "the others are new");
     assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([q("_http._tcp.local", rtype::PTR), q("_ipp._tcp.local", rtype::TXT)]));
 }
 
@@ -444,41 +440,35 @@ fn an_interface_asks_the_questions_it_is_told_to_as_it_is_set_to() {
 #[test]
 fn a_question_is_asked_again_once_it_is_older_than_the_time_it_is_remembered_for() {
     let span = Duration::from_secs(3600);
+    let minute = Duration::from_secs(60);
     let (seg, rx) = wired();
     seg.set_forward(Forward::After(span));
+    // Times are given, later and later: a clock cannot be put back.
+    let start = Instant::now();
     let ipp = [question("_ipp._tcp.local", rtype::PTR)];
-    let older = |seg: &Interface, by: Duration| {
-        let mut state = seg.state.borrow_mut();
-        for at in state.forwarded.values_mut() {
-            *at -= by;
-        }
-        for (_, at, _) in state.asked.order.iter_mut() {
-            *at -= by;
-        }
-    };
-    assert_eq!(seg.query_question(&ipp).unwrap(), 1);
+    let ask = |questions: &[Question], after: Duration| seg.query_question_at(questions, start + after).unwrap();
+
+    assert_eq!(ask(&ipp, Duration::ZERO), 1);
     recv(&rx).unwrap();
 
     // Not for a good while.
-    older(&seg, span - Duration::from_secs(60));
-    assert_eq!(seg.query_question(&ipp).unwrap(), 0, "still remembered");
+    assert_eq!(ask(&ipp, span - minute), 0, "still remembered");
     assert!(recv(&rx).is_none());
 
     // And once it is older than that, it is asked, and is remembered from then.
-    older(&seg, Duration::from_secs(61));
-    assert_eq!(seg.query_question(&ipp).unwrap(), 1, "forgotten, so asked");
+    assert_eq!(ask(&ipp, span + minute), 1, "forgotten, so asked");
     recv(&rx).unwrap();
-    older(&seg, Duration::from_secs(61));
-    assert_eq!(seg.query_question(&ipp).unwrap(), 0, "remembered again");
+    assert_eq!(ask(&ipp, span + minute + span - minute), 0, "remembered again");
     assert_eq!(seg.state.borrow().asked.order.len(), 1);
 
     // What is forgotten is the older, not what was asked since.
-    older(&seg, span);
-    seg.query_question(&[question("_http._tcp.local", rtype::PTR)]).unwrap();
+    let http = [question("_http._tcp.local", rtype::PTR)];
+    let asked_http = span + minute + Duration::from_secs(120);
+    assert_eq!(ask(&http, asked_http), 1);
     recv(&rx).unwrap();
-    older(&seg, Duration::from_secs(60));
-    let ipp_and_http = [question("_ipp._tcp.local", rtype::PTR), question("_http._tcp.local", rtype::PTR)];
-    assert_eq!(seg.query_question(&ipp_and_http).unwrap(), 1, "the one that is older only");
+    let both = [question("_ipp._tcp.local", rtype::PTR), question("_http._tcp.local", rtype::PTR)];
+    // The ipp is older than the time by a minute; the http is younger by a minute.
+    assert_eq!(ask(&both, span + minute + span + minute), 1, "the one that is older only");
     assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([q("_ipp._tcp.local", rtype::PTR)]));
 }
 
@@ -509,10 +499,8 @@ fn what_an_interface_asked_in_a_probe_is_not_asked_again_when_it_is_asked_elsewh
     // Forgotten with the devices, as when the interface goes and comes back.
     recv(&rx).unwrap();
     seg.forget_discovered();
-    for at in seg.state.borrow_mut().forwarded.values_mut() {
-        *at -= FORWARD_GAP;
-    }
-    assert_eq!(seg.query_question(&[question("_ipp._tcp.local", rtype::PTR)]).unwrap(), 1);
+    let later = Instant::now() + Duration::from_secs(2);
+    assert_eq!(seg.query_question_at(&[question("_ipp._tcp.local", rtype::PTR)], later).unwrap(), 1);
 }
 
 /// A device that is gone is not there to answer what was asked of it: what is
@@ -528,22 +516,17 @@ fn a_question_is_asked_again_once_the_device_that_answered_it_is_gone() {
         question("Plug._http._tcp.local", rtype::SRV),
         question("other.local", rtype::A),
     ];
-    assert_eq!(seg.query_question(&questions).unwrap(), 4);
+    let start = Instant::now();
+    let at = |secs: u64| start + Duration::from_secs(secs);
+    assert_eq!(seg.query_question_at(&questions, at(0)).unwrap(), 4);
     while recv(&rx).is_some() {}
-    let later = |seg: &Interface| {
-        for at in seg.state.borrow_mut().forwarded.values_mut() {
-            *at -= FORWARD_GAP;
-        }
-    };
-    later(&seg);
-    assert_eq!(seg.query_question(&questions).unwrap(), 0, "asked");
+    assert_eq!(seg.query_question_at(&questions, at(2)).unwrap(), 0, "asked");
 
     // The device runs out: what it answered is asked again, and what it did
     // not is not.
-    seg.expire(Instant::now() + Duration::from_secs(2 * 3600));
+    seg.expire(at(2 * 3600));
     assert!(seg.devices().is_empty());
-    later(&seg);
-    assert_eq!(seg.query_question(&questions).unwrap(), 3);
+    assert_eq!(seg.query_question_at(&questions, at(4)).unwrap(), 3);
     assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([
         q("plug.local", rtype::A),
         q("_http._tcp.local", rtype::PTR),
@@ -582,11 +565,10 @@ fn only_so_many_questions_are_remembered() {
     // Drained as it goes, without waiting for what is not coming.
     rx.set_nonblocking(true).unwrap();
     seg.set_forward(Forward::Once);
+    let start = Instant::now();
     for i in 0..MAX_REMEMBERED + 10 {
-        for at in seg.state.borrow_mut().forwarded.values_mut() {
-            *at -= FORWARD_GAP;
-        }
-        seg.query_question(&[question(&format!("x{i}.local"), rtype::A)]).unwrap();
+        let at = start + Duration::from_secs(2 * i as u64);
+        seg.query_question_at(&[question(&format!("x{i}.local"), rtype::A)], at).unwrap();
         while recv(&rx).is_some() {}
     }
     let state = seg.state.borrow();
