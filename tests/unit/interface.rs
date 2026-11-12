@@ -30,6 +30,7 @@ fn interface(name: &str) -> Interface {
 use crate::message::{record, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
 use crate::codec::{self, rtype, Header};
 use crate::addr::prefix;
+use crate::tracker::MAX_TYPES;
 use crate::listener::Link;
 
 /// Its first routable IPv4 or IPv6 address, and link-local one.
@@ -601,35 +602,6 @@ fn a_question_from_elsewhere_carries_the_known_answers_with_their_time_left() {
     let ttl_of = |data: &RData| known.iter().find(|(d, _)| *d == data).map(|&(_, ttl)| ttl);
     assert!(ttl_of(&RData::Ptr("TV._http._tcp.local".into())).is_some_and(|t| (69..=70).contains(&t)), "{known:?}");
     assert!(ttl_of(&RData::A("10.0.1.7".parse().unwrap())).is_some_and(|t| (49..=50).contains(&t)), "{known:?}");
-}
-
-/// Types asked for by name are asked for in each round, with what is
-/// known of them, and from then on in every probe; what is not a type is
-/// asked for but not remembered.
-#[test]
-fn types_asked_for_by_name_are_asked_with_what_is_known_and_remembered() {
-    let (seg, rx) = wired();
-    hear(&seg, "10.0.1.5", vec![a_record("plug.local", "10.0.1.5"), srv("Plug._shelly._tcp.local", 80, "plug.local")]);
-    let kinds = ["_shelly._tcp.local".to_string(), "_Hue._tcp.local".to_string(), "bogus".to_string()];
-
-    assert_eq!(run_probe(&seg, Some(&kinds)).0, Ok(9));
-    for _ in 0..3 {
-        let m = recv(&rx).unwrap();
-        let questions: Vec<(String, u16)> = m.questions.iter().map(|q| (q.name.clone(), q.qtype)).collect();
-        assert_eq!(questions, [q("_shelly._tcp.local", rtype::PTR), q("_Hue._tcp.local", rtype::PTR), q("bogus", rtype::PTR)]);
-        assert_eq!(m.answers.len(), 1, "{:?}", m.answers);
-        assert_eq!(m.answers[0].data, RData::Ptr("Plug._shelly._tcp.local".into()));
-    }
-    assert!(recv(&rx).is_none());
-    let types = seg.state.borrow_mut().tracker.types.clone();
-    assert!(types.contains("_hue._tcp.local") && types.contains("_shelly._tcp.local") && !types.contains("bogus"));
-
-    seg.probe_round().unwrap();
-    let probed: Vec<String> = std::iter::from_fn(|| recv(&rx)).flat_map(|m| m.questions).map(|q| q.name).collect();
-    assert!(probed.iter().any(|n| n == "_hue._tcp.local"), "{probed:?}");
-
-    // Without a sender, nothing.
-    assert_eq!(run_probe(&interface("quiet"), Some(&kinds)).0, Ok(0));
 }
 
 /// A way to send over IPv4 that always fails: its group is an IPv6
@@ -1636,11 +1608,10 @@ fn probe_browses_then_resolves() {
     assert_eq!(v4(&speaker), Some(ip("10.0.2.73")));
 }
 
-/// Run a probe (`kinds` `None`) or a query for types to its end, as the
-/// event loop would: the upkeep at each time it says it is due. How it
-/// went, and when each round, and its end, came due.
-fn run_probe(seg: &Interface, kinds: Option<&[String]>) -> (Probed, Vec<Instant>) {
-    let id = seg.begin(kinds.map(<[String]>::to_vec), "asked for", true);
+/// Run a probe to its end, as the event loop would: the upkeep at each time
+/// it says it is due. How it went, and when each round, and its end, came due.
+fn run_probe(seg: &Interface) -> (Probed, Vec<Instant>) {
+    let id = seg.begin("asked for", true);
     let mut rounds = Vec::new();
     loop {
         if let Some(result) = seg.probed(id) {
@@ -1655,7 +1626,7 @@ fn run_probe(seg: &Interface, kinds: Option<&[String]>) -> (Probed, Vec<Instant>
 #[test]
 fn probe_runs_every_round_and_counts_questions() {
     let (seg, rx) = wired();
-    let (result, rounds) = run_probe(&seg, None);
+    let (result, rounds) = run_probe(&seg);
     assert_eq!(result, Ok(3));
     assert_eq!(drain_queries(&rx), 3);
     // A round at once, then after each gap; done once the last has passed.
@@ -1670,7 +1641,7 @@ fn a_probe_asked_for_while_one_runs_is_that_one() {
     let joined = seg.probe();
     assert_eq!(seg.state.borrow_mut().probing.len(), 1);
     assert_eq!(seg.probed(joined), None, "not done yet");
-    let (result, _) = run_probe(&seg, None);
+    let (result, _) = run_probe(&seg);
     assert!(seg.state.borrow_mut().probing.is_empty());
     assert_eq!(seg.probed(joined), None, "the same one: taken already");
     assert_eq!(result, Ok(3));

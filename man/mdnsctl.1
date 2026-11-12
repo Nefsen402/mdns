@@ -149,7 +149,7 @@ in
 Run it to probe right now, for example to pick up a device you have just
 switched on.
 .TP
-\fBwatch\fR [\fB\-\-query\fR \fItype\fR]... [\fB\-\-interval\fR \fIspan\fR] \fIname\fR
+\fBwatch\fR [\fB\-\-query\fR \fItype\fR]... \fIname\fR
 Follow the segment called
 .I name
 and print each device as it appears, changes and goes, until interrupted.
@@ -190,35 +190,27 @@ first each one already known, as
 .BR present ,
 then the daemon asks for the type, and shows what answers and what changes from
 then on.
+The daemon asks as it asks any question on an interface, as that interface is
+set to
+.RB ( ForwardQuestions=
+in
+.BR mdnsd.conf (5)):
+by default each question once, so one it has asked before is not asked again,
+and what answered it is known already.
 A device that loses its last service of the type is shown as
 .BR removed .
-With
-.B \-\-interval
-.I span
-(such as
-.B 30s
-or
-.BR 5min ,
-at least ten seconds), the daemon asks again that often for as long as the
-watch runs, so that a device that only answers when asked is found soon after it
-is switched on.
-Without
-.BR \-\-interval ,
-it asks once.
 .IP
 It exits with status 2 if the daemon stops or the connection is lost, and
 quietly with status 0 if its output is closed, as with
 .BR "mdnsctl watch IoT | head" .
 .TP
-\fBsubscribe\fR [\fB\-\-query\fR \fItype\fR]... [\fB\-\-interval\fR \fIspan\fR] [\fB\-\-foreground\fR] [\fB\-\-log\fR \fIfile\fR] \fIname\fR \fB\-\-\fR \fIscript\fR [\fIarg\fR ...]
+\fBsubscribe\fR [\fB\-\-query\fR \fItype\fR]... [\fB\-\-foreground\fR] [\fB\-\-log\fR \fIfile\fR] \fIname\fR \fB\-\-\fR \fIscript\fR [\fIarg\fR ...]
 Watch the segment called
 .I name
 as
 .B watch
 does, with the same
-.B \-\-query
-and
-.BR \-\-interval ,
+.BR \-\-query ,
 and run
 .I script
 with its
@@ -281,8 +273,7 @@ supervisor or trying a script out.
 List the watches open on the daemon, oldest first, one line each: its id, the
 segment it watches, its
 .B \-\-query
-types and
-.B \-\-interval
+types
 .RB ( \-
 for none), how long it has been open, and the process holding it: its PID, its
 user and its command line.
@@ -533,7 +524,7 @@ the address of each as it is found, asking again every minute:
 .nf
 $ mdnsctl \-\-json devices \-\-query _shelly._tcp IoT \e
     | jq \-r '.devices[].addresses[0]'
-$ mdnsctl \-\-json watch \-\-query _shelly._tcp \-\-interval 1min IoT \e
+$ mdnsctl \-\-json watch \-\-query _shelly._tcp IoT \e
     | jq \-r \-\-unbuffered 'select(.event != "removed") | .device.addresses[0]'
 .fi
 .RE

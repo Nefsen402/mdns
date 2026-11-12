@@ -75,24 +75,20 @@ fn parses_commands_and_options() {
     assert_eq!(parse(&["-v"]), Err(Early::NoCommand), "the help, as an error");
 }
 
-/// `--query` and `--interval` may come anywhere, with their value as the
-/// next word or after `=`; the other words are the segment's name. They
-/// go to the daemon ahead of it.
+/// `--query` may come anywhere, with its value as the next word or after `=`;
+/// the other words are the segment's name. It goes to the daemon ahead of it.
 #[test]
 fn devices_and_watch_take_a_query() {
     let o = opts(&["devices", "--query", "_shelly._tcp", "IoT", "--query=_hue._tcp", "to", "br0"]);
-    let target = Target { segment: "IoT to br0".into(), query: vec!["_shelly._tcp".into(), "_hue._tcp".into()], interval: None, wait: None };
+    let target = Target { segment: "IoT to br0".into(), query: vec!["_shelly._tcp".into(), "_hue._tcp".into()], wait: None };
     assert_eq!(target.request("devices"), "devices --query=_shelly._tcp --query=_hue._tcp IoT to br0");
     assert_eq!(o.command, Command::Devices(target));
 
-    let o = opts(&["watch", "--interval", "1min", "--query=_shelly._tcp", "IoT"]);
+    let o = opts(&["watch", "--query=_shelly._tcp", "IoT"]);
     let Command::Watch(target) = o.command else { panic!("{o:?}") };
-    assert_eq!(target.interval, Some(Duration::from_secs(60)));
-    assert_eq!(target.request("watch"), "watch --query=_shelly._tcp --interval=60 IoT");
-    // Part of a second more is a second more: never asked more often than said.
-    let Command::Watch(target) = opts(&["watch", "--interval=10.5s", "--query=_x._tcp", "IoT"]).command else { panic!() };
-    assert_eq!(target.interval, Some(Duration::from_secs(11)));
-    // devices takes no --interval: it waits, it does not ask again.
+    assert_eq!(target.request("watch"), "watch --query=_shelly._tcp IoT");
+    // How often to ask is the interface's say, not a watch's.
+    assert!(parse(&["watch", "--query=_x._tcp", "--interval=1min", "IoT"]).is_err());
     assert!(parse(&["devices", "--query=_x._tcp", "--interval=1min", "IoT"]).is_err());
 }
 
@@ -117,9 +113,6 @@ fn rejects_bad_command_lines() {
         &["devices", "--query", "_x._tcp"],
         &["devices", "--query=", "IoT"],
         &["devices", "--query=_x._tcp\nsegments", "IoT"],
-        &["watch", "--interval=1min", "IoT"],
-        &["watch", "--query=_x._tcp", "--interval=5s", "IoT"],
-        &["watch", "--query=_x._tcp", "--interval=soon", "IoT"],
     ] {
         assert!(parse(args).is_err(), "{args:?}");
     }
@@ -163,15 +156,14 @@ fn a_commands_help_lists_its_arguments_and_options() {
          \x20 <SCRIPT>...  The script to run for each change, and its arguments, after --\n\
          \n\
          Options:\n\
-         \x20     --query <TYPE>     Ask for this service type by name, and run SCRIPT only for devices of it\n\
-         \x20     --interval <SPAN>  Ask for the --query types again this often (at least 10s)\n\
-         \x20     --foreground       Stay attached instead of going into the background\n\
-         \x20     --log <FILE>       Append what the subscriber has to say, and SCRIPT's output, to FILE\n\
-         \x20 -s, --socket <PATH>    The control socket [default: /run/mdnsd/mdnsd.sock]\n\
-         \x20 -v, --verbose          List devices with all details (addresses, services)\n\
-         \x20     --json             Print the daemon's reply unchanged\n\
-         \x20     --segmented-json   With devices: print each device as a line of JSON of its own\n\
-         \x20 -h, --help             Print help\n"
+         \x20     --query <TYPE>    Ask for this service type by name, and run SCRIPT only for devices of it\n\
+         \x20     --foreground      Stay attached instead of going into the background\n\
+         \x20     --log <FILE>      Append what the subscriber has to say, and SCRIPT's output, to FILE\n\
+         \x20 -s, --socket <PATH>   The control socket [default: /run/mdnsd/mdnsd.sock]\n\
+         \x20 -v, --verbose         List devices with all details (addresses, services)\n\
+         \x20     --json            Print the daemon's reply unchanged\n\
+         \x20     --segmented-json  With devices: print each device as a line of JSON of its own\n\
+         \x20 -h, --help            Print help\n"
     );
     // A usage error says how to use the command it was about.
     let Err(Early::Usage { usage, .. }) = parse(&["devices"]) else { panic!() };
@@ -384,17 +376,16 @@ fn renders_probe_results() {
 #[test]
 fn subscribe_takes_a_watch_and_a_script() {
     let o = opts(&[
-        "subscribe", "--query", "_shelly._tcp", "--interval=1min", "--log", "/var/log/plugs.log", "IoT", "to", "br0",
+        "subscribe", "--query", "_shelly._tcp", "--log", "/var/log/plugs.log", "IoT", "to", "br0",
         "--", "/usr/local/bin/configure", "--fast", "--query", "--",
     ]);
     let Command::Subscribe(sub) = o.command else { panic!("{o:?}") };
     assert_eq!(sub.target.segment, "IoT to br0");
     assert_eq!(sub.target.query, ["_shelly._tcp"]);
-    assert_eq!(sub.target.interval, Some(Duration::from_secs(60)));
     assert_eq!(sub.log.as_deref(), Some("/var/log/plugs.log"));
     assert!(!sub.foreground);
     assert_eq!(sub.script, ["/usr/local/bin/configure", "--fast", "--query", "--"]);
-    assert_eq!(sub.target.request("watch"), "watch --query=_shelly._tcp --interval=60 IoT to br0");
+    assert_eq!(sub.target.request("watch"), "watch --query=_shelly._tcp IoT to br0");
 
     let Command::Subscribe(sub) = opts(&["subscribe", "--foreground", "--log=x.log", "lan", "--", "s"]).command else { panic!() };
     assert!(sub.foreground);
@@ -836,19 +827,19 @@ fn the_time_is_told_in_utc() {
 fn renders_watchers() {
     let reply: Value = serde_json::from_str(
         r#"{"ok":true,"watchers":[
-            {"id":3,"segment":"IoT","query":[],"interval_s":null,"pid":4242,"uid":1000,"age_ms":93000},
-            {"id":7,"segment":"lan","query":["_shelly._tcp.local","_hue._tcp.local"],"interval_s":60,"pid":5151,"uid":0,"age_ms":2500},
-            {"id":9,"segment":"lan","query":[],"interval_s":null,"pid":null,"uid":null,"age_ms":10}]}"#,
+            {"id":3,"segment":"IoT","query":[],"pid":4242,"uid":1000,"age_ms":93000},
+            {"id":7,"segment":"lan","query":["_shelly._tcp.local","_hue._tcp.local"],"pid":5151,"uid":0,"age_ms":2500},
+            {"id":9,"segment":"lan","query":[],"pid":null,"uid":null,"age_ms":10}]}"#,
     )
     .unwrap();
     let user = |uid: u32| (uid == 1000).then(|| "alex".to_string());
     let command = |pid: i32| (pid == 4242).then(|| "mdnsctl watch IoT".to_string());
     assert_eq!(
         render_watchers(&reply, user, command).unwrap(),
-        "ID  SEGMENT  QUERY                    EVERY   AGE     PID   USER  COMMAND\n\
-         3   IoT      -                        -       1m 33s  4242  alex  mdnsctl watch IoT\n\
-         7   lan      _shelly._tcp, _hue._tcp  1m 00s  2.5s    5151  0     -\n\
-         9   lan      -                        -       10ms    -     -     -\n"
+        "ID  SEGMENT  QUERY                    AGE     PID   USER  COMMAND\n\
+         3   IoT      -                        1m 33s  4242  alex  mdnsctl watch IoT\n\
+         7   lan      _shelly._tcp, _hue._tcp  2.5s    5151  0     -\n\
+         9   lan      -                        10ms    -     -     -\n"
     );
     let none: Value = serde_json::from_str(r#"{"ok":true,"watchers":[]}"#).unwrap();
     assert_eq!(render_watchers(&none, user, command).unwrap(), "no watchers\n");

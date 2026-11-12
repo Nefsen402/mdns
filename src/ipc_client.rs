@@ -61,9 +61,6 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// A probe takes the daemon about four seconds to run before it replies.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Keep in sync with `ipc::MIN_QUERY_INTERVAL` in the daemon.
-const MIN_INTERVAL: Duration = Duration::from_secs(10);
-
 /// How long `devices --query` takes what answers, unless `--wait` says.
 const DEFAULT_WAIT: Duration = Duration::from_secs(4);
 
@@ -93,13 +90,12 @@ enum Command {
 }
 
 /// The segment of `devices` or `watch`, and the service types to ask for and
-/// show (`--query`), how often a watch asks again (`--interval`), and how
-/// long `devices --query` takes what answers (`--wait`).
+/// show (`--query`), and how long `devices --query` takes what answers
+/// (`--wait`).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Target {
     segment: String,
     query: Vec<String>,
-    interval: Option<Duration>,
     wait: Option<Duration>,
 }
 
@@ -129,9 +125,6 @@ impl Target {
         for kind in &self.query {
             line.push_str(&format!(" --query={kind}"));
         }
-        if let Some(every) = self.interval {
-            line.push_str(&format!(" --interval={}", every.as_secs()));
-        }
         format!("{line} {}", self.segment)
     }
 }
@@ -157,7 +150,6 @@ struct CommandInfo {
 }
 
 const QUERY_HELP: &str = "Ask for this service type by name, and list only devices of it";
-const INTERVAL_HELP: &str = "Ask for the --query types again this often (at least 10s)";
 const SEGMENT: (&str, &str) = ("<NAME>...", "The segment");
 
 const COMMANDS: &[CommandInfo] = &[
@@ -181,7 +173,7 @@ const COMMANDS: &[CommandInfo] = &[
         about: "Print the devices of a segment as they appear and go",
         args: " <NAME>...",
         arguments: &[SEGMENT],
-        options: &[("--query <TYPE>", "Ask for this service type by name, and show only devices of it"), ("--interval <SPAN>", INTERVAL_HELP)],
+        options: &[("--query <TYPE>", "Ask for this service type by name, and show only devices of it")],
     },
     CommandInfo {
         name: "subscribe",
@@ -190,7 +182,6 @@ const COMMANDS: &[CommandInfo] = &[
         arguments: &[SEGMENT, ("<SCRIPT>...", "The script to run for each change, and its arguments, after --")],
         options: &[
             ("--query <TYPE>", "Ask for this service type by name, and run SCRIPT only for devices of it"),
-            ("--interval <SPAN>", INTERVAL_HELP),
             ("--foreground", "Stay attached instead of going into the background"),
             ("--log <FILE>", "Append what the subscriber has to say, and SCRIPT's output, to FILE"),
         ],
@@ -298,17 +289,6 @@ fn wait_span(value: &str) -> Result<Duration, String> {
     Ok(span)
 }
 
-/// An `--interval`: a time span of at least [`MIN_INTERVAL`], in whole
-/// seconds as the daemon takes it, part of a second more being a second
-/// more, so it is never asked more often than said.
-fn interval_span(value: &str) -> Result<Duration, String> {
-    let span = config::parse_timespan(value).map_err(|e| e.to_string())?;
-    if span < MIN_INTERVAL {
-        return Err(format!("it must be at least {}s", MIN_INTERVAL.as_secs()));
-    }
-    Ok(Duration::from_secs(span.as_secs() + u64::from(span.subsec_nanos() > 0)))
-}
-
 /// Read the command line into [`Options`]. Options may come anywhere, before
 /// the command or after it; a segment's name is the words left over, so it
 /// needs no quoting even with spaces in it; `subscribe`'s script is what
@@ -322,7 +302,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
     let mut parser = args::Parser::new(args);
     let (mut socket, mut verbose, mut json, mut segmented, mut asked_help) = (config::DEFAULT_SOCKET.to_string(), false, false, false, false);
     let mut command: Option<&CommandInfo> = None;
-    let (mut words, mut query, mut interval, mut wait, mut foreground, mut log) = (Vec::new(), Vec::new(), None, None, false, None);
+    let (mut words, mut query, mut wait, mut foreground, mut log) = (Vec::new(), Vec::new(), None, false, None);
     let takes = |command: Option<&CommandInfo>, option: &str| command.is_some_and(|c| c.options.iter().any(|(o, _)| o.starts_with(option)));
     let bad = |command, e: args::Error| Early::usage(command, e.to_string());
     loop {
@@ -346,10 +326,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
             Long("wait") if takes(command, "--wait") => {
                 let v = parser.value().map_err(|e| bad(command, e))?;
                 wait = Some(wait_span(&v).map_err(|e| invalid("wait", &v, e))?);
-            }
-            Long("interval") if takes(command, "--interval") => {
-                let v = parser.value().map_err(|e| bad(command, e))?;
-                interval = Some(interval_span(&v).map_err(|e| invalid("interval", &v, e))?);
             }
             Long("foreground") if takes(command, "--foreground") => foreground = true,
             Long("log") if takes(command, "--log") => {
@@ -386,8 +362,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
             Vec::new()
         }
     };
-    if (wait.is_some() || interval.is_some()) && query.is_empty() {
-        return Err(usage(&format!("--{} is for --query", if wait.is_some() { "wait" } else { "interval" })));
+    if wait.is_some() && query.is_empty() {
+        return Err(usage("--wait is for --query"));
     }
     if segmented && info.name != "devices" {
         return Err(usage("--segmented-json is for devices"));
@@ -400,16 +376,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, Early> 
     if name.contains(['\n', '\r']) {
         return Err(usage("a segment's name cannot hold a line break"));
     }
-    let target = |interval, wait| match name.trim().is_empty() {
+    let target = |wait| match name.trim().is_empty() {
         true if words.is_empty() => Err(usage("the segment's name is needed")),
         true => Err(usage("the segment's name is blank")),
-        false => Ok(Target { segment: name.clone(), query: query.clone(), interval, wait }),
+        false => Ok(Target { segment: name.clone(), query: query.clone(), wait }),
     };
     let command = match info.name {
-        "devices" => Command::Devices(target(None, wait)?),
+        "devices" => Command::Devices(target(wait)?),
         "probe" => Command::Probe(Some(name.clone()).filter(|n| !n.trim().is_empty())),
-        "watch" => Command::Watch(target(interval, None)?),
-        "subscribe" => Command::Subscribe(Subscription { target: target(interval, None)?, script, foreground, log }),
+        "watch" => Command::Watch(target(None)?),
+        "subscribe" => Command::Subscribe(Subscription { target: target(None)?, script, foreground, log }),
         _ if !words.is_empty() => return Err(usage(&format!("unexpected argument '{}' found", words[0]))),
         "segments" => Command::Segments,
         "watchers" => Command::Watchers,
@@ -1322,7 +1298,7 @@ fn render_watchers(
         return Ok("no watchers\n".into());
     }
     let mut rows = vec![
-        ["ID", "SEGMENT", "QUERY", "EVERY", "AGE", "PID", "USER", "COMMAND"].map(String::from).to_vec(),
+        ["ID", "SEGMENT", "QUERY", "AGE", "PID", "USER", "COMMAND"].map(String::from).to_vec(),
     ];
     for w in list {
         let query: Vec<&str> = w["query"]
@@ -1332,14 +1308,12 @@ fn render_watchers(
             .map(|k| k.as_str().map(|k| k.strip_suffix(".local").unwrap_or(k)).ok_or_else(bad_reply))
             .collect::<Result<_, _>>()?;
         let query = if query.is_empty() { "-".to_string() } else { query.join(", ") };
-        let every = w["interval_s"].as_u64().map_or("-".to_string(), |s| span(s * 1000));
         let pid = w["pid"].as_i64().and_then(|p| i32::try_from(p).ok());
         let uid = w["uid"].as_u64().and_then(|u| u32::try_from(u).ok());
         rows.push(vec![
             w["id"].as_u64().ok_or_else(bad_reply)?.to_string(),
             w["segment"].as_str().ok_or_else(bad_reply)?.to_string(),
             query,
-            every,
             span(w["age_ms"].as_u64().ok_or_else(bad_reply)?),
             pid.map_or("-".to_string(), |p| p.to_string()),
             uid.map_or("-".to_string(), |u| user(u).unwrap_or_else(|| u.to_string())),

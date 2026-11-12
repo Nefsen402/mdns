@@ -8,7 +8,6 @@
 //! [`Advertise`] it is shown with.
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::net::IpAddr;
 
@@ -290,33 +289,6 @@ pub fn forward_queries<'a>(
     let mut qs = Questions::default();
     for q in questions {
         qs.ask(&q.name, q.qtype);
-    }
-    with_known(qs.into_queries(limit), known, limit)
-}
-
-/// Queries for the service types `kinds`, as asked for by name: each
-/// type, and, of the devices that have one, the instances not yet
-/// resolved and the hostnames without a routable address. Each packet
-/// carries the `known` answers to its questions, as many as fit.
-pub fn type_queries(
-    devices: &[Device],
-    kinds: &[String],
-    known: impl Fn(&Question) -> Vec<Record>,
-    limit: usize,
-) -> Vec<Message> {
-    let mut qs = Questions::default();
-    for kind in kinds {
-        qs.ask(kind, rtype::PTR);
-    }
-    let of_kind = |s: &&Rc<Service>| kinds.iter().any(|k| s.kind().eq_ignore_ascii_case(k));
-    for svc in devices.iter().flat_map(|d| &d.services).filter(of_kind).filter(|s| s.target().is_none()) {
-        qs.ask(&svc.instance(), rtype::SRV);
-        qs.ask(&svc.instance(), rtype::TXT);
-    }
-    let unreachable = devices.iter().filter(|d| d.services.iter().any(|s| of_kind(&s)) && d.routable().next().is_none());
-    for host in unreachable.filter_map(|d| d.hostname.as_deref()) {
-        qs.ask(host, rtype::A);
-        qs.ask(host, rtype::AAAA);
     }
     with_known(qs.into_queries(limit), known, limit)
 }

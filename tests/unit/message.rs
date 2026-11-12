@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::codec::Question;
 use crate::device::tests::*;
@@ -192,45 +194,6 @@ fn a_probe_asks_for_types_instances_subtypes_and_whatever_is_missing() {
     let queries = probe_queries(&[], &types, DEFAULT_MAX_PACKET);
     assert_eq!(asked(&queries).len(), 41);
     assert_eq!(queries.len(), 3);
-}
-
-/// Asking for types by name browses each, and finishes what is missing
-/// of their devices only: instances to resolve, hosts to find an address
-/// for. What is known goes along as known answers.
-#[test]
-fn asking_for_types_browses_them_and_resolves_their_devices_only() {
-    // Of the type, unresolved, known only by a link-local address.
-    let mut plug = tv("169.254.1.5", &["Plug"]);
-    plug.hostname = Some("plug.local".into());
-    plug.services[0].edit(|p| p.kind = "_shelly._tcp.local".into());
-    plug.services[0].edit(|p| p.instance = "Plug._shelly._tcp.local".into());
-    // Of another type, as unfinished: none of its business.
-    let mut other = tv("169.254.1.6", &["TV"]);
-    other.hostname = Some("other.local".into());
-    let kinds = ["_Shelly._tcp.local".to_string()];
-    let ptr = Record {
-        name: "_shelly._tcp.local".into(),
-        class: 1,
-        cache_flush: false,
-        ttl: 60,
-        data: RData::Ptr("Plug._shelly._tcp.local".into()),
-    };
-    let known = |q: &Question| if q.qtype == rtype::PTR { vec![ptr.clone()] } else { Vec::new() };
-
-    let queries = type_queries(&[plug.clone(), other], &kinds, known, DEFAULT_MAX_PACKET);
-    assert_eq!(asked(&queries), [
-        q("_Shelly._tcp.local", rtype::PTR),
-        q("Plug._shelly._tcp.local", rtype::SRV),
-        q("Plug._shelly._tcp.local", rtype::TXT),
-        q("plug.local", rtype::A),
-        q("plug.local", rtype::AAAA),
-    ]);
-    assert_eq!(queries[0].answers, [ptr]);
-
-    // Resolved and reachable, only the type is asked for.
-    plug.services[0].edit(|p| p.target = Some("plug.local".into()));
-    plug.add_addrs(&[ip("10.0.1.5")]);
-    assert_eq!(asked(&type_queries(&[plug], &kinds, |_| Vec::new(), DEFAULT_MAX_PACKET)), [q("_Shelly._tcp.local", rtype::PTR)]);
 }
 
 #[test]

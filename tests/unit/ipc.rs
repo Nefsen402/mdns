@@ -22,6 +22,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::config::Forward;
 use crate::listener::Link;
 use crate::device::EditService;
 
@@ -568,19 +569,18 @@ fn queries(rx: &std::net::UdpSocket) -> Vec<(Vec<String>, usize)> {
 }
 
 #[test]
-fn query_options_take_service_types_and_how_often_to_ask() {
-    let parse = |arg: &str| query_args(arg).map(|(q, rest)| (q.kinds, q.interval.map(|d| d.as_secs()), rest.to_string()));
-    assert_eq!(parse("IoT to br0"), Ok((vec![], None, "IoT to br0".into())));
+fn query_options_take_service_types() {
+    let parse = |arg: &str| query_args(arg).map(|(q, rest)| (q.kinds, rest.to_string()));
+    assert_eq!(parse("IoT to br0"), Ok((vec![], "IoT to br0".into())));
     assert_eq!(
-        parse("--query=_shelly._tcp --query=_Shelly._tcp.local. --query=_hue._tcp.local --interval=30 \"IoT\""),
-        Ok((vec!["_shelly._tcp.local".into(), "_hue._tcp.local".into()], Some(30), "\"IoT\"".into()))
+        parse("--query=_shelly._tcp --query=_Shelly._tcp.local. --query=_hue._tcp.local \"IoT\""),
+        Ok((vec!["_shelly._tcp.local".into(), "_hue._tcp.local".into()], "\"IoT\"".into()))
     );
     let err = |arg: &str| parse(arg).unwrap_err()["error"].as_str().unwrap().to_string();
     assert!(err("--query=shelly IoT").contains("not a service type"));
     assert!(err("--query=_a._b._tcp IoT").contains("not a service type"));
-    assert!(err("--interval=0 --query=_x._tcp IoT").contains("invalid --interval"));
-    assert!(err("--interval=5m --query=_x._tcp IoT").contains("invalid --interval"));
-    assert!(err("--interval=30 IoT").contains("needs a --query"));
+    // How often to ask is the interface's say, as of any question.
+    assert!(err("--interval=30 --query=_x._tcp IoT").contains("unknown option --interval=30"));
     assert!(err("--bogus IoT").contains("unknown option --bogus"));
 }
 
@@ -594,35 +594,69 @@ fn devices_lists_what_is_known_and_asks_nothing() {
     let ask = |request: &str| handle(&groups, &Watches::default(), request);
     let reply: Value = serde_json::from_str(&ask("devices IoT")).unwrap();
     assert_eq!(reply["devices"][0]["hostname"], "tv.local");
-    for request in ["devices --query=_http._tcp IoT", "devices --interval=30 IoT"] {
-        assert!(ask(request).contains("watch with --query"), "{request}");
-    }
+    assert!(ask("devices --query=_http._tcp IoT").contains("watch with --query"));
     assert!(queries(&a_rx).is_empty(), "nothing asked");
 }
 
 #[test]
-fn watch_with_a_query_shows_what_is_there_asks_and_asks_again() {
+fn watch_with_a_query_shows_what_is_there_and_asks_as_the_interface_says() {
     let (seg, rx) = wired("wifi");
     let groups = vec![Group { name: "IoT".into(), segment: Segment::new(vec![seg.clone()]).unwrap() }];
     announce(&seg, "10.0.1.7", "tv.local", "TV");
     let path = temp_socket("watch-query");
     let mut h = Harness::new(&path, groups);
+    // What of the type was asked, as the daemon puts it, for as long as it takes.
+    let http = |h: &mut Harness, rx: &std::net::UdpSocket| {
+        let mut asked = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            h.pump();
+            asked.extend(queries(rx).into_iter().filter(|(names, _)| names == &["_http._tcp.local"]));
+        }
+        asked
+    };
 
     let (mut stream, mut reader) = connect(&path);
-    let ack = h.ask(&mut stream, &mut reader, "watch --query=_http._tcp --interval=1 IoT");
+    let ack = h.ask(&mut stream, &mut reader, "watch --query=_http._tcp IoT");
     assert_eq!(ack, r#"{"ok":true,"name":"IoT","watching":true}"#);
     let present = h.json(&mut reader);
     assert_eq!((present["event"].as_str(), present["device"]["hostname"].as_str()), (Some("present"), Some("tv.local")));
     assert_eq!(present["ttl"], 300);
 
-    // Asked at once, with the TV as a known answer, and again a second on.
-    let mut asked = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while asked.len() < 6 && Instant::now() < deadline {
+    // Asked, with the TV as a known answer, in the three rounds of the query.
+    let asked = http(&mut h, &rx);
+    assert!(!asked.is_empty() && asked.iter().all(|&(_, known)| known == 1), "{asked:?}");
+
+    // Another watch for the same type shows what is there, and asks nothing: it
+    // has been asked, and what answered is known.
+    let (mut second, mut second_reader) = connect(&path);
+    h.ask(&mut second, &mut second_reader, "watch --query=_http._tcp IoT");
+    assert_eq!(h.json(&mut second_reader)["event"], "present");
+    assert!(http(&mut h, &rx).is_empty(), "asked once");
+
+    // A type that is new is asked, and where the interface asks nothing, none is.
+    let (mut third, mut third_reader) = connect(&path);
+    h.ask(&mut third, &mut third_reader, "watch --query=_ipp._tcp IoT");
+    let ipp = {
+        let mut asked = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            h.pump();
+            asked.extend(queries(&rx).into_iter().filter(|(names, _)| names == &["_ipp._tcp.local"]));
+        }
+        asked
+    };
+    assert!(!ipp.is_empty(), "a new type is asked");
+    seg.set_forward(Forward::Never);
+    let (mut fourth, mut fourth_reader) = connect(&path);
+    h.ask(&mut fourth, &mut fourth_reader, "watch --query=_hue._tcp IoT");
+    let mut hue = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < deadline {
         h.pump();
-        asked.extend(queries(&rx).into_iter().filter(|(names, _)| names == &["_http._tcp.local"]));
+        hue.extend(queries(&rx).into_iter().filter(|(names, _)| names == &["_hue._tcp.local"]));
     }
-    assert!(asked.len() >= 6 && asked.iter().all(|&(_, known)| known == 1), "{asked:?}");
+    assert!(hue.is_empty(), "never asks nothing: {hue:?}");
 
     // One without the type is not shown; one with it is.
     seg.observe(ip("10.0.1.8"));
@@ -695,7 +729,7 @@ fn watchers_lists_the_open_watches_and_who_holds_them() {
     assert!(list(&mut h).is_empty());
 
     let first = open(&mut h, "watch IoT");
-    let _second = open(&mut h, "watch --query=_shelly._tcp --interval=60 IoT");
+    let _second = open(&mut h, "watch --query=_shelly._tcp IoT");
     let watchers = list(&mut h);
     assert_eq!(watchers.len(), 2, "{watchers:?}");
     let (pid, uid) = (std::process::id() as i64, unsafe { libc::getuid() } as i64);
@@ -711,9 +745,9 @@ fn watchers_lists_the_open_watches_and_who_holds_them() {
         assert!(w["age_ms"].as_u64().is_some());
     }
     assert!(watchers[0]["id"].as_u64() < watchers[1]["id"].as_u64(), "oldest first");
-    assert_eq!((watchers[0]["query"].as_array().unwrap().len(), &watchers[0]["interval_s"]), (0, &Value::Null));
+    assert_eq!(watchers[0]["query"].as_array().unwrap().len(), 0);
     assert_eq!(watchers[1]["query"][0], "_shelly._tcp.local");
-    assert_eq!(watchers[1]["interval_s"], 60);
+    assert!(watchers[1].get("interval_s").is_none(), "there is no interval to say");
 
     // A watch whose client is gone leaves the list at once.
     drop(first);

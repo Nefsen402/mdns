@@ -26,7 +26,7 @@ use crate::time::Instant;
 use anyhow::{anyhow, bail, Result};
 
 use crate::config::{Advertise, AdvertiseConfig, Forward};
-use crate::device::{is_type, Advertised, Device, ServiceParts, Shared, HOST_TTL, OTHER_TTL};
+use crate::device::{Advertised, Device, ServiceParts, Shared, HOST_TTL, OTHER_TTL};
 use crate::message::{self, responses, service_ttl, Request, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
 use crate::addr::{family_of, is_link_local, Family, Prefix};
 use crate::listener::{Link, MDNS_PORT};
@@ -36,7 +36,7 @@ use crate::tracker::Event;
 use crate::prelude::*;
 
 use crate::table::{hash_name, Id, Multi, Table};
-use crate::tracker::{refresh_gap, Touched, Tracker, MAX_TYPES};
+use crate::tracker::{refresh_gap, Touched, Tracker};
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
 /// on an interface that re-announces what has not changed.
@@ -286,8 +286,6 @@ pub type Probed = core::result::Result<usize, String>;
 /// A probe, or a query for types by name, under way: which round comes next,
 /// and when.
 struct Probing {
-    /// The types asked for by name; `None` for a probe of everything.
-    kinds: Option<Vec<String>>,
     /// Why it runs, for the journal: at startup it says how it went, and
     /// otherwise only if it failed.
     why: &'static str,
@@ -711,6 +709,21 @@ impl Remembered {
 }
 
 impl State {
+    /// Whether this interface asks `question` on its link, as it is told to
+    /// ([`Forward`]): every one, none, or one it has not asked before, and not
+    /// one it asked longer ago than it remembers, if it is told a time.
+    fn may_ask(&mut self, question: &Question, now: Instant) -> bool {
+        match self.forward {
+            Forward::Always => true,
+            Forward::Never => false,
+            Forward::Once => !self.asked.contains(question),
+            Forward::After(span) => {
+                self.asked.forget_older(now, span);
+                !self.asked.contains(question)
+            }
+        }
+    }
+
     /// Remember the questions of `queries`, which were just put on the link, if
     /// it matters: only what goes by what was asked before does.
     fn note_asked(&mut self, queries: &[Message], now: Instant) {
@@ -807,8 +820,7 @@ impl State {
             }
         }
         for p in &self.probing {
-            let kinds = p.kinds.as_ref().map(|k| k.join(", "));
-            f("probe", &kinds.as_deref().unwrap_or("every type"), p.next);
+            f("probe", &"every type", p.next);
         }
         if let Some(at) = self.next_routine {
             f("probe", &"every type, as configured", at);
@@ -1614,16 +1626,13 @@ impl Interface {
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        if state.link.is_empty() || state.forward == Forward::Never {
+        if state.link.is_empty() {
             return Ok(0);
         }
         state.forwarded.retain(|_, at| now.saturating_duration_since(*at) < FORWARD_GAP);
-        if let Forward::After(span) = state.forward {
-            state.asked.forget_older(now, span);
-        }
         let mut fresh = Vec::new();
         for q in questions {
-            if state.forward.remembers() && state.asked.contains(q) {
+            if !state.may_ask(q, now) {
                 continue;
             }
             let key = (q.name.to_ascii_lowercase(), q.qtype);
@@ -1723,7 +1732,7 @@ impl Interface {
     /// once it is done ([`Interface::probed`]). One asked for while another is
     /// under way is that one.
     pub fn probe(&self) -> u64 {
-        self.begin(None, "asked for", true)
+        self.begin("asked for", true)
     }
 
     /// How the probe numbered `id` went, if it is done, and has not been
@@ -1737,7 +1746,7 @@ impl Interface {
     /// Like [`Interface::probe`], with no one to tell but the journal: `why`
     /// says what it is for there.
     pub fn start_probe(&self, why: &'static str) {
-        self.begin(None, why, false);
+        self.begin(why, false);
     }
 
     /// Which of the questions asked on the other interfaces of its segments
@@ -1761,28 +1770,17 @@ impl Interface {
         self.state.borrow_mut().probe_types = kinds.to_vec();
     }
 
-    /// Ask for the service types `kinds` by name, in three rounds like a
-    /// [probe](Interface::probe): devices that only answer when asked for
-    /// their type, and do not say what types they have, are found this way.
-    /// The types are remembered, so that every later probe asks for them too.
-    /// What is known here already goes along as known answers, so only what
-    /// is new, or about to run out, answers.
-    pub fn query_types(&self, kinds: &[String]) {
-        self.begin(Some(kinds.to_vec()), "query for types", false);
-    }
-
-    /// Start a probe (`kinds` `None`) or a query for types, unless the same
-    /// is under way already, which it then is; its number. How it went is
-    /// kept if it was `asked` for. An interface that cannot send has nothing to
-    /// do, and is done at once.
-    fn begin(&self, kinds: Option<Vec<String>>, why: &'static str, asked: bool) -> u64 {
+    /// Start a probe, unless one is under way already, which it then is; its
+    /// number. How it went is kept if it was `asked` for. An interface that
+    /// cannot send has nothing to do, and is done at once.
+    fn begin(&self, why: &'static str, asked: bool) -> u64 {
         let mut state = self.state.borrow_mut();
-        if let Some(p) = state.probing.iter_mut().find(|p| p.kinds == kinds) {
+        if let Some(p) = state.probing.first_mut() {
             p.asked |= asked;
             return p.id;
         }
         state.probes_started += 1;
-        let probing = Probing { kinds, why, id: state.probes_started, asked, round: 0, next: Instant::now(), sent: 0 };
+        let probing = Probing { why, id: state.probes_started, asked, round: 0, next: Instant::now(), sent: 0 };
         let id = probing.id;
         if state.link.is_empty() {
             drop(state);
@@ -1806,21 +1804,17 @@ impl Interface {
             due
         };
         if routine {
-            self.begin(None, "periodic", false);
+            self.begin("periodic", false);
         }
-        let due: Vec<(Option<Vec<String>>, usize)> = {
+        let due: Vec<usize> = {
             let state = self.state.borrow_mut();
-            state.probing.iter().filter(|p| p.next <= now).map(|p| (p.kinds.clone(), p.round)).collect()
+            state.probing.iter().filter(|p| p.next <= now).map(|p| p.round).collect()
         };
-        for (kinds, round) in due {
-            let ran = match (round < PROBE_GAPS.len(), &kinds) {
-                (false, _) => None,
-                (true, None) => Some(self.probe_round()),
-                (true, Some(kinds)) => Some(self.query_types_round(kinds)),
-            };
+        for round in due {
+            let ran = (round < PROBE_GAPS.len()).then(|| self.probe_round());
             let mut state = self.state.borrow_mut();
-            let Some(at) = state.probing.iter().position(|p| p.kinds == kinds) else { continue };
-            let p = &mut state.probing[at];
+            // The one that ran: only one runs at a time.
+            let Some(p) = state.probing.first_mut() else { continue };
             let result = match ran {
                 Some(Ok(sent)) => {
                     p.sent += sent;
@@ -1831,7 +1825,7 @@ impl Interface {
                 Some(Err(e)) => Err(format!("{e:#}")),
                 None => Ok(p.sent),
             };
-            let p = state.probing.remove(at);
+            let p = state.probing.remove(0);
             drop(state);
             self.finish(p, result);
         }
@@ -1867,26 +1861,6 @@ impl Interface {
         let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
         let types = state.tracker.types.iter().chain(&state.probe_types).cloned().collect();
         let queries = message::probe_queries(&devices, &types, state.max_packet);
-        let asked = ask(&state.link, &queries)?;
-        state.note_asked(&queries, Instant::now());
-        Ok(asked)
-    }
-
-    fn query_types_round(&self, kinds: &[String]) -> Result<usize> {
-        let mut guard = self.state.borrow_mut();
-        let state = &mut *guard;
-        if state.link.is_empty() {
-            return Ok(0);
-        }
-        for kind in kinds.iter().filter(|k| is_type(k)) {
-            if state.tracker.types.len() < MAX_TYPES {
-                state.tracker.types.insert(kind.to_ascii_lowercase());
-            }
-        }
-        let now = Instant::now();
-        let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
-        let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
-        let queries = message::type_queries(&devices, kinds, known, state.max_packet);
         let asked = ask(&state.link, &queries)?;
         state.note_asked(&queries, Instant::now());
         Ok(asked)

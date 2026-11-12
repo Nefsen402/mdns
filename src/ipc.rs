@@ -12,14 +12,14 @@
 //!    "services":[{"instance":...}]}]}
 //! probe [<segment name>]
 //!   {"ok":true,"probed":[{"interface":"wifi","queries":14,"error":null}]}
-//! watch [--query=<type>]... [--interval=<seconds>] <segment name>
+//! watch [--query=<type>]... <segment name>
 //!   {"ok":true,"name":"IoT","watching":true}
 //!   {"event":"present","segment":"IoT","ttl":300,"device":{...}}   (--query only)
 //!   {"event":"added","segment":"IoT","ttl":4500,"device":{...as in devices...}}
 //!   {"event":"removed","segment":"IoT","ttl":0,"device":{...}}
 //! watchers
 //!   {"ok":true,"watchers":[{"id":3,"segment":"IoT","query":["_shelly._tcp.local"],
-//!    "interval_s":60,"pid":4242,"uid":1000,"age_ms":93000}]}
+//!    "pid":4242,"uid":1000,"age_ms":93000}]}
 //! timers
 //!   {"ok":true,"timers":[{"id":1,"name":"upkeep wifi","running":false,
 //!    "due_in_ms":93000,"runs":4,"last_run_ago_ms":3000,"last_took_us":210,
@@ -48,17 +48,17 @@
 //! type; it may be given more than once. Many devices answer only when asked
 //! for their type, and not when asked what types there are, so neither a
 //! probe nor waiting finds them. The watch first sends a `present` line for
-//! each device of the type already known, asks, and with `--interval=` asks
-//! again that often (at least every ten seconds, never more often). A device
-//! that loses its last service of the type is `removed` from the watch. The
-//! types asked for are remembered, so probes ask for them from then on.
-//! `devices` only lists what is known: to ask for a type and see what
+//! each device of the type already known, and asks: as any question is asked
+//! on an interface, as it is set to (`ForwardQuestions=`), so a type already
+//! asked for is not asked for again, where each question is asked once. A
+//! device that loses its last service of the type is `removed` from the
+//! watch. `devices` only lists what is known: to ask for a type and see what
 //! answers, watch with a query for as long as you care to wait, as `mdnsctl
 //! devices --query` does.
 //!
 //! `watchers` lists the watches streaming now, oldest first: the segment,
-//! the `--query` types (empty for none) and `--interval` (`null` for none)
-//! each was asked with, how long it has been open, and the process and user
+//! the `--query` types (empty for none) each was asked with, how long it has
+//! been open, and the process and user
 //! holding it, as the kernel reports the other end of its connection (`null`
 //! if it cannot).
 //!
@@ -101,6 +101,7 @@ use crate::time::Instant;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+use crate::codec::{rtype, Question};
 use crate::segment::Notice;
 use crate::device::{is_type, Device, Origin};
 use crate::runtime::Why;
@@ -127,10 +128,6 @@ const MAX_OUTPUT: usize = 1 << 20;
 /// The longest `probe` waits for a probe, which takes a few seconds, to
 /// finish: mdnsctl waits fifteen.
 const PROBE_WAIT: Duration = Duration::from_secs(10);
-
-/// The least a watch's `--interval=` may be: asking takes about four seconds,
-/// and asking more often than this is only noise.
-const MIN_QUERY_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 
 /// The control socket and its clients, served from the event loop: nothing
 /// here waits, and what a client is to be told waits in its buffer until it
@@ -179,8 +176,8 @@ struct Streaming {
     /// loses its last service of them is shown to go, and one shown already
     /// is not shown again unchanged.
     shown: HashMap<(String, String), Value>,
-    /// When to ask for the query's types again, if ever.
-    next_ask: Option<Instant>,
+    /// Whether the query's types are yet to be asked, as the interfaces say.
+    to_ask: bool,
     since: Instant,
 }
 
@@ -269,9 +266,9 @@ impl Server {
                     }
                 }
                 State::Watching(watch) => {
-                    if let Some(at) = watch.next_ask.filter(|&at| at <= now) {
+                    if watch.to_ask {
                         ask_for_types(groups, &watch.name, &watch.query.kinds);
-                        watch.next_ask = watch.query.interval.map(|every| at + every);
+                        watch.to_ask = false;
                     }
                     for (_, notice) in notices.iter().filter(|(name, _)| *name == watch.name) {
                         let line = if watch.query.kinds.is_empty() {
@@ -300,7 +297,7 @@ impl Server {
     }
 
     /// When [`Server::tick`] next has something to do of its own accord: a
-    /// client to give up waiting for, a watch to ask again for its types.
+    /// client to give up waiting for, a watch to ask for its types.
     pub fn next_due(&self) -> Option<Instant> {
         self.clients
             .iter()
@@ -308,7 +305,7 @@ impl Server {
                 let own = match &c.state {
                     State::Requests => Some(c.active + IDLE),
                     State::Probing { until, .. } => Some(*until),
-                    State::Watching(watch) => watch.next_ask,
+                    State::Watching(watch) => watch.to_ask.then(Instant::now),
                 };
                 [own, c.stalled.map(|since| since + STREAM_WRITE)].into_iter().flatten().min()
             })
@@ -331,7 +328,7 @@ impl Server {
             .iter()
             .filter_map(|c| match &c.state {
                 State::Watching(w) => {
-                    let query = Query { kinds: w.query.kinds.clone(), interval: w.query.interval };
+                    let query = Query { kinds: w.query.kinds.clone() };
                     Some(Open { id: w.id, segment: w.name.clone(), query, peer: c.peer, since: w.since })
                 }
                 _ => None,
@@ -443,8 +440,8 @@ impl Client {
             }
             push_line(&mut self.output, line);
         }
-        let next_ask = (!query.kinds.is_empty()).then_some(now);
-        self.state = State::Watching(Streaming { id, name, query, shown, next_ask, since: now });
+        let to_ask = !query.kinds.is_empty();
+        self.state = State::Watching(Streaming { id, name, query, shown, to_ask, since: now });
     }
 }
 
@@ -513,7 +510,6 @@ impl Watches {
                     "id": w.id,
                     "segment": w.segment,
                     "query": w.query.kinds,
-                    "interval_s": w.query.interval.map(|d| d.as_secs()),
                     "pid": w.peer.and_then(|p| p.pid),
                     "uid": w.peer.map(|p| p.uid),
                     "age_ms": u64::try_from(w.since.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -599,12 +595,9 @@ struct Query {
     /// The service types to ask for by name, and to narrow the reply to;
     /// none for every device.
     kinds: Vec<String>,
-    /// How often a watch asks for them again.
-    interval: Option<Duration>,
 }
 
-/// The `--query=` and `--interval=` options `arg` starts with, and the
-/// segment name after them.
+/// The `--query=` options `arg` starts with, and the segment name after them.
 fn query_args(arg: &str) -> Result<(Query, &str), Value> {
     let mut query = Query::default();
     let mut rest = arg.trim_start();
@@ -616,17 +609,9 @@ fn query_args(arg: &str) -> Result<(Query, &str), Value> {
             if !query.kinds.iter().any(|k| k.eq_ignore_ascii_case(&kind)) {
                 query.kinds.push(kind);
             }
-        } else if let Some(secs) = option.strip_prefix("--interval=") {
-            let secs = secs.parse().ok().filter(|&s| s >= MIN_QUERY_INTERVAL.as_secs()).ok_or_else(|| {
-                error(&format!("invalid --interval {secs:?}: whole seconds, at least {}", MIN_QUERY_INTERVAL.as_secs()))
-            })?;
-            query.interval = Some(Duration::from_secs(secs));
         } else {
             return Err(error(&format!("unknown option {option}")));
         }
-    }
-    if query.interval.is_some() && query.kinds.is_empty() {
-        return Err(error("--interval needs a --query to ask again"));
     }
     Ok((query, rest))
 }
@@ -669,7 +654,7 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
     let (query, name) = query_args(arg)?;
     let name = segment_arg(name);
     if name.is_empty() {
-        return Err(error("usage: watch [--query=<type>]... [--interval=<seconds>] <segment name>"));
+        return Err(error("usage: watch [--query=<type>]... <segment name>"));
     }
     let members: Vec<&Group> = groups.iter().filter(|g| g.name == name).collect();
     if members.is_empty() {
@@ -694,10 +679,17 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
 }
 
 /// Ask for the types of a watch's query on the interfaces of the named
-/// segment: the event loop runs the rounds, while the watch goes on.
+/// segment, as any question is asked: an interface asks it as it is set to
+/// (`ForwardQuestions=`), all of them, those it has not asked before, or
+/// none.
 fn ask_for_types(groups: &[Group], name: &str, kinds: &[String]) {
+    let questions: Vec<Question> =
+        kinds.iter().map(|kind| Question { name: kind.clone(), qtype: rtype::PTR, class: 1, unicast_response: false }).collect();
     for seg in links_of(groups, name) {
-        seg.query_types(kinds);
+        // Failing to send is no matter: what is asked again is asked as is set.
+        if let Err(e) = seg.query_question(&questions) {
+            eprintln!("{}: asking for {} failed: {e:#}", seg.interface(), kinds.join(", "));
+        }
     }
 }
 

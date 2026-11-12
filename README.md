@@ -283,11 +283,13 @@ Once found, a device stays listed as long as it keeps answering, and plain
 
 **Reacting as devices appear.** `watch` streams changes, so a script need not
 poll. With `--query` it starts with the devices of the type already known, and
-`--interval` asks for the type again that often, to find one switched on
-later. For example, configure each Shelly plug once as it is found:
+asks for the type as any question is asked on an interface (`ForwardQuestions=`
+in `mdnsd.conf(5)`): by default once, so a type asked for before is not asked
+for again, and what answered it is known already. For example, configure each
+Shelly plug once as it is found:
 
 ```sh
-mdnsctl --json watch --query _shelly._tcp --interval 1min lan |
+mdnsctl --json watch --query _shelly._tcp lan |
 jq -r --unbuffered 'select(.event != "removed") | .device.addresses[0] // empty' |
 while read -r ip; do configure-plug "$ip"; done
 ```
@@ -301,7 +303,7 @@ instead, and `mdnsctl` stays behind in the background to run a script of yours
 for each change:
 
 ```sh
-$ mdnsctl subscribe --query _shelly._tcp --interval 1min --log /var/log/plugs.log lan -- /usr/local/bin/configure-plug
+$ mdnsctl subscribe --query _shelly._tcp --log /var/log/plugs.log lan -- /usr/local/bin/configure-plug
 48213
 ```
 
