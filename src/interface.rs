@@ -26,10 +26,8 @@ use crate::time::Instant;
 use anyhow::{anyhow, bail, Result};
 
 use crate::config::{Advertise, AdvertiseConfig};
-use crate::device::{
-    is_type, responses, service_ttl, Advertised, Device, ServiceParts, Shared,
-    DEFAULT_MAX_PACKET, HOST_TTL, MIN_REFLECT_TTL, OTHER_TTL,
-};
+use crate::device::{is_type, Advertised, Device, ServiceParts, Shared, HOST_TTL, OTHER_TTL};
+use crate::message::{self, responses, service_ttl, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
 use crate::addr::{family_of, is_link_local, Family, Prefix};
 use crate::listener::{Link, MDNS_PORT};
 use crate::codec::{Message, Question, Record};
@@ -675,7 +673,7 @@ impl State {
     /// and put the events out.
     fn report(&mut self, mut touched: Touched, now: Instant) {
         for (ll, device) in core::mem::take(&mut touched.nudges) {
-            nudge(&self.link, ll, &Device::refresh_queries(core::slice::from_ref(&device), self.max_packet));
+            nudge(&self.link, ll, &message::refresh_queries(core::slice::from_ref(&device), self.max_packet));
         }
         let names = touched.names(&self.tracker.discovered);
         let events = touched.events(&self.tracker.discovered);
@@ -885,7 +883,7 @@ impl State {
         let old = m.shown.as_ref().zip(old_device.as_deref()).map(|(s, device)| Advertised { device, how: &s.how, host_ttl: s.host_ttl() });
         let new = want.as_ref().zip(new_device.as_deref()).map(|(s, device)| Advertised { device, how: &s.how, host_ttl: s.host_ttl() });
         let host_here = self.tracker.discovered.contains_host(key);
-        let records = Device::transition(old, new, &|instance| self.is_local(instance), host_here);
+        let records = message::transition(old, new, &|instance| self.is_local(instance), host_here);
         drop((old_device, new_device));
         let sent = !records.is_empty();
         if sent {
@@ -999,27 +997,27 @@ impl Interface {
     /// How long a device is kept, at least, after it was last heard from. A
     /// device lives for the longest TTL it announced, but never for less than
     /// this, so that a device that announces tiny TTLs is not dropped between
-    /// two of the daemon's checks. The default is [`DEFAULT_MIN_LIFETIME`].
+    /// two of the daemon's checks. The default is [`DEFAULT_MIN_LIFETIME`](crate::config::DEFAULT_MIN_LIFETIME).
     /// Applies to what is heard from now on.
     pub fn set_min_lifetime(&self, min_lifetime: Duration) {
         self.state.borrow_mut().tracker.min_lifetime = min_lifetime;
     }
 
     /// How many addresses of a family a discovered device is kept with, at
-    /// most: more are not taken. The default is [`DEFAULT_MAX_ADDRS`].
+    /// most: more are not taken. The default is [`DEFAULT_MAX_ADDRS`](crate::config::DEFAULT_MAX_ADDRS).
     /// Applies to what is heard from now on.
     pub fn set_max_addrs(&self, max_addrs: usize) {
         self.state.borrow_mut().tracker.max_addrs = max_addrs.max(1);
     }
 
     /// How many devices it remembers, at most: a host beyond that is not
-    /// learned of. The default is [`DEFAULT_MAX_DEVICES`].
+    /// learned of. The default is [`DEFAULT_MAX_DEVICES`](crate::config::DEFAULT_MAX_DEVICES).
     pub fn set_max_devices(&self, max_devices: usize) {
         self.state.borrow_mut().tracker.max_devices = max_devices.max(1);
     }
 
     /// How many services a device is kept with, at most: more are not taken.
-    /// The default is [`DEFAULT_MAX_SERVICES`].
+    /// The default is [`DEFAULT_MAX_SERVICES`](crate::config::DEFAULT_MAX_SERVICES).
     pub fn set_max_services(&self, max_services: usize) {
         self.state.borrow_mut().tracker.max_services = max_services.max(1);
     }
@@ -1426,7 +1424,7 @@ impl Interface {
     /// has not had a full announcement for 80% of its TTL; and try again
     /// what failed to send. A failed send
     /// is retried after [`ANNOUNCE_RETRY`]; the first error is returned after
-    /// every device was tried. Run by [`Interface::schedule`] when due.
+    /// every device was tried. Run by [`Interface::upkeep`] when due.
     pub fn reannounce(&self, now: Instant) -> Result<()> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
@@ -1500,7 +1498,7 @@ impl Interface {
             .zip(&borrowed)
             .map(|((_, shown), device)| Advertised { device, how: &shown.how, host_ttl: shown.host_ttl() })
             .collect();
-        let Some((msgs, answered)) = Device::query_response(&devices, query, legacy, state.max_packet) else {
+        let Some((msgs, answered)) = message::query_response(&devices, query, legacy, state.max_packet) else {
             return Ok(());
         };
         for msg in &msgs {
@@ -1543,7 +1541,7 @@ impl Interface {
             }
         }
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
-        ask(&state.link, &Device::forward_queries(fresh, known, state.max_packet))
+        ask(&state.link, &message::forward_queries(fresh, known, state.max_packet))
     }
 
     // Fed by the receive loops and the timer.
@@ -1766,7 +1764,7 @@ impl Interface {
 
         let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
         let types = state.tracker.types.iter().chain(&state.probe_types).cloned().collect();
-        ask(&state.link, &Device::probe_queries(&devices, &types, state.max_packet))
+        ask(&state.link, &message::probe_queries(&devices, &types, state.max_packet))
     }
 
     fn query_types_round(&self, kinds: &[String]) -> Result<usize> {
@@ -1783,7 +1781,7 @@ impl Interface {
         let now = Instant::now();
         let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
-        ask(&state.link, &Device::type_queries(&devices, kinds, known, state.max_packet))
+        ask(&state.link, &message::type_queries(&devices, kinds, known, state.max_packet))
     }
 
     /// Ask the devices that are about to expire to answer again, so that a
@@ -1799,7 +1797,7 @@ impl Interface {
     /// `before` (at least five seconds) until it expires. Devices known only by
     /// the address they were heard from have nothing to ask for and are left
     /// alone, and so is one whose time has already run out. Run by
-    /// [`Interface::schedule`] when due, after [`Interface::expire`]; returns how
+    /// [`Interface::upkeep`] when due, after [`Interface::expire`]; returns how
     /// many questions were sent.
     pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
         let mut guard = self.state.borrow_mut();
@@ -1829,13 +1827,13 @@ impl Interface {
             let device = entry.device.snapshot();
             discovered.edit(id, |entry| entry.refreshed = Some(now));
             let direct = direct_address(&device, link).filter(|_| !retry);
-            let queries = Device::refresh_queries(core::slice::from_ref(&device), *max_packet);
+            let queries = message::refresh_queries(core::slice::from_ref(&device), *max_packet);
             match direct {
                 Some(addr) if ask_at(link, addr, &queries) => asked += queries.iter().map(|q| q.questions.len()).sum::<usize>(),
                 _ => asking.push(device),
             }
         }
-        Ok(asked + ask(link, &Device::refresh_queries(&asking, *max_packet))?)
+        Ok(asked + ask(link, &message::refresh_queries(&asking, *max_packet))?)
     }
 
     /// Drop devices whose lifetime has run out as of `now`.

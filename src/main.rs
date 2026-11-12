@@ -23,6 +23,7 @@ mod segment;
 mod interface;
 mod signal;
 mod listener;
+mod message;
 mod table;
 mod time;
 mod tracker;

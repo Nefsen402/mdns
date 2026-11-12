@@ -84,7 +84,7 @@ const MAX_MIN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// The default for how long a device is kept at least after it was last heard
 /// from, whatever TTLs it announced: a minute, so that a device that announces a
 /// TTL of a second, as a buggy one may, is not asked about every few seconds. See
-/// [`Segment::set_min_lifetime`].
+/// `Interface::set_min_lifetime`.
 pub const DEFAULT_MIN_LIFETIME: Duration = Duration::from_secs(60);
 
 /// The default for how many addresses of a family a device is kept with:

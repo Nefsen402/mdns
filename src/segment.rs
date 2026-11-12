@@ -38,7 +38,7 @@ const MAX_NOTICES: usize = 4096;
 const RETRY: Duration = Duration::from_secs(5);
 
 /// A change to a device discovered on one of a segment's interfaces, as
-/// [`Interface::watch`] delivers it.
+/// [`Segment::take_notices`] delivers it.
 #[derive(Clone, Debug)]
 pub struct Notice {
     /// The interface the device was discovered on.
@@ -100,8 +100,8 @@ struct Failed {
 
 impl Segment {
     /// Start reflecting between `interfaces`, which must be on different
-    /// interfaces, and may be none yet: [`add`](Interface::add) and
-    /// [`remove`](Interface::remove) say what comes and goes. Devices already
+    /// interfaces, and may be none yet: [`add`](Segment::add) and
+    /// [`remove`](Segment::remove) say what comes and goes. Devices already
     /// discovered are reflected before this returns.
     ///
     /// Where segments share an interface and more than one wants a hostname
@@ -120,7 +120,7 @@ impl Segment {
         Self::with_options(segments, untrusted, Forward::default(), Advertise::default(), ReflectedWhen::default(), None)
     }
 
-    /// Like [`with_untrusted`](Interface::with_untrusted), putting the
+    /// Like [`with_untrusted`](Segment::with_untrusted), putting the
     /// questions asked on each interface to the others as `forward` says,
     /// reflecting as much of a device as `advertise` says, reflecting the
     /// devices that have what `when` asks for, and announcing what it reflects with the address TTL
@@ -423,7 +423,7 @@ impl Inner {
 
     /// Show `device`, one of `from`, on the other interfaces, those that are
     /// announced anything, or only on `only`: as it is to be shown there
-    /// ([`Device::reflectable`]), or withdraw it if it is not to be, or has
+    /// ([`Device::reflectable`](crate::device::Device::reflectable)), or withdraw it if it is not to be, or has
     /// gone (`gone`). It is the one device that every interface shows, which is
     /// as it is now; the interfaces are told when it changes, to look again.
     ///

@@ -27,7 +27,7 @@ fn interface(name: &str) -> Interface {
     seg
 }
 
-use crate::device::{record, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
+use crate::message::{record, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
 use crate::codec::{self, rtype, Header};
 use crate::addr::prefix;
 use crate::listener::Link;
