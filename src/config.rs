@@ -225,10 +225,6 @@ pub struct SegmentConfig {
     /// are announced to the others, but not the others' to them. Each is one
     /// of `interfaces` or a name one of them matches.
     pub untrusted: Vec<String>,
-    /// How often to probe its interfaces for devices: `None` follows the
-    /// `ProbeInterval=` of each interface, and `Some(None)` is off for this
-    /// segment.
-    pub probe_interval: Option<Option<Duration>>,
     /// Which questions asked on one of its interfaces are put to the others.
     pub forward: Forward,
     /// What of a device is reflected with it: which of the addresses it was
@@ -274,7 +270,7 @@ struct InterfaceConfig {
     min_lifetime: Option<Duration>,
     /// `Some(None)` is off.
     refresh_before: Option<Option<Duration>>,
-    /// `None` is off, and so is `Some(None)`.
+    /// `Some(None)` is off.
     probe_interval: Option<Option<Duration>>,
     /// Empty is not set here, and left to the nameless section.
     probe_services: Vec<String>,
@@ -301,9 +297,8 @@ pub struct Interface {
     /// again: [`DEFAULT_REFRESH_BEFORE`] unless set; `None` leaves that to the
     /// periodic probe.
     pub refresh_before: Option<Duration>,
-    /// How often to probe it for devices: as often as the most frequent of the
-    /// segments it is in asks, each its own `ProbeInterval=` or else the
-    /// interface's; `None` if none of them probes.
+    /// How often to probe it for devices: `None` is not by itself, only at
+    /// startup, when it comes up, and on request.
     pub probe_interval: Option<Duration>,
     /// The service types every probe of it browses for, as well as those its
     /// devices have announced, lowercase and under `.local`: devices that only
@@ -402,17 +397,16 @@ impl Config {
 
     /// What is settled for the interface `name`, with every default filled in:
     /// what its `[Interface]` section says, or else the one without a name, or
-    /// else the default; and, from the segments that have it, how often it is
-    /// probed and whether it announces again. An interface that no segment has
+    /// else the default; and, from the segments that have it, whether it
+    /// announces again. An interface that no segment has
     /// has what is set for all of them, and nothing of its segments.
     pub fn interface(&self, name: &str) -> Interface {
         let mut segments = self.segments.iter().filter(|seg| seg.has(name));
-        let own_probe = setting_of(&self.settings, name, None, |i| i.probe_interval);
         Interface {
             name: name.to_string(),
             min_lifetime: setting_of(&self.settings, name, DEFAULT_MIN_LIFETIME, |i| i.min_lifetime),
             refresh_before: setting_of(&self.settings, name, Some(DEFAULT_REFRESH_BEFORE), |i| i.refresh_before),
-            probe_interval: segments.clone().filter_map(|seg| seg.probe_interval.unwrap_or(own_probe)).min(),
+            probe_interval: setting_of(&self.settings, name, None, |i| i.probe_interval),
             probe_services: setting_of(&self.settings, name, Vec::new(), |i| Some(i.probe_services.clone()).filter(|kinds| !kinds.is_empty())),
             max_addrs: setting_of(&self.settings, name, DEFAULT_MAX_ADDRS, |i| i.max_addrs),
             max_devices: setting_of(&self.settings, name, DEFAULT_MAX_DEVICES, |i| i.max_devices),
@@ -506,10 +500,6 @@ impl Config {
                                     .map(String::from),
                             );
                         }
-                    }
-                    ("segment", "probeinterval") => {
-                        let interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
-                        config.segments.last_mut().unwrap().probe_interval = Some(interval);
                     }
                     ("interface", "name") => {
                         settings.last_mut().unwrap().name = Some(value).filter(|v| !v.is_empty());

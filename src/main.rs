@@ -239,8 +239,6 @@ fn describe(interface: &config::Interface) {
         ),
         None => eprintln!("{name}: refreshing devices before they expire is off"),
     }
-    // Each interface is probed as often as the most frequent of its segments
-    // asks.
     match interface.probe_interval {
         Some(interval) => {
             eprintln!("{name}: probing every {}s", interval.as_secs());

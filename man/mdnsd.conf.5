@@ -424,20 +424,6 @@ Independent of
 .B TTL=
 of
 .BR [Advertise] .
-.TP
-.B ProbeInterval=
-Optional.
-How often to probe the interfaces of this segment for devices, in place of the
-.B ProbeInterval=
-of each of its interfaces (see
-.BR [Interface] );
-.B 0
-or
-.B off
-turns it off for this segment.
-Probing is done per interface, so an interface in several segments is probed as
-often as the most frequent of them asks.
-It must be at least 10 seconds.
 .PP
 A segment is a group of interfaces, as many as you like, whose devices are
 reflected between
@@ -667,9 +653,11 @@ end is set to the same.
 .B ProbeInterval=
 Also probe this interface for devices this often, as a time span: browse for
 service types and instances.
-A segment can set its own for its interfaces (see
-.BR [Segment] ).
 Not set by default.
+.B 0
+or
+.B off
+turns it off for an interface that the section without a name sets it for.
 It must be at least 10 seconds.
 This is how a new quiet device that never announces itself is found; without it,
 new devices are found at startup, when they announce themselves (most do when

@@ -692,59 +692,15 @@ fn an_interface_probes_and_refreshes_as_its_own_section_says_or_else_the_one_for
     assert_eq!((refresh("br0"), refresh("media"), refresh("wifi")), (Some(60), Some(60), None));
     assert_eq!(refresh("br0"), Some(60), "an interface with no section of its own has the one for all");
     let elsewhere = c.interface("elsewhere");
-    assert_eq!((elsewhere.name.as_str(), elsewhere.refresh_before, elsewhere.probe_interval), ("elsewhere", Some(Duration::from_secs(60)), None), "one that no segment has is settled all the same");
+    assert_eq!((elsewhere.name.as_str(), elsewhere.refresh_before, elsewhere.probe_interval), ("elsewhere", Some(Duration::from_secs(60)), Some(Duration::from_secs(240))), "one that no segment has is settled all the same");
 }
 
-/// Three segments over br0: one that follows its interfaces', one with its
-/// own interval, and one that turns probing off for itself.
-fn probing(probe: &str) -> Config {
-    Config::parse(&format!(
-        "{probe}
-[Segment]
-Name=default
-Interfaces=br0,lan
-[Segment]
-Name=often
-Interfaces=br0,media
-ProbeInterval=1min
-[Segment]
-Name=quiet
-Interfaces=wifi,guest
-ProbeInterval=off
-"
-    ))
-    .unwrap()
-}
-
+/// An interval is the interface's to set, in no segment: there it is not a
+/// setting at all.
 #[test]
-fn a_segment_probes_as_often_as_it_says_or_else_as_its_interfaces_say() {
-    let c = probing("[Interface]\nProbeInterval=4min");
-    let secs = |iface: &str| c.interface(iface).probe_interval.map(|d| d.as_secs());
-    assert_eq!(c.segments.iter().map(|s| s.probe_interval).collect::<Vec<_>>(), [
-        None,
-        Some(Some(Duration::from_secs(60))),
-        Some(None)
-    ]);
-    assert_eq!(secs("lan"), Some(240), "from [Interface]");
-    assert_eq!(secs("media"), Some(60));
-    assert_eq!(secs("br0"), Some(60), "in two segments: the more frequent one");
-    assert_eq!(secs("wifi"), None, "off for its only segment, whatever [Interface] says");
-    assert_eq!(secs("nonesuch"), None);
-
-    // Without a setting of the interface, only the segment that asks is probed.
-    let c = probing("");
-    assert_eq!(c.interface("lan").probe_interval, None);
-    assert_eq!(c.interface("br0").probe_interval, Some(Duration::from_secs(60)));
-}
-
-#[test]
-fn a_segment_probe_interval_is_checked_like_the_global_one() {
-    let with = |v: &str| error_of(&format!("[Segment]\nName=x\nInterfaces=a\nProbeInterval={v}\n"));
-    assert!(with("5s").contains("line 4") && with("5s").contains("ProbeInterval= must be at least 10 seconds"));
-    assert!(with("soon").contains("invalid ProbeInterval"));
-    // The last one counts, and 0 is off.
-    let c = Config::parse("[Segment]\nName=x\nInterfaces=a\nProbeInterval=1min\nProbeInterval=0\n").unwrap();
-    assert_eq!(c.segments[0].probe_interval, Some(None));
+fn a_segment_has_no_probe_interval() {
+    let err = error_of("[Segment]\nName=x\nInterfaces=a\nProbeInterval=1min\n");
+    assert!(err.contains("line 4") && err.contains("unknown setting"), "{err}");
 }
 
 #[test]
