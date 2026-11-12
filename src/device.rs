@@ -1,6 +1,6 @@
-//! What is known about a device on a segment: its hostname, addresses and
-//! services. Kept by [`Segment`](crate::segment::Segment), and announced on
-//! other segments by the [`Reflector`](crate::reflector::Reflector).
+//! What is known about a device on an interface: its hostname, addresses and
+//! services. Kept by [`Interface`](crate::interface::Interface), and announced on
+//! other interfaces by the [`Reflector`](crate::reflector::Reflector).
 //!
 //! A response is read into one [`Report`] per host it describes, which a
 //! [`Device`] then takes in with [`Device::learn`]; a device is turned back
@@ -74,7 +74,7 @@ const SERVICE_ENUMERATION: &str = "_services._dns-sd._udp.local";
 const MAX_REVERSE: usize = 8;
 
 /// A reflected device is never announced for less than this, however short a
-/// TTL it announced itself with: where a segment announces again, it is at 80%
+/// TTL it announced itself with: where an interface announces again, it is at 80%
 /// of its TTL, and a few seconds would be a flood.
 pub const MIN_REFLECT_TTL: u32 = 10;
 
@@ -333,7 +333,7 @@ impl Service {
     }
 }
 
-/// A device on a segment. Once it has announced a hostname it is known by
+/// A device on an interface. Once it has announced a hostname it is known by
 /// that; until then only by the address it was heard from.
 ///
 /// Its addresses are of both families, whichever it was heard over: mDNS
@@ -346,7 +346,7 @@ pub struct Device {
     /// (IPv4, or global or ULA IPv6: a device often has both), then
     /// link-local ones, which only mean something on the link it was heard
     /// on; IPv4 before IPv6. At most [`DEFAULT_MAX_ADDRS`] of a family, unless
-    /// the segment keeps more. [`Device::addrs`] has them as plain IPs.
+    /// the interface keeps more. [`Device::addrs`] has them as plain IPs.
     pub addresses: Box<[Address]>,
     /// Those it learned of are in order of their instance names, ignoring
     /// case: names that differ only in case are one and the same.
@@ -389,7 +389,7 @@ impl PartialEq for Advertised<'_> {
 
 impl Eq for Advertised<'_> {}
 
-/// A device held once, however many segments show it: it is changed where it
+/// A device held once, however many interfaces show it: it is changed where it
 /// is heard, and those that show it see the change without being told. They
 /// are told of what changed (an [`Event`](crate::tracker::Event)) when it is
 /// time to do something about it. Two are the same device if they are the same
@@ -882,7 +882,7 @@ impl Device {
 
     /// This device together with `other`, of the same host: what either has,
     /// whichever is which. It is what is announced of a device that more than
-    /// one reflector reflects from the same segment, each as it is to show it
+    /// one reflector reflects from the same interface, each as it is to show it
     /// (`how`, and `other_how` for `other`). The addresses it has are those
     /// advertised of either, which is all there is of the two.
     pub fn union(&self, how: &Advertise, other: &Device, other_how: &Advertise) -> Device {
@@ -1226,7 +1226,7 @@ impl Device {
         records
     }
 
-    /// The records that take a segment from announcing this device to
+    /// The records that take an interface from announcing this device to
     /// announcing `new` under the same hostname: all of `new`, and goodbyes
     /// for the services and addresses of this one that `new` does not have.
     pub fn replacement(&self, how: &Advertise, new: Advertised, host_ttl: u32, other_ttl: u32) -> Vec<Record> {
@@ -1304,7 +1304,7 @@ impl Device {
         records
     }
 
-    /// The queries that look for devices on a segment where `devices` are
+    /// The queries that look for devices on an interface where `devices` are
     /// known and `types` were said to be offered: what types there are, the
     /// instances of each, the subtypes clients browse by (they are not sent
     /// when their type is browsed), where each instance not yet resolved is,
@@ -1339,7 +1339,7 @@ impl Device {
         qs.into_queries(limit)
     }
 
-    /// Queries that ask `questions`, put on another segment, as this
+    /// Queries that ask `questions`, put on another interface, as this
     /// daemon's own: each once, a few to a packet, and for a multicast answer
     /// whatever the asker wanted, so that it is heard and can be reflected.
     /// Each packet carries the `known` answers to its questions, as many as
@@ -1426,12 +1426,12 @@ impl Device {
         qs.into_queries(limit)
     }
 
-    /// The records that take a segment from announcing `old` to announcing
+    /// The records that take an interface from announcing `old` to announcing
     /// `new` under one hostname, either of them nothing, each announced with
     /// the TTL of its address in its `ttl`: all of `new`, and goodbyes for
     /// what of `old` it does not have.
     ///
-    /// What devices on the segment have themselves is theirs. No goodbye is
+    /// What devices on the interface have themselves is theirs. No goodbye is
     /// sent for a service whose instance name one has (`local` says),
     /// nor, if one has the hostname (`host_here`), for the NSEC, which may say
     /// just what theirs does. And no goodbye carries the cache-flush bit,

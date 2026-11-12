@@ -6,7 +6,7 @@ use super::*;
 use crate::listener::Link;
 use crate::codec::{Header, Message, RData, Record};
 use crate::reflector::Reflector;
-use crate::segment::Segment;
+use crate::interface::Interface;
 
 fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
@@ -52,17 +52,17 @@ fn fd(socket: impl std::os::fd::IntoRawFd) -> OwnedFd {
     unsafe { rustix::fd::FromRawFd::from_raw_fd(socket.into_raw_fd()) }
 }
 
-/// A group of one segment on `lo`, which can send, and where its questions go.
-fn group_on_lo() -> (Vec<Group>, Segment, UdpSocket) {
+/// A group of one interface on `lo`, which can send, and where its questions go.
+fn group_on_lo() -> (Vec<Group>, Interface, UdpSocket) {
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-    let seg = Segment::new(listener::LOOPBACK);
+    let seg = Interface::new(listener::LOOPBACK);
     seg.attach(Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap()));
     let reflector = Reflector::new(vec![seg.clone()]).unwrap();
     (vec![Group { name: "lan".into(), reflector }], seg, rx)
 }
 
-fn hear(seg: &Segment, from: &str, host: &str, addrs: &[&str]) {
+fn hear(seg: &Interface, from: &str, host: &str, addrs: &[&str]) {
     let answers = addrs
         .iter()
         .map(|a| {
@@ -245,7 +245,7 @@ fn a_name_is_only_answered_for_on_the_interfaces_it_is_advertised_on() {
     let (groups, _seg, _rx) = group_on_lo();
     let (mut h, path) = Harness::advertising("where", groups, &[advertise("pc.local", &[listener::LOOPBACK]), advertise("away.local", &["eth9"])], dual_stack);
     assert!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 pc.local\n").starts_with("+ "));
-    // Of an interface the segment does not have, nothing: it is asked for, and not found.
+    // Of an interface the group does not have, nothing: it is asked for, and not found.
     assert_eq!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 away.local\n"), "-15 Timeout reached\n");
 }
 

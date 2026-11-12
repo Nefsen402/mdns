@@ -27,8 +27,8 @@ use crate::device::EditService;
 
 /// A segment that keeps a device at least five minutes, which is what these
 /// tests of what is listed assume; the default keeps one for its TTL.
-fn segment(name: &str) -> Segment {
-    let seg = Segment::new(name);
+fn segment(name: &str) -> Interface {
+    let seg = Interface::new(name);
     seg.set_min_lifetime(Duration::from_secs(300));
     seg
 }
@@ -42,15 +42,15 @@ use crate::codec::{Header, Message, RData, Record};
 use crate::reflector::{deliver_made, Reflector};
 
 /// A segment that is used over `family`, to somewhere nobody listens.
-fn linked(name: &str, family: Family) -> Segment {
+fn linked(name: &str, family: Family) -> Interface {
     let seg = segment(name);
     let socket = fd(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
     seg.attach(Link::to(family, socket, "127.0.0.1:9".parse().unwrap()));
     seg
 }
 
-fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Segment>) {
-    let segs: Vec<Segment> = interfaces.iter().map(|i| linked(i, family)).collect();
+fn group(name: &str, family: Family, interfaces: &[&str]) -> (Group, Vec<Interface>) {
+    let segs: Vec<Interface> = interfaces.iter().map(|i| linked(i, family)).collect();
     let reflector = Reflector::new(segs.clone()).unwrap();
     (Group { name: name.into(), reflector }, segs)
 }
@@ -64,7 +64,7 @@ fn rec(name: &str, data: RData) -> Record {
 }
 
 /// Make `seg` hear a full announcement from `from`.
-fn announce(seg: &Segment, from: &str, host: &str, instance: &str) {
+fn announce(seg: &Interface, from: &str, host: &str, instance: &str) {
     let addr: Ipv4Addr = from.parse().unwrap();
     let msg = Message {
         header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
@@ -143,7 +143,7 @@ fn lists_segments_merging_families() {
 
 #[test]
 fn segments_say_which_interfaces_are_untrusted() {
-    let segs: Vec<Segment> = ["br0", "wifi"].iter().map(|i| linked(i, Family::V4)).collect();
+    let segs: Vec<Interface> = ["br0", "wifi"].iter().map(|i| linked(i, Family::V4)).collect();
     let reflector = Reflector::with_untrusted(segs, &["wifi".to_string()]).unwrap();
     let groups = [Group { name: "IoT to br0".into(), reflector }];
     assert_eq!(
@@ -192,7 +192,7 @@ fn reflected_copies_are_not_listed() {
 }
 
 /// This host, with an ssh service, as `[Advertise]` makes it.
-fn advertise_self(seg: &Segment) {
+fn advertise_self(seg: &Interface) {
     let mut pc = Device {
         hostname: Some("pc.local".into()),
         services: vec![crate::device::ServiceParts {
@@ -207,7 +207,7 @@ fn advertise_self(seg: &Segment) {
         ..Device::default()
     };
     pc.add_addrs(&[ip("10.0.0.5")]);
-    seg.add_reflected_ttl(crate::segment::OWN, &crate::device::Shared::new(pc), Duration::from_secs(120)).unwrap();
+    seg.add_reflected_ttl(crate::interface::OWN, &crate::device::Shared::new(pc), Duration::from_secs(120)).unwrap();
 }
 
 /// Nothing is heard of this host, so it is listed as it advertises itself,
@@ -545,7 +545,7 @@ fn watch_streams_changes_until_the_daemon_stops() {
 }
 
 /// A segment on `interface` that sends to the returned socket.
-fn wired(interface: &str) -> (Segment, std::net::UdpSocket) {
+fn wired(interface: &str) -> (Interface, std::net::UdpSocket) {
     let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
     let seg = segment(interface);

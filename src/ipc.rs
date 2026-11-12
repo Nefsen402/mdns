@@ -105,7 +105,7 @@ use crate::reflector::Notice;
 use crate::device::{is_type, Device, Origin};
 use crate::runtime::Why;
 use crate::poll;
-use crate::segment::{Event, Probed, Segment};
+use crate::interface::{Event, Probed, Interface};
 use crate::listener::Family;
 use crate::Group;
 
@@ -643,8 +643,8 @@ fn service_type(name: &str) -> Result<String, Value> {
 
 /// The interfaces of the named segment, or of all segments if `name` is
 /// empty, each once.
-pub fn links_of(groups: &[Group], name: &str) -> Vec<Segment> {
-    let mut links: Vec<Segment> = Vec::new();
+pub fn links_of(groups: &[Group], name: &str) -> Vec<Interface> {
+    let mut links: Vec<Interface> = Vec::new();
     for seg in groups.iter().filter(|g| name.is_empty() || g.name == name).flat_map(|g| g.reflector.segments()) {
         if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);
@@ -903,7 +903,7 @@ fn timer_list(groups: &[Group]) -> Value {
 
     // Each link's upkeep, and what it is waiting to do. A link that is in
     // several segments is listed once.
-    let mut links: Vec<Segment> = Vec::new();
+    let mut links: Vec<Interface> = Vec::new();
     for seg in groups.iter().flat_map(|g| g.reflector.segments()) {
         if !links.iter().any(|l| l.interface() == seg.interface()) {
             links.push(seg);

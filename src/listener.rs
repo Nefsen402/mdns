@@ -1,6 +1,6 @@
 //! What an interface hears and says with.
 //!
-//! A [`Link`] is all that a segment knows of how its interface is reached: it
+//! A [`Link`] is all that an [`Interface`](crate::interface::Interface) knows of how it is reached: it
 //! listens over every family the interface is used over, and what is said goes
 //! to everyone on it, which is each family's group or, for a tunnel that cannot
 //! carry multicast, each of its peers.
@@ -94,7 +94,7 @@ pub fn missing(interface: &config::Interface) -> Vec<Family> {
     families(interface).into_iter().filter(|&family| interface.peers.is_empty() && !joinable(&interface.name, family)).collect()
 }
 
-/// What an interface hears and says with, and all that a segment knows of how
+/// What an interface hears and says with, and all that an interface knows of how
 /// it is reached: it listens over every family it is used over, and what it
 /// says goes to everyone on the link, which is each family's group.
 #[derive(Default)]
@@ -238,7 +238,7 @@ fn family_of(addr: IpAddr) -> Family {
     if addr.is_ipv4() { Family::V4 } else { Family::V6 }
 }
 
-/// What a segment sends with: a socket, and, where one socket is shared by
+/// What an interface sends with: a socket, and, where one socket is shared by
 /// every interface, the interface a datagram is to go out of.
 pub struct Sender {
     fd: OwnedFd,

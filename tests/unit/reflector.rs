@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use super::*;
 use crate::config::{Advertise, Neighbours};
 use crate::device::Device;
-use crate::segment::OWN;
+use crate::interface::OWN;
 
 /// `socket` as the segment takes a socket.
 fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
@@ -26,20 +26,20 @@ fn ll6(d: &Device) -> Option<IpAddr> {
 }
 
 /// A segment whose "multicast group" is a local socket we can read.
-fn wired(name: &str) -> (Segment, UdpSocket) {
+fn wired(name: &str) -> (Interface, UdpSocket) {
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let seg = Segment::new(name);
+    let seg = Interface::new(name);
     seg.attach(Link::to(Family::V4, fd(tx), rx.local_addr().unwrap()));
     (seg, rx)
 }
 
 /// Like [`wired`], for an IPv6 segment.
-fn wired_v6(name: &str) -> (Segment, UdpSocket) {
+fn wired_v6(name: &str) -> (Interface, UdpSocket) {
     let (_, rx) = wired(name);
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let seg = Segment::new(name);
+    let seg = Interface::new(name);
     seg.attach(Link::to(Family::V6, fd(tx), rx.local_addr().unwrap()));
     (seg, rx)
 }
@@ -105,7 +105,7 @@ fn rec_ttl(name: &str, data: RData, ttl: u32) -> Record {
 #[test]
 #[ignore = "a measurement, not a check"]
 fn reflecting_one_more_device_costs() {
-    crate::segment::set_checking(false);
+    crate::interface::set_checking(false);
     println!("{:>8} {:>14} {:>16}", "devices", "one more us", "its goodbye us");
     for n in [10usize, 100, 400, 1000, 4000] {
         let (a, _arx) = wired("a");
@@ -134,12 +134,12 @@ fn reflecting_one_more_device_costs() {
     }
 }
 
-fn announce(seg: &Segment, from: &str, host: &str, instances: &[&str]) {
+fn announce(seg: &Interface, from: &str, host: &str, instances: &[&str]) {
     announce_ttl(seg, from, host, instances, 120, 120);
 }
 
 /// Like [`announce`], with the TTLs of the address and of the services.
-fn announce_ttl(seg: &Segment, from: &str, host: &str, instances: &[&str], addr_ttl: u32, svc_ttl: u32) {
+fn announce_ttl(seg: &Interface, from: &str, host: &str, instances: &[&str], addr_ttl: u32, svc_ttl: u32) {
     let addr: Ipv4Addr = from.parse().unwrap();
     let mut answers = vec![rec_ttl(host, RData::A(addr), addr_ttl)];
     for i in instances {
@@ -163,7 +163,7 @@ fn announce_ttl(seg: &Segment, from: &str, host: &str, instances: &[&str], addr_
 
 /// Make an IPv6 `seg` hear `host` announcing `addrs` (AAAA records) and one
 /// service, from the link-local address `from`.
-fn announce6(seg: &Segment, from: &str, host: &str, addrs: &[&str], instance: &str) {
+fn announce6(seg: &Interface, from: &str, host: &str, addrs: &[&str], instance: &str) {
     let mut answers: Vec<Record> =
         addrs.iter().map(|a| rec(host, RData::Aaaa(a.parse::<Ipv6Addr>().unwrap()))).collect();
     answers.push(rec("_http._tcp.local", RData::Ptr(format!("{instance}._http._tcp.local"))));
@@ -281,7 +281,7 @@ fn a_device_without_services_is_reflected_only_if_asked_to() {
 
 /// Make `seg` hear `host` at `from` announce a service of each of `services`
 /// (an instance name and a type, such as `_ipp._tcp`).
-fn announce_kinds(seg: &Segment, from: &str, host: &str, services: &[(&str, &str)]) {
+fn announce_kinds(seg: &Interface, from: &str, host: &str, services: &[(&str, &str)]) {
     let addr: Ipv4Addr = from.parse().unwrap();
     let mut answers = vec![rec_ttl(host, RData::A(addr), 120)];
     for (instance, kind) in services {
@@ -405,7 +405,7 @@ fn hostname_clash_goes_to_lowest_segment_then_fails_over() {
 }
 
 /// What each segment announces, by hostname.
-fn announced_on(seg: &Segment) -> Vec<String> {
+fn announced_on(seg: &Interface) -> Vec<String> {
     let mut names: Vec<String> = seg.reflected_devices().into_iter().filter_map(|d| d.hostname).collect();
     names.sort();
     names
@@ -705,12 +705,12 @@ fn only_services_known_where_they_are_are_reflected() {
 }
 
 /// A client on `seg` asks `name` (type A), from port 5353.
-fn ask(seg: &Segment, client: &str, name: &str) {
+fn ask(seg: &Interface, client: &str, name: &str) {
     ask_type(seg, client, name, rtype::A);
 }
 
 /// Like [`ask`], for records of `qtype`.
-fn ask_type(seg: &Segment, client: &str, name: &str, qtype: u16) {
+fn ask_type(seg: &Interface, client: &str, name: &str, qtype: u16) {
     let msg = Message {
         header: Header { id: 0, response: false, opcode: 0, authoritative: false, truncated: false, rcode: 0 },
         questions: vec![Question { name: name.into(), qtype, class: 1, unicast_response: false }],

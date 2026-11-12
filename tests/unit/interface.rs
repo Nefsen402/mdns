@@ -10,7 +10,7 @@ use crate::device::{addr_of, edit, Origin, META_QUERY};
 use std::collections::BTreeSet;
 use crate::codec::RData;
 
-/// `socket` as the segment takes a socket.
+/// `socket` as the interface takes a socket.
 fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
     use std::os::fd::IntoRawFd;
     // SAFETY: a descriptor just given up by its owner.
@@ -18,11 +18,11 @@ fn fd(socket: std::net::UdpSocket) -> rustix::fd::OwnedFd {
 }
 const FLOOR: Duration = Duration::from_secs(300);
 
-/// A segment that keeps a device at least five minutes, as most of these
+/// An interface that keeps a device at least five minutes, as most of these
 /// tests are of timings that go by a lifetime that long; the default keeps
 /// a device for exactly its TTL.
-fn segment(name: &str) -> Segment {
-    let seg = Segment::new(name);
+fn segment(name: &str) -> Interface {
+    let seg = Interface::new(name);
     seg.set_min_lifetime(FLOOR);
     seg
 }
@@ -131,8 +131,8 @@ fn expire_removes_and_notifies() {
     assert_eq!(rx.try_recv(), Ok(Event::Removed(unnamed("10.0.1.5").into())));
 }
 
-/// A v4 segment whose "multicast group" is a local socket we can read.
-fn wired() -> (Segment, UdpSocket) {
+/// A v4 interface whose "multicast group" is a local socket we can read.
+fn wired() -> (Interface, UdpSocket) {
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -500,11 +500,11 @@ fn broken() -> (UdpSocket, SocketAddr) {
 }
 
 /// Give `seg` a working way to send again, to `rx`.
-fn repair(seg: &Segment, rx: &UdpSocket) {
+fn repair(seg: &Interface, rx: &UdpSocket) {
     seg.attach(Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx.local_addr().unwrap()));
 }
 
-fn retry_of(seg: &Segment, host: &str) -> Option<Instant> {
+fn retry_of(seg: &Interface, host: &str) -> Option<Instant> {
     seg.state.borrow_mut().hosts[host].retry
 }
 
@@ -671,7 +671,7 @@ fn an_announcement_too_big_for_the_mtu_goes_in_packets_that_fit() {
     assert_eq!(records, expected, "all of it, once");
 }
 
-/// Whatever the segment sends, it keeps within its interface's MTU:
+/// Whatever the interface sends, it keeps within its interface's MTU:
 /// replies, probes, refreshes and questions asked on another's behalf.
 #[test]
 fn everything_sent_keeps_within_the_mtu() {
@@ -750,7 +750,7 @@ const MAC: [u8; 6] = [0x04, 0x09, 0x86, 0x43, 0xe3, 0xf6];
 fn a_device_is_given_the_addresses_the_neighbour_table_has_for_it() {
     let seg = segment("test");
     let events = seg.subscribe();
-    let learned = |seg: &Segment| -> Vec<IpAddr> {
+    let learned = |seg: &Interface| -> Vec<IpAddr> {
         let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         d.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip).collect()
     };
@@ -789,7 +789,7 @@ fn a_device_is_given_the_addresses_the_neighbour_table_has_for_it() {
 
 /// A device that announced only IPv4 is found in the table by that, and
 /// given its IPv6 addresses: which of them are reflected is for each
-/// segment to say.
+/// interface to say.
 #[test]
 fn a_device_is_found_in_the_neighbour_table_by_any_address_it_announced() {
     let seg = segment("test");
@@ -845,7 +845,7 @@ fn a_service_without_a_host_is_not_given_to_a_device_whose_address_was_guessed()
         srv("Speakers._raop._tcp.local", 7000, "speakers.local"),
         ptr("_ssh._tcp.local", "router._ssh._tcp.local"),
     ]);
-    let speakers = |seg: &Segment| seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("speakers.local")).unwrap();
+    let speakers = |seg: &Interface| seg.devices().into_iter().find(|d| d.hostname.as_deref() == Some("speakers.local")).unwrap();
     assert!(speakers(&seg).services.iter().all(|s| s.kind() == "_raop._tcp.local"), "{:?}", speakers(&seg).services);
     // Held where it was heard from, by address, until it says whose it is.
     let by_address = seg.devices().into_iter().find(|d| d.hostname.is_none() && d.service("router._ssh._tcp.local").is_some());
@@ -862,7 +862,7 @@ fn a_service_without_a_host_is_not_given_to_a_device_whose_address_was_guessed()
 #[test]
 fn only_neighbour_addresses_on_the_interfaces_networks_are_learned() {
     let seg = segment("test");
-    let learned = |seg: &Segment| -> Vec<IpAddr> {
+    let learned = |seg: &Interface| -> Vec<IpAddr> {
         let d = seg.devices().into_iter().find(|d| d.hostname.is_some()).unwrap();
         d.addresses.iter().filter(|a| a.origin == Origin::Neighbour).map(|a| a.ip).collect()
     };
@@ -920,7 +920,7 @@ fn a_device_unknown_to_the_neighbour_table_is_nudged_once() {
     let rx = UdpSocket::bind("[::1]:0").unwrap();
     let seg = segment("test");
     seg.attach(Link::to(Family::V6, fd(UdpSocket::bind("[::1]:0").unwrap()), rx.local_addr().unwrap()));
-    let nudged = |seg: &Segment| {
+    let nudged = |seg: &Interface| {
         let state = seg.state.borrow();
         state.tracker.discovered.get(host_id(&state, "speakers.local")).nudged
     };
@@ -939,7 +939,7 @@ fn a_device_unknown_to_the_neighbour_table_is_nudged_once() {
 /// One sender may describe only so many hosts: a sleep proxy speaks for
 /// several, but not for thousands. Others are not held back, and the
 /// hosts it described are still kept up to date.
-/// However many addresses a device announces, a segment keeps no more
+/// However many addresses a device announces, an interface keeps no more
 /// of a family than it is set to.
 #[test]
 fn a_segment_keeps_as_many_addresses_as_it_is_set_to() {
@@ -1130,7 +1130,7 @@ fn goodbyes_over_both_families_leave_in_either_order() {
     }
 }
 
-/// When the interface goes, the segment lets go of its sockets and of the
+/// When the interface goes, the interface lets go of its sockets and of the
 /// devices on it, and keeps what it announces; when it is back, that is
 /// announced again.
 #[test]
@@ -1206,14 +1206,14 @@ fn asking(questions: &[Question], proposed: Vec<Record>) -> Vec<u8> {
     .unwrap()
 }
 
-/// The events of a segment, taken as a test asks for them, the way a
+/// The events of an interface, taken as a test asks for them, the way a
 /// channel's receiver gives them.
 struct Events<'a> {
-    seg: &'a Segment,
+    seg: &'a Interface,
     taken: RefCell<VecDeque<Event>>,
 }
 
-impl Segment {
+impl Interface {
     fn subscribe(&self) -> Events<'_> {
         self.take_events();
         Events { seg: self, taken: RefCell::default() }
@@ -1244,7 +1244,7 @@ fn passed_on(events: &Events) -> Vec<Vec<Asked>> {
 }
 
 /// Pretend the last multicast of every reflected device was `secs` ago.
-fn age(seg: &Segment, secs: u64) {
+fn age(seg: &Interface, secs: u64) {
     let mut state = seg.state.borrow_mut();
     for host in state.hosts.hosts_all() {
         state.hosts.edit(&host, |m| {
@@ -1415,14 +1415,14 @@ fn a_segment_that_reannounces_keeps_unchanged_devices_up_at_80_percent_of_their_
 
 /// Send the second announcement of what `seg` last announced anew, a
 /// second after, as heard on `rx`.
-fn repeat(seg: &Segment, rx: &UdpSocket) -> Message {
+fn repeat(seg: &Interface, rx: &UdpSocket) -> Message {
     let at = seg.state.borrow_mut().hosts["tv.local"].announced + ANNOUNCE_REPEAT;
     seg.reannounce(at).unwrap();
     recv(rx).expect("announced a second time")
 }
 
 /// Make `seg` hear a response carrying `records` from `from`.
-fn hear(seg: &Segment, from: &str, records: Vec<Record>) {
+fn hear(seg: &Interface, from: &str, records: Vec<Record>) {
     let msg = Message {
         header: Header { id: 0, response: true, opcode: 0, authoritative: true, truncated: false, rcode: 0 },
         questions: vec![],
@@ -1502,7 +1502,7 @@ fn probe_browses_then_resolves() {
 /// Run a probe (`kinds` `None`) or a query for types to its end, as the
 /// event loop would: the upkeep at each time it says it is due. How it
 /// went, and when each round, and its end, came due.
-fn run_probe(seg: &Segment, kinds: Option<&[String]>) -> (Probed, Vec<Instant>) {
+fn run_probe(seg: &Interface, kinds: Option<&[String]>) -> (Probed, Vec<Instant>) {
     let id = seg.begin(kinds.map(<[String]>::to_vec), "asked for", true);
     let mut rounds = Vec::new();
     loop {
@@ -1636,8 +1636,8 @@ fn a_device_without_services_can_be_advertised() {
     assert!(recv(&rx).unwrap().answers.iter().all(|r| r.ttl == 0));
 }
 
-/// A segment over both families, each with a local socket for a group.
-fn wired_both() -> (Segment, UdpSocket, UdpSocket) {
+/// An interface over both families, each with a local socket for a group.
+fn wired_both() -> (Interface, UdpSocket, UdpSocket) {
     let (_, rx4) = wired();
     let (_, rx6) = wired_family(Family::V6);
     let seg = segment("test");
@@ -1700,8 +1700,8 @@ fn a_probe_goes_out_over_both_families() {
     }
 }
 
-/// A segment of `family` whose "multicast group" is a local socket.
-fn wired_family(family: Family) -> (Segment, UdpSocket) {
+/// An interface of `family` whose "multicast group" is a local socket.
+fn wired_family(family: Family) -> (Interface, UdpSocket) {
     let (_, rx) = wired();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
     let seg = segment("test");
@@ -1860,7 +1860,7 @@ fn a_device_with_no_addresses_is_announced_by_its_services() {
 }
 
 /// Records do not belong to the transport they go out on: an IPv4
-/// segment announces a device's IPv6 addresses too, in the same packet.
+/// interface announces a device's IPv6 addresses too, in the same packet.
 #[test]
 fn a_device_is_announced_with_the_addresses_of_both_families() {
     let (seg, rx) = wired();
@@ -2028,7 +2028,7 @@ fn probe_asks_for_the_addresses_of_named_devices_that_have_no_routable_one() {
 /// Pretend the device called `host` was heard from so that it now expires at `at`.
 /// Pretend `host` and its addresses run out at `at`, as hearing from it
 /// would make them.
-fn set_expiry(seg: &Segment, host: &str, at: Instant) {
+fn set_expiry(seg: &Interface, host: &str, at: Instant) {
     let mut state = seg.state.borrow_mut();
     let id = host_id(&state, host);
     state
@@ -2046,7 +2046,7 @@ fn set_expiry(seg: &Segment, host: &str, at: Instant) {
 /// printer.local lives only for the 5 minute floor (all its TTLs are 120);
 /// other.local announces its address and a PTR for 4500 seconds, so it and
 /// its address live 75 minutes.
-fn hear_a_short_and_a_long_lived_device(seg: &Segment) {
+fn hear_a_short_and_a_long_lived_device(seg: &Interface) {
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
     hear(seg, "10.0.1.8", vec![
         Record { ttl: 4500, ..a_record("other.local", "10.0.1.8") },
@@ -2326,7 +2326,7 @@ fn making_room_leaves_the_addresses_a_packet_repeats() {
 }
 
 /// A device whose records all have this TTL, heard on `seg`.
-fn hear_a_device_with_ttl(seg: &Segment, ttl: u32) {
+fn hear_a_device_with_ttl(seg: &Interface, ttl: u32) {
     hear(seg, "10.0.1.30", vec![
         record("d.local".into(), true, ttl, RData::A("10.0.1.30".parse().unwrap())),
         record("D._x._tcp.local".into(), true, ttl, RData::Srv { priority: 0, weight: 0, port: 1, target: "d.local".into() }),
@@ -2335,7 +2335,7 @@ fn hear_a_device_with_ttl(seg: &Segment, ttl: u32) {
 }
 
 /// Is the device still known `secs` after it was heard, once expired as of then?
-fn alive_after(seg: &Segment, secs: u64) -> bool {
+fn alive_after(seg: &Interface, secs: u64) -> bool {
     seg.expire(Instant::now() + Duration::from_secs(secs));
     !seg.devices().is_empty()
 }
@@ -2394,10 +2394,10 @@ fn refresh_follows_the_configured_floor() {
     assert!(recv(&rx).is_some());
 }
 
-// A device of another segment, announced by a handle to it.
+// A device of another interface, announced by a handle to it.
 
-/// `tv.local` with a service, heard on a segment.
-fn tv_on(seg: &Segment) {
+/// `tv.local` with a service, heard on an interface.
+fn tv_on(seg: &Interface) {
     hear(seg, "10.0.1.5", vec![a_record("tv.local", "10.0.1.5"), srv("TV._http._tcp.local", 80, "tv.local")]);
 }
 
@@ -2421,12 +2421,12 @@ fn the_longest_name_and_services_the_configuration_takes_are_announced() {
 }
 
 /// `tv.local` saying goodbye to its address.
-fn tv_leaves(seg: &Segment) {
+fn tv_leaves(seg: &Interface) {
     hear(seg, "10.0.1.5", vec![record("tv.local".into(), true, 0, RData::A(ip("10.0.1.5").to_string().parse().unwrap()))]);
 }
 
-/// Priorities of what is made for a segment, that rank behind the devices of
-/// the segments there are.
+/// Priorities of what is made for an interface, that rank behind the devices of
+/// the interfaces there are.
 const FIRST: u32 = 1_000_000;
 const SECOND: u32 = FIRST + 1;
 
@@ -2440,14 +2440,14 @@ fn reflector(n: usize) -> Rc<Advertise> {
 }
 
 /// The device of `seg` called `host`, as a reflector is given it.
-fn shown(seg: &Segment, host: &str) -> Shared {
+fn shown(seg: &Interface, host: &str) -> Shared {
     let named = |d: &Shared| d.borrow().hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(host));
     seg.shared_devices().into_iter().find(named).expect("it is there")
 }
 
 /// `target` is shown the device of `origin` called `host` as it is now, by
 /// the first reflector.
-fn reflect_of(target: &Segment, origin: &Segment, host: &str) -> Result<bool> {
+fn reflect_of(target: &Interface, origin: &Interface, host: &str) -> Result<bool> {
     target.reflect(origin.priority(), &shown(origin, host), &reflector(0), None)
 }
 
@@ -2477,7 +2477,7 @@ fn a_device_of_another_segment_is_announced_as_it_was_last_shown() {
     assert!(recv(&rx).is_none() || recv(&rx).is_none());
 }
 
-/// What is shown stays until it is withdrawn: the segment does not look at
+/// What is shown stays until it is withdrawn: the interface does not look at
 /// where it came from, which the reflector does.
 #[test]
 fn a_reflected_device_is_withdrawn_with_goodbyes_when_the_reflector_says() {
@@ -2498,7 +2498,7 @@ fn a_reflected_device_is_withdrawn_with_goodbyes_when_the_reflector_says() {
     assert!(!b.remove_reflected(&reflector(0), &tv).unwrap(), "nothing left");
 }
 
-/// Several reflectors may show a device of the same segment, each as it is
+/// Several reflectors may show a device of the same interface, each as it is
 /// to be shown by it: what is announced is what they show together,
 /// whichever came first, and each is taken back on its own.
 #[test]
@@ -2521,7 +2521,7 @@ fn what_two_reflectors_show_of_a_device_of_one_segment_is_announced_together() {
     }
 }
 
-/// A segment taken down withdraws what is announced on it, copies and its own
+/// An interface taken down withdraws what is announced on it, copies and its own
 /// alike, with goodbyes, and says that its devices are gone, so that whoever
 /// shows copies of them elsewhere withdraws them.
 #[test]
@@ -2549,7 +2549,7 @@ fn a_segment_taken_down_withdraws_what_it_announced_and_says_its_devices_are_gon
     assert!(b.state.borrow().hosts.is_empty());
 }
 
-/// A segment that talks to a peer hears it alone, and takes its questions for
+/// An interface that talks to a peer hears it alone, and takes its questions for
 /// mDNS from whatever port it asks.
 #[test]
 fn a_segment_that_talks_to_a_peer_hears_it_alone() {
@@ -2604,13 +2604,13 @@ fn a_device_that_is_renamed_is_withdrawn_under_its_old_name_and_shown_under_the_
     assert!(b.state.borrow().hosts.is_empty());
 }
 
-/// Of devices of one name from different segments, the lowest segment's is
+/// Of devices of one name from different interfaces, the lowest interface's is
 /// announced, whoever shows them, and the next takes over when it goes.
 #[test]
 fn of_one_name_from_two_segments_the_lowest_is_announced_and_the_next_takes_over() {
     let (b, _rx) = wired();
     let (low, high) = (Shared::new(tv("10.0.1.1", &["Low"])), Shared::new(tv("10.0.2.2", &["High"])));
-    // Shown in the order that is not the segments'.
+    // Shown in the order that is not the interfaces'.
     b.reflect(2, &high, &reflector(1), None).unwrap();
     b.reflect(1, &low, &reflector(0), None).unwrap();
     let shown = b.reflected_devices();
@@ -2665,7 +2665,7 @@ fn a_device_without_a_hostname_or_a_ttl_of_zero_is_not_reflected() {
     assert_eq!(b.state.borrow().hosts["tv.local"].host_ttl(), 900);
 }
 
-// What a full segment costs. Not a test: run it with
+// What a full interface costs. Not a test: run it with
 // `cargo test --release scale -- --ignored --nocapture`.
 
 /// Counts the heap the tests hold, for what a device costs in memory.
@@ -2711,15 +2711,15 @@ fn heap() -> (usize, usize) {
     (LIVE_BYTES.load(Relaxed), LIVE_BLOCKS.load(Relaxed))
 }
 
-/// A segment that has heard `n` devices, each from an address of its own
+/// An interface that has heard `n` devices, each from an address of its own
 /// (a sender may describe only so many), with an address that runs out
 /// before the device does, as a host's address does against its services.
-fn crowded(n: usize) -> Segment {
+fn crowded(n: usize) -> Interface {
     crowded_named(n, "host", 1)
 }
 
 /// Like [`crowded`], with hosts called `{prefix}{i}.local`, on 10.`net`.x.y.
-fn crowded_named(n: usize, prefix: &str, net: usize) -> Segment {
+fn crowded_named(n: usize, prefix: &str, net: usize) -> Interface {
     let (seg, _rx) = wired();
     seg.set_refresh_before(Some(Duration::from_secs(30)));
     seg.set_max_devices(n + 1);
@@ -2772,7 +2772,7 @@ fn scale_of_what_a_full_segment_costs() {
         seg.handle(sa("10.0.1.7"), &again).unwrap();
         let handle = micros(500, || seg.handle(sa("10.0.1.7"), &again).unwrap());
 
-        // A question asked on another segment, put to this one with what is known
+        // A question asked on another interface, put to this one with what is known
         // of it as known answers; a different one each time, as it is asked at most
         // once a second.
         let mut asked = 0;
@@ -2812,8 +2812,8 @@ fn scale_of_what_a_full_segment_costs() {
     }
 }
 
-/// What reflecting costs: a segment that has heard `n` devices and is
-/// made to announce `n` more, from other segments, answering queries and
+/// What reflecting costs: an interface that has heard `n` devices and is
+/// made to announce `n` more, from other interfaces, answering queries and
 /// hearing new devices. Run it like the other.
 #[test]
 #[ignore = "a measurement, not a check"]
@@ -2828,7 +2828,7 @@ fn scale_of_what_a_full_segment_costs_to_reflect_with() {
         let seg = crowded(n);
         seg.set_max_devices(n + 1000);
         seg.set_reannounce(true);
-        // The devices of another segment, which this one announces by handles
+        // The devices of another interface, which this one announces by handles
         // to them.
         let other = crowded_named(n, "m", 2);
         let (reflected_from, _) = heap();
@@ -2880,12 +2880,12 @@ fn scale_of_what_a_full_segment_costs_to_reflect_with() {
 
 // The timer-driven upkeep.
 
-fn expiry_of(seg: &Segment, host: &str) -> Instant {
+fn expiry_of(seg: &Interface, host: &str) -> Instant {
     let state = seg.state.borrow();
     state.tracker.discovered.get(host_id(&state, host)).expires
 }
 
-fn next_due(seg: &Segment) -> Option<Instant> {
+fn next_due(seg: &Interface) -> Option<Instant> {
     seg.state.borrow_mut().next_due(Instant::now())
 }
 

@@ -16,7 +16,7 @@
 //! family, is answered with either. One address is told, not a list, as Avahi
 //! does: a routable one before a link-local one.
 //!
-//! A name is looked up in what is known of every segment, and in the names
+//! A name is looked up in what is known of every interface, and in the names
 //! this host advertises, at its own addresses. One not known is asked for, on
 //! every interface, and waited for a little: a device that is quiet says
 //! nothing until it is asked. An address is only looked up in what is known,

@@ -1,4 +1,4 @@
-//! The devices heard on a segment, and what a packet or the kernel says of
+//! The devices heard on an interface, and what a packet or the kernel says of
 //! them: [`Tracker`] brings them up to date and says what changed.
 
 use core::hash::{BuildHasher, Hasher};
@@ -12,7 +12,7 @@ use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
 
 use crate::device::{addr_of, edit, Shared, family_of, is_link_local, is_type, is_usable, Device, Origin, Report, HOST_TTL, META_QUERY, OTHER_TTL};
 
-use crate::segment::Asked;
+use crate::interface::Asked;
 use crate::codec::{Message, Question, RData, Record};
 use crate::prelude::*;
 use crate::config::{Advertise, DEFAULT_MAX_ADDRS, DEFAULT_MAX_DEVICES, DEFAULT_MAX_SERVICES, DEFAULT_MIN_LIFETIME};
@@ -20,7 +20,7 @@ use crate::listener::{Family, Prefix};
 use crate::table::{hash_addr, hash_name, Id, Multi, Table};
 use crate::time::Instant;
 
-/// Service types remembered per segment, so a hostile device cannot grow it
+/// Service types remembered per interface, so a hostile device cannot grow it
 /// without bound by announcing endless made-up types.
 pub const MAX_TYPES: usize = 256;
 
@@ -28,10 +28,10 @@ pub const MAX_TYPES: usize = 256;
 /// kernel looks up its link-layer address, it is not asked so again.
 const NUDGE_GAP: Duration = Duration::from_secs(60);
 
-/// What is known of the devices heard on a segment.
+/// What is known of the devices heard on an interface.
 pub struct Tracker {
     pub discovered: Devices,
-    /// Service types devices on this segment have said they offer, learned
+    /// Service types devices on this interface have said they offer, learned
     /// from answers to the type enumeration query.
     pub types: BTreeSet<String>,
     /// The least a device is kept after it was last heard from.
@@ -462,7 +462,7 @@ impl Touched {
     }
 }
 
-/// A change to the devices of a segment, or a question asked on it: what
+/// A change to the devices of an interface, or a question asked on it: what
 /// the tracker has to say of what it heard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -474,8 +474,8 @@ pub enum Event {
     /// A device went, as it was last.
     Removed(Shared),
     /// The questions of a query that no device here owns the name of: for
-    /// the reflector to put to the segments whose devices it announces here
-    /// ([`Segment::query_question`](crate::segment::Segment::query_question)),
+    /// the reflector to put to the interfaces whose devices it announces here
+    /// ([`Interface::query_question`](crate::interface::Interface::query_question)),
     /// as it is configured to.
     Question(Vec<Asked>),
 }
@@ -648,7 +648,7 @@ pub fn refresh_gap(before: Duration) -> Duration {
     (before / 4).max(Duration::from_secs(5))
 }
 
-// The discovered devices of a segment, each held in one place, and how they
+// The discovered devices of an interface, each held in one place, and how they
 // are found.
 //
 // A device is [kept](Table) and called by its [`Id`]; nothing about it tells
@@ -911,7 +911,7 @@ impl Devices {
     }
 
     /// Whether the tables hold what the devices have, and nothing else: for
-    /// tests, which change things without the segment's own care.
+    /// tests, which change things without the interface's own care.
     #[cfg(test)]
     pub fn check(&self) {
         self.table.check();

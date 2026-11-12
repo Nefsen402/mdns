@@ -24,7 +24,7 @@ use anyhow::{bail, Result};
 
 use crate::config::{glob, Advertise, Forward, ReflectedWhen};
 use crate::device::Shared;
-use crate::segment::{Asked, Event, Segment};
+use crate::interface::{Asked, Event, Interface};
 
 use crate::prelude::*;
 
@@ -73,7 +73,7 @@ struct Inner {
 
 #[derive(Clone)]
 struct Member {
-    segment: Segment,
+    segment: Interface,
     untrusted: bool,
 }
 
@@ -89,7 +89,7 @@ struct Book {
 /// One thing a segment could not be told: that a device of the segment of
 /// `priority` is to be shown, or, if not `show`, withdrawn.
 struct Failed {
-    target: Segment,
+    target: Interface,
     priority: u32,
     device: Shared,
     show: bool,
@@ -103,8 +103,8 @@ impl Reflector {
     ///
     /// Where reflectors share an interface and more than one wants a hostname
     /// announced there, the device of the segment with the lowest priority is
-    /// (see [`Segment::priority`]), and the next takes over when it goes.
-    pub fn new(segments: Vec<Segment>) -> Result<Reflector> {
+    /// (see [`Interface::priority`]), and the next takes over when it goes.
+    pub fn new(segments: Vec<Interface>) -> Result<Reflector> {
         Self::with_untrusted(segments, &[])
     }
 
@@ -113,7 +113,7 @@ impl Reflector {
     /// announced to the others, but they do not learn about the devices of the
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
-    pub fn with_untrusted(segments: Vec<Segment>, untrusted: &[String]) -> Result<Reflector> {
+    pub fn with_untrusted(segments: Vec<Interface>, untrusted: &[String]) -> Result<Reflector> {
         Self::with_options(segments, untrusted, Forward::default(), Advertise::default(), ReflectedWhen::default(), None)
     }
 
@@ -123,7 +123,7 @@ impl Reflector {
     /// devices that have what `when` asks for, and announcing what it reflects with the address TTL
     /// `reflect_ttl`, if given, in place of each device's own.
     pub fn with_options(
-        segments: Vec<Segment>,
+        segments: Vec<Interface>,
         untrusted: &[String],
         forward: Forward,
         advertise: Advertise,
@@ -170,7 +170,7 @@ impl Reflector {
 
 impl Reflector {
     /// The segments this reflector spans, in the order they came.
-    pub fn segments(&self) -> Vec<Segment> {
+    pub fn segments(&self) -> Vec<Interface> {
         self.inner.snapshot().into_iter().map(|m| m.segment).collect()
     }
 
@@ -182,7 +182,7 @@ impl Reflector {
     /// Span `segment` too, as its interface has come: what the others have is
     /// announced on it (unless it is untrusted), and what it finds is
     /// announced on them. It must not be on an interface already spanned.
-    pub fn add(&self, segment: Segment) -> Result<()> {
+    pub fn add(&self, segment: Interface) -> Result<()> {
         let untrusted = self.inner.untrusted.iter().any(|name| glob(name, segment.interface()));
         {
             let mut members = self.inner.members.borrow_mut();
@@ -242,7 +242,7 @@ impl Reflector {
 impl Reflector {
     /// Act on `event`, a change on `segment`, if that is one this reflector
     /// spans.
-    pub fn handle(&self, segment: &Segment, event: Event) {
+    pub fn handle(&self, segment: &Interface, event: Event) {
         self.inner.handle(segment, event);
     }
 
@@ -268,7 +268,7 @@ pub fn deliver(reflectors: &[&Reflector]) {
 }
 
 fn deliver_to(inners: &[&Inner]) {
-    let mut segments: Vec<Segment> = Vec::new();
+    let mut segments: Vec<Interface> = Vec::new();
     for seg in inners.iter().flat_map(|i| i.snapshot()).map(|m| m.segment) {
         if !segments.iter().any(|s| s.is(&seg)) {
             segments.push(seg);
@@ -354,7 +354,7 @@ impl Inner {
         self.members.borrow().clone()
     }
 
-    fn handle(&self, segment: &Segment, event: Event) {
+    fn handle(&self, segment: &Interface, event: Event) {
         if let Some(src) = self.snapshot().iter().position(|m| m.segment.is(segment)) {
             self.apply(src, event);
         }
@@ -425,7 +425,7 @@ impl Inner {
     /// as it is now; the segments are told when it changes, to look again.
     ///
     /// Failures are logged and kept, so that [`Inner::reconcile`] tries again.
-    fn relay(&self, from: &Segment, device: &Shared, gone: bool, only: Option<&Segment>) {
+    fn relay(&self, from: &Interface, device: &Shared, gone: bool, only: Option<&Interface>) {
         let show = !gone && self.reflectable(device);
         let priority = from.priority();
         let mut book = self.book();
@@ -446,7 +446,7 @@ impl Inner {
 
     /// Show `device` on `target`, a device of the segment of `priority`, or
     /// withdraw it if not `show`, and keep it to try again if that fails.
-    fn attempt(&self, book: &mut Book, target: &Segment, priority: u32, device: &Shared, show: bool) {
+    fn attempt(&self, book: &mut Book, target: &Interface, priority: u32, device: &Shared, show: bool) {
         book.failed.retain(|f| !(f.target.is(target) && f.device.is(device)));
         let result = if show {
             target.reflect(priority, device, &self.advertise, self.reflect_ttl).map(drop)

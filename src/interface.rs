@@ -1,11 +1,12 @@
 //! The devices on one interface, and what the daemon says and asks there.
 //!
-//! A [`Segment`] keeps a model of the link rather than its packets: the
-//! devices heard on it, with their addresses and services, the ones put there
-//! by hand or reflected from elsewhere, and what is wanted announced under their names. It
+//! An [`Interface`] keeps a model of the link rather than its packets: the
+//! devices heard on it, with their addresses and services, the ones reflected
+//! onto it from elsewhere, and what is wanted announced under their names. It
 //! answers for them, announces, probes and refreshes them, and forgets them
-//! as they expire, sending through the [`socket`](crate::listener)s attached to
-//! it.
+//! as they expire, sending through the [`Link`](crate::listener::Link) attached
+//! to it. Which interfaces reflect to each other is for the
+//! [`Segment`](crate::segment::Segment).
 
 use core::fmt;
 use alloc::collections::{BTreeSet, VecDeque};
@@ -38,7 +39,7 @@ use crate::table::{hash_name, Id, Multi, Table};
 use crate::tracker::{refresh_gap, Touched, Tracker, MAX_TYPES};
 
 /// Re-announce a reflected device at 80% of the shortest TTL it advertises,
-/// on a segment that re-announces what has not changed.
+/// on an interface that re-announces what has not changed.
 fn reannounce_after(host_ttl: u32) -> Duration {
     Duration::from_secs(u64::from(host_ttl) * 4 / 5)
 }
@@ -64,11 +65,11 @@ const MAX_PROBED: usize = 64;
 /// A record may not be multicast more than once a second (RFC 6762 section 6).
 const MIN_MULTICAST_GAP: Duration = Duration::from_secs(1);
 
-/// A question put to a segment on another's behalf is not put to it again
+/// A question put to an interface on another's behalf is not put to it again
 /// within this long: clients ask again after a second, and several ask alike.
 const FORWARD_GAP: Duration = Duration::from_secs(1);
 
-/// Questions remembered per segment as just put to it, so that a client
+/// Questions remembered per interface as just put to it, so that a client
 /// asking endless made-up names cannot grow the list without bound.
 const MAX_FORWARDED: usize = 1024;
 
@@ -87,7 +88,7 @@ const MAX_MAX_PACKET: usize = 9000;
 
 pub use crate::tracker::Event;
 
-/// A question asked on a segment, as passed on to the reflector.
+/// A question asked on an interface, as passed on to the reflector.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Asked {
     pub question: Question,
@@ -96,7 +97,7 @@ pub struct Asked {
     pub answered: bool,
 }
 
-/// Something a segment's timer is waiting to do: see [`Segment::pending`].
+/// Something an interface's timer is waiting to do: see [`Interface::pending`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pending {
     /// `expire`, `refresh` or `re-announce`.
@@ -116,9 +117,9 @@ impl fmt::Display for Labelled<'_> {
     }
 }
 
-/// The priority of what is made for a segment, such as the daemon's own name
+/// The priority of what is made for an interface, such as the daemon's own name
 /// (`[Advertise]`): it comes first of all, ahead of any device of another
-/// segment, which has that segment's priority, above this.
+/// interface, which has that interface's priority, above this.
 pub const OWN: u32 = 0;
 
 /// What a [`Reflected`] is told apart by: where its device and its [`Advertise`] are.
@@ -134,9 +135,9 @@ type ReflectedKey = (usize, usize);
 #[derive(Clone)]
 struct Reflected {
     /// Which wins where the same hostname is wanted announced by more than
-    /// one: the lowest. What is made for the segment comes first of all, with
-    /// [`OWN`]; a copy of a device of another segment has that segment's
-    /// priority, which is above. Copies of the same segment's device (the same
+    /// one: the lowest. What is made for the interface comes first of all, with
+    /// [`OWN`]; a copy of a device of another interface has that interface's
+    /// priority, which is above. Copies of the same interface's device (the same
     /// priority) are shown together.
     priority: u32,
     device: Shared,
@@ -195,7 +196,7 @@ impl Reflected {
     }
 }
 
-/// The priority of the next segment made, if it is not set.
+/// The priority of the next interface made, if it is not set.
 static NEXT_PRIORITY: AtomicU32 = AtomicU32::new(1);
 
 /// A hostname announced on behalf of somewhere else, plus the timing needed
@@ -208,7 +209,7 @@ struct Host {
     /// [`State::wanted`] for what is.
     reflected: Vec<Reflected>,
     /// What is announced: what the winner was, less what devices on this
-    /// segment have themselves (see [`State::wanted`]). `None` while a device
+    /// interface have themselves (see [`State::wanted`]). `None` while a device
     /// here has the hostname.
     shown: Option<Reflected>,
     /// When the full record set was last multicast; drives re-announcement.
@@ -261,7 +262,7 @@ impl Host {
     /// When it is next due for re-announcing, or for another try after
     /// sending failed; `None` if nothing is shown and nothing is pending.
     /// What changed is announced a second time; what has not, only if the
-    /// segment re-announces `unchanged` ones.
+    /// interface re-announces `unchanged` ones.
     fn reannounce_at(&self, unchanged: bool) -> Option<Instant> {
         let after = |gap: Duration| self.announced.checked_add(gap).unwrap_or(self.announced);
         let due = |_: &Reflected| match (self.repeat, unchanged) {
@@ -273,7 +274,7 @@ impl Host {
     }
 }
 
-/// The segment's upkeep (expiry, refreshing and re-announcing): when the
+/// The interface's upkeep (expiry, refreshing and re-announcing): when the
 /// event loop is to run it, and how it has run.
 #[derive(Default)]
 struct Upkeep {
@@ -297,7 +298,7 @@ struct Probing {
     /// otherwise only if it failed.
     why: &'static str,
     /// Its number, under which how it went is kept for whoever asked for it
-    /// ([`Segment::probed`]), if anyone did.
+    /// ([`Interface::probed`]), if anyone did.
     id: u64,
     asked: bool,
     /// The next round, or [`PROBE_GAPS`]'s length when only the wait for the
@@ -307,7 +308,7 @@ struct Probing {
     sent: usize,
 }
 
-/// How a segment's upkeep has run, for `timers`.
+/// How an interface's upkeep has run, for `timers`.
 pub struct UpkeepInfo {
     pub due: Option<Instant>,
     pub running: bool,
@@ -316,7 +317,7 @@ pub struct UpkeepInfo {
     pub last_took: Option<Duration>,
 }
 
-// The devices a segment announces, each held in one place, and how they are
+// The devices an interface announces, each held in one place, and how they are
 // found.
 //
 // A device is kept (in a [`Table`]) and called by its [`Id`]. It is found by
@@ -358,7 +359,7 @@ impl Host {
 
 /// What the tables hold of one: the hashes of the names it, or any claim on
 /// it, has records under, and when it is held as due. It is kept with the
-/// device, not worked out again, as a claim on a device of another segment has
+/// device, not worked out again, as a claim on a device of another interface has
 /// the names of that device, which can change without this being told, until
 /// the reflector says to look again.
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -595,7 +596,7 @@ impl Hosts {
                 assert!(self.by_due.contains(&(at, id)), "it is held as due: {host}");
             }
             // What was held is what it would be now, but for a device of another
-            // segment that changed since.
+            // interface that changed since.
             let now = self.held_now(entry);
             assert_eq!(held.due, now.due, "it is held as due as it is: {host}");
             if entry.reflected.iter().all(|m| m.priority == 0) {
@@ -626,14 +627,14 @@ impl core::ops::Index<&str> for Hosts {
 struct State {
     /// What is known of the devices heard here.
     tracker: Tracker,
-    /// Devices we announce on this segment on behalf of somewhere else, by
+    /// Devices we announce on this interface on behalf of somewhere else, by
     /// lowercase hostname.
     hosts: Hosts,
-    /// Changes not yet taken by the event loop ([`Segment::take_events`]).
+    /// Changes not yet taken by the event loop ([`Interface::take_events`]).
     outbox: Vec<Event>,
-    /// See [`Segment::priority`].
+    /// See [`Interface::priority`].
     priority: u32,
-    /// How what is made for the segment is shown: all of it.
+    /// How what is made for the interface is shown: all of it.
     own: Rc<Advertise>,
     /// The probes and queries for types under way, the number of the last
     /// one started, and how those asked for went, by number, until taken.
@@ -656,7 +657,7 @@ struct State {
     /// The most a packet sent here may hold: what the interface's MTU leaves.
     max_packet: usize,
     upkeep: Upkeep,
-    /// The questions put to this segment on another's behalf, in lowercase,
+    /// The questions put to this interface on another's behalf, in lowercase,
     /// and when, for [`FORWARD_GAP`].
     forwarded: HashMap<(String, u16), Instant>,
 }
@@ -701,8 +702,8 @@ impl State {
         self.outbox.push(event);
     }
 
-    /// The next time [`Segment::expire`], [`Segment::refresh`] or
-    /// [`Segment::reannounce`] has something to do, or `None` if never. A time
+    /// The next time [`Interface::expire`], [`Interface::refresh`] or
+    /// [`Interface::reannounce`] has something to do, or `None` if never. A time
     /// in the past means it is due now. Every time returned is one at which
     /// one of them acts, so that running them moves it on.
     fn next_due(&self, _now: Instant) -> Option<Instant> {
@@ -729,7 +730,7 @@ impl State {
 
     /// Every time something is due, as what is to be done (`expire`,
     /// `refresh` or `re-announce`), to whom, and when. What
-    /// [`State::next_due`] and [`Segment::pending`] are made of.
+    /// [`State::next_due`] and [`Interface::pending`] are made of.
     fn for_each_deadline(&self, f: &mut dyn FnMut(&'static str, &dyn fmt::Display, Instant)) {
         let before = self.upkeep.before;
         for e in self.tracker.discovered.iter() {
@@ -779,7 +780,7 @@ impl State {
     }
 
 
-    /// Whether a device on this segment offers a service called `instance`,
+    /// Whether a device on this interface offers a service called `instance`,
     /// ignoring case.
     fn is_local(&self, instance: &str) -> bool {
         self.tracker.discovered.with_name(instance).any(|e| e.device.borrow().service(instance).is_some())
@@ -792,9 +793,9 @@ impl State {
     /// is ours, and announced whatever is here.
     fn wanted(&self, key: &str, host: &Host) -> Option<Reflected> {
         let first = host.reflected.first()?;
-        // What other segments' devices of the name there are: the lowest
-        // segment's is announced, as everyone who reflects it shows it, and
-        // those who show the same segment's device show it together. One made
+        // What other interfaces' devices of the name there are: the lowest
+        // interface's is announced, as everyone who reflects it shows it, and
+        // those who show the same interface's device show it together. One made
         // for it is shown alone.
         let group: Vec<&Reflected> = match first.priority {
             OWN => vec![first],
@@ -915,7 +916,7 @@ impl State {
 
     /// The questions of `query` that are not about a name a device here owns
     /// (it answers for itself), each with whether something announced here
-    /// has an answer to it: those the other segments might be asked. None
+    /// has an answer to it: those the other interfaces might be asked. None
     /// from a device probing for names it is about to take: they are its own.
     fn asked(&self, query: &Message) -> Vec<Asked> {
         if !query.authorities.is_empty() {
@@ -932,7 +933,7 @@ impl State {
             .collect()
     }
 
-    /// The devices this segment answers queries for, by hostname: what is
+    /// The devices this interface answers queries for, by hostname: what is
     /// shown of each, with the TTL its address is announced with. Left out
     /// are those multicast less than a second ago (RFC 6762 section 6), unless
     /// the reply is to go to a `legacy` resolver alone, and, for a device
@@ -961,9 +962,9 @@ impl State {
     }
 
     /// [Settle](State::settle) the announced hostnames that someone wants
-    /// records under one of `names` for, after the devices on this segment
+    /// records under one of `names` for, after the devices on this interface
     /// that had them changed: the others are as they were. One that fails to
-    /// send is tried again by [`Segment::reannounce`], which reports it if it
+    /// send is tried again by [`Interface::reannounce`], which reports it if it
     /// fails again.
     fn settle_for(&mut self, names: &[String], now: Instant) {
         let mut keys: Vec<String> = names.iter().flat_map(|name| self.hosts.hosts_claiming(name)).collect();
@@ -977,22 +978,22 @@ impl State {
     }
 }
 
-/// One mDNS segment (interface) and the two device lists kept for it:
-/// devices discovered on the wire, and devices added by hand, over every
+/// One interface, and the two device lists kept for it: devices discovered on
+/// the wire, and devices reflected onto it, over every
 /// family it serves: one list, whichever family a device was heard over.
 /// Cheap to clone; clones share state, so its link, the reflectors spanning
 /// it and the control socket can each hold one.
 #[derive(Clone)]
-pub struct Segment {
+pub struct Interface {
     interface: Rc<str>,
     state: Rc<RefCell<State>>,
 }
 
-impl Segment {
-    /// A segment for `interface`, to be given a link with
-    /// [`attach`](Segment::attach).
-    pub fn new(interface: &str) -> Segment {
-        Segment {
+impl Interface {
+    /// The state of the interface called `interface`, to be given a link with
+    /// [`attach`](Interface::attach).
+    pub fn new(interface: &str) -> Interface {
+        Interface {
             interface: interface.into(),
             state: Rc::new(RefCell::new(State {
                 max_packet: DEFAULT_MAX_PACKET,
@@ -1034,7 +1035,7 @@ impl Segment {
 
     /// Take the interface's MTU: no packet sent here is bigger than it leaves
     /// once the IP and UDP headers are added, so that none has to go out in
-    /// fragments. Until it is told, a segment assumes a standard Ethernet
+    /// fragments. Until it is told, an interface assumes a standard Ethernet
     /// frame ([`DEFAULT_MAX_PACKET`]). Returns what a packet may now hold.
     pub fn set_mtu(&self, mtu: u32) -> usize {
         let room = usize::try_from(mtu.saturating_sub(IP_UDP_HEADERS)).unwrap_or(usize::MAX);
@@ -1060,7 +1061,7 @@ impl Segment {
         state.sync_refresh();
     }
 
-    /// When [`Segment::upkeep`] next has something to do, or `None` if never;
+    /// When [`Interface::upkeep`] next has something to do, or `None` if never;
     /// a time in the past means it is due now.
     pub fn next_due(&self) -> Option<Instant> {
         self.state.borrow_mut().next_due(Instant::now())
@@ -1068,7 +1069,7 @@ impl Segment {
 
     /// Do what is due at `now`: drop what has run out, ask the devices about
     /// to expire to answer again, and re-announce. Run by the event loop when
-    /// [`Segment::next_due`] says.
+    /// [`Interface::next_due`] says.
     pub fn upkeep(&self, now: Instant) {
         let started = Instant::now();
         let before = {
@@ -1112,7 +1113,7 @@ impl Segment {
         self.state.borrow().link.families()
     }
 
-    /// Give the segment its link, replacing an earlier one. Without any (as in
+    /// Give the interface its link, replacing an earlier one. Without any (as in
     /// unit tests), what is reflected is recorded but nothing goes on the wire.
     pub fn attach(&self, link: impl Into<Rc<Link>>) {
         let mut state = self.state.borrow_mut();
@@ -1122,30 +1123,30 @@ impl Segment {
 
     // 1. Discovered devices.
 
-    /// Devices currently active on this segment (excludes those announced
+    /// Devices currently active on this interface (excludes those announced
     /// for others), as they are now.
     pub fn devices(&self) -> Vec<Device> {
         let state = self.state.borrow_mut();
         state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect()
     }
 
-    /// The devices themselves, to be shown on other segments: each is the
-    /// one this segment holds, and changes as it does.
+    /// The devices themselves, to be shown on other interfaces: each is the
+    /// one this interface holds, and changes as it does.
     pub fn shared_devices(&self) -> Vec<Shared> {
         let state = self.state.borrow();
         state.tracker.discovered.iter().map(|e| e.device.clone()).collect()
     }
 
-    /// Which segment's device wins where more than one wants the same
+    /// Which interface's device wins where more than one wants the same
     /// hostname announced: the lowest. Not the same as another's.
     pub fn priority(&self) -> u32 {
         self.state.borrow().priority
     }
 
-    /// Set [`priority`](Segment::priority). Above 0: that is a device made
-    /// for a segment, which comes first of all.
+    /// Set [`priority`](Interface::priority). Above 0: that is a device made
+    /// for an interface, which comes first of all.
     pub fn set_priority(&self, priority: u32) {
-        assert!(priority > 0, "0 is for what is made for a segment");
+        assert!(priority > 0, "0 is for what is made for an interface");
         self.state.borrow_mut().priority = priority;
     }
 
@@ -1157,12 +1158,12 @@ impl Segment {
         core::mem::take(&mut self.state.borrow_mut().outbox)
     }
 
-    /// Whether `other` is this very segment, not just one of the same name.
-    pub fn is(&self, other: &Segment) -> bool {
+    /// Whether `other` is this very interface, not just one of the same name.
+    pub fn is(&self, other: &Interface) -> bool {
         Rc::ptr_eq(&self.state, &other.state)
     }
 
-    /// Everything this segment's timer is waiting for, soonest first: devices
+    /// Everything this interface's timer is waiting for, soonest first: devices
     /// to expire, to ask again, and to re-announce. The timer's own time is the
     /// first of these.
     pub fn pending(&self) -> Vec<Pending> {
@@ -1175,7 +1176,7 @@ impl Segment {
         all
     }
 
-    /// How much longer the daemon keeps `device`, a device of this segment, if
+    /// How much longer the daemon keeps `device`, a device of this interface, if
     /// it is not heard from again, to the second; zero if it is not (or no
     /// longer) known.
     pub fn lifetime_left(&self, device: &Device) -> Duration {
@@ -1184,21 +1185,21 @@ impl Segment {
 
     // 3. Reflected devices, invisible to 1 and 2.
 
-    /// Announce `device` on this segment, made for it, with `priority` (such
+    /// Announce `device` on this interface, made for it, with `priority` (such
     /// as [`OWN`]), under its hostname. It needs a hostname and at least one
-    /// address, all of this segment's family, and announces exactly the
+    /// address, all of this interface's family, and announces exactly the
     /// addresses it has. Its address records are announced with the TTL it
     /// announced itself with (at least ten seconds, and two minutes if it did
     /// not say), and those of its services with theirs.
     ///
     /// It is the caller's to say again when it has changed, with another
-    /// call, and to withdraw with [`remove_reflected`](Segment::remove_reflected).
+    /// call, and to withdraw with [`remove_reflected`](Interface::remove_reflected).
     ///
     /// If another wants the same hostname announced, the lower priority
     /// wins: an outranked device is only remembered, and announced once the
     /// ones ahead of it are removed. Replacing what is announced also sends
     /// goodbyes for services and addresses that are no longer there. A device
-    /// on this segment comes first of all: while one has the hostname, a
+    /// on this interface comes first of all: while one has the hostname, a
     /// reflected device of that name is not announced, and services whose
     /// instance names one has are left out (the advertised name is announced
     /// regardless).
@@ -1210,24 +1211,24 @@ impl Segment {
         self.add_reflected_ttl(priority, device, Duration::from_secs(ttl.into()))
     }
 
-    /// Like [`add_reflected`](Segment::add_reflected), with the address records
+    /// Like [`add_reflected`](Interface::add_reflected), with the address records
     /// announced for `host_ttl` (whole seconds, at least one) whatever the
-    /// device says, and, if the segment re-announces, re-announced at 80% of
+    /// device says, and, if the interface re-announces, re-announced at 80% of
     /// it.
     pub fn add_reflected_ttl(&self, priority: u32, device: &Shared, host_ttl: Duration) -> Result<bool> {
         let own = Rc::clone(&self.state.borrow().own);
         self.reflect(priority, device, &own, Some(host_ttl))
     }
 
-    /// Announce `device`, one of another segment, whose `priority` is that
-    /// segment's, and is to be shown here as `how` says, with the TTL
+    /// Announce `device`, one of another interface, whose `priority` is that
+    /// interface's, and is to be shown here as `how` says, with the TTL
     /// `host_ttl` for its address records, if given, or else its own. The
     /// device is held where it is heard, and so is shown as it is now:
     /// whoever shows it says again when it has changed, and withdraws it with
-    /// [`remove_reflected`](Segment::remove_reflected) when it has gone. A device of the
-    /// same name from the same segment that more than one shows (each with its
+    /// [`remove_reflected`](Interface::remove_reflected) when it has gone. A device of the
+    /// same name from the same interface that more than one shows (each with its
     /// own `how`) is announced as what they show of it together; from another
-    /// segment, the lowest priority's is, and the other takes over when it
+    /// interface, the lowest priority's is, and the other takes over when it
     /// goes. Returns whether anything was sent.
     pub fn reflect(&self, priority: u32, device: &Shared, how: &Rc<Advertise>, host_ttl: Option<Duration>) -> Result<bool> {
         let host_ttl = host_ttl.map(|ttl| u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX));
@@ -1241,14 +1242,14 @@ impl Segment {
         self.state.borrow_mut().put(reflected, Instant::now())
     }
 
-    /// How what is made for this segment ([`add_reflected`](Segment::add_reflected))
-    /// is shown, for [`remove_reflected`](Segment::remove_reflected).
+    /// How what is made for this interface ([`add_reflected`](Interface::add_reflected))
+    /// is shown, for [`remove_reflected`](Interface::remove_reflected).
     pub fn own(&self) -> Rc<Advertise> {
         Rc::clone(&self.state.borrow().own)
     }
 
-    /// Forget `device`, to be shown as `how` says: made for this segment (see
-    /// [`own`](Segment::own)) or reflected. If that is what is announced, the
+    /// Forget `device`, to be shown as `how` says: made for this interface (see
+    /// [`own`](Interface::own)) or reflected. If that is what is announced, the
     /// next one's device takes its place, or, if there is none, goodbyes are
     /// sent for it. Returns false if there was no such device. If sending
     /// fails it is kept.
@@ -1268,10 +1269,10 @@ impl Segment {
         self.withdraw_where(|m| Rc::ptr_eq(&m.how, how))
     }
 
-    /// Take the segment down: everything announced on it is withdrawn, with
+    /// Take the interface down: everything announced on it is withdrawn, with
     /// goodbyes, and every device found on it is forgotten, which is said by
-    /// an [event](Segment::take_events) of each going, for whoever shows
-    /// copies of them elsewhere to withdraw them. Once every segment is down
+    /// an [event](Interface::take_events) of each going, for whoever shows
+    /// copies of them elsewhere to withdraw them. Once every interface is down
     /// nothing is announced of any. Every one is tried; the first error is
     /// returned.
     pub fn destroy(&self) -> Result<()> {
@@ -1306,7 +1307,7 @@ impl Segment {
 
     /// Announce again everything announced here, as when the interface has
     /// come back: whoever is on it now may never have heard it. A failed send
-    /// is retried by [`Segment::reannounce`].
+    /// is retried by [`Interface::reannounce`].
     pub fn announce_all(&self) -> Result<()> {
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
@@ -1422,7 +1423,7 @@ impl Segment {
             .collect()
     }
 
-    /// The devices announced on this segment: for each hostname, what is
+    /// The devices announced on this interface: for each hostname, what is
     /// shown of the one that won.
     pub fn reflected_devices(&self) -> Vec<Device> {
         let state = self.state.borrow_mut();
@@ -1430,11 +1431,11 @@ impl Segment {
     }
 
     /// Announce a second time what changed a second ago ([`ANNOUNCE_REPEAT`]),
-    /// and, if the segment re-announces ([`Segment::set_reannounce`]), what
+    /// and, if the interface re-announces ([`Interface::set_reannounce`]), what
     /// has not had a full announcement for 80% of its TTL; and try again
     /// what failed to send. A failed send
     /// is retried after [`ANNOUNCE_RETRY`]; the first error is returned after
-    /// every device was tried. Run by [`Segment::schedule`] when due.
+    /// every device was tried. Run by [`Interface::schedule`] when due.
     pub fn reannounce(&self, now: Instant) -> Result<()> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
@@ -1523,7 +1524,7 @@ impl Segment {
         Ok(())
     }
 
-    /// Ask the devices on this segment `questions` asked on another segment,
+    /// Ask the devices on this interface `questions` asked on another interface,
     /// in a query of the daemon's own: nothing of the asker's packet comes
     /// here, not its address, not its known answers, not its wish for a
     /// unicast reply. Their answers are heard like any, and so reflected;
@@ -1533,7 +1534,7 @@ impl Segment {
     ///
     /// A question asked here within [`FORWARD_GAP`] is not asked again, nor
     /// any once [`MAX_FORWARDED`] are waiting it out. Returns how many were
-    /// asked. A no-op when the segment has no sender attached.
+    /// asked. A no-op when the interface has no sender attached.
     pub fn query_question(&self, questions: &[Question]) -> Result<usize> {
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
@@ -1572,7 +1573,7 @@ impl Segment {
         }
     }
 
-    /// Record that `addr` was heard on this segment, without any record data.
+    /// Record that `addr` was heard on this interface, without any record data.
     pub fn observe(&self, addr: IpAddr) {
         self.apply(addr, Instant::now(), None);
     }
@@ -1635,7 +1636,7 @@ impl Segment {
     /// because each round's answers decide the next one's questions; the
     /// upkeep runs them as they come due, and the answers are handled as they
     /// arrive. How many questions it sent is kept under the number returned,
-    /// once it is done ([`Segment::probed`]). One asked for while another is
+    /// once it is done ([`Interface::probed`]). One asked for while another is
     /// under way is that one.
     pub fn probe(&self) -> u64 {
         self.begin(None, "asked for", true)
@@ -1649,7 +1650,7 @@ impl Segment {
         state.probed.remove(at).map(|(_, result)| result)
     }
 
-    /// Like [`Segment::probe`], with no one to tell but the journal: `why`
+    /// Like [`Interface::probe`], with no one to tell but the journal: `why`
     /// says what it is for there.
     pub fn start_probe(&self, why: &'static str) {
         self.begin(None, why, false);
@@ -1671,7 +1672,7 @@ impl Segment {
     }
 
     /// Ask for the service types `kinds` by name, in three rounds like a
-    /// [probe](Segment::probe): devices that only answer when asked for
+    /// [probe](Interface::probe): devices that only answer when asked for
     /// their type, and do not say what types they have, are found this way.
     /// The types are remembered, so that every later probe asks for them too.
     /// What is known here already goes along as known answers, so only what
@@ -1682,7 +1683,7 @@ impl Segment {
 
     /// Start a probe (`kinds` `None`) or a query for types, unless the same
     /// is under way already, which it then is; its number. How it went is
-    /// kept if it was `asked` for. A segment that cannot send has nothing to
+    /// kept if it was `asked` for. An interface that cannot send has nothing to
     /// do, and is done at once.
     fn begin(&self, kinds: Option<Vec<String>>, why: &'static str, asked: bool) -> u64 {
         let mut state = self.state.borrow_mut();
@@ -1765,7 +1766,7 @@ impl Segment {
     }
 
     /// One round of queries, built from what is known right now. A no-op
-    /// when the segment has no sender attached.
+    /// when the interface has no sender attached.
     fn probe_round(&self) -> Result<usize> {
         let state = self.state.borrow_mut();
         if state.link.is_empty() {
@@ -1800,14 +1801,14 @@ impl Segment {
     ///
     /// A device is due once it would expire within `before` of `now`: its
     /// lifetime is the longest TTL it announced, at least the minimum lifetime
-    /// ([`Segment::set_min_lifetime`]).
+    /// ([`Interface::set_min_lifetime`]).
     /// It is asked for what it announced (its address, and the service and text
     /// records of each instance) and not for whole service types, so only it
     /// answers. A device that does not answer is asked again after a quarter of
     /// `before` (at least five seconds) until it expires. Devices known only by
     /// the address they were heard from have nothing to ask for and are left
     /// alone, and so is one whose time has already run out. Run by
-    /// [`Segment::schedule`] when due, after [`Segment::expire`]; returns how
+    /// [`Interface::schedule`] when due, after [`Interface::expire`]; returns how
     /// many questions were sent.
     pub fn refresh(&self, now: Instant, before: Duration) -> Result<usize> {
         let mut guard = self.state.borrow_mut();
@@ -1858,7 +1859,7 @@ impl Segment {
 }
 
 // Whether tests check the tables that find things after each change; the
-// measurement of what a full segment costs turns it off.
+// measurement of what a full interface costs turns it off.
 #[cfg(test)]
 thread_local! {
     static CHECKING: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
@@ -1915,7 +1916,7 @@ fn send(link: &Link, limit: usize, records: &[Record]) -> Result<()> {
     first_err.map_or(Ok(()), Err)
 }
 
-/// Send `msg` to everyone on the link. A no-op when the segment has no link
+/// Send `msg` to everyone on the link. A no-op when the interface has no link
 /// attached.
 fn multicast(link: &Link, msg: &Message) -> Result<()> {
     link.send(&msg.encode()?)
@@ -1928,5 +1929,5 @@ fn transmit(link: &Link, family: Family, msg: &Message, dest: Option<SocketAddr>
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/segment.rs"]
+#[path = "../tests/unit/interface.rs"]
 mod tests;

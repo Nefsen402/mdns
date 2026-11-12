@@ -158,7 +158,7 @@ fn query(name: &str, qtype: u16) -> Message {
     }
 }
 
-/// Make `device` hear `records`, as a segment puts them to the one device
+/// Make `device` hear `records`, as an interface puts them to the one device
 /// they are about: the report on it, and what ties to no host.
 fn hear(device: &mut Device, records: Vec<Record>) {
     let msg = response(records);
@@ -531,7 +531,7 @@ fn a_transition_announces_the_new_and_takes_back_only_what_is_ours() {
     assert_eq!(bye.len(), old.announcement(&Advertise::ALL, 0, 0).len());
     assert!(bye.iter().all(|r| !r.cache_flush));
 
-    // But not what a device on the segment has: a service of the same
+    // But not what a device on the interface has: a service of the same
     // instance name, or, if one has the hostname, the NSEC.
     let local = |name: &str| name.eq_ignore_ascii_case("kitchen._http._tcp.local");
     let bye = goodbyes(&Device::transition(Some((&old).into()), None, &local, true));
@@ -654,7 +654,7 @@ fn learned_addresses_can_be_kept_to_families_with_a_link_local_address() {
 
 /// Which services a device is announced with is for whoever shows it to say,
 /// as the records are made: one of a type kept out, or not yet resolved, is in
-/// none of them, nor its name in the names it answers to, and a segment that
+/// none of them, nor its name in the names it answers to, and an interface that
 /// stops showing it says goodbye to it.
 #[test]
 fn services_are_announced_as_they_are_advertised() {

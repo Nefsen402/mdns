@@ -19,7 +19,7 @@ mod ipc;
 mod netlink;
 mod poll;
 mod reflector;
-mod segment;
+mod interface;
 mod signal;
 mod listener;
 mod table;
@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use config::{AdvertiseConfig, Config, Forward, Neighbours};
 use netlink::{Event, Netlink};
 use reflector::Reflector;
-use segment::Segment;
+use interface::Interface;
 use listener::{Family, Hub, Link};
 
 /// What every module takes from alloc, as std's prelude would give it.
@@ -202,7 +202,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
     server.shut_down();
     drop(server);
     drop(avahi);
-    let links: Vec<Segment> = ifaces.live.iter().map(|i| i.segment.clone()).collect();
+    let links: Vec<Interface> = ifaces.live.iter().map(|i| i.segment.clone()).collect();
     for link in &links {
         if let Err(e) = link.destroy() {
             eprintln!("{}: withdrawing what was announced failed: {e:#}", link.interface());
@@ -301,7 +301,7 @@ struct Ifaces<'a> {
 struct Iface {
     /// What is settled for it, which its sockets are made from.
     interface: config::Interface,
-    segment: Segment,
+    segment: Interface,
     /// The names to advertise with this host's addresses here.
     advertise: Vec<AdvertiseConfig>,
     /// The interface's index.
@@ -460,7 +460,7 @@ impl Iface {
     /// config say of it. It has no sockets until
     /// [`open_sockets`](Iface::open_sockets).
     fn new(interface: &config::Interface, index: u32, ifaces: &Ifaces) -> Iface {
-        let segment = Segment::new(&interface.name);
+        let segment = Interface::new(&interface.name);
         segment.set_min_lifetime(interface.min_lifetime);
         segment.set_max_addrs(interface.max_addrs);
         segment.set_max_devices(interface.max_devices);
