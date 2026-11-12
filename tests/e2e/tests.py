@@ -1244,19 +1244,23 @@ class Timers(Case):
         self.assertTrue(got, "the device the watch is for is asked\n" + self.logs(d))
         self.assertTrue(other.hearer.none(asks("other.local", A), since=other_asked), "the other, which nothing is looking for, is not")
 
-    def test_a_device_with_no_address_left_is_gone_though_its_services_are_not(self):
-        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
-        d = self.lab.daemon(conf("[Interface]\nMinimumLifetime=40s\n[Segment]\nName=s\nInterfaces=ra\nActive=no\n"))
+    def test_a_device_with_no_address_left_is_kept_and_what_asked_for_it_is_asked_again(self):
+        la, lb = self.two_links()
+        ha = la.hearer()
+        d = self.lab.daemon(conf("[Interface]\nMinimumLifetime=40s\n[Segment]\nName=s\nInterfaces=ra,rb\nActive=no\n"))
+        asker = lb.device("10.9.2.50")
         dev = la.device("10.9.1.50")
         # An address of forty seconds, and a service of seventy-five minutes.
         dev.multicast(response(a("dev.local", "10.9.1.50", 40), ptr("_http._tcp.local", "Dev._http._tcp.local"),
                                srv("Dev._http._tcp.local", 80, "dev.local", ttl=4500), txt("Dev._http._tcp.local", "k=v")))
         d.settle()
-        self.assertTrue(d.host("s", "dev.local"), self.logs(d))
-        d.advance(30)
-        self.assertTrue(d.host("s", "dev.local"), "its address has not run out")
-        d.advance(15)
-        self.assertFalse(d.host("s", "dev.local"), "gone with its last address, whatever else of it is good\n" + self.logs(d))
+        asker.multicast(query(("_http._tcp.local", PTR)))
+        self.assertTrue(ha.wait(asks("_http._tcp.local", PTR, src=la.router_addr), 5), "the first time\n" + self.logs(d))
+        d.advance(45)
+        self.assertTrue(d.host("s", "dev.local"), "kept with its service, though it has no address\n" + self.logs(d))
+        heard = ha.count()
+        asker.multicast(query(("_http._tcp.local", PTR)))
+        self.assertTrue(ha.wait(asks("_http._tcp.local", PTR, src=la.router_addr), 5, since=heard), "asked again\n" + self.logs(d))
 
     def test_a_device_with_a_short_ttl_is_asked_three_quarters_of_the_way_in_and_not_at_once(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")

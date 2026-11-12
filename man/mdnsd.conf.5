@@ -394,9 +394,9 @@ of a service type they have) are asked to answer again before their records run
 out, for as long as the watch is open: the daemon asks only what something asks
 it to, as an ordinary mDNS client does.
 What it has heard is kept for as long as the records say, and no longer: a
-device whose last address has run out is gone, whatever else of it is good, and
-each question that a device that is gone had answered is forgotten, so that the
-next asks again.
+device whose last address has run out is kept with its other records, but is
+not shown on other interfaces, and each question that it, or a device that is
+gone, had answered is forgotten, so that the next asks again.
 What something asks for is still asked: a lookup through the Avahi socket
 .RB ( AvahiSocket=
 of

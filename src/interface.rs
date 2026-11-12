@@ -800,6 +800,11 @@ impl State {
                 nudge(&self.link, ll, &message::refresh_queries(core::slice::from_ref(&device), self.max_packet));
             }
         }
+        // A device with no address left is kept, but is not there to answer what
+        // was asked of it for one, so what asks for it next is to ask.
+        for device in core::mem::take(&mut touched.unreachable) {
+            self.asked.forget_device(&device.borrow());
+        }
         let names = touched.names(&self.tracker.discovered);
         let events = touched.events(&self.tracker.discovered);
         if !events.is_empty() {

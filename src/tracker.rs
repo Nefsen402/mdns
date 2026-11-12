@@ -183,21 +183,17 @@ impl Tracker {
         for &id in &stale {
             touched.note(&self.discovered, id);
         }
-        // A device that has no address left, because its last ran out, is gone
-        // though its other records have not: nothing can reach it, nothing is
-        // announced of it, and what answers a question about it, while it is
-        // kept, keeps the question from being asked.
-        let mut stale = stale;
+        // A device whose last address ran out is kept, with its other records,
+        // but nothing can reach it: it is noted, for the questions it answered
+        // to be asked again.
         for id in running {
             touched.note(&self.discovered, id);
-            let gone = self.discovered.edit(id, |entry| {
+            let lost = self.discovered.edit(id, |entry| {
                 let had = !entry.device.borrow().addresses.is_empty();
                 entry.expire_addrs(now);
-                had && entry.device.borrow().addresses.is_empty()
+                (had && entry.device.borrow().addresses.is_empty()).then(|| entry.device.clone())
             });
-            if gone == Some(true) {
-                stale.push(id);
-            }
+            touched.unreachable.extend(lost.flatten());
         }
         for id in stale {
             self.discovered.remove(id);
@@ -407,6 +403,8 @@ pub struct Touched {
     /// The devices to ask on their link-local addresses, for the kernel to
     /// look up their link-layer addresses, with the device each is of.
     pub nudges: Vec<(IpAddr, Device)>,
+    /// The devices whose last address has run out.
+    pub unreachable: Vec<Shared>,
 }
 
 impl Touched {
@@ -539,9 +537,11 @@ impl Entry {
 
     /// Its records that answer `q`, each with the time it has left here as
     /// its TTL, as known answers to a query asking `q` (RFC 6762 section 7.1).
-    /// None of one without a hostname, which has no records of its own.
+    /// None of one without a hostname, which has no records of its own, nor of
+    /// one with no address left: what it is asked is for it to answer, with the
+    /// addresses it has to give.
     pub fn known_answers(&self, q: &Question, now: Instant) -> Vec<Record> {
-        if self.device.borrow().hostname.is_none() {
+        if self.device.borrow().hostname.is_none() || self.device.borrow().addresses.is_empty() {
             return Vec::new();
         }
         let host_ttl = self.device.borrow().ttl.unwrap_or(HOST_TTL);

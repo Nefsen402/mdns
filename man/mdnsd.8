@@ -53,9 +53,9 @@ of an
 in
 .BR mdnsd.conf (5)),
 or for the TTL of its records if that is longer.
-A device whose last address has run out is dropped too, though its other
-records have not: it cannot be reached, and what is known of it would keep what
-was asked of it from being asked again.
+A device whose last address has run out is kept, with its other records, but
+it cannot be reached and is not shown on other interfaces; the questions it
+answered are forgotten, so that the next asks again.
 A goodbye packet (TTL 0) removes it immediately.
 .SS Probing
 Devices announce themselves rarely, and some only answer when asked, so waiting

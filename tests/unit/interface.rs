@@ -2286,12 +2286,13 @@ fn refresh_retries_after_a_gap_and_stops_once_the_device_has_answered() {
     assert!(recv(&rx).is_none());
 }
 
-/// A device whose last address has run out is gone, though its other records
-/// have not: it cannot be reached, nothing of it is announced, and while it is
-/// kept what is known of it keeps what was asked for it from being asked.
+/// A device whose last address has run out is kept, with its other records,
+/// though it cannot be reached; what asked for it is to ask again, since what
+/// is known of it would keep the question from being asked.
 #[test]
-fn a_device_is_gone_when_its_last_address_runs_out_though_its_other_records_have_not() {
-    let seg = interface("test");
+fn a_device_whose_last_address_runs_out_is_kept_and_what_asked_for_it_is_asked_again() {
+    let (seg, rx) = wired();
+    seg.set_forward(Forward::Once);
     let two_addresses = |ttl| record("plug.local".into(), true, ttl, RData::A("10.0.1.6".parse().unwrap()));
     hear(&seg, "10.0.1.5", vec![
         a_record("plug.local", "10.0.1.5"),
@@ -2300,17 +2301,34 @@ fn a_device_is_gone_when_its_last_address_runs_out_though_its_other_records_have
         srv("Plug._http._tcp.local", 80, "plug.local"),
     ]);
     hear(&seg, "10.0.1.7", vec![a_record("tv.local", "10.0.1.7"), ptr("_ipp._tcp.local", "TV._ipp._tcp.local"), srv("TV._ipp._tcp.local", 631, "tv.local")]);
-    assert_eq!(seg.devices().len(), 2);
+    let http = [question("_http._tcp.local", rtype::PTR)];
+    let ipp = [question("_ipp._tcp.local", rtype::PTR)];
+    let t0 = Instant::now();
+    assert_eq!(seg.query_question_at(&http, t0).unwrap(), 1);
+    assert_eq!(seg.query_question_at(&ipp, t0).unwrap(), 1);
+    assert_eq!(seg.query_question_at(&ipp, t0 + Duration::from_secs(60)).unwrap(), 0, "asked once");
     let events = seg.subscribe();
 
     // The addresses of two minutes have run out, as late as a device is kept at
     // least; the services have not.
     seg.expire(Instant::now() + FLOOR + Duration::from_secs(10));
     let left = seg.devices();
-    assert_eq!(left.iter().filter_map(|d| d.hostname.as_deref()).collect::<Vec<_>>(), ["plug.local"], "the TV has no address left");
-    assert_eq!(left[0].addrs().collect::<Vec<_>>(), [ip("10.0.1.6")], "one that has another is kept");
+    assert_eq!(left.len(), 2, "both are kept");
+    let tv = left.iter().find(|d| d.hostname.as_deref() == Some("tv.local")).unwrap();
+    assert_eq!(tv.addrs().count(), 0);
+    assert_eq!(tv.services.len(), 1, "with what else is known of it");
+    let plug = left.iter().find(|d| d.hostname.as_deref() == Some("plug.local")).unwrap();
+    assert_eq!(plug.addrs().collect::<Vec<_>>(), [ip("10.0.1.6")], "one that has another is as it was");
     let told: Vec<Event> = events.try_iter().collect();
-    assert!(told.iter().any(|e| matches!(e, Event::Removed(d) if d.borrow().hostname.as_deref() == Some("tv.local"))), "{told:?}");
+    assert!(!told.iter().any(|e| matches!(e, Event::Removed(_))), "none is gone: {told:?}");
+
+    // What the TV answered is asked again; what the plug did is not.
+    let later = t0 + Duration::from_secs(120);
+    while recv(&rx).is_some() {}
+    assert_eq!(seg.query_question_at(&ipp, later).unwrap(), 1, "asked again");
+    let sent = recv(&rx).unwrap();
+    assert!(sent.answers.is_empty(), "with no known answer for it to be silent by: {:?}", sent.answers);
+    assert_eq!(seg.query_question_at(&http, later).unwrap(), 0, "the plug can still be reached");
 }
 
 /// Where the interface asks nothing of its own accord, the devices that a watch
