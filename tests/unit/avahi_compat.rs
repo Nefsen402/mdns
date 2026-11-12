@@ -3,6 +3,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::net::UnixStream;
 
 use super::*;
+use crate::config::AdvertiseConfig;
 use crate::listener::Link;
 use crate::codec::{Header, Message, RData, Record};
 use crate::segment::Segment;
@@ -87,17 +88,10 @@ struct Harness {
 
 impl Harness {
     fn new(tag: &str, groups: Vec<Group>) -> (Harness, String) {
-        Harness::advertising(tag, groups, &[], |_, _| Vec::new())
-    }
-
-    /// With this host advertising `own`, and having the addresses `addresses`
-    /// says on an interface.
-    fn advertising(tag: &str, groups: Vec<Group>, own: &[AdvertiseConfig], addresses: Addresses) -> (Harness, String) {
         std::fs::create_dir_all("target").unwrap();
         let path = format!("target/avahi-test-{}-{tag}.sock", std::process::id());
         let _ = std::fs::remove_file(&path);
-        let mut server = Server::bind(&path, own, &[Family::V4, Family::V6]).unwrap();
-        server.addresses = addresses;
+        let server = Server::bind(&path).unwrap();
         (Harness { server, groups }, path)
     }
 
@@ -213,23 +207,20 @@ fn an_address_of_a_family_a_known_name_has_none_of_is_not_waited_long_for() {
     assert!(started.elapsed() >= KNOWN_WAIT && started.elapsed() < WAIT, "{:?}", started.elapsed());
 }
 
-fn advertise(name: &str, interfaces: &[&str]) -> AdvertiseConfig {
-    AdvertiseConfig { name: name.into(), interfaces: interfaces.iter().map(|s| s.to_string()).collect(), ..AdvertiseConfig::default() }
+/// This host advertises `name` on `seg`, with the addresses it has there.
+fn advertise(seg: &Interface, name: &str, addrs: &[&str]) {
+    let block = AdvertiseConfig { name: name.into(), ..AdvertiseConfig::default() };
+    seg.advertise(&block, &addrs.iter().map(|a| ip(a)).collect::<Vec<_>>());
 }
 
 /// This host has an IPv4 address and a global and a link-local IPv6 address.
-fn dual_stack(_: &str, _: &[Family]) -> Vec<IpAddr> {
-    vec![ip("10.0.0.1"), ip("2001:db8::1"), ip("fe80::1")]
-}
-
-fn v4_only(_: &str, _: &[Family]) -> Vec<IpAddr> {
-    vec![ip("10.0.0.1")]
-}
+const DUAL_STACK: [&str; 3] = ["10.0.0.1", "2001:db8::1", "fe80::1"];
 
 #[test]
 fn a_name_this_host_advertises_is_answered_at_its_own_addresses() {
-    let (groups, _seg, _rx) = group_on_lo();
-    let (mut h, path) = Harness::advertising("own", groups, &[advertise("Pc.local", &[])], dual_stack);
+    let (groups, seg, _rx) = group_on_lo();
+    advertise(&seg, "Pc.local", &DUAL_STACK);
+    let (mut h, path) = Harness::new("own", groups);
     let index = listener::ifindex(listener::LOOPBACK).unwrap();
     // Without asking the network: it is not waited for.
     let started = Instant::now();
@@ -241,18 +232,21 @@ fn a_name_this_host_advertises_is_answered_at_its_own_addresses() {
 }
 
 #[test]
-fn a_name_is_only_answered_for_on_the_interfaces_it_is_advertised_on() {
-    let (groups, _seg, _rx) = group_on_lo();
-    let (mut h, path) = Harness::advertising("where", groups, &[advertise("pc.local", &[listener::LOOPBACK]), advertise("away.local", &["eth9"])], dual_stack);
+fn a_name_this_host_no_longer_advertises_is_no_longer_answered() {
+    let (groups, seg, _rx) = group_on_lo();
+    advertise(&seg, "pc.local", &["10.0.0.1"]);
+    let (mut h, path) = Harness::new("gone", groups);
     assert!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 pc.local\n").starts_with("+ "));
-    // Of an interface the group does not have, nothing: it is asked for, and not found.
-    assert_eq!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 away.local\n"), "-15 Timeout reached\n");
+    // The addresses go: what is announced goes with them, and so does the answer.
+    advertise(&seg, "pc.local", &[]);
+    assert_eq!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 pc.local\n"), "-15 Timeout reached\n");
 }
 
 #[test]
 fn an_advertised_name_with_no_address_of_a_family_is_not_waited_long_for() {
-    let (groups, _seg, _rx) = group_on_lo();
-    let (mut h, path) = Harness::advertising("advfamily", groups, &[advertise("pc.local", &[])], v4_only);
+    let (groups, seg, _rx) = group_on_lo();
+    advertise(&seg, "pc.local", &["10.0.0.1"]);
+    let (mut h, path) = Harness::new("advfamily", groups);
     let started = Instant::now();
     assert!(h.ask(&path, "RESOLVE-HOSTNAME-IPV4 pc.local\n").starts_with("+ "));
     assert_eq!(h.ask(&path, "RESOLVE-HOSTNAME-IPV6 pc.local\n"), "-15 Timeout reached\n");
@@ -265,12 +259,4 @@ fn a_request_that_is_too_long_is_refused() {
     let (mut h, path) = Harness::new("long", groups);
     let reply = h.ask(&path, &format!("RESOLVE-HOSTNAME-IPV4 {}", "a".repeat(2000)));
     assert!(reply.starts_with("-21") && reply.contains("too long"), "{reply}");
-}
-
-#[test]
-fn a_name_is_advertised_on_all_interfaces_unless_it_says_which() {
-    let block = |name: &str, interfaces: &[&str]| AdvertiseConfig { name: name.into(), interfaces: interfaces.iter().map(|s| s.to_string()).collect(), ..AdvertiseConfig::default() };
-    assert!(advertised_on(&block("pc.local", &[]), "br0"));
-    assert!(advertised_on(&block("pc.local", &["br0"]), "br0"));
-    assert!(!advertised_on(&block("pc.local", &["media"]), "br0"));
 }

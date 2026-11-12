@@ -16,8 +16,9 @@
 //! family, is answered with either. One address is told, not a list, as Avahi
 //! does: a routable one before a link-local one.
 //!
-//! A name is looked up in what is known of every interface, and in the names
-//! this host advertises, at its own addresses. One not known is asked for, on
+//! A name is looked up in what is known of every interface, which includes the
+//! names this host advertises, at the addresses it announces them with. One not
+//! known is asked for, on
 //! every interface, and waited for a little: a device that is quiet says
 //! nothing until it is asked. An address is only looked up in what is known,
 //! as `nss-mdns` only asks for link-local ones, and nothing is asked for it.
@@ -36,8 +37,7 @@ use crate::time::Instant;
 
 use anyhow::Result;
 
-use crate::config::AdvertiseConfig;
-use crate::device::is_link_local;
+use crate::device::{is_link_local, Device};
 use crate::ipc::links_of;
 use crate::codec::{rtype, Question};
 use crate::poll;
@@ -71,20 +71,6 @@ const MAX_CLIENTS: usize = 64;
 pub struct Server {
     listener: OwnedFd,
     clients: Vec<Client>,
-    /// The names this host advertises, which it answers for at its own
-    /// addresses, and the families it listens over.
-    own: Vec<AdvertiseConfig>,
-    families: Vec<Family>,
-    /// The addresses this host has on an interface, of the families: read from
-    /// the system, or, in a test, made up.
-    addresses: Addresses,
-}
-
-/// How the addresses of this host on an interface are had.
-type Addresses = fn(&str, &[Family]) -> Vec<IpAddr>;
-
-fn system_addresses(interface: &str, families: &[Family]) -> Vec<IpAddr> {
-    listener::addresses(interface, families).unwrap_or_default()
 }
 
 struct Client {
@@ -127,10 +113,10 @@ struct Found {
 impl Server {
     /// Listen at `path`, for anyone, before anything else happens, so that a
     /// bad path, or an Avahi that has it, is reported at startup.
-    pub fn bind(path: &str, own: &[AdvertiseConfig], families: &[Family]) -> Result<Server> {
+    pub fn bind(path: &str) -> Result<Server> {
         let listener = crate::ipc::bind(path, 0o666)?;
         eprintln!("avahi: listening on {path}");
-        Ok(Server { listener, clients: Vec::new(), own: own.to_vec(), families: families.to_vec(), addresses: system_addresses })
+        Ok(Server { listener, clients: Vec::new() })
     }
 
     /// The descriptors to wait on: the listener, and every client, readable
@@ -184,14 +170,12 @@ impl Server {
     /// are not known, give up on those that are not found in time, and let
     /// go of what is done.
     pub fn tick(&mut self, groups: &[Group], now: Instant) {
-        let Server { clients, own, families, addresses, .. } = self;
-        let host = Host { own, families, addresses: *addresses };
-        for c in clients.iter_mut() {
+        for c in self.clients.iter_mut() {
             if c.asked.is_none() && !c.closing {
                 c.take_request(now);
             }
             if let Some(asked) = &mut c.asked {
-                let (known, host_known) = answer(groups, &host, &asked.request);
+                let (known, host_known) = answer(groups, &asked.request);
                 if host_known {
                     asked.deadline = asked.deadline.min(asked.at + KNOWN_WAIT);
                 }
@@ -213,7 +197,7 @@ impl Server {
                 c.gone = true;
             }
         }
-        clients.retain(|c| !c.gone && !(c.closing && c.output.is_empty()));
+        self.clients.retain(|c| !c.gone && !(c.closing && c.output.is_empty()));
     }
 
     /// When [`Server::tick`] next has something to do of its own accord.
@@ -318,34 +302,19 @@ fn parse(line: &str) -> Result<Request, String> {
     }
 }
 
-/// This host, as it answers for itself: the names it advertises, and the
-/// addresses it has.
-struct Host<'a> {
-    own: &'a [AdvertiseConfig],
-    families: &'a [Family],
-    addresses: Addresses,
-}
-
-impl Host<'_> {
-    /// Its addresses on `interface`, if it advertises a name there.
-    fn on(&self, interface: &str) -> Vec<IpAddr> {
-        (self.addresses)(interface, self.families)
-    }
-}
-
 /// The line that answers `request`, if it is known now, and whether the name
 /// is known at all: at some address, or as one this host advertises, which
 /// is of nothing if it has no address of the family asked for.
-fn answer(groups: &[Group], host: &Host, request: &Request) -> (Option<String>, bool) {
+fn answer(groups: &[Group], request: &Request) -> (Option<String>, bool) {
     match request {
         Request::Host { name, family } => {
-            let (found, advertised) = hosts(groups, host, name);
+            let (found, advertised) = hosts(groups, name);
             let line = choose(&found, *family).map(|f| format!("+ {} {} {name} {}", listener::ifindex(&f.interface).unwrap_or(0), protocol(f.ip), f.ip));
             (line, advertised || !found.is_empty())
         }
         // What is known is told, and nothing waits for the rest.
         Request::Address(addr) => {
-            let line = match name_of(groups, host, *addr) {
+            let line = match name_of(groups, *addr) {
                 Some((interface, name)) => format!("+ {} {} {name}", listener::ifindex(&interface).unwrap_or(0), protocol(*addr)),
                 None => "-30 Not found".to_string(),
             };
@@ -359,46 +328,48 @@ fn protocol(ip: IpAddr) -> u8 {
     u8::from(ip.is_ipv6())
 }
 
-/// Every address `name` (lowercase) is known at, and the interface of each:
-/// those of this host, if it advertises it, and those of devices heard of;
-/// and whether this host advertises it on any interface.
-fn hosts(groups: &[Group], host: &Host, name: &str) -> (Vec<Found>, bool) {
-    let mut found = Vec::new();
-    let mut advertised = false;
+/// Every device known on an interface, those this host advertises as its own
+/// first, as `visit` takes them: the device, and whether it is this host's.
+fn each_device(groups: &[Group], mut visit: impl FnMut(&str, &Device, bool) -> bool) {
     for seg in links_of(groups, "") {
-        if host.own.iter().any(|b| b.name.eq_ignore_ascii_case(name) && advertised_on(b, seg.interface())) {
-            advertised = true;
-            for ip in host.on(seg.interface()) {
-                found.push(Found { interface: seg.interface().to_string(), ip });
+        for (device, _) in seg.own_devices() {
+            if visit(seg.interface(), &device.borrow(), true) {
+                return;
             }
         }
-        for device in seg.devices().iter().filter(|d| d.hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(name))) {
-            found.extend(device.addrs().map(|ip| Found { interface: seg.interface().to_string(), ip }));
+        for device in seg.devices() {
+            if visit(seg.interface(), &device, false) {
+                return;
+            }
         }
     }
-    (found, advertised)
 }
 
-/// Whether the advertised `block` is advertised on `interface`.
-fn advertised_on(block: &AdvertiseConfig, interface: &str) -> bool {
-    block.interfaces.is_empty() || block.interfaces.iter().any(|i| crate::config::glob(i, interface))
+/// Every address `name` (lowercase) is known at, and the interface of each,
+/// and whether this host advertises it on any interface, which it is of
+/// nothing if it has no address of the family asked for.
+fn hosts(groups: &[Group], name: &str) -> (Vec<Found>, bool) {
+    let mut found = Vec::new();
+    let mut advertised = false;
+    each_device(groups, |interface, device, own| {
+        if device.hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(name)) {
+            advertised |= own;
+            found.extend(device.addrs().map(|ip| Found { interface: interface.to_string(), ip }));
+        }
+        false
+    });
+    (found, advertised)
 }
 
 /// The name `addr` is of, and the interface it is on: of this host, or of a
 /// device heard of.
-fn name_of(groups: &[Group], host: &Host, addr: IpAddr) -> Option<(String, String)> {
-    for seg in links_of(groups, "") {
-        let ours = host.own.iter().find(|b| advertised_on(b, seg.interface()) && host.on(seg.interface()).contains(&addr));
-        if let Some(block) = ours {
-            return Some((seg.interface().to_string(), block.name.clone()));
-        }
-        for device in seg.devices() {
-            if let (Some(host), true) = (&device.hostname, device.addrs().any(|a| a == addr)) {
-                return Some((seg.interface().to_string(), host.clone()));
-            }
-        }
-    }
-    None
+fn name_of(groups: &[Group], addr: IpAddr) -> Option<(String, String)> {
+    let mut named = None;
+    each_device(groups, |interface, device, _| {
+        named = device.hostname.as_ref().filter(|_| device.addrs().any(|a| a == addr)).map(|host| (interface.to_string(), host.clone()));
+        named.is_some()
+    });
+    named
 }
 
 /// The address to tell of `found`, of `family` if one is wanted: a routable

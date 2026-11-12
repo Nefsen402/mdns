@@ -188,7 +188,7 @@ fn daemon(args: Vec<String>) -> Result<()> {
 
     let mut server = ipc::Server::bind(&config.socket, config.socket_mode as rustix::fs::RawMode)?;
     let mut avahi = match &config.avahi_socket {
-        Some(path) => Some(avahi_compat::Server::bind(path, &config.advertise, &families)?),
+        Some(path) => Some(avahi_compat::Server::bind(path)?),
         None => None,
     };
 
