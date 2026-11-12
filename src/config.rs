@@ -276,6 +276,8 @@ struct InterfaceConfig {
     refresh_before: Option<Option<Duration>>,
     /// `None` is off, and so is `Some(None)`.
     probe_interval: Option<Option<Duration>>,
+    /// Empty is not set here, and left to the nameless section.
+    probe_services: Vec<String>,
     max_addrs: Option<usize>,
     max_devices: Option<usize>,
     max_services: Option<usize>,
@@ -303,6 +305,10 @@ pub struct Interface {
     /// segments it is in asks, each its own `ProbeInterval=` or else the
     /// interface's; `None` if none of them probes.
     pub probe_interval: Option<Duration>,
+    /// The service types every probe of it browses for, as well as those its
+    /// devices have announced, lowercase and under `.local`: devices that only
+    /// answer when asked for their type are found this way.
+    pub probe_services: Vec<String>,
     /// How many addresses of a family a device heard on it is kept with, at
     /// most: [`DEFAULT_MAX_ADDRS`] unless set.
     pub max_addrs: usize,
@@ -407,6 +413,7 @@ impl Config {
             min_lifetime: setting_of(&self.settings, name, DEFAULT_MIN_LIFETIME, |i| i.min_lifetime),
             refresh_before: setting_of(&self.settings, name, Some(DEFAULT_REFRESH_BEFORE), |i| i.refresh_before),
             probe_interval: segments.clone().filter_map(|seg| seg.probe_interval.unwrap_or(own_probe)).min(),
+            probe_services: setting_of(&self.settings, name, Vec::new(), |i| Some(i.probe_services.clone()).filter(|kinds| !kinds.is_empty())),
             max_addrs: setting_of(&self.settings, name, DEFAULT_MAX_ADDRS, |i| i.max_addrs),
             max_devices: setting_of(&self.settings, name, DEFAULT_MAX_DEVICES, |i| i.max_devices),
             max_services: setting_of(&self.settings, name, DEFAULT_MAX_SERVICES, |i| i.max_services),
@@ -521,6 +528,15 @@ impl Config {
                     ("interface", "probeinterval") => {
                         let interval = parse_span(&value, lineno, "ProbeInterval", MIN_PROBE_INTERVAL)?;
                         settings.last_mut().unwrap().probe_interval = Some(interval);
+                    }
+                    ("interface", "probeservices") => {
+                        let kinds = &mut settings.last_mut().unwrap().probe_services;
+                        for word in value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+                            let kind = parse_service_type(word, lineno)?;
+                            if !kinds.contains(&kind) {
+                                kinds.push(kind);
+                            }
+                        }
                     }
                     ("interface", "refreshbefore") => {
                         let before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
@@ -871,6 +887,19 @@ fn parse_peer(word: &str, lineno: usize) -> Result<IpAddr> {
         bail!("line {lineno}: Peer= must be the address of a host, not {word:?}");
     }
     Ok(peer)
+}
+
+/// A service type to probe for: `_http._tcp`, with `.local` after it or not.
+fn parse_service_type(word: &str, lineno: usize) -> Result<String> {
+    let lower = word.to_ascii_lowercase();
+    let bare = lower.strip_suffix(".local").unwrap_or(&lower);
+    let ok = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    match bare.split('.').collect::<Vec<_>>()[..] {
+        [service, "_tcp" | "_udp"] if service.len() >= 2 && service.starts_with('_') && service.chars().all(ok) => {
+            Ok(format!("{bare}.local"))
+        }
+        _ => bail!("line {lineno}: ProbeServices= must be service types such as _http._tcp, not {word:?}"),
+    }
 }
 
 /// The port of a peer: a port, which is not zero.

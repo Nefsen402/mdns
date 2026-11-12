@@ -147,9 +147,14 @@ Services=_ssh._tcp:22 _http._tcp:8080
 MaxAddresses=8
 MaxDevices=1024
 
+# ProbeServices: devices that answer only when asked for their type, and never
+# say it when asked for every type (Shelly plugs answer _http._tcp alone), are
+# found because every probe, at startup and whenever the interface comes up,
+# browses for these too.
 [Interface]
 Name=wifi
 MinimumLifetime=1h
+ProbeServices=_http._tcp, _shelly._tcp
 
 # The daemon itself: the control socket of `mdnsctl`, and Avahi's, so that
 # `ping router.local` works with Avahi gone.

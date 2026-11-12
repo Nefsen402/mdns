@@ -469,6 +469,7 @@ impl Iface {
         segment.set_refresh_before(interface.refresh_before);
         // The rounds run in the event loop; the interval is between starts.
         segment.set_probe_interval(interface.probe_interval);
+        segment.set_probe_types(&interface.probe_services);
         // Where the same hostname is found on more than one, the lowest
         // interface's device is the one reflected; an interface keeps its index.
         segment.set_priority(index.max(1));

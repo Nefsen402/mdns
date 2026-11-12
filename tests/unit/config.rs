@@ -282,7 +282,7 @@ fn what_the_configuration_takes_as_a_name_is_what_can_be_written() {
 fn man_page_documents_every_key_and_its_example_parses() {
     let man = include_str!("../../man/mdnsd.conf.5");
     for key in [
-        "IPv4=", "IPv6=", "Peer=", "PeerPort=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "RefreshBefore=", "Hostname=", "TTL=",
+        "IPv4=", "IPv6=", "Peer=", "PeerPort=", "Socket=", "MinimumLifetime=", "ProbeInterval=", "ProbeServices=", "RefreshBefore=", "Hostname=", "TTL=",
         "ReflectTTL=", "MaxAddresses=", "MaxDevices=", "MaxServices=", "Name=", "Interfaces=", "Untrusted=", "ForwardQuestions=", "NeighbourAddresses=",
         "Reannounce=", "ReflectedWhen=", "ReflectedServices=",
     ] {
@@ -421,6 +421,22 @@ fn the_section_for_every_interface_is_what_the_others_start_from() {
 /// An interface can talk to hosts alone instead of to the groups, at a port
 /// that is the mDNS one unless said: the hosts of one interface, more than one
 /// of them, in the families that are on.
+#[test]
+fn an_interface_is_probed_for_the_types_it_is_told() {
+    let kinds = |extra: &str| {
+        Config::parse(&format!("{extra}\n[Segment]\nName=a\nInterfaces=ra,rb\n")).map(|c| (c.interface("ra").probe_services, c.interface("rb").probe_services))
+    };
+    let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(kinds("").unwrap(), (vec![], vec![]));
+    assert_eq!(kinds("[Interface]\nProbeServices=_http._tcp, _Shelly._tcp.local _http._tcp").unwrap().0, own(&["_http._tcp.local", "_shelly._tcp.local"]));
+    let both = kinds("[Interface]\nProbeServices=_http._tcp\n[Interface]\nName=rb\nProbeServices=_ssh._tcp").unwrap();
+    assert_eq!(both, (own(&["_http._tcp.local"]), own(&["_ssh._tcp.local"])), "the named one is the exception");
+    for bad in ["http", "_http", "_http._sctp", "_http._tcp._tcp", "_a b._tcp", "host.local"] {
+        let e = kinds(&format!("[Interface]\nProbeServices={bad}")).unwrap_err().to_string();
+        assert!(e.contains("must be service types"), "{bad}: {e}");
+    }
+}
+
 #[test]
 fn an_interface_talks_to_its_peers_alone() {
     let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
@@ -651,6 +667,7 @@ fn each_interface_is_settled_once_with_its_defaults_filled_in() {
             min_lifetime: DEFAULT_MIN_LIFETIME,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
             probe_interval: None,
+            probe_services: Vec::new(),
             max_addrs: DEFAULT_MAX_ADDRS,
             max_devices: DEFAULT_MAX_DEVICES,
             max_services: DEFAULT_MAX_SERVICES,

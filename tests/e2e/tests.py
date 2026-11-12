@@ -649,6 +649,7 @@ class Interfaces(Case):
         ha = la.hearer()
         la.add_router_addr("10.9.1.1/24")
         self.assertTrue(d.advance_until(lambda: ha.seen(alive("pc.local", A, "10.9.1.1"))), "and announces on it\n" + self.logs(d))
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE))), "and probes it\n" + self.logs(d))
         # It is a device that is heard from too, where it did not hear before.
         la.device("10.9.1.50").multicast(announcement("tv", "10.9.1.50", "TV"))
         d.settle()
@@ -1248,6 +1249,34 @@ class Timers(Case):
         heard = ha.count()
         d.advance(60)
         self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE), heard), step=1, limit=10), "every time")
+
+    def test_the_types_an_interface_is_told_to_probe_for_are_asked_at_startup(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        ha = la.hearer()
+        d = self.lab.daemon(conf("[Interface]\nProbeServices=_http._tcp\n[Segment]\nName=s\nInterfaces=ra\n"))
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks("_http._tcp.local", PTR))), "asked for\n" + self.logs(d))
+
+    @follows_changes
+    def test_the_types_are_asked_on_an_interface_that_appears_late_and_on_one_that_comes_back(self):
+        d = self.lab.daemon(conf("[Interface]\nProbeServices=_http._tcp\n[Segment]\nName=s\nInterfaces=ra\n"))
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        ha = la.hearer()
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks(*PROBE)) and ha.seen(asks("_http._tcp.local", PTR))), "probed when it appears\n" + self.logs(d))
+        la.set_router_up(False)
+        d.settle()
+        mark, heard = d.mark(), ha.count()
+        la.set_router_up(True)
+        self.assertTrue(d.wait_log(r"ra: up$", 5, mark), self.logs(d))
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks("_http._tcp.local", PTR), heard)), "and when it is back")
+
+    def test_each_interface_of_a_segment_is_probed_for_its_own_types(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        lb = self.lab.link("rb", "10.9.2.1/24", "10.9.2.2/24")
+        ha, hb = la.hearer(), lb.hearer()
+        d = self.lab.daemon(conf("[Interface]\nName=ra\nProbeServices=_http._tcp\n[Interface]\nName=rb\nProbeServices=_ssh._tcp\n[Segment]\nName=s\nInterfaces=ra,rb\n"))
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks("_http._tcp.local", PTR)) and hb.seen(asks("_ssh._tcp.local", PTR))), self.logs(d))
+        self.assertTrue(d.advance_until(lambda: not self.probing(d), step=1))
+        self.assertTrue(ha.none(asks("_ssh._tcp.local", PTR)) and hb.none(asks("_http._tcp.local", PTR)), "and not for the other's")
 
     def test_an_interface_with_no_probe_interval_is_only_probed_at_startup_and_on_request(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")

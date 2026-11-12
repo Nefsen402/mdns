@@ -642,6 +642,9 @@ struct State {
     probed: VecDeque<(u64, Probed)>,
     /// How often to probe on its own, if at all, and when next.
     probe_interval: Option<Duration>,
+    /// The service types every probe asks for besides those learned: the ones
+    /// the configuration names, which no device can add to.
+    probe_types: Vec<String>,
     next_routine: Option<Instant>,
     /// What it hears and says with: all that it knows of how it is reached.
     /// Until it has one it says nothing and hears nothing.
@@ -1661,6 +1664,12 @@ impl Segment {
         drop(state);
     }
 
+    /// Have every probe browse for the service types `kinds` too, from the
+    /// first: those of `ProbeServices=`, for devices that never say their type.
+    pub fn set_probe_types(&self, kinds: &[String]) {
+        self.state.borrow_mut().probe_types = kinds.to_vec();
+    }
+
     /// Ask for the service types `kinds` by name, in three rounds like a
     /// [probe](Segment::probe): devices that only answer when asked for
     /// their type, and do not say what types they have, are found this way.
@@ -1764,7 +1773,8 @@ impl Segment {
         }
 
         let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
-        ask(&state.link, &Device::probe_queries(&devices, &state.tracker.types, state.max_packet))
+        let types = state.tracker.types.iter().chain(&state.probe_types).cloned().collect();
+        ask(&state.link, &Device::probe_queries(&devices, &types, state.max_packet))
     }
 
     fn query_types_round(&self, kinds: &[String]) -> Result<usize> {

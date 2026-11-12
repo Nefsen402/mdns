@@ -684,6 +684,24 @@ addresses, or
 .B MinimumLifetime=
 if that is longer) to keep devices listed, and the daemon warns about it at
 startup.
+.TP
+.B ProbeServices=
+Optional.
+Service types, such as
+.BR _http._tcp ,
+separated by commas or spaces, that every probe of this interface browses for
+besides those its devices have announced.
+Some devices answer only when asked for the type they offer, and never say it
+in answer to a question for all types: a Shelly plug answers
+.B _http._tcp
+and nothing else.
+Without the type being named here, such a device is found only when it
+announces itself, which it does when it joins a network.
+A probe runs at startup, whenever the interface comes up (also one that was not
+there when the daemon started), on request and every
+.BR ProbeInterval= ,
+and each asks for these types.
+None by default.
 .PP
 .B MinimumLifetime=
 and
