@@ -108,14 +108,16 @@ pub const DEFAULT_MAX_SERVICES: usize = 64;
 /// itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Forward {
-    /// Every one. A browse for a type that one device was heard to have can
-    /// have other answers still, from devices that only answer when asked.
-    #[default]
+    /// Every one, each time it is asked. A browse for a type that one device
+    /// was heard to have can have other answers still, from devices that only
+    /// answer when asked, and one that joined and did not say so.
     Always,
     /// Each question once: those that it has not asked on its link before,
     /// whoever asked, and not again. A device that answers a question when it
     /// is put to it is found by the first, and one that announces itself is
-    /// heard when it does.
+    /// heard when it does; what is found is kept up by asking each device
+    /// before it expires, as a client that holds on to what it learned would.
+    #[default]
     Once,
     /// None: only what devices announce, or answer a probe with, is reflected.
     Never,
@@ -304,7 +306,7 @@ pub struct Interface {
     /// startup, when it comes up, and on request.
     pub probe_interval: Option<Duration>,
     /// Which of the questions asked on the other interfaces of its segments
-    /// it asks on its link: [`Forward::Always`] unless set.
+    /// it asks on its link: [`Forward::Once`] unless set.
     pub forward: Forward,
     /// The service types every probe of it browses for, as well as those its
     /// devices have announced, lowercase and under `.local`: devices that only
@@ -1010,7 +1012,8 @@ fn parse_service_kinds(value: &str, lineno: usize) -> Result<(BTreeSet<String>, 
 fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
     match value.to_ascii_lowercase().as_str() {
         // An empty assignment resets, as everywhere.
-        "always" | "" => Ok(Forward::Always),
+        "" => Ok(Forward::default()),
+        "always" => Ok(Forward::Always),
         "once" => Ok(Forward::Once),
         "never" => Ok(Forward::Never),
         _ => bail!("line {lineno}: invalid ForwardQuestions {value:?}: always, once or never"),

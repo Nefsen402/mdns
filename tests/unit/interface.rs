@@ -496,6 +496,8 @@ fn only_so_many_questions_are_remembered() {
 #[test]
 fn a_question_from_elsewhere_is_asked_once_a_second_without_the_askers_wishes() {
     let (seg, rx) = wired();
+    // Every time, which is what a second apart is about.
+    seg.set_forward(Forward::Always);
     let wants_unicast = Question { unicast_response: true, ..question("printer.local", rtype::A) };
     let questions = [wants_unicast, question("_ipp._tcp.local", rtype::PTR)];
 
@@ -770,6 +772,8 @@ fn an_announcement_too_big_for_the_mtu_goes_in_packets_that_fit() {
 #[test]
 fn everything_sent_keeps_within_the_mtu() {
     let (seg, rx) = wired();
+    // Asked again each time, as what is asked of it is the same as the probe's.
+    seg.set_forward(Forward::Always);
     let max_packet = seg.set_mtu(576);
     let packets = || {
         let mut buf = [0u8; 9000];

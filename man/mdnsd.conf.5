@@ -661,9 +661,9 @@ Which of the questions that clients ask on the other interfaces of its
 segments the daemon asks on this interface, in a query of its own, so that the
 answer is reflected:
 .B always
-(the default) asks every one,
+asks every one each time,
 .B once
-each the first time, and
+(the default) each the first time only, and
 .B never
 none.
 A device that only answers when asked is found by being asked; with
@@ -675,7 +675,15 @@ it is asked as a question is new to this interface: one it has put on its link
 before, whoever asked it, is not asked again.
 A device that answers a question when it is put to it is found by the first
 time, and one that announces itself, as most do when they join a network, is
-heard when it does, so the second asks for nothing that is not known.
+heard when it does, so the second asks for nothing that is not known; what is
+found is kept up by asking each device before it expires
+.RB ( RefreshBefore= ),
+as a client that holds on to what it learned would.
+A device that joins later and neither announces itself nor is asked for by a
+probe (see
+.BR ProbeInterval= )
+is found when a new question is asked, or by
+.BR "mdnsctl probe" .
 What the interface has asked itself, in a probe, counts.
 It remembers the last 4096 questions, and forgets them all when it forgets its
 devices, as when it goes away and comes back.
