@@ -10,7 +10,7 @@
 //! On Linux each socket is pinned to a single interface and bound to the mDNS
 //! multicast group address rather than the wildcard, so it shows up in
 //! `ss` as `224.0.0.251%wifi:5353` and only ever sees that link's traffic. If
-//! what is sent to the daemon itself is to be heard too (`on` in `[Listen]`) it
+//! what is sent to the daemon itself is to be heard too (`on` in `[Interface]`) it
 //! is bound to the wildcard address instead, `0.0.0.0%wifi:5353`: pinned to the
 //! interface still, and joined to the group on it alone.
 //!
@@ -33,7 +33,7 @@ use rustix::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
 use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
 
-use crate::config::Interface;
+use crate::config;
 use crate::runtime::{errno, Why};
 
 
@@ -49,7 +49,7 @@ pub enum Family {
 
 /// The families `interface` is used over: those of its peers, if it has any,
 /// and else those it listens over.
-pub fn families(interface: &Interface) -> Vec<Family> {
+pub fn families(interface: &config::Interface) -> Vec<Family> {
     if interface.peers.is_empty() {
         [(interface.ipv4, Family::V4), (interface.ipv6, Family::V6)]
             .into_iter()
@@ -65,7 +65,7 @@ pub fn families(interface: &Interface) -> Vec<Family> {
 
 /// The families of `interface` of which what is sent to the daemon itself is
 /// heard too: none with peers, which are heard alone.
-pub fn unicast(interface: &Interface) -> Vec<Family> {
+pub fn unicast(interface: &config::Interface) -> Vec<Family> {
     if !interface.peers.is_empty() {
         return Vec::new();
     }
@@ -80,7 +80,7 @@ pub fn unicast(interface: &Interface) -> Vec<Family> {
 /// family it hears that over. A socket of an interface's own hears no more than
 /// that already; the sockets shared by every interface, which hear what any of
 /// them does, have to be held to it.
-pub fn hears(interface: &Interface, to: Option<IpAddr>) -> bool {
+pub fn hears(interface: &config::Interface, to: Option<IpAddr>) -> bool {
     match to {
         Some(to) if !to.is_multicast() => unicast(interface).contains(&family_of(to)),
         _ => true,
@@ -90,7 +90,7 @@ pub fn hears(interface: &Interface, to: Option<IpAddr>) -> bool {
 /// The families of `interface` that it cannot be listened to over yet, as it
 /// has no address to join the group by: they are joined when it has one. A
 /// peer's is not a group to join, and needs no address of the interface's.
-pub fn missing(interface: &Interface) -> Vec<Family> {
+pub fn missing(interface: &config::Interface) -> Vec<Family> {
     families(interface).into_iter().filter(|&family| interface.peers.is_empty() && !joinable(&interface.name, family)).collect()
 }
 
@@ -409,7 +409,7 @@ impl Link {
     /// itself for those it says so of. It keeps the source port at 5353, and
     /// sends to the group (scoped to the interface for IPv6), or, if it has
     /// peers, to them alone.
-    pub fn open(interface: &Interface) -> Result<Link> {
+    pub fn open(interface: &config::Interface) -> Result<Link> {
         if !interface.peers.is_empty() {
             return Link::open_peers(&interface.name, &interface.peers, interface.peer_port);
         }
@@ -884,7 +884,7 @@ mod portable {
         /// The link of `interface`, joined to the group over the families it is
         /// used over and can be now, asking hosts directly over those it hears
         /// what is sent to the daemon itself of.
-        pub fn link(&self, interface: &Interface) -> Result<Link> {
+        pub fn link(&self, interface: &config::Interface) -> Result<Link> {
             if !interface.peers.is_empty() {
                 bail!("{}: Peer= needs a socket of the interface's own, which this system cannot make", interface.name);
             }
@@ -1059,5 +1059,5 @@ fn set_int(fd: impl AsFd, level: libc::c_int, name: libc::c_int, value: libc::c_
 pub(crate) const LOOPBACK: &str = if cfg!(target_os = "linux") { "lo" } else { "lo0" };
 
 #[cfg(test)]
-#[path = "../tests/unit/interface.rs"]
+#[path = "../tests/unit/listener.rs"]
 mod tests;

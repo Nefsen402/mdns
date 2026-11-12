@@ -19,7 +19,7 @@ use crate::config::{Advertise, Neighbours, ReflectedWhen, DEFAULT_MAX_ADDRS};
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_SERVICES;
 use crate::codec::{self, rtype, Header, Message, Question, RData, Record};
-use crate::interface::Family;
+use crate::listener::Family;
 
 use crate::prelude::*;
 

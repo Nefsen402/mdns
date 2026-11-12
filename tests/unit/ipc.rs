@@ -22,7 +22,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::interface::Link;
+use crate::listener::Link;
 use crate::device::EditService;
 
 /// A segment that keeps a device at least five minutes, which is what these

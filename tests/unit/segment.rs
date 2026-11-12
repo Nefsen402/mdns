@@ -29,7 +29,7 @@ fn segment(name: &str) -> Segment {
 
 use crate::device::{record, LEGACY_TTL_CAP, QUESTIONS_PER_PACKET};
 use crate::codec::{self, rtype, Header};
-use crate::interface::{prefix, Link};
+use crate::listener::{prefix, Link};
 
 /// Its first routable IPv4 or IPv6 address, and link-local one.
 fn v4(d: &Device) -> Option<IpAddr> {
@@ -3305,7 +3305,7 @@ fn live_announce() {
     let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
     for family in [Family::V4, Family::V6] {
         // Let a listener on this same host hear it.
-        let (_socket, link) = crate::interface::looped(&iface, family);
+        let (_socket, link) = crate::listener::looped(&iface, family);
         let seg = segment(&iface);
         seg.attach(link);
         let addr = match family {
@@ -3326,7 +3326,7 @@ fn live_announce() {
 #[ignore]
 fn live_respond() {
     let iface = std::env::var("MDNS_TEST_IFACE").unwrap();
-    let (socket, link) = crate::interface::looped(&iface, Family::V4);
+    let (socket, link) = crate::listener::looped(&iface, Family::V4);
     let seg = segment(&iface);
     seg.attach(link);
     seg.add_reflected(OWN, &Shared::new(tv("10.9.9.9", &["LiveTV"]))).unwrap();
