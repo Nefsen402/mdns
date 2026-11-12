@@ -286,24 +286,6 @@ Several untrusted interfaces do not learn about each other either.
 Devices are still tracked on an untrusted interface, and listed by
 .BR mdnsctl (1).
 .TP
-.B ForwardQuestions=
-Optional.
-Which questions asked on an interface of this segment the daemon asks on its
-other interfaces, in a query of its own, so that the answer is reflected:
-.B always
-(the default) asks every one,
-.B unknown
-only those that nothing announced on the asking interface answers, and
-.B never
-none.
-With
-.BR unknown ,
-a device that only answers when asked is not found once another device of its
-type has been: a browse for that type is answered from the copy of the other.
-Questions about a name a device on the asking interface owns, and those of a
-device probing for its names, are never asked elsewhere; nor are those of an
-untrusted interface.
-.TP
 .B NeighbourAddresses=
 Optional:
 .BR always ,
@@ -672,6 +654,34 @@ addresses, or
 .B MinimumLifetime=
 if that is longer) to keep devices listed, and the daemon warns about it at
 startup.
+.TP
+.B ForwardQuestions=
+Optional.
+Which of the questions that clients ask on the other interfaces of its
+segments the daemon asks on this interface, in a query of its own, so that the
+answer is reflected:
+.B always
+(the default) asks every one,
+.B once
+each the first time, and
+.B never
+none.
+A device that only answers when asked is found by being asked; with
+.B always
+that is whenever a client looks for its type.
+With
+.BR once ,
+it is asked as a question is new to this interface: one it has put on its link
+before, whoever asked it, is not asked again.
+A device that answers a question when it is put to it is found by the first
+time, and one that announces itself, as most do when they join a network, is
+heard when it does, so the second asks for nothing that is not known.
+What the interface has asked itself, in a probe, counts.
+It remembers the last 4096 questions, and forgets them all when it forgets its
+devices, as when it goes away and comes back.
+Questions about a name a device on the asking interface owns, and those of a
+device probing for its names, are never asked elsewhere; nor are those of an
+untrusted interface.
 .TP
 .B ProbeServices=
 Optional.

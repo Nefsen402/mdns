@@ -376,22 +376,6 @@ fn services_are_announced_as_they_are_advertised() {
     assert_eq!(srv(goodbyes, 0), ["Bare._ipp._tcp.local", "Shell._ssh._tcp.local"]);
 }
 
-#[test]
-fn a_device_knows_what_it_has_and_what_its_nsec_says_it_has_not() {
-    let mut device = tv("10.0.1.9", &["TV"]);
-    let knows = |d: &Device, name: &str, qtype: u16| {
-        d.knows(&Advertise::ALL, &Question { name: name.into(), qtype, class: 1, unicast_response: false })
-    };
-    assert!(knows(&device, "TV.local", rtype::A));
-    assert!(knows(&device, "tv.local", rtype::ANY));
-    assert!(knows(&device, "_http._tcp.local", rtype::PTR));
-    assert!(knows(&device, "TV._http._tcp.local", rtype::SRV));
-    assert!(!knows(&device, "tv.local", rtype::AAAA), "it has not said");
-    assert!(!knows(&device, "printer.local", rtype::A));
-    device.nsec = Some(vec![rtype::A].into());
-    assert!(knows(&device, "tv.local", rtype::AAAA), "it said it has none");
-}
-
 /// The names a device is indexed by are those its announcement has records
 /// under, no more and no fewer: a device is asked about nothing else.
 #[test]
@@ -448,7 +432,8 @@ fn records_for_a_question_are_only_the_records_it_has() {
     let records = device.records_for(&Advertise::ALL, &ask("_http._tcp.local", rtype::PTR), 120, 4500);
     let kinds: Vec<u16> = records.iter().map(Record::rtype).collect();
     assert_eq!(kinds, [rtype::PTR]);
-    assert!(device.knows(&Advertise::ALL, &ask("tv.local", rtype::AAAA)), "its NSEC says it has none");
+    let denied = device.answers(&Advertise::ALL, &query("tv.local", rtype::AAAA), 120, 4500).0;
+    assert!(denied.iter().all(|r| r.rtype() == rtype::NSEC) && !denied.is_empty(), "its NSEC says it has none");
     assert!(device.records_for(&Advertise::ALL, &ask("tv.local", rtype::AAAA), 120, 4500).is_empty());
 }
 

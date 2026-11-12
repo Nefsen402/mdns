@@ -24,10 +24,11 @@ use crate::time::Instant;
 
 use anyhow::{bail, Result};
 
-use crate::config::{glob, Advertise, Forward, ReflectedWhen};
+use crate::codec::Question;
+use crate::config::{glob, Advertise, ReflectedWhen};
 use crate::device::Shared;
 use crate::interface::Interface;
-use crate::tracker::{Asked, Event};
+use crate::tracker::Event;
 
 use crate::prelude::*;
 
@@ -60,7 +61,6 @@ struct Inner {
     /// The interfaces whose interfaces are untrusted, by name or pattern, whether
     /// they are here or not.
     untrusted: Vec<String>,
-    forward: Forward,
     /// What of a device is reflected with it, made once for all the interfaces
     /// it is shown on.
     advertise: Rc<Advertise>,
@@ -117,18 +117,16 @@ impl Segment {
     /// others, so a network that is not to see the rest can still be seen
     /// from it.
     pub fn with_untrusted(segments: Vec<Interface>, untrusted: &[String]) -> Result<Segment> {
-        Self::with_options(segments, untrusted, Forward::default(), Advertise::default(), ReflectedWhen::default(), None)
+        Self::with_options(segments, untrusted, Advertise::default(), ReflectedWhen::default(), None)
     }
 
-    /// Like [`with_untrusted`](Segment::with_untrusted), putting the
-    /// questions asked on each interface to the others as `forward` says,
-    /// reflecting as much of a device as `advertise` says, reflecting the
+    /// Like [`with_untrusted`](Segment::with_untrusted), reflecting as much of
+    /// a device as `advertise` says, reflecting the
     /// devices that have what `when` asks for, and announcing what it reflects with the address TTL
     /// `reflect_ttl`, if given, in place of each device's own.
     pub fn with_options(
         segments: Vec<Interface>,
         untrusted: &[String],
-        forward: Forward,
         advertise: Advertise,
         when: ReflectedWhen,
         reflect_ttl: Option<Duration>,
@@ -148,7 +146,6 @@ impl Segment {
         let inner = Rc::new(Inner {
             members: RefCell::new(members),
             untrusted,
-            forward,
             advertise: Rc::new(advertise),
             when,
             reflect_ttl,
@@ -390,32 +387,21 @@ impl Inner {
         }
     }
 
-    /// Put the questions asked on `src`, those [`Forward`] lets through, to
-    /// the other interfaces: those whose devices are announced on it, so whose
-    /// answers will be. An untrusted interface is announced nothing, so its
-    /// questions are put nowhere.
-    fn forward(&self, src: usize, asked: &[Asked]) {
+    /// Put the questions asked on `src` to the other interfaces: those whose
+    /// devices are announced on it, so whose answers will be. Which of them an
+    /// interface asks on its link is its own say (`ForwardQuestions=`). An
+    /// untrusted interface is announced nothing, so its questions are put
+    /// nowhere.
+    fn forward(&self, src: usize, questions: &[Question]) {
         let members = self.snapshot();
-        if members[src].untrusted {
-            return;
-        }
-        let questions: Vec<_> = asked
-            .iter()
-            .filter(|a| match self.forward {
-                Forward::Always => true,
-                Forward::Unknown => !a.answered,
-                Forward::Never => false,
-            })
-            .map(|a| a.question.clone())
-            .collect();
-        if questions.is_empty() {
+        if members[src].untrusted || questions.is_empty() {
             return;
         }
         for (target, seg) in members.iter().map(|m| &m.segment).enumerate() {
             if target == src {
                 continue;
             }
-            if let Err(e) = seg.query_question(&questions) {
+            if let Err(e) = seg.query_question(questions) {
                 eprintln!("{}: asking on behalf of {} failed: {e:#}", seg.interface(), members[src].segment.interface());
             }
         }

@@ -122,18 +122,12 @@ fn daemon(args: Vec<String>) -> Result<()> {
     let mut segments = Vec::new();
     for seg in &config.segments {
         let segment =
-            Segment::with_options(Vec::new(), &seg.untrusted, seg.forward, seg.advertise.clone(), seg.reflected_when.clone(), seg.reflect_ttl)
+            Segment::with_options(Vec::new(), &seg.untrusted, seg.advertise.clone(), seg.reflected_when.clone(), seg.reflect_ttl)
             .with_context(|| format!("starting segment {:?}", seg.name))?;
         eprintln!("segment {:?}: {}", seg.name, seg.interfaces.join(", "));
         if !seg.untrusted.is_empty() {
             eprintln!("segment {:?}: {} not told about the others", seg.name, seg.untrusted.join(", "));
         }
-        let forwarding = match seg.forward {
-            Forward::Always => "every question asked on one interface",
-            Forward::Unknown => "only questions nothing announced on an interface answers",
-            Forward::Never => "no questions",
-        };
-        eprintln!("segment {:?}: asking {forwarding} on the others", seg.name);
         let when = &seg.reflected_when;
         if *when != config::ReflectedWhen::default() {
             let needs: Vec<&str> = [(when.address, "address"), (when.hostname, "hostname"), (when.service, "service")]
@@ -232,6 +226,12 @@ fn describe(interface: &config::Interface) {
     if interface.reannounce {
         eprintln!("{name}: announcing reflected devices again at 80% of their TTL, changed or not");
     }
+    let forwarding = match interface.forward {
+        Forward::Always => "every question asked on the others of its segments",
+        Forward::Once => "each question asked on the others of its segments, once",
+        Forward::Never => "no questions of the others of its segments",
+    };
+    eprintln!("{name}: asking {forwarding}");
     match interface.refresh_before {
         Some(before) => eprintln!(
             "{name}: asking devices to answer again {}s before they would expire, or three quarters of the way through a shorter life",
@@ -471,6 +471,7 @@ impl Iface {
         // The rounds run in the event loop; the interval is between starts.
         interface.set_probe_interval(settings.probe_interval);
         interface.set_probe_types(&settings.probe_services);
+        interface.set_forward(settings.forward);
         // Where the same hostname is found on more than one, the lowest
         // interface's device is the one reflected; an interface keeps its index.
         interface.set_priority(index.max(1));

@@ -69,7 +69,7 @@ the speaker never hears the phone.
 - **Quiet devices are found.** Many devices never announce themselves and only
   answer when asked. The daemon probes at startup, asks each device to answer
   again just before it would expire, and asks the other networks what clients
-  ask on one (`ForwardQuestions=` in `mdnsd.conf(5)`), so devices
+  ask on one (`ForwardQuestions=` in `mdnsd.conf(5)`: every time, or once each), so devices
   stay visible while they are there.
 - **Both IP families as one.** A device is one device whichever family it spoke:
   one that only speaks IPv6 is announced over IPv4 too, with its IPv6

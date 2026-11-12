@@ -145,22 +145,39 @@ class Reflecting(Case):
         self.assertTrue(hb.wait(alive("tv.local", A, "10.9.1.51")), self.logs(d))
         self.assertGreater(told(), once)
 
-    def test_a_question_is_forwarded_to_the_other_interfaces_when_the_segment_says_so(self):
+    def test_a_question_is_forwarded_to_the_other_interfaces_when_the_interface_says_so(self):
         la, lb = self.two_links()
         hb = lb.hearer()
-        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,rb\nForwardQuestions=always\n"))
+        d = self.lab.daemon(conf("[Interface]\nForwardQuestions=always\n[Segment]\nName=s\nInterfaces=ra,rb\n"))
         asker = la.device("10.9.1.50")
         asker.multicast(query(("_ipp._tcp.local", PTR)))
         got = hb.wait(asks("_ipp._tcp.local", PTR, src=lb.router_addr), 5)
         self.assertTrue(got, self.logs(d))
 
-    def test_a_question_is_not_forwarded_when_the_segment_says_never(self):
+    def test_a_question_is_not_forwarded_when_the_interface_says_never(self):
         la, lb = self.two_links()
         hb = lb.hearer()
-        d = self.lab.daemon(conf("[Segment]\nName=s\nInterfaces=ra,rb\nForwardQuestions=never\n"))
+        d = self.lab.daemon(conf("[Interface]\nForwardQuestions=never\n[Segment]\nName=s\nInterfaces=ra,rb\n"))
         la.device("10.9.1.50").multicast(query(("_ipp._tcp.local", PTR)))
         d.settle()
         self.assertTrue(hb.none(asks("_ipp._tcp.local", PTR)))
+
+    def test_a_question_is_forwarded_once_when_the_interface_says_once(self):
+        la, lb = self.two_links()
+        hb = lb.hearer()
+        d = self.lab.daemon(conf("[Interface]\nName=rb\nForwardQuestions=once\n[Segment]\nName=s\nInterfaces=ra,rb\n"))
+        asker = la.device("10.9.1.50")
+        asker.multicast(query(("_ipp._tcp.local", PTR)))
+        self.assertTrue(hb.wait(asks("_ipp._tcp.local", PTR, src=lb.router_addr), 5), "the first time it is asked\n" + self.logs(d))
+        # Asked again, long after: it has been asked, so it is not, whatever is
+        # heard of it. A question that is new is.
+        d.advance(30)
+        heard = hb.count()
+        asker.multicast(query(("_ipp._tcp.local", PTR)))
+        d.settle()
+        self.assertTrue(hb.none(asks("_ipp._tcp.local", PTR), since=heard), "not a second time\n" + self.logs(d))
+        asker.multicast(query(("_http._tcp.local", PTR)))
+        self.assertTrue(hb.wait(asks("_http._tcp.local", PTR, src=lb.router_addr), 5, since=heard), "a new one\n" + self.logs(d))
 
 
 class Topologies(Case):
@@ -235,9 +252,10 @@ class Topologies(Case):
         la, lb, lc = self.three_links()
         ha, hb, hc = la.hearer(), lb.hearer(), lc.hearer()
         d = self.lab.daemon(conf(
-            "[Segment]\nName=ab\nInterfaces=ra,rb\nForwardQuestions=always\n"
-            "[Segment]\nName=bc\nInterfaces=rb,rc\nForwardQuestions=always\n"
-            "[Segment]\nName=ac\nInterfaces=ra,rc\nForwardQuestions=always\n"))
+            "[Interface]\nForwardQuestions=always\n"
+            "[Segment]\nName=ab\nInterfaces=ra,rb\n"
+            "[Segment]\nName=bc\nInterfaces=rb,rc\n"
+            "[Segment]\nName=ac\nInterfaces=ra,rc\n"))
         question = ("_ipp._tcp.local", PTR)
         def asked(link, hearer):
             return len(hearer.matching(lambda h: h.src == link.router_addr and h.message.asks(*question) and not h.message.response))

@@ -625,15 +625,6 @@ impl Device {
         records
     }
 
-    /// Whether it has an answer to `q`: a record, or, by its NSEC, the word
-    /// that there is none.
-    #[cfg(test)]
-    pub fn knows(&self, how: &Advertise, q: &Question) -> bool {
-        let mut coverage = Coverage::default();
-        coverage.add(self, how, &q.name);
-        (q.class == 1 || q.class == 255) && coverage.knows(q.qtype)
-    }
-
     /// Its records that match `query`, with known-answer suppression
     /// applied, plus the additional records a client will want next (RFC 6763
     /// section 12): a PTR brings its SRV and TXT, and an SRV brings its address.
@@ -756,44 +747,6 @@ impl Device {
             extra.push(rec);
         }
         (answers.into_iter().cloned().collect(), extra.into_iter().cloned().collect())
-    }
-}
-
-/// What the devices announced under one name between them answer of each
-/// type that might be asked of it: a record of it, or, by an NSEC, the word
-/// that there is none. Built once for a name, whatever types are asked.
-#[derive(Default)]
-pub struct Coverage {
-    /// The types of the records under the name.
-    types: HashSet<u16>,
-    /// What each NSEC under the name says it has.
-    nsecs: Vec<Vec<u16>>,
-}
-
-impl Coverage {
-    /// Count what `device`, shown as `how`, has under `name`.
-    pub fn add(&mut self, device: &Device, how: &Advertise, name: &str) {
-        if device.hostname.is_none() {
-            return;
-        }
-        for rec in device.announcement(how, 1, 1).iter().filter(|r| r.name.eq_ignore_ascii_case(name)) {
-            self.types.insert(rec.rtype());
-            if let RData::Nsec { types, .. } = &rec.data
-                && !self.nsecs.contains(types)
-            {
-                self.nsecs.push(types.clone());
-            }
-        }
-    }
-
-    /// Whether a question of `qtype` of the name has an answer: any record
-    /// for ANY (an NSEC is not one of the records a name has), else one of
-    /// the type, or an NSEC that says there is none.
-    pub fn knows(&self, qtype: u16) -> bool {
-        if qtype == rtype::ANY {
-            return self.types.iter().any(|&t| t != rtype::NSEC);
-        }
-        self.types.contains(&qtype) || self.nsecs.iter().any(|types| !types.contains(&qtype))
     }
 }
 

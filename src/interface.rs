@@ -25,13 +25,13 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::config::{Advertise, AdvertiseConfig};
+use crate::config::{Advertise, AdvertiseConfig, Forward};
 use crate::device::{is_type, Advertised, Device, ServiceParts, Shared, HOST_TTL, OTHER_TTL};
-use crate::message::{self, responses, service_ttl, Coverage, Request, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
+use crate::message::{self, responses, service_ttl, Request, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
 use crate::addr::{family_of, is_link_local, Family, Prefix};
 use crate::listener::{Link, MDNS_PORT};
 use crate::codec::{Message, Question, Record};
-use crate::tracker::{Asked, Event};
+use crate::tracker::Event;
 
 use crate::prelude::*;
 
@@ -72,6 +72,11 @@ const FORWARD_GAP: Duration = Duration::from_secs(1);
 /// Questions remembered per interface as just put to it, so that a client
 /// asking endless made-up names cannot grow the list without bound.
 const MAX_FORWARDED: usize = 1024;
+
+/// Questions remembered per interface as put on its link, so that a client
+/// asking endless made-up names cannot grow the list without bound: the oldest
+/// is forgotten first, and asked again if it is asked for again.
+const MAX_REMEMBERED: usize = 4096;
 
 /// The headers around an mDNS packet: those of IPv6, the larger of the two
 /// families, and of UDP. What an interface's MTU leaves for the packet is its
@@ -649,9 +654,60 @@ struct State {
     /// The questions put to this interface on another's behalf, in lowercase,
     /// and when, for [`FORWARD_GAP`].
     forwarded: HashMap<(String, u16), Instant>,
+    /// Which of the questions asked on other interfaces it asks here.
+    forward: Forward,
+    /// The questions it has put on its link, for [`Forward::Once`].
+    asked: Remembered,
+}
+
+/// Questions, by lowercase name and type, in the order they were put on the
+/// link, up to [`MAX_REMEMBERED`].
+#[derive(Default)]
+struct Remembered {
+    seen: HashSet<(String, u16)>,
+    order: VecDeque<(String, u16)>,
+}
+
+impl Remembered {
+    fn key(question: &Question) -> (String, u16) {
+        (question.name.to_ascii_lowercase(), question.qtype)
+    }
+
+    fn contains(&self, question: &Question) -> bool {
+        self.seen.contains(&Self::key(question))
+    }
+
+    fn insert(&mut self, question: &Question) {
+        let key = Self::key(question);
+        if self.seen.contains(&key) {
+            return;
+        }
+        if self.order.len() >= MAX_REMEMBERED
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.seen.remove(&oldest);
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+    }
+
+    fn clear(&mut self) {
+        self.seen.clear();
+        self.order.clear();
+    }
 }
 
 impl State {
+    /// Remember the questions of `queries`, which were just put on the link, if
+    /// it matters: only [`Forward::Once`] goes by what was asked before.
+    fn note_asked(&mut self, queries: &[Message]) {
+        if self.forward == Forward::Once {
+            for question in queries.iter().flat_map(|query| &query.questions) {
+                self.asked.insert(question);
+            }
+        }
+    }
+
     /// Whether the tables that find things are what the devices and the
     /// neighbour table are, for tests to ask after anything that changes them.
     #[cfg(test)]
@@ -904,38 +960,26 @@ impl State {
     }
 
     /// The questions of `query` that are not about a name a device here owns
-    /// (it answers for itself), each with whether something announced here
-    /// has an answer to it: those the other interfaces might be asked. None
-    /// from a device probing for names it is about to take: they are its own.
-    fn asked(&self, query: &Message) -> Vec<Asked> {
+    /// (it answers for itself), each once: those the other interfaces might be
+    /// asked. None from a device probing for names it is about to take: they
+    /// are its own.
+    fn asked(&self, query: &Message) -> Vec<Question> {
         if !query.authorities.is_empty() {
             return Vec::new();
         }
-        // Each question once, and what answers a name found once, however
-        // many types of it are asked: `None` for a name a device here owns.
+        // Each question once, and whether a device here owns a name once
+        // however many types of it are asked.
         let mut seen: HashSet<(String, u16, u16)> = HashSet::new();
-        let mut covered: HashMap<String, Option<Coverage>> = HashMap::new();
+        let mut owned: HashMap<String, bool> = HashMap::new();
         let mut out = Vec::new();
         for q in &query.questions {
             let lower = q.name.to_ascii_lowercase();
             if !seen.insert((lower.clone(), q.qtype, q.class)) {
                 continue;
             }
-            let coverage = covered.entry(lower).or_insert_with(|| {
-                if self.is_local(&q.name) || self.tracker.discovered.contains_host(&q.name) {
-                    return None;
-                }
-                let mut coverage = Coverage::default();
-                for host in self.hosts.with_shown_name(&q.name) {
-                    if let Some(shown) = &host.shown {
-                        coverage.add(&shown.device.borrow(), &shown.how, &q.name);
-                    }
-                }
-                Some(coverage)
-            });
-            if let Some(coverage) = coverage {
-                let answered = (q.class == 1 || q.class == 255) && coverage.knows(q.qtype);
-                out.push(Asked { question: q.clone(), answered });
+            let ours = *owned.entry(lower).or_insert_with(|| self.is_local(&q.name) || self.tracker.discovered.contains_host(&q.name));
+            if !ours {
+                out.push(q.clone());
             }
         }
         out
@@ -1414,10 +1458,12 @@ impl Interface {
 
     /// Forget every device discovered here, as when the interface is gone:
     /// they cannot be reached through it, and their copies elsewhere are
-    /// withdrawn. They are found again once it is back.
+    /// withdrawn. They are found again once it is back, and so is what they
+    /// answer: the questions asked here before are forgotten with them.
     pub fn forget_discovered(&self) {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
+        state.asked.clear();
         let touched = state.tracker.forget();
         state.report(touched, Instant::now());
     }
@@ -1546,19 +1592,24 @@ impl Interface {
     /// already goes along as known answers, with the time it has left, so
     /// that only devices not yet heard of, or about to run out, answer.
     ///
-    /// A question asked here within [`FORWARD_GAP`] is not asked again, nor
-    /// any once [`MAX_FORWARDED`] are waiting it out. Returns how many were
-    /// asked. A no-op when the interface has no sender attached.
+    /// Which are asked is this interface's own say ([`Forward`]): all, none,
+    /// or each once, those it has not asked on its link before. A question
+    /// asked here within [`FORWARD_GAP`] is not asked again, nor any once
+    /// [`MAX_FORWARDED`] are waiting it out. Returns how many were asked. A
+    /// no-op when the interface has no sender attached.
     pub fn query_question(&self, questions: &[Question]) -> Result<usize> {
         let now = Instant::now();
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
-        if state.link.is_empty() {
+        if state.link.is_empty() || state.forward == Forward::Never {
             return Ok(0);
         }
         state.forwarded.retain(|_, at| now.saturating_duration_since(*at) < FORWARD_GAP);
         let mut fresh = Vec::new();
         for q in questions {
+            if state.forward == Forward::Once && state.asked.contains(q) {
+                continue;
+            }
             let key = (q.name.to_ascii_lowercase(), q.qtype);
             if !state.forwarded.contains_key(&key) && state.forwarded.len() < MAX_FORWARDED {
                 state.forwarded.insert(key, now);
@@ -1566,7 +1617,10 @@ impl Interface {
             }
         }
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
-        ask(&state.link, &message::forward_queries(fresh, known, state.max_packet))
+        let queries = message::forward_queries(fresh, known, state.max_packet);
+        let asked = ask(&state.link, &queries)?;
+        state.note_asked(&queries);
+        Ok(asked)
     }
 
     // Fed by the receive loops and the timer.
@@ -1668,6 +1722,12 @@ impl Interface {
     /// says what it is for there.
     pub fn start_probe(&self, why: &'static str) {
         self.begin(None, why, false);
+    }
+
+    /// Which of the questions asked on the other interfaces of its segments
+    /// it asks on its link: all, none, or each once.
+    pub fn set_forward(&self, forward: Forward) {
+        self.state.borrow_mut().forward = forward;
     }
 
     /// Probe on its own every `every`, the first one that long from now, as
@@ -1782,14 +1842,18 @@ impl Interface {
     /// One round of queries, built from what is known right now. A no-op
     /// when the interface has no sender attached.
     fn probe_round(&self) -> Result<usize> {
-        let state = self.state.borrow_mut();
+        let mut guard = self.state.borrow_mut();
+        let state = &mut *guard;
         if state.link.is_empty() {
             return Ok(0);
         }
 
         let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
         let types = state.tracker.types.iter().chain(&state.probe_types).cloned().collect();
-        ask(&state.link, &message::probe_queries(&devices, &types, state.max_packet))
+        let queries = message::probe_queries(&devices, &types, state.max_packet);
+        let asked = ask(&state.link, &queries)?;
+        state.note_asked(&queries);
+        Ok(asked)
     }
 
     fn query_types_round(&self, kinds: &[String]) -> Result<usize> {
@@ -1806,7 +1870,10 @@ impl Interface {
         let now = Instant::now();
         let devices: Vec<Device> = state.tracker.discovered.iter().map(|e| e.device.snapshot()).collect();
         let known = |q: &Question| state.tracker.discovered.with_name(&q.name).flat_map(|e| e.known_answers(q, now)).collect();
-        ask(&state.link, &message::type_queries(&devices, kinds, known, state.max_packet))
+        let queries = message::type_queries(&devices, kinds, known, state.max_packet);
+        let asked = ask(&state.link, &queries)?;
+        state.note_asked(&queries);
+        Ok(asked)
     }
 
     /// Ask the devices that are about to expire to answer again, so that a

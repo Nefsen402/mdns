@@ -466,15 +466,6 @@ impl Touched {
     }
 }
 
-/// A question asked on an interface, as the tracker passes it on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Asked {
-    pub question: Question,
-    /// Whether something announced here has an answer to it already. For a
-    /// browse, that is one answer, not necessarily all of them.
-    pub answered: bool,
-}
-
 /// A change to the devices of an interface, or a question asked on it: what
 /// the tracker has to say of what it heard.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -490,7 +481,7 @@ pub enum Event {
     /// the segment to put to the interfaces whose devices it announces here
     /// ([`Interface::query_question`](crate::interface::Interface::query_question)),
     /// as it is configured to.
-    Question(Vec<Asked>),
+    Question(Vec<Question>),
 }
 
 impl Event {

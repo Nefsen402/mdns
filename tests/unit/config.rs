@@ -489,19 +489,27 @@ fn comments_blank_lines_crlf_and_continuations_are_fine() {
     assert_eq!(c.segments[0].name, "a=b");
 }
 
-/// Each segment forwards every question unless it says otherwise.
+/// Each interface asks every question of the others of its segments unless
+/// it says otherwise, and the segment has no say.
 #[test]
-fn forwarding_questions_is_set_per_segment_and_always_by_default() {
+fn forwarding_questions_is_set_per_interface_and_always_by_default() {
     let forward = |extra: &str| {
-        let c = Config::parse(&format!("[Segment]\nName=a\nInterfaces=x,y\n{extra}\n[Segment]\nName=b\nInterfaces=z")).unwrap();
-        (c.segments[0].forward, c.segments[1].forward)
+        let c = Config::parse(&format!("{extra}\n[Segment]\nName=a\nInterfaces=x,y\n")).unwrap();
+        (c.interface("x").forward, c.interface("y").forward)
     };
     assert_eq!(forward(""), (Forward::Always, Forward::Always));
-    assert_eq!(forward("ForwardQuestions=Unknown"), (Forward::Unknown, Forward::Always));
-    assert_eq!(forward("ForwardQuestions=never"), (Forward::Never, Forward::Always));
-    assert_eq!(forward("ForwardQuestions=never\nForwardQuestions="), (Forward::Always, Forward::Always));
-    let bad = error_of("[Segment]\nName=a\nInterfaces=x\nForwardQuestions=sometimes");
-    assert!(bad.contains("line 4") && bad.contains("ForwardQuestions"), "{bad}");
+    assert_eq!(forward("[Interface]\nForwardQuestions=Once"), (Forward::Once, Forward::Once));
+    assert_eq!(forward("[Interface]\nName=x\nForwardQuestions=never"), (Forward::Never, Forward::Always));
+    assert_eq!(
+        forward("[Interface]\nForwardQuestions=never\n[Interface]\nName=y\nForwardQuestions=once"),
+        (Forward::Never, Forward::Once),
+        "the named one is the exception"
+    );
+    assert_eq!(forward("[Interface]\nForwardQuestions=never\nForwardQuestions="), (Forward::Always, Forward::Always));
+    let bad = error_of("[Interface]\nForwardQuestions=sometimes\n[Segment]\nName=a\nInterfaces=x");
+    assert!(bad.contains("line 2") && bad.contains("ForwardQuestions"), "{bad}");
+    let segment = error_of("[Segment]\nName=a\nInterfaces=x\nForwardQuestions=never");
+    assert!(segment.contains("line 4") && segment.contains("unknown setting"), "{segment}");
 }
 
 /// A config is read from its file, and an error says which file, and,
@@ -667,6 +675,7 @@ fn each_interface_is_settled_once_with_its_defaults_filled_in() {
             min_lifetime: DEFAULT_MIN_LIFETIME,
             refresh_before: Some(DEFAULT_REFRESH_BEFORE),
             probe_interval: None,
+            forward: Forward::Always,
             probe_services: Vec::new(),
             max_addrs: DEFAULT_MAX_ADDRS,
             max_devices: DEFAULT_MAX_DEVICES,

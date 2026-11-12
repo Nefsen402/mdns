@@ -102,17 +102,21 @@ pub const DEFAULT_MAX_DEVICES: usize = 1024;
 /// flood, not a device. See `[Interface] MaxServices=`.
 pub const DEFAULT_MAX_SERVICES: usize = 64;
 
-/// Which of the questions asked on one of a segment's interfaces it puts to
-/// the others (`ForwardQuestions=`). Never a probe, nor one about a name a
-/// device on the asking segment owns: it answers for itself.
+/// Which of the questions asked on the other interfaces of its segments an
+/// interface asks on its own link (`ForwardQuestions=`). Never a probe, nor
+/// one about a name a device on the asking interface owns: it answers for
+/// itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Forward {
     /// Every one. A browse for a type that one device was heard to have can
     /// have other answers still, from devices that only answer when asked.
     #[default]
     Always,
-    /// Those that nothing announced on the asking segment has an answer to.
-    Unknown,
+    /// Each question once: those that it has not asked on its link before,
+    /// whoever asked, and not again. A device that answers a question when it
+    /// is put to it is found by the first, and one that announces itself is
+    /// heard when it does.
+    Once,
     /// None: only what devices announce, or answer a probe with, is reflected.
     Never,
 }
@@ -225,8 +229,6 @@ pub struct SegmentConfig {
     /// are announced to the others, but not the others' to them. Each is one
     /// of `interfaces` or a name one of them matches.
     pub untrusted: Vec<String>,
-    /// Which questions asked on one of its interfaces are put to the others.
-    pub forward: Forward,
     /// What of a device is reflected with it: which of the addresses it was
     /// given from the neighbour table (`NeighbourAddresses=`) and which
     /// service types (`ReflectedServices=`).
@@ -272,6 +274,7 @@ struct InterfaceConfig {
     refresh_before: Option<Option<Duration>>,
     /// `Some(None)` is off.
     probe_interval: Option<Option<Duration>>,
+    forward: Option<Forward>,
     /// Empty is not set here, and left to the nameless section.
     probe_services: Vec<String>,
     max_addrs: Option<usize>,
@@ -300,6 +303,9 @@ pub struct Interface {
     /// How often to probe it for devices: `None` is not by itself, only at
     /// startup, when it comes up, and on request.
     pub probe_interval: Option<Duration>,
+    /// Which of the questions asked on the other interfaces of its segments
+    /// it asks on its link: [`Forward::Always`] unless set.
+    pub forward: Forward,
     /// The service types every probe of it browses for, as well as those its
     /// devices have announced, lowercase and under `.local`: devices that only
     /// answer when asked for their type are found this way.
@@ -407,6 +413,7 @@ impl Config {
             min_lifetime: setting_of(&self.settings, name, DEFAULT_MIN_LIFETIME, |i| i.min_lifetime),
             refresh_before: setting_of(&self.settings, name, Some(DEFAULT_REFRESH_BEFORE), |i| i.refresh_before),
             probe_interval: setting_of(&self.settings, name, None, |i| i.probe_interval),
+            forward: setting_of(&self.settings, name, Forward::default(), |i| i.forward),
             probe_services: setting_of(&self.settings, name, Vec::new(), |i| Some(i.probe_services.clone()).filter(|kinds| !kinds.is_empty())),
             max_addrs: setting_of(&self.settings, name, DEFAULT_MAX_ADDRS, |i| i.max_addrs),
             max_devices: setting_of(&self.settings, name, DEFAULT_MAX_DEVICES, |i| i.max_devices),
@@ -528,6 +535,9 @@ impl Config {
                             }
                         }
                     }
+                    ("interface", "forwardquestions") => {
+                        settings.last_mut().unwrap().forward = Some(parse_forward(&value, lineno)?);
+                    }
                     ("interface", "refreshbefore") => {
                         let before = parse_span(&value, lineno, "RefreshBefore", MIN_REFRESH_BEFORE)?;
                         settings.last_mut().unwrap().refresh_before = Some(before);
@@ -560,9 +570,6 @@ impl Config {
                             "auto" | "" => None,
                             _ => Some(parse_host_ttl(&value, lineno, "ReflectTTL")?),
                         };
-                    }
-                    ("segment", "forwardquestions") => {
-                        config.segments.last_mut().unwrap().forward = parse_forward(&value, lineno)?;
                     }
                     ("interface", "ipv4") => settings.last_mut().unwrap().ipv4 = Some(parse_listen(entry, lineno, "IPv4")?),
                     ("interface", "ipv6") => settings.last_mut().unwrap().ipv6 = Some(parse_listen(entry, lineno, "IPv6")?),
@@ -1004,9 +1011,9 @@ fn parse_forward(value: &str, lineno: usize) -> Result<Forward> {
     match value.to_ascii_lowercase().as_str() {
         // An empty assignment resets, as everywhere.
         "always" | "" => Ok(Forward::Always),
-        "unknown" => Ok(Forward::Unknown),
+        "once" => Ok(Forward::Once),
         "never" => Ok(Forward::Never),
-        _ => bail!("line {lineno}: invalid ForwardQuestions {value:?}: always, unknown or never"),
+        _ => bail!("line {lineno}: invalid ForwardQuestions {value:?}: always, once or never"),
     }
 }
 

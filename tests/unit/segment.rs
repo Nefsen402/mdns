@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
 use super::*;
-use crate::config::{Advertise, Neighbours};
+use crate::config::{Advertise, Forward, Neighbours};
 use crate::device::Device;
 use crate::interface::OWN;
 
@@ -266,7 +266,7 @@ fn a_device_without_services_is_reflected_only_if_asked_to() {
         let (b, _brx) = wired("b");
         let when = ReflectedWhen { service, ..ReflectedWhen::default() };
         let _r =
-            Segment::with_options(vec![a.clone(), b.clone()], &[], Forward::default(), Advertise::default(), when, None)
+            Segment::with_options(vec![a.clone(), b.clone()], &[], Advertise::default(), when, None)
                 .unwrap();
 
         announce(&a, "10.0.1.6", "bare.local", &[]);
@@ -319,7 +319,7 @@ fn only_the_services_of_the_types_asked_for_are_reflected() {
             .advertise
             .clone();
         let _r =
-            Segment::with_options(vec![a.clone(), b.clone()], &[], Forward::default(), advertise, when, None)
+            Segment::with_options(vec![a.clone(), b.clone()], &[], advertise, when, None)
                 .unwrap();
         announce_kinds(&a, "10.0.1.7", "mixed.local", &[("Office", "_ipp._tcp"), ("Shell", "_ssh._tcp")]);
         announce_kinds(&a, "10.0.1.8", "shell.local", &[("Box", "_ssh._tcp")]);
@@ -353,7 +353,7 @@ fn a_device_without_a_routable_address_is_reflected_only_if_asked_to() {
         let (b, _brx) = wired_v6("b");
         let when = ReflectedWhen { address, ..ReflectedWhen::default() };
         let _r =
-            Segment::with_options(vec![a.clone(), b.clone()], &[], Forward::default(), Advertise::default(), when, None)
+            Segment::with_options(vec![a.clone(), b.clone()], &[], Advertise::default(), when, None)
                 .unwrap();
 
         announce6(&a, "fe80::6", "mute.local", &["fe80::6"], "Mute");
@@ -505,7 +505,7 @@ fn a_configured_reflect_ttl_wins_for_the_address_and_leaves_the_services_alone()
     let (a, _arx) = wired("a");
     let (b, brx) = wired("b");
     let ttl = Some(Duration::from_secs(900));
-    let _r = Segment::with_options(vec![a.clone(), b.clone()], &[], Forward::default(), Advertise::default(), ReflectedWhen::default(), ttl).unwrap();
+    let _r = Segment::with_options(vec![a.clone(), b.clone()], &[], Advertise::default(), ReflectedWhen::default(), ttl).unwrap();
 
     announce_ttl(&a, "10.0.1.5", "tv.local", &["TV"], 300, 600);
     wait_for(|| b.reflected_devices().len() == 1);
@@ -520,7 +520,7 @@ fn interfaces_sharing_an_interface_each_reflect_with_their_own_ttl() {
     let (media, _mrx) = wired("media");
     let (wifi, _wrx) = wired("wifi");
     let ttl = Some(Duration::from_secs(900));
-    let _media = Segment::with_options(vec![br0.clone(), media.clone()], &[], Forward::default(), Advertise::default(), ReflectedWhen::default(), ttl);
+    let _media = Segment::with_options(vec![br0.clone(), media.clone()], &[], Advertise::default(), ReflectedWhen::default(), ttl);
     let _wifi = Segment::new(vec![br0.clone(), wifi.clone()]).unwrap();
 
     announce_ttl(&media, "10.0.2.5", "tv.local", &["TV"], 300, 600);
@@ -727,19 +727,21 @@ fn asked_names(msgs: &[Message]) -> Vec<String> {
     msgs.iter().filter(|m| !m.header.response).flat_map(|m| &m.questions).map(|q| q.name.clone()).collect()
 }
 
-/// A question br0 has no answer to is asked, by the daemon, on the
-/// segments whose devices br0 is told about, untrusted ones included.
-/// Their answer is reflected, and the client asking again is answered,
-/// and, forwarding only what is unknown, not asked about elsewhere. An
-/// untrusted segment's questions go nowhere: nothing would come back.
+/// A question asked on br0 is asked, by the daemon, on the interfaces whose
+/// devices br0 is told about, untrusted ones included. Their answer is
+/// reflected, and the client asking again is answered, and, where each
+/// question is asked once, not asked about elsewhere again. An untrusted
+/// interface's questions go nowhere: nothing would come back.
 #[test]
 fn a_question_nothing_answers_is_asked_where_the_answer_could_come_from() {
     let (br0, br0_rx) = wired("br0");
     let (media, media_rx) = wired("media");
     let (wifi, wifi_rx) = wired("wifi");
     let segments = vec![br0.clone(), media.clone(), wifi.clone()];
-    let _r =
-        Segment::with_options(segments, &["wifi".to_string()], Forward::Unknown, Advertise::default(), ReflectedWhen::default(), None).unwrap();
+    for target in [&media, &wifi] {
+        target.set_forward(Forward::Once);
+    }
+    let _r = Segment::with_options(segments, &["wifi".to_string()], Advertise::default(), ReflectedWhen::default(), None).unwrap();
 
     ask(&br0, "10.0.0.50", "printer.local");
     deliver_made();
@@ -765,17 +767,18 @@ fn a_question_nothing_answers_is_asked_where_the_answer_could_come_from() {
     assert!(asked_names(&drain(&br0_rx)).is_empty() && asked_names(&drain(&media_rx)).is_empty());
 }
 
-/// A browse that a copy answers may have other answers still, from
-/// devices that only answer when asked: it is asked elsewhere unless the
-/// segment forwards only what it has no answer to, or nothing. What is
-/// known there goes along as known answers, so that only the others
-/// answer.
+/// A browse that a copy answers may have other answers still, from devices
+/// that only answer when asked: it is asked on the other interface, as that
+/// interface is set to, with what is known there going along as known answers
+/// so that only the others answer. Always and unknown ask it the first time;
+/// never, nothing; and a question that is new is asked wherever it is not never.
 #[test]
 fn a_browse_a_copy_answers_is_asked_elsewhere_as_configured() {
-    for forward in [Forward::Always, Forward::Unknown, Forward::Never] {
+    for forward in [Forward::Always, Forward::Once, Forward::Never] {
         let (br0, _br0_rx) = wired("br0");
         let (media, media_rx) = wired("media");
-        let _r = Segment::with_options(vec![br0.clone(), media.clone()], &[], forward, Advertise::default(), ReflectedWhen::default(), None).unwrap();
+        media.set_forward(forward);
+        let _r = Segment::with_options(vec![br0.clone(), media.clone()], &[], Advertise::default(), ReflectedWhen::default(), None).unwrap();
         announce(&media, "10.0.2.7", "tv.local", &["TV"]);
         wait_for(|| br0.reflected_devices().len() == 1);
         drain(&media_rx);
@@ -783,17 +786,17 @@ fn a_browse_a_copy_answers_is_asked_elsewhere_as_configured() {
         ask_type(&br0, "10.0.0.50", "_http._tcp.local", rtype::PTR);
         deliver_made();
         let queries: Vec<Message> = drain(&media_rx).into_iter().filter(|m| !m.header.response).collect();
-        if forward == Forward::Always {
-            assert_eq!(asked_names(&queries), ["_http._tcp.local"]);
+        if forward == Forward::Never {
+            assert!(queries.is_empty(), "{forward:?}: {queries:?}");
+        } else {
+            assert_eq!(asked_names(&queries), ["_http._tcp.local"], "{forward:?}");
             let known = &queries[0].answers;
             assert_eq!(known.len(), 1, "{known:?}");
             assert_eq!(known[0].data, RData::Ptr("TV._http._tcp.local".into()));
             assert!(known[0].ttl > 0 && known[0].ttl <= 120, "the time it has left: {}", known[0].ttl);
-        } else {
-            assert!(queries.is_empty(), "{forward:?}: {queries:?}");
         }
 
-        // Never forwarding, not even what nothing answers is asked.
+        // Another question is new, so it is asked wherever it is asked at all.
         ask(&br0, "10.0.0.50", "printer.local");
         deliver_made();
         let asked = asked_names(&drain(&media_rx));
@@ -917,7 +920,7 @@ fn a_interface_chooses_which_neighbour_addresses_to_reflect() {
         let (b, _brx) = wired("b");
         let mut advertise = Advertise::default();
         advertise.neighbours = mode;
-        let _r = Segment::with_options(vec![a.clone(), b.clone()], &[], Forward::default(), advertise, ReflectedWhen::default(), None).unwrap();
+        let _r = Segment::with_options(vec![a.clone(), b.clone()], &[], advertise, ReflectedWhen::default(), None).unwrap();
         a.set_prefixes(vec![prefix("10.0.1.0/24"), prefix("fd00::/64")]);
         for (addr, mac) in [("10.0.1.9", 9), ("fd00::9", 9), ("fe80::8", 8), ("fd00::8", 8)] {
             a.neighbour(ip(addr), Some(vec![2, 0, 0, 0, 0, mac]));

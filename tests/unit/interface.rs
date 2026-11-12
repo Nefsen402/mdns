@@ -355,11 +355,12 @@ fn a_device_probing_for_a_name_is_not_answered_with_a_copy() {
     assert_eq!(recv(&rx).expect("defended").answers[0].data, RData::A("10.0.1.1".parse().unwrap()));
 }
 
-/// A question is passed on for the segment to ask elsewhere, marked
-/// with whether something announced here answers it; one that a device
-/// here owns the name of, or that a device asks while probing, is not.
+/// A question is passed on for the segment to ask elsewhere, each once;
+/// one that a device here owns the name of, or that a device asks while
+/// probing, is not. Whether something here answers it is not asked: what
+/// an interface asks on its link is its own say.
 #[test]
-fn a_question_is_passed_on_marked_with_whether_it_is_answered_here() {
+fn a_question_is_passed_on_unless_a_device_here_owns_its_name() {
     let (seg, rx) = wired();
     let events = seg.subscribe();
     let mut copy = tv("10.0.2.9", &["TV"]);
@@ -373,21 +374,18 @@ fn a_question_is_passed_on_marked_with_whether_it_is_answered_here() {
     let client = sa("10.0.1.50");
 
     seg.handle(client, &asking(&[question("printer.local", rtype::A)], vec![])).unwrap();
-    assert_eq!(passed_on(&events), [vec![passed("printer.local", rtype::A, false)]]);
+    assert_eq!(passed_on(&events), [vec![question("printer.local", rtype::A)]]);
 
-    // The copy's address, and even what its NSEC says it has not got,
-    // are answered here; the browse for a type it has not got is not.
+    // What a copy here answers is passed on all the same: it is not the whole
+    // answer, if a device is quiet.
     let mixed = [question("tv.local", rtype::A), question("tv.local", rtype::AAAA), question("_ipp._tcp.local", rtype::PTR)];
     seg.handle(client, &asking(&mixed, vec![])).unwrap();
-    assert_eq!(passed_on(&events), [vec![
-        passed("tv.local", rtype::A, true),
-        passed("tv.local", rtype::AAAA, true),
-        passed("_ipp._tcp.local", rtype::PTR, false),
-    ]]);
+    assert_eq!(passed_on(&events), [mixed.to_vec()]);
 
-    // A copy that may not answer again just yet still knows the answer.
-    seg.handle(client, &asking(&[question("tv.local", rtype::A)], vec![])).unwrap();
-    assert_eq!(passed_on(&events), [vec![passed("tv.local", rtype::A, true)]]);
+    // Each once, whatever the case of the name, however often it is asked.
+    let again = [question("tv.local", rtype::A), question("TV.local", rtype::A), question("tv.local", rtype::A)];
+    seg.handle(client, &asking(&again, vec![])).unwrap();
+    assert_eq!(passed_on(&events), [vec![question("tv.local", rtype::A)]]);
 
     // Names a device here owns, it answers for itself, whatever the case.
     let owned = [question("NAS.local", rtype::A), question("files._smb._tcp.local", rtype::TXT)];
@@ -398,6 +396,101 @@ fn a_question_is_passed_on_marked_with_whether_it_is_answered_here() {
     seg.handle(client, &asking(&[question("printer.local", rtype::ANY)], vec![a_record("printer.local", "10.0.1.50")])).unwrap();
     hear(&seg, "10.0.1.20", vec![a_record("nas.local", "10.0.1.20")]);
     assert!(passed_on(&events).is_empty());
+}
+
+/// What an interface asks on its link of the questions asked elsewhere is
+/// its own say: all of them, none, or each once.
+#[test]
+fn an_interface_asks_the_questions_it_is_told_to_as_it_is_set_to() {
+    let later = |seg: &Interface| {
+        for at in seg.state.borrow_mut().forwarded.values_mut() {
+            *at -= FORWARD_GAP;
+        }
+    };
+    let ipp = [question("_ipp._tcp.local", rtype::PTR)];
+
+    // Always: every time it is asked, as soon as it may be.
+    let (seg, rx) = wired();
+    seg.set_forward(Forward::Always);
+    assert_eq!(seg.query_question(&ipp).unwrap(), 1);
+    recv(&rx).unwrap();
+    later(&seg);
+    assert_eq!(seg.query_question(&ipp).unwrap(), 1, "asked again");
+    recv(&rx).unwrap();
+
+    // Never: nothing, nor is it remembered.
+    let (seg, rx) = wired();
+    seg.set_forward(Forward::Never);
+    assert_eq!(seg.query_question(&ipp).unwrap(), 0);
+    assert!(recv(&rx).is_none());
+    assert!(seg.state.borrow().asked.order.is_empty());
+
+    // Once: each question once, whatever the case, and not again however
+    // long after; another question is new.
+    let (seg, rx) = wired();
+    seg.set_forward(Forward::Once);
+    assert_eq!(seg.query_question(&ipp).unwrap(), 1);
+    recv(&rx).unwrap();
+    later(&seg);
+    assert_eq!(seg.query_question(&[question("_IPP._tcp.local", rtype::PTR)]).unwrap(), 0, "asked before");
+    assert!(recv(&rx).is_none());
+    let both = [question("_ipp._tcp.local", rtype::PTR), question("_http._tcp.local", rtype::PTR), question("_ipp._tcp.local", rtype::TXT)];
+    assert_eq!(seg.query_question(&both).unwrap(), 2, "the others are new");
+    assert_eq!(asked(&recv(&rx).unwrap()), BTreeSet::from([q("_http._tcp.local", rtype::PTR), q("_ipp._tcp.local", rtype::TXT)]));
+}
+
+/// What the interface asked itself is asked before: a probe of a type, and
+/// a question asked of it, are done once the one is, and only then.
+#[test]
+fn what_an_interface_asked_in_a_probe_is_not_asked_again_when_it_is_asked_elsewhere() {
+    let (seg, rx) = wired();
+    seg.set_forward(Forward::Once);
+    seg.set_probe_types(&["_http._tcp.local".to_string()]);
+    seg.probe();
+    // Its rounds run on its own time.
+    let mut rounds = 0;
+    while seg.state.borrow().probing.len() > 0 && rounds < 20 {
+        rounds += 1;
+        for p in seg.state.borrow_mut().probing.iter_mut() {
+            p.next = Instant::now();
+        }
+        seg.upkeep(Instant::now());
+    }
+    let sent: Vec<Message> = std::iter::from_fn(|| recv(&rx)).collect();
+    assert!(sent.iter().flat_map(|m| &m.questions).any(|q| q.name == "_http._tcp.local"), "the probe asked for the type");
+
+    // Asked elsewhere now, it is not asked again; another type is.
+    assert_eq!(seg.query_question(&[question("_http._tcp.local", rtype::PTR)]).unwrap(), 0);
+    assert_eq!(seg.query_question(&[question("_ipp._tcp.local", rtype::PTR)]).unwrap(), 1);
+
+    // Forgotten with the devices, as when the interface goes and comes back.
+    recv(&rx).unwrap();
+    seg.forget_discovered();
+    for at in seg.state.borrow_mut().forwarded.values_mut() {
+        *at -= FORWARD_GAP;
+    }
+    assert_eq!(seg.query_question(&[question("_ipp._tcp.local", rtype::PTR)]).unwrap(), 1);
+}
+
+/// However many made-up questions are asked, only so many are remembered, the
+/// oldest forgotten first.
+#[test]
+fn only_so_many_questions_are_remembered() {
+    let (seg, rx) = wired();
+    // Drained as it goes, without waiting for what is not coming.
+    rx.set_nonblocking(true).unwrap();
+    seg.set_forward(Forward::Once);
+    for i in 0..MAX_REMEMBERED + 10 {
+        for at in seg.state.borrow_mut().forwarded.values_mut() {
+            *at -= FORWARD_GAP;
+        }
+        seg.query_question(&[question(&format!("x{i}.local"), rtype::A)]).unwrap();
+        while recv(&rx).is_some() {}
+    }
+    let state = seg.state.borrow();
+    assert_eq!((state.asked.order.len(), state.asked.seen.len()), (MAX_REMEMBERED, MAX_REMEMBERED));
+    assert!(!state.asked.contains(&question("x0.local", rtype::A)), "the oldest is forgotten");
+    assert!(state.asked.contains(&question(&format!("x{}.local", MAX_REMEMBERED + 9), rtype::A)));
 }
 
 #[test]
@@ -1190,10 +1283,6 @@ fn question(name: &str, qtype: u16) -> Question {
     Question { name: name.into(), qtype, class: 1, unicast_response: false }
 }
 
-fn passed(name: &str, qtype: u16, answered: bool) -> Asked {
-    Asked { question: question(name, qtype), answered }
-}
-
 /// A query asking `questions`, with `proposed` records if it is a probe.
 fn asking(questions: &[Question], proposed: Vec<Record>) -> Vec<u8> {
     Message {
@@ -1234,7 +1323,7 @@ impl Events<'_> {
 }
 
 /// The questions passed on so far, one list per query.
-fn passed_on(events: &Events) -> Vec<Vec<Asked>> {
+fn passed_on(events: &Events) -> Vec<Vec<Question>> {
     events
         .try_iter()
         .filter_map(|e| match e {
