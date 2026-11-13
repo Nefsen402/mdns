@@ -244,7 +244,7 @@ fn describe(interface: &config::Interface) {
             if interface.active { "devices" } else { "the devices a watch is for" },
             before.as_secs()
         ),
-        None => eprintln!("{name}: refreshing devices before they expire is off"),
+        None => eprintln!("{name}: refreshing devices before they expire is off, but for the devices a watch is for ({}s before)", config::DEFAULT_REFRESH_BEFORE.as_secs()),
     }
     match interface.probe_interval {
         Some(interval) => {

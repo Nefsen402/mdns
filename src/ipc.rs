@@ -48,9 +48,9 @@
 //! type; it may be given more than once. Many devices answer only when asked
 //! for their type, and not when asked what types there are, so neither a
 //! probe nor waiting finds them. The watch first sends a `present` line for
-//! each device of the type already known, and asks: as any question is asked
-//! on an interface, as it is set to (`ForwardQuestions=`), so a type already
-//! asked for is not asked for again, where each question is asked once. A
+//! each device of the type already known, and asks, though the interface asks
+//! nothing of the others' questions (`ForwardQuestions=never`); where each
+//! question is asked once, a type already asked for is not asked for again. A
 //! device that loses its last service of the type is `removed` from the
 //! watch. Where an interface asks nothing of its own accord (`Active=no`), the
 //! devices of the type are asked to answer again before they run out for as
@@ -707,15 +707,14 @@ fn follow(groups: &[Group], arg: &str) -> Result<Watch, Value> {
 }
 
 /// Ask for the types of a watch's query on the interfaces of the named
-/// segment, as any question is asked: an interface asks it as it is set to
-/// (`ForwardQuestions=`), all of them, those it has not asked before, or
-/// none.
+/// segment. What a person asks for is not held back by `ForwardQuestions=never`
+/// (see [`Interface::query_wanted`]).
 fn ask_for_types(groups: &[Group], name: &str, kinds: &[String]) {
     let questions: Vec<Question> =
         kinds.iter().map(|kind| Question { name: kind.clone(), qtype: rtype::PTR, class: 1, unicast_response: false }).collect();
     for seg in links_of(groups, name) {
-        // Failing to send is no matter: what is asked again is asked as is set.
-        if let Err(e) = seg.query_question(&questions) {
+        // Failing to send is no matter: it is asked again by the next watch.
+        if let Err(e) = seg.query_wanted(&questions) {
             eprintln!("{}: asking for {} failed: {e:#}", seg.interface(), kinds.join(", "));
         }
     }

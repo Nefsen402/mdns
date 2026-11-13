@@ -402,7 +402,11 @@ What something asks for is still asked: a lookup through the Avahi socket
 of
 .BR [Ipc] ),
 a
-.BR "mdnsctl watch \-\-query" ,
+.BR "mdnsctl watch \-\-query"
+(even where
+.B ForwardQuestions=
+is
+.BR never ),
 a question put by another interface of the segment
 .RB ( ForwardQuestions= ),
 and
@@ -588,7 +592,9 @@ Default
 .B 0
 or
 .B off
-turns it off.
+turns it off, but for the devices that an open
+.B mdnsctl watch \-\-query
+is for, which are asked 30 seconds before they run out all the same.
 A device lives for as long as the longest TTL it announced, and at least
 .B MinimumLifetime=
 (one minute by default).

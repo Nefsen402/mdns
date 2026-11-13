@@ -634,7 +634,8 @@ fn watch_with_a_query_shows_what_is_there_and_asks_as_the_interface_says() {
     assert_eq!(h.json(&mut second_reader)["event"], "present");
     assert!(http(&mut h, &rx).is_empty(), "asked once");
 
-    // A type that is new is asked, and where the interface asks nothing, none is.
+    // A type that is new is asked, and so is one where the interface asks nothing
+    // of the others' questions: what a person asks for is.
     let (mut third, mut third_reader) = connect(&path);
     h.ask(&mut third, &mut third_reader, "watch --query=_ipp._tcp IoT");
     let ipp = {
@@ -656,7 +657,7 @@ fn watch_with_a_query_shows_what_is_there_and_asks_as_the_interface_says() {
         h.pump();
         hue.extend(queries(&rx).into_iter().filter(|(names, _)| names == &["_hue._tcp.local"]));
     }
-    assert!(hue.is_empty(), "never asks nothing: {hue:?}");
+    assert!(!hue.is_empty(), "asked though the interface asks nothing of its own accord");
 
     // One without the type is not shown; one with it is.
     seg.observe(ip("10.0.1.8"));

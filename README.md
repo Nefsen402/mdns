@@ -294,9 +294,10 @@ Once found, a device stays listed as long as it keeps answering, and plain
 
 **Reacting as devices appear.** `watch` streams changes, so a script need not
 poll. With `--query` it starts with the devices of the type already known, and
-asks for the type as any question is asked on an interface (`ForwardQuestions=`
-in `mdnsd.conf(5)`): by default once, so a type asked for before is not asked
-for again, and what answered it is known already. For example, configure each
+asks for the type on every interface of the segment, even one set to ask nothing
+of the others' questions (`ForwardQuestions=never` in `mdnsd.conf(5)`); by default
+a type asked for before is not asked for again, and what answered it is known
+already. For example, configure each
 Shelly plug once as it is found:
 
 ```sh

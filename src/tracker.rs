@@ -716,9 +716,9 @@ pub(crate) struct Devices {
     /// How long before one would run out they are asked to answer again; none
     /// if they are not.
     refresh: Option<Duration>,
-    /// Whether only the devices that have a service of one of `watched` are:
-    /// all of them are if it is not.
-    only_watched: bool,
+    /// Whether all of them are, as the interface is set to ask: those that have
+    /// a service of one of `watched` are whatever it is set to.
+    everyone: bool,
     /// The service types, in lowercase, that something is looking for.
     watched: Vec<String>,
     hasher: DefaultHashBuilder,
@@ -825,10 +825,11 @@ impl Devices {
     }
 
     /// Whether `entry` is asked to answer again before it runs out, if there is
-    /// a way to ask: all are, unless only those that something is looking for
-    /// are, the ones that have a service of a type it watches.
+    /// a way to ask: all are where the interface is set to ask, and those that
+    /// something is looking for, that have a service of a type it watches, are
+    /// whatever it is set to.
     pub fn refreshes(&self, entry: &Entry) -> bool {
-        !self.only_watched
+        self.everyone
             || entry.device.borrow().services.iter().any(|svc| self.watched.iter().any(|kind| svc.kind().eq_ignore_ascii_case(kind)))
     }
 
@@ -883,15 +884,15 @@ impl Devices {
     }
 
     /// Set how long before they run out devices are asked to answer again, or
-    /// that they are not, and whether only those with a service of one of the
-    /// types `watched` (in lowercase) are. It is what [`Devices::refresh_at`]
+    /// that they are not, whether all are or only those with a service of one of
+    /// the types `watched` (in lowercase). It is what [`Devices::refresh_at`]
     /// goes by, so the times they are held under are made again.
-    pub fn set_refresh(&mut self, before: Option<Duration>, only_watched: bool, watched: &[String]) {
-        if self.refresh == before && self.only_watched == only_watched && self.watched == watched {
+    pub fn set_refresh(&mut self, before: Option<Duration>, everyone: bool, watched: &[String]) {
+        if self.refresh == before && self.everyone == everyone && self.watched == watched {
             return;
         }
         self.refresh = before;
-        self.only_watched = only_watched;
+        self.everyone = everyone;
         self.watched = watched.to_vec();
         self.by_refresh.clear();
         for id in self.table.ids().collect::<Vec<_>>() {

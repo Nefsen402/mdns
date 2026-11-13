@@ -1244,6 +1244,22 @@ class Timers(Case):
         self.assertTrue(got, "the device the watch is for is asked\n" + self.logs(d))
         self.assertTrue(other.hearer.none(asks("other.local", A), since=other_asked), "the other, which nothing is looking for, is not")
 
+    def test_a_watch_is_asked_and_kept_up_though_nothing_is_active_refreshing_is_off_and_questions_are_not_forwarded(self):
+        la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
+        d = self.lab.daemon(conf("[Interface]\nRefreshBefore=off\nForwardQuestions=never\nMinimumLifetime=40s\n[Segment]\nName=s\nInterfaces=ra\nActive=no\n"))
+        ha = la.hearer()
+        dev = la.device("10.9.1.50")
+        dev.multicast(announcement("dev", "10.9.1.50", "Dev", kind="_http._tcp", ttl=40))
+        d.settle()
+        asked = ha.count()
+        watch = self.lab.track(Watch([self.lab.ctl, "-s", d.socket_path, "watch", "--query", "_http._tcp", "s"]))
+        self.assertTrue(watch.wait("dev.local", 5), "the watch has it\n" + self.logs(d))
+        self.assertTrue(d.advance_until(lambda: ha.seen(asks("_http._tcp.local", PTR), asked)), "asked for the type though forwarding is never\n" + self.logs(d))
+        asked = dev.hearer.count()
+        d.advance(31)
+        got = dev.hearer.seen(asks("dev.local", A), asked) or dev.hearer.wait(asks("dev.local", A), 5, since=asked)
+        self.assertTrue(got, "kept up though refreshing is off\n" + self.logs(d))
+
     def test_a_device_with_no_address_left_is_kept_and_what_asked_for_it_is_asked_again(self):
         la, lb = self.two_links()
         ha = la.hearer()

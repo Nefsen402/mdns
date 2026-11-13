@@ -194,13 +194,13 @@ first each one already known, as
 .BR present ,
 then the daemon asks for the type, and shows what answers and what changes from
 then on.
-The daemon asks as it asks any question on an interface, as that interface is
-set to
-.RB ( ForwardQuestions=
+The daemon asks on every interface of the segment, though one is set to ask
+nothing of the others' questions
+.RB ( ForwardQuestions=never
 in
-.BR mdnsd.conf (5)):
-by default each question once, so one it has asked before is not asked again,
-and what answered it is known already.
+.BR mdnsd.conf (5));
+where each question is asked once, as by default, one asked before is not asked
+again, and what answered it is known already.
 A device that loses its last service of the type is shown as
 .BR removed .
 Where the daemon asks nothing of its own accord

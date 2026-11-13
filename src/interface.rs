@@ -25,7 +25,7 @@ use crate::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::config::{Advertise, AdvertiseConfig, Forward};
+use crate::config::{Advertise, AdvertiseConfig, Forward, DEFAULT_REFRESH_BEFORE};
 use crate::device::{Advertised, Device, ServiceParts, Shared, HOST_TTL, OTHER_TTL};
 use crate::message::{self, responses, service_ttls, Request, DEFAULT_MAX_PACKET, MIN_REFLECT_TTL};
 use crate::addr::{family_of, is_link_local, Family, Prefix};
@@ -753,8 +753,12 @@ impl State {
     /// Whether this interface asks `question` on its link, as it is told to
     /// ([`Forward`]): every one, none, or one it has not asked before, and not
     /// one it asked longer ago than it remembers, if it is told a time.
-    fn may_ask(&mut self, question: &Question, now: Instant) -> bool {
-        match self.forward {
+    fn may_ask(&mut self, question: &Question, now: Instant, wanted: bool) -> bool {
+        // What a person asked for is asked though the interface asks nothing of
+        // the others' questions; it is only not asked again where each is asked
+        // once.
+        let forward = if wanted && self.forward == Forward::Never { Forward::Always } else { self.forward };
+        match forward {
             Forward::Always => true,
             Forward::Never => false,
             Forward::Once => !self.asked.contains(question),
@@ -848,8 +852,16 @@ impl State {
     /// Have the devices go by how long before they run out they are asked to
     /// answer again, when that, or whether there is a way to ask, changed.
     fn sync_refresh(&mut self) {
-        let before = self.upkeep.before.filter(|_| !self.link.is_empty());
-        self.tracker.discovered.set_refresh(before, !self.active, &self.watched);
+        let before = self.refresh_margin().filter(|_| !self.link.is_empty());
+        self.tracker.discovered.set_refresh(before, self.active && self.upkeep.before.is_some(), &self.watched);
+    }
+
+    /// How long before they run out the devices are asked to answer again:
+    /// as set, or, where that is off, the default, for the devices a watch is
+    /// for. `Active=` and `RefreshBefore=` filter which are asked; a watch is
+    /// not filtered by them.
+    fn refresh_margin(&self) -> Option<Duration> {
+        self.upkeep.before.or_else(|| (!self.watched.is_empty()).then_some(DEFAULT_REFRESH_BEFORE))
     }
 
     /// Every time something is due, as what is to be done (`expire`,
@@ -1210,7 +1222,7 @@ impl Interface {
             let mut state = self.state.borrow_mut();
             state.upkeep.running = true;
             state.upkeep.last_run = Some(started);
-            state.upkeep.before
+            state.refresh_margin()
         };
         // Drop what has run out first, so that nothing is asked that is being
         // dropped, then ask the devices about to expire to answer again.
@@ -1679,9 +1691,22 @@ impl Interface {
         self.query_question_at(questions, Instant::now())
     }
 
+    /// [`Interface::query_question`] for what a person asked for, as a watch
+    /// does: asked though `ForwardQuestions=` is `never`, which is for what the
+    /// daemon would ask on behalf of the clients of the other interfaces. Where
+    /// each question is asked once, it is.
+    pub fn query_wanted(&self, questions: &[Question]) -> Result<usize> {
+        self.ask_questions(questions, Instant::now(), true)
+    }
+
     /// [`Interface::query_question`] at `now`, which a test gives to be later,
     /// as a clock that began a moment ago cannot be put back to be earlier.
     fn query_question_at(&self, questions: &[Question], now: Instant) -> Result<usize> {
+        self.ask_questions(questions, now, false)
+    }
+
+    /// Ask `questions`, those that may be asked, and are `wanted` if a person asked.
+    fn ask_questions(&self, questions: &[Question], now: Instant, wanted: bool) -> Result<usize> {
         let mut guard = self.state.borrow_mut();
         let state = &mut *guard;
         if state.link.is_empty() {
@@ -1690,7 +1715,7 @@ impl Interface {
         state.forwarded.retain(|_, at| now.saturating_duration_since(*at) < FORWARD_GAP);
         let mut fresh = Vec::new();
         for q in questions {
-            if !state.may_ask(q, now) {
+            if !state.may_ask(q, now, wanted) {
                 continue;
             }
             let key = (q.name.to_ascii_lowercase(), q.qtype);

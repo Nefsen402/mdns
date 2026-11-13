@@ -139,6 +139,7 @@ fn wired() -> (Interface, UdpSocket) {
     rx.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
     let seg = interface("test");
+    seg.set_refresh_before(Some(Duration::from_secs(30)));
     seg.attach(Link::to(Family::V4, fd(tx), rx.local_addr().unwrap()));
     (seg, rx)
 }
@@ -1789,6 +1790,7 @@ fn wired_both() -> (Interface, UdpSocket, UdpSocket) {
     let (_, rx4) = wired();
     let (_, rx6) = wired_family(Family::V6);
     let seg = interface("test");
+    seg.set_refresh_before(Some(Duration::from_secs(30)));
     seg.attach(
         Link::to(Family::V4, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx4.local_addr().unwrap())
             .and(Family::V6, fd(UdpSocket::bind("127.0.0.1:0").unwrap()), rx6.local_addr().unwrap()),
@@ -1853,6 +1855,7 @@ fn wired_family(family: Family) -> (Interface, UdpSocket) {
     let (_, rx) = wired();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
     let seg = interface("test");
+    seg.set_refresh_before(Some(Duration::from_secs(30)));
     seg.attach(Link::to(family, fd(tx), rx.local_addr().unwrap()));
     (seg, rx)
 }
@@ -2364,6 +2367,34 @@ fn an_interface_that_is_not_active_asks_to_answer_again_only_the_devices_a_watch
     assert_eq!(listed, ["cam.local"]);
     seg.set_watched(&[]);
     assert!(seg.pending().into_iter().all(|p| p.what != "refresh"), "none when nothing is looked for");
+}
+
+/// RefreshBefore=off is not for the devices a watch is for: they are asked to
+/// answer again, by the default margin, for as long as it is open, and no other
+/// device is.
+#[test]
+fn a_watch_keeps_its_devices_up_though_refreshing_is_off() {
+    let (seg, rx) = wired();
+    seg.set_refresh_before(None);
+    let at120 = |r: Record| Record { ttl: 120, ..r };
+    seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
+    hear(&seg, "10.0.1.8", vec![
+        a_record("cam.local", "10.0.1.8"),
+        at120(ptr("_rtsp._tcp.local", "Cam._rtsp._tcp.local")),
+        srv("Cam._rtsp._tcp.local", 554, "cam.local"),
+    ]);
+    let t = Instant::now() + Duration::from_secs(280);
+    assert!(seg.pending().into_iter().all(|p| p.what != "refresh"), "none while nothing is looked for");
+
+    seg.set_watched(&["_rtsp._tcp.local".to_string()]);
+    let listed: Vec<String> = seg.pending().into_iter().filter(|p| p.what == "refresh").map(|p| p.who).collect();
+    assert_eq!(listed, ["cam.local"]);
+    seg.upkeep(t);
+    let names: Vec<String> = recv(&rx).unwrap().questions.into_iter().map(|q| q.name).collect();
+    assert!(names.contains(&"cam.local".to_string()) && names.iter().all(|n| !n.to_ascii_lowercase().contains("printer")), "{names:?}");
+
+    seg.set_watched(&[]);
+    assert!(seg.pending().into_iter().all(|p| p.what != "refresh"), "none when the watch is closed");
 }
 
 #[test]
@@ -3120,6 +3151,7 @@ fn next_due(seg: &Interface) -> Option<Instant> {
 #[test]
 fn the_next_deadline_is_the_earliest_of_expiry_refresh_and_reannounce() {
     let (seg, _rx) = wired();
+    seg.set_refresh_before(None);
     assert_eq!(next_due(&seg), None, "nothing known, nothing due");
 
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
@@ -3311,6 +3343,7 @@ fn a_margin_too_big_for_the_clock_neither_panics_nor_spins() {
 #[test]
 fn a_device_is_dropped_the_moment_it_expires() {
     let (seg, _rx) = wired();
+    seg.set_refresh_before(None);
     let events = seg.subscribe();
     seg.handle(sa("10.0.1.7"), &announcement(120)).unwrap();
 
@@ -3328,6 +3361,7 @@ fn a_device_is_dropped_the_moment_it_expires() {
 #[test]
 fn a_device_heard_is_due_when_it_runs_out() {
     let (seg, _rx) = wired();
+    seg.set_refresh_before(None);
     seg.set_min_lifetime(Duration::ZERO);
     assert_eq!(seg.next_due(), None, "nothing known: never");
     let before = Instant::now();
