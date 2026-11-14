@@ -823,22 +823,12 @@ class Peers(Case):
     multicast: the peer is a device that is the other daemon, and the other
     interface is a link as any."""
 
-    def daemon(self, config):
-        """The daemon, unless it cannot talk to a peer: a socket for each interface, which
-        the BSDs, and the sockets shared by every interface, do not have, is what it takes."""
-        try:
-            return self.lab.daemon(config)
-        except RuntimeError as e:
-            if "which this system cannot make" in str(e):
-                self.skipTest("a peer needs a socket of the interface's own")
-            raise
-
     def world(self, interface="Peer=10.9.1.2", segment="Interfaces=ra,rb"):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         lb = self.lab.link("rb", "10.9.2.1/24", "10.9.2.2/24")
         # A packet from an address that is not on the link is not for the kernel to drop.
         self.lab.net.relax_source_checks()
-        d = self.daemon(f"[Interface]\nIPv6=off\n[Interface]\nName=ra\n{interface}\n[Segment]\nName=s\n{segment}\n")
+        d = self.lab.daemon(f"[Interface]\nIPv6=off\n[Interface]\nName=ra\n{interface}\n[Segment]\nName=s\n{segment}\n")
         peer = la.device("10.9.1.2")
         return la, lb, d, peer
 
@@ -891,7 +881,7 @@ class Peers(Case):
     def test_a_peer_is_at_the_port_that_is_said(self):
         la = self.lab.link("ra", "10.9.1.1/24", "10.9.1.2/24")
         lb = self.lab.link("rb", "10.9.2.1/24", "10.9.2.2/24")
-        d = self.daemon("[Interface]\nIPv6=off\n[Interface]\nName=ra\nPeer=10.9.1.2\nPeerPort=5454\n[Segment]\nName=s\nInterfaces=ra,rb\n")
+        d = self.lab.daemon("[Interface]\nIPv6=off\n[Interface]\nName=ra\nPeer=10.9.1.2\nPeerPort=5454\n[Segment]\nName=s\nInterfaces=ra,rb\n")
         peer = la.device("10.9.1.2", port=5454)
         peer.unicast(announcement("tv", "10.9.8.50", "TV"), "10.9.1.1", port=5454)
         lb.device("10.9.2.50").multicast(announcement("pc", "10.9.2.50", "PC"))
