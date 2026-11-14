@@ -240,3 +240,24 @@ fn an_interface_takes_what_is_sent_to_the_daemon_over_the_families_it_hears_that
     assert!(!hears(&neither, own4) && !hears(&neither, own6));
     assert!(hears(&neither, group4) && hears(&neither, group6));
 }
+
+/// A socket to peers is bound to one address of the interface, so peers are
+/// grouped by what that address has to be: of their family, and for IPv6
+/// whether it is link-local, where the peer is by the interface.
+#[test]
+fn peers_are_grouped_by_the_address_a_socket_to_them_is_bound_to() {
+    assert_eq!(peer_groups(&[]), []);
+    assert_eq!(peer_groups(&[ip("10.8.0.2"), ip("10.8.0.3")]), [(Family::V4, false)]);
+    assert_eq!(peer_groups(&[ip("fe80::2"), ip("fd00::2"), ip("10.8.0.2"), ip("fe80::3")]), [(Family::V6, true), (Family::V6, false), (Family::V4, false)]);
+}
+
+/// An interface that has no address of the family of its peer cannot be talked
+/// to them over yet, where the socket is bound to one, and is waited for.
+#[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
+#[test]
+fn an_interface_with_no_address_for_its_peers_waits() {
+    // The loopback's addresses are not ones to be reached at.
+    let text = format!("[Interface]\nName={LOOPBACK}\nPeer=10.8.0.2\n[Segment]\nName=a\nInterfaces={LOOPBACK}\n");
+    let interface = crate::config::Config::parse(&text).unwrap().interface(LOOPBACK);
+    assert_eq!(missing(&interface), [Family::V4]);
+}

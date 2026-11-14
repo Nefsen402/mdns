@@ -21,6 +21,10 @@
 //! interface that is, to hand the datagram to; what came in on another is
 //! dropped. Sending says which interface it goes out of, each time. The cargo
 //! feature `portable-sockets` makes Linux do the same, to test it.
+//!
+//! Peers are not heard through those shared sockets, which other programs on
+//! port 5353 are ahead of for what is sent to the wildcard address: each kind of
+//! peer has a socket of its own, bound to an address of the interface.
 
 use alloc::ffi::CString;
 use alloc::format;
@@ -86,7 +90,44 @@ pub fn hears(interface: &config::Interface, to: Option<IpAddr>) -> bool {
 /// has no address to join the group by: they are joined when it has one. A
 /// peer's is not a group to join, and needs no address of the interface's.
 pub fn missing(interface: &config::Interface) -> Vec<Family> {
+    if !interface.peers.is_empty() {
+        return peers_missing(interface);
+    }
     families(interface).into_iter().filter(|&family| interface.peers.is_empty() && !joinable(&interface.name, family)).collect()
+}
+
+/// The sockets a link talks to its peers with, where they are of an interface's
+/// own: one for each family they are of, and whether it is the scoped one, for
+/// link-local peers, which are where they are by the interface. A family's
+/// peers are all of one kind, as one socket is bound to one address.
+#[cfg_attr(all(target_os = "linux", not(feature = "portable-sockets")), allow(dead_code))]
+fn peer_groups(peers: &[IpAddr]) -> Vec<(Family, bool)> {
+    let mut groups: Vec<(Family, bool)> = Vec::new();
+    for peer in peers {
+        let (family, scoped) = (family_of(*peer), peer.is_ipv6() && crate::addr::is_link_local(peer));
+        if !groups.iter().any(|&(f, s)| f == family && s == scoped) {
+            groups.push((family, scoped));
+        }
+    }
+    groups
+}
+
+/// The families of an interface with peers that it cannot talk to them over
+/// yet: where sockets are of an interface's own, there is nothing to wait for.
+#[cfg(all(target_os = "linux", not(feature = "portable-sockets")))]
+fn peers_missing(_interface: &config::Interface) -> Vec<Family> {
+    Vec::new()
+}
+
+/// The families of an interface with peers that it cannot talk to them over
+/// yet: a socket here is bound to an address of the interface, and has to
+/// wait for one.
+#[cfg(not(all(target_os = "linux", not(feature = "portable-sockets"))))]
+fn peers_missing(interface: &config::Interface) -> Vec<Family> {
+    families(interface)
+        .into_iter()
+        .filter(|&family| peer_groups(&interface.peers).iter().any(|&(f, scoped)| f == family && portable::peer_address(&interface.name, family, scoped).is_err()))
+        .collect()
 }
 
 /// What an interface hears and says with, and all that an interface knows of how
@@ -771,6 +812,62 @@ mod portable {
             .ok_or_else(|| anyhow!("no IPv4 address on {interface}"))
     }
 
+    /// The address of `interface` over `family` that a socket to peers is
+    /// bound to, `scoped` for those that are link-local: what the peers send
+    /// is sent to it, which no other socket on the port, bound to the
+    /// wildcard address as the others here are, takes the datagram from.
+    pub(super) fn peer_address(interface: &str, family: Family, scoped: bool) -> Result<IpAddr> {
+        addresses(interface, &[family])?
+            .into_iter()
+            .find(|addr| crate::addr::is_link_local(addr) == scoped)
+            .ok_or_else(|| anyhow!("no {}{family:?} address on {interface}", if scoped { "link-local " } else { "" }))
+    }
+
+    /// The link of `interface` that talks to `peers` alone, at `port`, with a
+    /// socket of its own for each kind of peer, bound to an address of the
+    /// interface: it keeps the source port at `port`, which the peers hear it
+    /// from. Unlike a socket pinned to the interface it hears what is sent to
+    /// that address, wherever it came in, so the peers it is for are told by
+    /// who sent it.
+    fn open_peers(interface: &str, peers: &[IpAddr], port: u16) -> Result<Link> {
+        let index = ifindex(interface)?;
+        let mut link = Link { peers: peers.to_vec(), ..Link::default() };
+        let groups = peer_groups(peers);
+        if groups.iter().filter(|g| g.0 == Family::V6).count() > 1 {
+            bail!("{interface}: Peer= has IPv6 peers that are link-local and others that are not: a socket is bound to one address, so they are of one kind");
+        }
+        for (family, scoped) in groups {
+            let addr = peer_address(interface, family, scoped)?;
+            let socket = udp(family).with_context(|| format!("opening {family:?} socket on {interface}"))?;
+            let fd = &socket;
+            // Share the port with whatever else has it, as the wildcard.
+            sockopt::set_socket_reuseaddr(fd, true).map_err(Why)?;
+            sockopt::set_socket_reuseport(fd, true).map_err(Why)?;
+            let bound = match addr {
+                IpAddr::V4(addr) => rustix::net::bind(fd, &SocketAddrV4::new(addr, port)),
+                IpAddr::V6(addr) => {
+                    sockopt::set_ipv6_v6only(fd, true).map_err(Why)?;
+                    rustix::net::bind(fd, &SocketAddrV6::new(addr, port, 0, if scoped { index } else { 0 }))
+                }
+            };
+            bound.map_err(Why).with_context(|| format!("binding to {addr} port {port} on {interface}"))?;
+            rustix::io::ioctl_fionbio(fd, true).map_err(Why)?;
+            let sender = Sender::from(rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(Why)?);
+            let to = peers
+                .iter()
+                .copied()
+                .filter(|&peer| family_of(peer) == family)
+                .map(|peer| match peer {
+                    IpAddr::V6(v6) if scoped => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, index)),
+                    peer => SocketAddr::new(peer, port),
+                })
+                .collect();
+            link.add(family, sender, to, false);
+            link.listeners.push(socket);
+        }
+        Ok(link)
+    }
+
     /// The sockets of the BSDs and of `portable-sockets`: one for each family,
     /// shared by every interface.
     pub struct Hub {
@@ -849,7 +946,7 @@ mod portable {
         /// what is sent to the daemon itself of.
         pub fn link(&self, interface: &config::Interface) -> Result<Link> {
             if !interface.peers.is_empty() {
-                bail!("{}: Peer= needs a socket of the interface's own, which this system cannot make", interface.name);
+                return open_peers(&interface.name, &interface.peers, interface.peer_port);
             }
             let (name, unicast, missing) = (&interface.name, unicast(interface), missing(interface));
             let mut link = Link::default();

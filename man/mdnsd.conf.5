@@ -659,10 +659,11 @@ A device is not asked directly, at an address it has, on such an interface: its
 peer is asked.
 Repeated, it adds peers; empty, it resets.
 It is for the section of one interface, not for every interface or a pattern.
-Where the daemon cannot make sockets of an interface's own (the BSDs, and
-Linux with
+Where the daemon cannot pin sockets to an interface (the BSDs, and Linux with
 .BR portable-sockets )
-it is an error.
+the peers are talked to with a socket bound to an address of the interface
+instead, which it needs one of for each family of its peers, and waits for; and
+the IPv6 peers are all link-local, or none of them are.
 Put the interface in a segment as any other: untrusted, a peer is told nothing
 of the others and its devices are reflected to them; trusted, they are shown
 each other's.

@@ -250,8 +250,13 @@ each sees the other's devices, as two networks of a router do.
   over the tunnel, as well.
 - It is for a tunnel with an address at each end, or any link where multicast
   does not reach: `Peer=` is of one interface, whatever it is.
-- Linux only, for now: the BSDs share one socket between all interfaces, which
-  cannot say who an interface's peers are.
+- **On the BSDs and macOS**, where one socket is shared by every interface, the
+  peers get sockets of their own, bound to an address of the tunnel's interface
+  (rather than pinned to it, as on Linux): other programs that share port 5353
+  on the wildcard address, such as the system's mDNS responder, would otherwise
+  be handed what the peers send. The interface needs an address of the family
+  of its peers to be bound to, and is waited for if it has none; the IPv6 peers
+  of one interface are either all link-local or none.
 
 ## Tracking devices for scripts
 
