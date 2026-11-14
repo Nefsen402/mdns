@@ -31,7 +31,6 @@ use core::time::Duration;
 
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::io::Errno;
-use rustix::net::SocketFlags;
 
 use crate::time::Instant;
 
@@ -152,7 +151,7 @@ impl Server {
 
     fn accept(&mut self) {
         while self.clients.len() < MAX_CLIENTS {
-            match rustix::net::accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
+            match crate::runtime::accept(&self.listener) {
                 Ok(stream) => {
                     let client = Client { stream, input: Vec::new(), output: Vec::new(), asked: None, since: Instant::now(), closing: false, gone: false };
                     self.clients.push(client);

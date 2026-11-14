@@ -500,7 +500,7 @@ fn spawn(program: &str, args: &[String], env: &[(&str, String)], stdin: &OwnedFd
     let envp_ptrs: Vec<*const c_char> = envp.iter().map(|e| e.as_ptr()).chain(core::iter::once(core::ptr::null())).collect();
     // The child says why it could not run the program, if it could not; a
     // program that runs closes this, as it is not inherited.
-    let (report_rx, report_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    let (report_rx, report_tx) = crate::runtime::pipe(false)?;
     let (stdin, report) = (stdin.as_raw_fd(), report_tx.as_raw_fd());
 
     // SAFETY: no other thread is running, and the child makes only
@@ -587,8 +587,14 @@ impl Conn {
     /// long as it takes. A write may wait [`TIMEOUT`].
     fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), Errno> {
         use rustix::net::sockopt::{set_socket_timeout, Timeout};
-        set_socket_timeout(&self.fd, Timeout::Recv, timeout)?;
-        set_socket_timeout(&self.fd, Timeout::Send, Some(TIMEOUT))
+        let set = |which, timeout| match set_socket_timeout(&self.fd, which, timeout) {
+            // macOS refuses setsockopt on a socket whose peer has closed it.
+            // Nothing is lost: the next read says so, as end of stream.
+            Err(Errno::INVAL) if cfg!(target_os = "macos") => Ok(()),
+            result => result,
+        };
+        set(Timeout::Recv, timeout)?;
+        set(Timeout::Send, Some(TIMEOUT))
     }
 }
 
@@ -596,9 +602,9 @@ impl Conn {
 fn send(socket: &str, line: &str, timeout: Duration) -> Result<Conn, Failure> {
     let err = |e| connect_err(socket, e);
     let connected = || {
-        use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
         let addr = SocketAddrUnix::new(socket)?;
-        let fd = rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None)?;
+        let fd = crate::runtime::socket(AddressFamily::UNIX, SocketType::STREAM, None, false)?;
         rustix::io::retry_on_intr(|| rustix::net::connect(&fd, &addr))?;
         Ok(fd)
     };
@@ -822,7 +828,7 @@ fn executable(name: &str) -> Result<String, String> {
 /// going to `log`, or nowhere.
 fn detach(socket: &str, line: &str, log: Option<&OwnedFd>) -> Result<Conn, Failure> {
     let failed = |e| Failure::Connect(format!("cannot go into the background: {}", Why(e)));
-    let (report_rx, report_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(failed)?;
+    let (report_rx, report_tx) = crate::runtime::pipe(false).map_err(failed)?;
     // SAFETY: no other thread has been started, so the child is a full copy.
     match unsafe { libc::fork() } {
         -1 => Err(failed(errno())),
@@ -1063,7 +1069,7 @@ impl Subscriber {
     /// environment.
     fn start(&mut self, event: String) {
         let cannot = |e| note(&format!("cannot run {}: {}", self.script, Why(e)));
-        let (stdin_rx, stdin_tx) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
+        let (stdin_rx, stdin_tx) = match crate::runtime::pipe(false) {
             Ok(pipe) => pipe,
             Err(e) => return cannot(e),
         };
@@ -1363,6 +1369,7 @@ fn command_line(_pid: i32) -> Option<String> {
 }
 
 /// A command line as the system has it, its words each ended by a NUL.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "dragonfly"))]
 fn words_of(raw: &[u8]) -> Option<String> {
     let words: Vec<String> =
         raw.split(|&b| b == 0).filter(|w| !w.is_empty()).map(|w| String::from_utf8_lossy(w).into_owned()).collect();

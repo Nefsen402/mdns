@@ -96,7 +96,7 @@ use core::time::Duration;
 
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::io::Errno;
-use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
 
 use crate::time::Instant;
 
@@ -228,7 +228,7 @@ impl Server {
 
     fn accept(&mut self) {
         loop {
-            match rustix::net::accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
+            match crate::runtime::accept(&self.listener) {
                 Ok(stream) => {
                     let peer = peer_of(&stream);
                     let now = Instant::now();
@@ -482,12 +482,12 @@ pub fn bind(path: &str, mode: rustix::fs::RawMode) -> Result<OwnedFd> {
         if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::Socket {
             bail!("{path} exists and is not a socket");
         }
-        if unix_socket(SocketFlags::CLOEXEC).and_then(|fd| connect(&fd, path)).is_ok() {
+        if unix_socket(false).and_then(|fd| connect(&fd, path)).is_ok() {
             bail!("{path} is in use by a running instance");
         }
         rustix::fs::unlink(path).map_err(Why).with_context(|| format!("removing stale {path}"))?;
     }
-    let listener = unix_socket(SocketFlags::CLOEXEC | SocketFlags::NONBLOCK).map_err(Why).context("making the control socket")?;
+    let listener = unix_socket(true).map_err(Why).context("making the control socket")?;
     let addr = SocketAddrUnix::new(path).map_err(Why).with_context(|| format!("binding {path}"))?;
     rustix::net::bind(&listener, &addr).map_err(Why).with_context(|| format!("binding {path}"))?;
     rustix::net::listen(&listener, 128).map_err(Why).with_context(|| format!("listening on {path}"))?;
@@ -495,9 +495,9 @@ pub fn bind(path: &str, mode: rustix::fs::RawMode) -> Result<OwnedFd> {
     Ok(listener)
 }
 
-/// A stream socket of the Unix family, with `flags`.
-fn unix_socket(flags: SocketFlags) -> rustix::io::Result<OwnedFd> {
-    rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None)
+/// A stream socket of the Unix family, non-blocking if `nonblock`.
+fn unix_socket(nonblock: bool) -> rustix::io::Result<OwnedFd> {
+    crate::runtime::socket(AddressFamily::UNIX, SocketType::STREAM, None, nonblock)
 }
 
 /// Connect `fd` to the Unix socket at `path`.

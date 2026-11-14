@@ -31,7 +31,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddr
 use anyhow::{bail, Context, Result};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use rustix::io::Errno;
-use rustix::net::{sockopt, AddressFamily, SocketFlags, SocketType};
+use rustix::net::{sockopt, AddressFamily, SocketType};
 
 use crate::addr::{Family, Prefix};
 use crate::config;
@@ -582,7 +582,7 @@ pub fn mtu(name: &str) -> Result<u32> {
         *dst = b as libc::c_char;
     }
     // Any socket will do for the ioctl; it is closed when `sock` drops.
-    let sock = rustix::net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None).map_err(Why)?;
+    let sock = crate::runtime::socket(AddressFamily::INET, SocketType::DGRAM, None, false).map_err(Why)?;
     // SAFETY: `req` is a valid ifreq naming the interface; SIOCGIFMTU fills
     // in its MTU.
     if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU as _, &mut req) } != 0 {
@@ -994,7 +994,7 @@ fn udp(family: Family) -> Result<OwnedFd> {
         Family::V4 => AddressFamily::INET,
         Family::V6 => AddressFamily::INET6,
     };
-    Ok(rustix::net::socket_with(domain, SocketType::DGRAM, SocketFlags::CLOEXEC, Some(rustix::net::ipproto::UDP)).map_err(Why)?)
+    Ok(crate::runtime::socket(domain, SocketType::DGRAM, Some(rustix::net::ipproto::UDP), false).map_err(Why)?)
 }
 
 /// An integer socket option rustix has no wrapper for.

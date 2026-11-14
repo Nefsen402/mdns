@@ -5,7 +5,7 @@
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use rustix::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use rustix::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use crate::runtime::{errno, Why};
 
@@ -32,15 +32,9 @@ pub struct Signals {
 /// Handle SIGTERM and SIGINT from now on by writing to a pipe, whose reading
 /// end is returned. Call once.
 pub fn install() -> Result<Signals, Why> {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` has room for the two descriptors pipe2 fills in.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(Why(errno()));
-    }
-    // SAFETY: both were just created, and are owned by nothing else. The
-    // writing end lives as long as the process, for the handler.
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    WRITE_END.store(fds[1], Ordering::Relaxed);
+    let (read, write) = crate::runtime::pipe(true).map_err(Why)?;
+    // The writing end lives as long as the process, for the handler.
+    WRITE_END.store(write.into_raw_fd(), Ordering::Relaxed);
     for sig in [libc::SIGTERM, libc::SIGINT] {
         // SAFETY: an all-zero sigaction is valid; the fields set are its own,
         // and the handler only does what a handler may.

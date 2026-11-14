@@ -110,6 +110,76 @@ pub fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno() }
 }
 
+/// Close `fd` on exec, and make it non-blocking if `nonblock`: where the
+/// system cannot do either as it makes the descriptor (macOS has no
+/// SOCK_CLOEXEC, accept4 or pipe2), a second call after it does.
+#[cfg(target_os = "macos")]
+fn mark(fd: &rustix::fd::OwnedFd, nonblock: bool) -> rustix::io::Result<()> {
+    rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)?;
+    if nonblock {
+        let flags = rustix::fs::fcntl_getfl(fd)?;
+        rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)?;
+    }
+    Ok(())
+}
+
+/// A socket not inherited by programs run from here, non-blocking if `nonblock`.
+#[allow(dead_code)]
+pub fn socket(
+    domain: rustix::net::AddressFamily,
+    ty: rustix::net::SocketType,
+    protocol: Option<rustix::net::Protocol>,
+    nonblock: bool,
+) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        use rustix::net::SocketFlags;
+        let flags = if nonblock { SocketFlags::CLOEXEC | SocketFlags::NONBLOCK } else { SocketFlags::CLOEXEC };
+        rustix::net::socket_with(domain, ty, flags, protocol)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let fd = rustix::net::socket(domain, ty, protocol)?;
+        mark(&fd, nonblock)?;
+        Ok(fd)
+    }
+}
+
+/// A connection accepted from `listener`, not inherited by programs run from
+/// here, and non-blocking.
+#[allow(dead_code)]
+pub fn accept(listener: &rustix::fd::OwnedFd) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        use rustix::net::SocketFlags;
+        rustix::net::accept_with(listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let fd = rustix::net::accept(listener)?;
+        mark(&fd, true)?;
+        Ok(fd)
+    }
+}
+
+/// A pipe, `(read, write)`, not inherited by programs run from here,
+/// non-blocking if `nonblock`.
+#[allow(dead_code)]
+pub fn pipe(nonblock: bool) -> rustix::io::Result<(rustix::fd::OwnedFd, rustix::fd::OwnedFd)> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        use rustix::pipe::PipeFlags;
+        rustix::pipe::pipe_with(if nonblock { PipeFlags::CLOEXEC | PipeFlags::NONBLOCK } else { PipeFlags::CLOEXEC })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (r, w) = rustix::pipe::pipe()?;
+        mark(&r, nonblock)?;
+        mark(&w, nonblock)?;
+        Ok((r, w))
+    }
+}
+
 /// What the last libc call that failed left in `errno`.
 pub fn errno() -> Errno {
     // SAFETY: errno is the calling thread's, and always there to read.

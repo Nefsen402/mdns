@@ -475,7 +475,7 @@ fn errors_say_what_is_wrong() {
 fn a_program_runs_with_its_input_and_environment() {
     // Not inherited, as in Subscriber::start: a script holding the
     // writing end of its own stdin would never see it end.
-    let (stdin_rx, stdin_tx) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    let (stdin_rx, stdin_tx) = crate::runtime::pipe(false).unwrap();
     let (out, _) = script("spawned", 3);
     let out_file = PathBuf::from(out.replace(".sh", ".out"));
     let pid = spawn(&out, &["one".into()], &[("MDNS_HOSTNAME", "set".into())], &stdin_rx).unwrap();
