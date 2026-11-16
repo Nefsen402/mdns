@@ -20,5 +20,6 @@ cargo fetch --locked
 dpkg-buildpackage -us -uc -b --no-check-builddeps "$@"
 
 # dpkg-buildpackage puts its output next to the source tree.
-mkdir -p "$here/out"
-mv "$root"/../mdnsd_*.deb "$root"/../mdnsd_*.buildinfo "$root"/../mdnsd_*.changes "$here/out/"
+out=${OUT_DIR:-$here/out}
+mkdir -p "$out"
+mv "$root"/../mdnsd_*.deb "$root"/../mdnsd_*.buildinfo "$root"/../mdnsd_*.changes "$out/"
