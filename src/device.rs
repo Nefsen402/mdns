@@ -876,7 +876,7 @@ impl Device {
         }
         device.addresses.sort_by_key(|a| addr_order(&a.ip));
         for service in other.advertised_services(other_how) {
-            if device.service(&service.instance()).is_none() {
+            if device.service(service.instance()).is_none() {
                 device.insert_service(service.clone());
             }
         }
@@ -1100,7 +1100,7 @@ impl Device {
     /// to `max_services`.
     pub fn absorb(&mut self, earlier: Device, max_services: usize) {
         for svc in earlier.services {
-            if self.service(&svc.instance()).is_none() && self.services.len() < max_services {
+            if self.service(svc.instance()).is_none() && self.services.len() < max_services {
                 self.insert_service(svc);
             }
         }
@@ -1137,11 +1137,11 @@ impl Device {
     /// This device without the services whose instance names `taken` says
     /// are taken: itself, if it has none.
     pub fn without(&self, taken: &dyn Fn(&str) -> bool) -> Cow<'_, Device> {
-        if !self.services.iter().any(|s| taken(&s.instance())) {
+        if !self.services.iter().any(|s| taken(s.instance())) {
             return Cow::Borrowed(self);
         }
         let mut device = self.clone();
-        edit(&mut device.services).retain(|s| !taken(&s.instance()));
+        edit(&mut device.services).retain(|s| !taken(s.instance()));
         Cow::Owned(device)
     }
 
@@ -1159,8 +1159,8 @@ impl Device {
         let mut any = false;
         for svc in self.advertised_services(how) {
             any = true;
-            f(&svc.kind());
-            f(&svc.instance());
+            f(svc.kind());
+            f(svc.instance());
             for sub in svc.subtypes() {
                 f(sub);
             }

@@ -156,12 +156,12 @@ fn advertise_is_optional_and_validated() {
 /// Any number of them, each with its own name, services, interfaces and TTL.
 #[test]
 fn there_may_be_any_number_of_advertise_sections() {
-    let c = Config::parse(&format!(
+    let c = Config::parse(
         "[Advertise]\nHostname=pc\nServices=_ssh._tcp:22\nInterface=br0\nTTL=1h\n\
          [Advertise]\nHostname=files\nServices=_smb._tcp:445\nInterface=media\n\
          [Advertise]\nHostname=other\n\
-         [Segment]\nName=a\nInterfaces=br0,media\n"
-    ))
+         [Segment]\nName=a\nInterfaces=br0,media\n",
+    )
     .unwrap();
     assert_eq!(c.advertise.len(), 3);
     assert_eq!((c.advertise[0].name.as_str(), c.advertise[0].ttl), ("pc.local", Duration::from_secs(3600)));

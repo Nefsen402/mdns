@@ -66,7 +66,7 @@ fn the_tables_find_what_a_scan_of_the_devices_does_through_any_mix_of_changes() 
         let (n, pick) = (next() % 300, next());
         // A name of mixed case, as announced, spelt differently each time.
         let spelt = |step: u64| -> String {
-            format!("Host{n}.local").chars().enumerate().map(|(i, c)| if (i as u64 + step) % 3 == 0 { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() }).collect()
+            format!("Host{n}.local").chars().enumerate().map(|(i, c)| if (i as u64 + step).is_multiple_of(3) { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() }).collect()
         };
         let key = format!("host{n}.local");
         match pick % 4 {
@@ -119,7 +119,8 @@ fn the_tables_find_what_a_scan_of_the_devices_does_through_any_mix_of_changes() 
     // The tables find what a scan of the devices does.
     let same = |found: Vec<*const Entry>, scan: Vec<*const Entry>| {
         let (mut found, mut scan) = (found, scan);
-        (found.sort(), scan.sort());
+        found.sort();
+        scan.sort();
         assert_eq!(found, scan);
     };
     let ptrs = |entries: Vec<&Entry>| entries.into_iter().map(|e| e as *const Entry).collect::<Vec<_>>();

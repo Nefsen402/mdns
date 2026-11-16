@@ -285,8 +285,8 @@ pub fn probe_queries(devices: &[Device], types: &BTreeSet<String>, limit: usize)
         qs.ask(sub, rtype::PTR);
     }
     for svc in services().filter(|s| s.target().is_none()) {
-        qs.ask(&svc.instance(), rtype::SRV);
-        qs.ask(&svc.instance(), rtype::TXT);
+        qs.ask(svc.instance(), rtype::SRV);
+        qs.ask(svc.instance(), rtype::TXT);
     }
     for host in devices.iter().filter(|d| d.routable().next().is_none()).filter_map(|d| d.hostname.as_deref()) {
         qs.ask(host, rtype::A);
@@ -326,8 +326,8 @@ pub fn refresh_queries(devices: &[Device], limit: usize) -> Vec<Message> {
             }
         }
         for svc in &device.services {
-            qs.ask(&svc.instance(), rtype::SRV);
-            qs.ask(&svc.instance(), rtype::TXT);
+            qs.ask(svc.instance(), rtype::SRV);
+            qs.ask(svc.instance(), rtype::TXT);
         }
     }
     qs.into_queries(limit)

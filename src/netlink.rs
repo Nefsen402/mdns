@@ -260,10 +260,11 @@ impl Netlink {
             if let Err(e) = self.resync() {
                 eprintln!("netlink: asking for what is there failed: {e}");
             }
-        } else if seq == LINK_DUMP && refused.is_none() {
-            if let Err(e) = self.request_neighbours() {
-                eprintln!("netlink: asking for the neighbour tables failed: {e}");
-            }
+        } else if seq == LINK_DUMP
+            && refused.is_none()
+            && let Err(e) = self.request_neighbours()
+        {
+            eprintln!("netlink: asking for the neighbour tables failed: {e}");
         }
     }
 

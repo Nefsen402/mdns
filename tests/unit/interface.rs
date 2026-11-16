@@ -483,7 +483,7 @@ fn what_an_interface_asked_in_a_probe_is_not_asked_again_when_it_is_asked_elsewh
     seg.probe();
     // Its rounds run on its own time.
     let mut rounds = 0;
-    while seg.state.borrow().probing.len() > 0 && rounds < 20 {
+    while !seg.state.borrow().probing.is_empty() && rounds < 20 {
         rounds += 1;
         for p in seg.state.borrow_mut().probing.iter_mut() {
             p.next = Instant::now();
@@ -1896,7 +1896,7 @@ fn a_device_first_heard_by_address_becomes_the_named_device() {
     assert_eq!(devices[0].hostname.as_deref(), Some("speaker.local"));
     assert_eq!(v4(&devices[0]), Some(ip("10.0.2.73")));
     assert_eq!(devices[0].services.len(), 1, "the service learned before the name is kept");
-    assert_eq!((devices[0].services[0].port(), devices[0].services[0].target().as_deref()), (7000, Some("speaker.local")));
+    assert_eq!((devices[0].services[0].port(), devices[0].services[0].target()), (7000, Some("speaker.local")));
 
     let kinds: Vec<&str> = rx
         .try_iter()
@@ -3488,7 +3488,7 @@ fn ingest_fills_in_hostname_and_services() {
     let s = &d.services[0];
     assert_eq!(s.instance(), "Printer._http._tcp.local");
     assert_eq!(s.kind(), "_http._tcp.local");
-    assert_eq!((s.port(), s.target().as_deref()), (631, Some("printer.local")));
+    assert_eq!((s.port(), s.target()), (631, Some("printer.local")));
     assert_eq!(s.txt().collect::<Vec<_>>(), vec![b"ty=hp".to_vec()]);
 
     assert!(matches!(rx.try_recv(), Ok(Event::Added(_))));

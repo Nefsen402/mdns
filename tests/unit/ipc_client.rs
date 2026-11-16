@@ -687,7 +687,7 @@ fn query_stream() -> Vec<String> {
 }
 
 fn query_options(path: &str, json: bool, verbose: bool, wait: Duration) -> (Options, Target) {
-    let target = Target { segment: "IoT".into(), query: vec!["_x._tcp".into()], wait: Some(wait), ..Target::default() };
+    let target = Target { segment: "IoT".into(), query: vec!["_x._tcp".into()], wait: Some(wait) };
     let opts = Options { socket: path.into(), json, segmented: false, verbose, command: Command::Segments };
     (opts, target)
 }
