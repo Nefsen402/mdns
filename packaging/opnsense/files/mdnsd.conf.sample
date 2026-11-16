@@ -1,0 +1,7 @@
+# See mdnsd.conf(5), and the README for what to put here (the segments, each
+# with its interface).
+#
+# FreeBSD has no /run, which is where the control socket goes by default; mdnsctl
+# is told where it is with `mdnsctl -s /var/run/mdnsd/mdnsd.sock`.
+[Ipc]
+Socket=/var/run/mdnsd/mdnsd.sock

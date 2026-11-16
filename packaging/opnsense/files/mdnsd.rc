@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# PROVIDE: mdnsd
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+# mdnsd_enable (YES/NO)   enable it; NO by default
+# mdnsd_config            the configuration, /usr/local/etc/mdnsd.conf by default
+#
+# It is not started without the configuration, which is for the interfaces
+# only you know. The control socket's directory is /var/run/mdnsd, which the
+# configuration says with [Ipc] Socket= (see mdnsd.conf.sample) and mdnsctl
+# with -s: FreeBSD has no /run.
+
+. /etc/rc.subr
+
+name=mdnsd
+rcvar=mdnsd_enable
+desc="mDNS discovery and reflection daemon"
+
+load_rc_config $name
+: ${mdnsd_enable:=NO}
+: ${mdnsd_config:=/usr/local/etc/mdnsd.conf}
+
+pidfile=/var/run/${name}.pid
+procname=/usr/local/bin/mdnsd
+command=/usr/sbin/daemon
+command_args="-f -P ${pidfile}.daemon -p ${pidfile} -u mdnsd -- ${procname} ${mdnsd_config}"
+required_files=${mdnsd_config}
+start_precmd=mdnsd_precmd
+extra_commands=reload
+reload_cmd="mdnsd_restart"
+sig_stop=TERM
+
+mdnsd_precmd()
+{
+	install -d -o mdnsd -g mdnsd -m 0755 /var/run/mdnsd
+}
+
+# The configuration is read once, at the start.
+mdnsd_restart()
+{
+	/usr/sbin/service mdnsd restart
+}
+
+run_rc_command "$1"
