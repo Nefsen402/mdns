@@ -1,0 +1,128 @@
+name: Release
+
+# A tag that names a version (v0.1.0) builds every package under packaging/
+# and attaches them to a release of that name, made if there is none. By hand,
+# it builds them and keeps them as artifacts, and releases nothing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The version of the tag is the crate's, and the packages that name it
+  # themselves (the PKGBUILD, the Debian changelog) have it too: a package
+  # that says another one is not what the release is of.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the versions
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          arch=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          debian=$(sed -n '1s/^mdnsd (\([^-]*\)-.*/\1/p' packaging/debian/changelog)
+          echo "Cargo.toml $crate, PKGBUILD $arch, debian/changelog $debian"
+          [ "$crate" = "$arch" ] && [ "$crate" = "$debian" ]
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            [ "$GITHUB_REF_NAME" = "v$crate" ] || { echo "the tag is $GITHUB_REF_NAME, the crate v$crate" >&2; exit 1; }
+          fi
+
+  # What there is the tools for here: the .deb (its own tools are Ubuntu's), and
+  # the packages that are cross-built, with rustup's targets, from this machine.
+  # Each folder of packaging/ has the build.sh that release.sh runs.
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The crate uses edition 2024, so it needs a recent toolchain.
+      - name: Install Rust (stable), and the targets of the cross-built packages
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update \
+            --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl \
+            --target armv7-unknown-linux-musleabihf --target x86_64-unknown-freebsd
+          rustup default stable
+          rustc --version
+
+      # clang and lld link for FreeBSD; debhelper is what the .deb is made with.
+      - name: Install the build tools
+        run: sudo apt-get install -y --no-install-recommends clang lld zstd debhelper
+
+      - name: Build the packages
+        env:
+          ONLY: debian openwrt opnsense
+        run: packaging/release.sh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-ubuntu
+          path: dist
+          retention-days: 7
+
+  # makepkg is Arch's, and will not run as root: a container of Arch, with a user.
+  arch:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: archlinux:base-devel
+    steps:
+      - name: Install the build tools
+        run: pacman -Syu --noconfirm --needed git rust
+
+      - uses: actions/checkout@v4
+
+      - name: Build the package
+        env:
+          ONLY: arch
+        run: |
+          useradd -m builder
+          git config --system --add safe.directory '*'
+          chown -R builder .
+          su builder -c 'packaging/release.sh dist'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-arch
+          path: dist
+          retention-days: 7
+
+  # Only for a tag: the packages and their checksums, on the release.
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [build, arch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          # The .buildinfo and .changes of the .deb are not for the release.
+          rm -f ./*.buildinfo ./*.changes
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber -- *
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME" -- *
+          fi
