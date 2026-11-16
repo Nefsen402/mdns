@@ -24,9 +24,12 @@ ipk() { # rust target, openwrt architecture
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' RETURN
 
-    mkdir -p "$tmp/data/usr/bin" "$tmp/data/etc/init.d" "$tmp/data/usr/share/man/man"{1,5,8} "$tmp/control"
+    mkdir -p "$tmp/data/usr/bin" "$tmp/data/etc/init.d" "$tmp/data/lib/upgrade/keep.d" \
+        "$tmp/data/usr/share/man/man"{1,5,8} "$tmp/control"
     install -m755 "$bin/mdnsd" "$bin/mdnsctl" "$tmp/data/usr/bin/"
     install -m755 "$here/files/mdnsd.init" "$tmp/data/etc/init.d/mdnsd"
+    # What sysupgrade keeps: the configuration, which no package ships.
+    install -m644 "$here/files/keep.d" "$tmp/data/lib/upgrade/keep.d/mdnsd"
     install -m644 "$root/man/mdnsctl.1" "$tmp/data/usr/share/man/man1/"
     install -m644 "$root/man/mdnsd.conf.5" "$tmp/data/usr/share/man/man5/"
     install -m644 "$root/man/mdnsd.8" "$tmp/data/usr/share/man/man8/"

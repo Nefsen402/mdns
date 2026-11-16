@@ -540,7 +540,7 @@ rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
   `arm_cortex-a7_neon-vfpv4`; `ARCHES` names others): `opkg install` it, write
   `/etc/mdnsd.conf`, then `service mdnsd start`. The package creates the
   `mdnsd` user, and its procd script restarts a crashed daemon (not past five
-  crashes in an hour).
+  crashes in an hour). `/etc/mdnsd.conf` is kept by `sysupgrade`.
 - **OPNsense** (`mdnsd-*-FreeBSD14-amd64.pkg`, also for pfSense): `pkg add` it,
   copy `/usr/local/etc/mdnsd.conf.sample` to `mdnsd.conf` and add the segments,
   then `sysrc mdnsd_enable=YES && service mdnsd start`. FreeBSD has no `/run`:
