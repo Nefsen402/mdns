@@ -524,6 +524,29 @@ user and group. Configure and start it as described above (`/etc/mdnsd.conf`,
 then `systemctl enable --now mdnsd`; the package enables the unit but it does
 not run until the config exists).
 
+## Installing (OpenWrt, OPNsense)
+
+`packaging/release.sh` builds every package under `packaging/` (the Arch and
+Debian ones above, and these) into `dist/`. The OpenWrt and OPNsense ones are
+cross-built from Linux, with rustup's targets, `clang`, `lld` and `zstd`:
+
+```sh
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+    armv7-unknown-linux-musleabihf x86_64-unknown-freebsd
+./packaging/release.sh            # or ONLY="openwrt opnsense" ./packaging/release.sh
+```
+
+- **OpenWrt** (`mdnsd_*_ARCH.ipk`, for `x86_64`, `aarch64_generic` and
+  `arm_cortex-a7_neon-vfpv4`; `ARCHES` names others): `opkg install` it, write
+  `/etc/mdnsd.conf`, then `service mdnsd start`. The package creates the
+  `mdnsd` user, and its procd script restarts a crashed daemon (not past five
+  crashes in an hour).
+- **OPNsense** (`mdnsd-*-FreeBSD14-amd64.pkg`, also for pfSense): `pkg add` it,
+  copy `/usr/local/etc/mdnsd.conf.sample` to `mdnsd.conf` and add the segments,
+  then `sysrc mdnsd_enable=YES && service mdnsd start`. FreeBSD has no `/run`:
+  the sample puts the control socket in `/var/run/mdnsd/`, which `mdnsctl` is
+  told with `-s /var/run/mdnsd/mdnsd.sock`.
+
 ## Documentation
 
 The man pages are the reference, and are installed with the package:

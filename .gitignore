@@ -19,3 +19,8 @@ __pycache__/
 /packaging/debian/*.substvars
 /packaging/debian/*.debhelper*
 /packaging/debian/debhelper-build-stamp
+
+# packaging/release.sh output, and what the packages are built from
+/dist/
+/packaging/openwrt/out/
+/packaging/opnsense/out/
