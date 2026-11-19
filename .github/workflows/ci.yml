@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The crate uses edition 2024, so it needs a recent toolchain.
       - name: Install Rust (stable)
@@ -41,7 +41,7 @@ jobs:
         run: python3 tests/e2e/coverage.py build --out binaries
 
       - name: Keep the binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries
           path: binaries
@@ -52,9 +52,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries
           path: binaries
@@ -63,7 +63,7 @@ jobs:
         run: python3 tests/e2e/coverage.py unit --binaries binaries --out profile-unit
 
       - name: Keep the profile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: profile-unit
           path: profile-unit
@@ -82,9 +82,9 @@ jobs:
       matrix:
         sockets: [pinned, portable]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries
           path: binaries
@@ -103,14 +103,14 @@ jobs:
 
       - name: Keep the daemon's logs of a failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-logs-${{ matrix.sockets }}
           path: e2e-logs
           retention-days: 7
 
       - name: Keep the profile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: profile-e2e-${{ matrix.sockets }}
           path: profile-e2e
@@ -130,7 +130,7 @@ jobs:
       pull-requests: write
     steps:
       # The source is read from where it was when it was built, which is here.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The LLVM tools of the compiler read what it wrote.
       - name: Install Rust (stable)
@@ -138,13 +138,13 @@ jobs:
           rustup toolchain install stable --profile minimal --component llvm-tools-preview --no-self-update
           rustup default stable
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries
           path: binaries
 
       # Each profile in a folder of its own, by the name it was kept under.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: profile-*
           path: profiles
@@ -171,13 +171,13 @@ jobs:
 
       # master's figures are what the next pull request is compared with.
       - name: Keep the figures
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-summary
           path: coverage-report/summary.json
 
       - name: Keep the report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: |
@@ -189,7 +189,7 @@ jobs:
       # on a pull request from a fork.
       - name: Comment on the pull request
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -206,6 +206,77 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
+  # The routers it is for: ARM, which has prebuilt targets, is built and linked;
+  # MIPS (big-endian, as OpenWrt's ath79 is, and little-endian, as its ramips is)
+  # has none, so std is built from source, by a nightly that is pinned so that its
+  # changes are not this project's failures, and the code is checked, not linked
+  # (there is no musl for it to link with). It catches what is true of the code
+  # alone: pointer widths of 32 bits, and bytes in either order.
+  cross:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-unknown-linux-musl }
+          - { target: armv7-unknown-linux-musleabihf }
+          - { target: mips-unknown-linux-musl, nightly: nightly-2026-11-14 }
+          - { target: mipsel-unknown-linux-musl, nightly: nightly-2026-11-14 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable), and the target's standard library
+        if: ${{ !matrix.nightly }}
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }} --no-self-update
+          rustup default stable
+
+      - name: Install Rust (a nightly, with the sources of std)
+        if: ${{ matrix.nightly }}
+        run: |
+          rustup toolchain install ${{ matrix.nightly }} --profile minimal --component rust-src --no-self-update
+          rustup default ${{ matrix.nightly }}
+
+      # The tests are checked too, so that what they build for is what is built.
+      - name: Check
+        if: ${{ !matrix.nightly }}
+        run: cargo check --locked --all-targets --target ${{ matrix.target }}
+
+      # rust-lld, with the C library that comes with the target, links it.
+      - name: Build and link
+        if: ${{ !matrix.nightly }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Check (std built from source)
+        if: ${{ matrix.nightly }}
+        run: cargo check --locked --all-targets -Zbuild-std=std,panic_abort --target ${{ matrix.target }}
+
+  # macOS is kept buildable, natively: linking for it takes Apple's SDK, which a
+  # runner of theirs has. The daemon, mdnsctl and the unit tests' executables are
+  # built and linked; not run, as nothing here has seen them run on macOS (and the
+  # end-to-end tests need what it does not have: network namespaces, or jails).
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Build the unit tests
+        run: cargo test --locked --no-run
+
   # The daemon for FreeBSD, built here, for the job that follows to run: Rust is
   # slow to install in a virtual machine, and to build with there. It is linked
   # against the release's own C library, which the script fetches; see
@@ -214,7 +285,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable), and its FreeBSD target
         run: |
@@ -229,7 +300,7 @@ jobs:
         run: python3 tests/e2e/cross_freebsd.py ${{ env.FREEBSD }} --out freebsd-binaries
 
       - name: Keep the binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: freebsd-binaries
           path: freebsd-binaries
@@ -249,11 +320,11 @@ jobs:
       run:
         shell: cpa.sh {0} --sync-files runner-to-vm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: freebsd-binaries
           path: freebsd-binaries

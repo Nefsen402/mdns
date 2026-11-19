@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check the versions
         run: |
@@ -30,7 +30,9 @@ jobs:
           arch=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
           debian=$(sed -n '1s/^mdnsd (\([^-]*\)-.*/\1/p' packaging/debian/changelog)
           echo "Cargo.toml $crate, PKGBUILD $arch, debian/changelog $debian"
-          [ "$crate" = "$arch" ] && [ "$crate" = "$debian" ]
+          # Each on a line of its own: bash -e does not stop for the first half of `a && b`.
+          [ "$crate" = "$arch" ] || { echo "PKGBUILD says $arch, the crate $crate" >&2; exit 1; }
+          [ "$crate" = "$debian" ] || { echo "debian/changelog says $debian, the crate $crate" >&2; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             [ "$GITHUB_REF_NAME" = "v$crate" ] || { echo "the tag is $GITHUB_REF_NAME, the crate v$crate" >&2; exit 1; }
           fi
@@ -43,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The crate uses edition 2024, so it needs a recent toolchain.
       - name: Install Rust (stable), and the targets of the cross-built packages
@@ -63,7 +65,7 @@ jobs:
           ONLY: debian openwrt opnsense
         run: packaging/release.sh dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages-ubuntu
           path: dist
@@ -79,7 +81,7 @@ jobs:
       - name: Install the build tools
         run: pacman -Syu --noconfirm --needed git rust
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build the package
         env:
@@ -90,7 +92,7 @@ jobs:
           chown -R builder .
           su builder -c 'packaging/release.sh dist'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages-arch
           path: dist
@@ -105,7 +107,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: packages-*
           path: dist
